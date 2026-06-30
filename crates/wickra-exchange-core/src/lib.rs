@@ -18,6 +18,8 @@
 mod credentials;
 mod error;
 mod events;
+mod idempotency;
+mod instruments;
 mod options;
 mod symbol;
 mod traits;
@@ -27,6 +29,8 @@ mod types;
 pub use credentials::Credentials;
 pub use error::{Error, Result};
 pub use events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
+pub use idempotency::ClientIdGenerator;
+pub use instruments::{Instrument, InstrumentCache, InstrumentFilters};
 pub use options::{ExchangeOptions, MarginMode, MarketType, PositionMode};
 pub use symbol::Symbol;
 pub use traits::{Exchange, Execution, MarketData};
