@@ -368,7 +368,7 @@ jobs:
           tool: cargo-llvm-cov
       - name: Generate coverage (lcov)
         run: >
-          cargo llvm-cov
+          cargo llvm-cov --all-features
           -p wickra-exchange-core -p wickra-exchange
           --lcov --output-path lcov.info
       - name: Upload to Codecov

@@ -13,6 +13,7 @@ categories.workspace = true
 description = "Core traits, types and shared connectivity machinery for wickra-exchange: a typed, unified API over the ten largest crypto exchanges."
 
 [dependencies]
+wickra-core = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 rust_decimal = { workspace = true }
