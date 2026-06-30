@@ -21,6 +21,7 @@ mod events;
 mod idempotency;
 mod instruments;
 mod options;
+mod orderbook;
 mod symbol;
 mod traits;
 mod transport;
@@ -32,6 +33,7 @@ pub use events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
 pub use idempotency::ClientIdGenerator;
 pub use instruments::{Instrument, InstrumentCache, InstrumentFilters};
 pub use options::{ExchangeOptions, MarginMode, MarketType, PositionMode};
+pub use orderbook::{BookUpdate, OrderBookBuilder};
 pub use symbol::Symbol;
 pub use traits::{Exchange, Execution, MarketData};
 pub use transport::{
