@@ -15,6 +15,7 @@ description = "Core traits, types and shared connectivity machinery for wickra-e
 [dependencies]
 wickra-core = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 rust_decimal = { workspace = true }
 zeroize = { workspace = true }
@@ -24,7 +25,6 @@ base64 = { workspace = true }
 hex = { workspace = true }
 
 [dev-dependencies]
-serde_json = { workspace = true }
 rust_decimal_macros = { workspace = true }
 
 [lints]
