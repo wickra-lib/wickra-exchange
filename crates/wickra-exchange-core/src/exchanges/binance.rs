@@ -5,36 +5,82 @@
 //! [`MockHttpTransport`] with recorded Binance responses. Only the production
 //! wiring of a real socket lives elsewhere.
 //!
-//! This first slice covers the public REST market-data surface (ticker, klines,
-//! depth) plus the URL/symbol mapping and the Binance error taxonomy. Signed
-//! execution and the WebSocket streams land in later slices.
+//! Covered here: the public REST market data (ticker, klines, depth), the
+//! URL/symbol mapping, the Binance error taxonomy, and HMAC-SHA256 signed
+//! execution (place/cancel/query order, account balances). The WebSocket market
+//! and user-data streams land in a later slice.
 
+use crate::credentials::Credentials;
 use crate::error::{Error, Result};
 use crate::events::{BookLevel, OrderBookSnapshot};
-use crate::normalize::parse_decimal;
+use crate::normalize::{format_decimal, parse_decimal};
 use crate::options::{ExchangeOptions, MarketType};
+use crate::signing::hmac_sha256_hex;
 use crate::symbol::Symbol;
-use crate::transport::{HttpRequest, HttpResponse, HttpTransport};
-use crate::types::Ticker;
+use crate::transport::{HttpMethod, HttpRequest, HttpResponse, HttpTransport};
+use crate::types::{
+    Balance, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker, TimeInForce,
+};
+use rust_decimal::Decimal;
 use serde::Deserialize;
 use wickra_core::Candle;
+
+/// The current Unix time in milliseconds, from the system clock.
+fn system_now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is before the Unix epoch")
+        .as_millis() as i64
+}
 
 /// A Binance client over an injected HTTP transport.
 pub struct Binance {
     http: Box<dyn HttpTransport>,
     rest_base: String,
     market_type: MarketType,
+    credentials: Option<Credentials>,
+    recv_window_ms: u64,
+    now_ms: Box<dyn Fn() -> i64 + Send + Sync>,
 }
 
 impl Binance {
-    /// Build a Binance client over the given transport and options.
-    #[must_use]
-    pub fn with_http(http: Box<dyn HttpTransport>, options: &ExchangeOptions) -> Self {
+    fn build(
+        http: Box<dyn HttpTransport>,
+        options: &ExchangeOptions,
+        credentials: Option<Credentials>,
+    ) -> Self {
         Self {
             http,
             rest_base: rest_base_url(options.market_type, options.testnet).to_string(),
             market_type: options.market_type,
+            credentials,
+            recv_window_ms: options.recv_window_ms,
+            now_ms: Box::new(system_now_ms),
         }
+    }
+
+    /// Build a public (unauthenticated) Binance client over the given transport.
+    #[must_use]
+    pub fn with_http(http: Box<dyn HttpTransport>, options: &ExchangeOptions) -> Self {
+        Self::build(http, options, None)
+    }
+
+    /// Build an authenticated Binance client for signed endpoints.
+    #[must_use]
+    pub fn with_credentials(
+        http: Box<dyn HttpTransport>,
+        options: &ExchangeOptions,
+        credentials: Credentials,
+    ) -> Self {
+        Self::build(http, options, Some(credentials))
+    }
+
+    /// Override the timestamp source (used for deterministic signing in tests).
+    #[must_use]
+    pub fn with_clock(mut self, now_ms: Box<dyn Fn() -> i64 + Send + Sync>) -> Self {
+        self.now_ms = now_ms;
+        self
     }
 
     /// The market type this client is configured for.
@@ -96,6 +142,87 @@ impl Binance {
         })
     }
 
+    /// Place an order. The order is validated locally first, then sent signed.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the order is invalid, credentials are missing, or
+    /// the venue rejects it.
+    pub fn place_order(&self, request: &OrderRequest) -> Result<Order> {
+        request.validate()?;
+        let type_str = if request.post_only && request.order_type == OrderType::Limit {
+            "LIMIT_MAKER"
+        } else {
+            order_type_str(request.order_type)
+        };
+        let mut params = format!(
+            "symbol={}&side={}&type={type_str}&quantity={}",
+            Self::wire_symbol(&request.symbol),
+            side_str(request.side),
+            format_decimal(request.quantity),
+        );
+        if let Some(price) = request.price {
+            params.push_str("&price=");
+            params.push_str(&format_decimal(price));
+        }
+        if let Some(stop) = request.stop_price {
+            params.push_str("&stopPrice=");
+            params.push_str(&format_decimal(stop));
+        }
+        if matches!(type_str, "LIMIT" | "STOP_LOSS_LIMIT" | "TAKE_PROFIT_LIMIT") {
+            params.push_str("&timeInForce=");
+            params.push_str(tif_str(request.time_in_force));
+        }
+        if let Some(id) = &request.client_order_id {
+            params.push_str("&newClientOrderId=");
+            params.push_str(id);
+        }
+        if request.reduce_only {
+            params.push_str("&reduceOnly=true");
+        }
+        let body = self.signed_request(HttpMethod::Post, "/api/v3/order", &params)?;
+        parse_order(&request.symbol, &body)
+    }
+
+    /// Cancel an open order by venue id.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if credentials are missing or the venue rejects it.
+    pub fn cancel_order(&self, symbol: &Symbol, order_id: &str) -> Result<()> {
+        let params = format!("symbol={}&orderId={order_id}", Self::wire_symbol(symbol));
+        self.signed_request(HttpMethod::Delete, "/api/v3/order", &params)?;
+        Ok(())
+    }
+
+    /// Query a single order by venue id.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if credentials are missing or the order is unknown.
+    pub fn query_order(&self, symbol: &Symbol, order_id: &str) -> Result<Order> {
+        let params = format!("symbol={}&orderId={order_id}", Self::wire_symbol(symbol));
+        let body = self.signed_request(HttpMethod::Get, "/api/v3/order", &params)?;
+        parse_order(symbol, &body)
+    }
+
+    /// Account balances (assets with a non-zero free or locked amount are
+    /// included as the venue reports them).
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if credentials are missing or the request fails.
+    pub fn balances(&self) -> Result<Vec<Balance>> {
+        let body = self.signed_request(HttpMethod::Get, "/api/v3/account", "")?;
+        let raw: RawAccount = deserialize(&body)?;
+        raw.balances
+            .iter()
+            .map(|b| {
+                Ok(Balance {
+                    asset: b.asset.clone(),
+                    free: parse_decimal(&b.free)?,
+                    locked: parse_decimal(&b.locked)?,
+                })
+            })
+            .collect()
+    }
+
     /// Issue a GET and return the body, mapping non-2xx responses onto the error
     /// taxonomy.
     fn get(&self, path: &str, query: &str) -> Result<String> {
@@ -107,6 +234,113 @@ impl Binance {
             Err(map_error(&response))
         }
     }
+
+    /// Sign `params` (HMAC-SHA256 over the query with `recvWindow` + `timestamp`)
+    /// and issue the request with the API-key header.
+    fn signed_request(&self, method: HttpMethod, path: &str, params: &str) -> Result<String> {
+        let creds = self.credentials.as_ref().ok_or(Error::InvalidCredentials(
+            "signed endpoint requires credentials",
+        ))?;
+        let timestamp = (self.now_ms)();
+        let payload = if params.is_empty() {
+            format!("recvWindow={}&timestamp={timestamp}", self.recv_window_ms)
+        } else {
+            format!(
+                "{params}&recvWindow={}&timestamp={timestamp}",
+                self.recv_window_ms
+            )
+        };
+        let signature = hmac_sha256_hex(creds.api_secret.as_bytes(), payload.as_bytes());
+        let url = format!("{}{path}?{payload}&signature={signature}", self.rest_base);
+        let request =
+            HttpRequest::new(method, url).with_header("X-MBX-APIKEY", creds.api_key.clone());
+        let response = self.http.execute(&request)?;
+        if response.is_success() {
+            Ok(response.body)
+        } else {
+            Err(map_error(&response))
+        }
+    }
+}
+
+fn side_str(side: OrderSide) -> &'static str {
+    match side {
+        OrderSide::Buy => "BUY",
+        OrderSide::Sell => "SELL",
+    }
+}
+
+fn order_type_str(order_type: OrderType) -> &'static str {
+    match order_type {
+        OrderType::Market => "MARKET",
+        OrderType::Limit => "LIMIT",
+        OrderType::StopMarket => "STOP_LOSS",
+        OrderType::StopLimit => "STOP_LOSS_LIMIT",
+    }
+}
+
+fn tif_str(tif: TimeInForce) -> &'static str {
+    match tif {
+        TimeInForce::Gtc => "GTC",
+        TimeInForce::Ioc => "IOC",
+        TimeInForce::Fok => "FOK",
+    }
+}
+
+fn parse_side(raw: &str) -> Result<OrderSide> {
+    match raw {
+        "BUY" => Ok(OrderSide::Buy),
+        "SELL" => Ok(OrderSide::Sell),
+        other => Err(Error::Deserialization(format!("unknown side {other:?}"))),
+    }
+}
+
+fn parse_order_type(raw: &str) -> Result<OrderType> {
+    match raw {
+        "MARKET" => Ok(OrderType::Market),
+        "LIMIT" | "LIMIT_MAKER" => Ok(OrderType::Limit),
+        "STOP_LOSS" | "TAKE_PROFIT" => Ok(OrderType::StopMarket),
+        "STOP_LOSS_LIMIT" | "TAKE_PROFIT_LIMIT" => Ok(OrderType::StopLimit),
+        other => Err(Error::Deserialization(format!(
+            "unknown order type {other:?}"
+        ))),
+    }
+}
+
+fn parse_status(raw: &str) -> Result<OrderStatus> {
+    match raw {
+        "NEW" => Ok(OrderStatus::New),
+        "PARTIALLY_FILLED" => Ok(OrderStatus::PartiallyFilled),
+        "FILLED" => Ok(OrderStatus::Filled),
+        "CANCELED" | "PENDING_CANCEL" => Ok(OrderStatus::Canceled),
+        "REJECTED" => Ok(OrderStatus::Rejected),
+        "EXPIRED" | "EXPIRED_IN_MATCH" => Ok(OrderStatus::Expired),
+        other => Err(Error::Deserialization(format!("unknown status {other:?}"))),
+    }
+}
+
+fn parse_order(symbol: &Symbol, body: &str) -> Result<Order> {
+    let raw: RawOrder = deserialize(body)?;
+    let executed = parse_decimal(&raw.executed_qty)?;
+    let average_price = if executed > Decimal::ZERO {
+        Some(parse_decimal(&raw.cummulative_quote_qty)? / executed)
+    } else {
+        None
+    };
+    let parsed_price = parse_decimal(&raw.price)?;
+    let price = (parsed_price > Decimal::ZERO).then_some(parsed_price);
+    Ok(Order {
+        id: raw.order_id.to_string(),
+        client_order_id: (!raw.client_order_id.is_empty()).then_some(raw.client_order_id),
+        symbol: symbol.clone(),
+        side: parse_side(&raw.side)?,
+        order_type: parse_order_type(&raw.order_type)?,
+        status: parse_status(&raw.status)?,
+        quantity: parse_decimal(&raw.orig_qty)?,
+        filled_quantity: executed,
+        price,
+        average_price,
+    })
 }
 
 /// The REST base URL for a market type and network.
@@ -142,6 +376,37 @@ struct RawDepth {
 struct BinanceError {
     code: i64,
     msg: String,
+}
+
+#[derive(Deserialize)]
+struct RawOrder {
+    #[serde(rename = "orderId")]
+    order_id: u64,
+    #[serde(rename = "clientOrderId", default)]
+    client_order_id: String,
+    side: String,
+    #[serde(rename = "type")]
+    order_type: String,
+    status: String,
+    #[serde(rename = "origQty")]
+    orig_qty: String,
+    #[serde(rename = "executedQty")]
+    executed_qty: String,
+    #[serde(rename = "cummulativeQuoteQty")]
+    cummulative_quote_qty: String,
+    price: String,
+}
+
+#[derive(Deserialize)]
+struct RawAccount {
+    balances: Vec<RawBalance>,
+}
+
+#[derive(Deserialize)]
+struct RawBalance {
+    asset: String,
+    free: String,
+    locked: String,
 }
 
 fn deserialize<T: for<'de> Deserialize<'de>>(body: &str) -> Result<T> {
@@ -373,5 +638,124 @@ mod tests {
             binance.klines(&symbol(), "1h", 1).unwrap_err(),
             Error::Deserialization(_)
         ));
+    }
+
+    const ORDER_JSON: &str = r#"{"symbol":"BTCUSDT","orderId":28,"clientOrderId":"abc",
+        "price":"100.00000000","origQty":"1.00000000","executedQty":"0.00000000",
+        "cummulativeQuoteQty":"0.00000000","status":"NEW","type":"LIMIT","side":"BUY"}"#;
+
+    /// An authenticated client over a mock transport with a fixed clock.
+    fn signed_client(now_ms: i64) -> (Binance, Arc<MockHttpTransport>) {
+        let mock = Arc::new(MockHttpTransport::new());
+        let opts = ExchangeOptions::mainnet(MarketType::Spot);
+        let binance = Binance::with_credentials(
+            Box::new(ArcTransport(Arc::clone(&mock))),
+            &opts,
+            Credentials::new("APIKEY", "SECRET"),
+        )
+        .with_clock(Box::new(move || now_ms));
+        (binance, mock)
+    }
+
+    #[test]
+    fn place_order_signs_request_and_parses_response() {
+        let (binance, mock) = signed_client(1000);
+        mock.push_json(200, ORDER_JSON);
+        let order = binance
+            .place_order(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)))
+            .unwrap();
+        assert_eq!(order.id, "28");
+        assert_eq!(order.client_order_id.as_deref(), Some("abc"));
+        assert_eq!(order.status, OrderStatus::New);
+        assert_eq!(order.quantity, dec!(1));
+        assert_eq!(order.price, Some(dec!(100)));
+        assert_eq!(order.average_price, None);
+
+        let req = &mock.recorded_requests()[0];
+        assert_eq!(req.method, HttpMethod::Post);
+        let payload = "symbol=BTCUSDT&side=BUY&type=LIMIT&quantity=1&price=100\
+                       &timeInForce=GTC&recvWindow=5000&timestamp=1000";
+        let sig = crate::signing::hmac_sha256_hex(b"SECRET", payload.as_bytes());
+        assert!(req.url.contains(payload), "payload mismatch: {}", req.url);
+        assert!(req.url.ends_with(&format!("signature={sig}")));
+        assert!(req
+            .headers
+            .iter()
+            .any(|(k, v)| k == "X-MBX-APIKEY" && v == "APIKEY"));
+    }
+
+    #[test]
+    fn post_only_limit_becomes_limit_maker_without_tif() {
+        let (binance, mock) = signed_client(1000);
+        mock.push_json(200, ORDER_JSON);
+        binance
+            .place_order(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)).post_only())
+            .unwrap();
+        let req = &mock.recorded_requests()[0];
+        assert!(req.url.contains("type=LIMIT_MAKER"));
+        assert!(!req.url.contains("timeInForce"));
+    }
+
+    #[test]
+    fn signed_endpoint_without_credentials_errors() {
+        let (binance, _) = client(MarketType::Spot, false);
+        let err = binance
+            .place_order(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)))
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidCredentials(_)));
+    }
+
+    #[test]
+    fn cancel_order_is_a_signed_delete() {
+        let (binance, mock) = signed_client(1000);
+        mock.push_json(
+            200,
+            r#"{"symbol":"BTCUSDT","orderId":28,"status":"CANCELED"}"#,
+        );
+        binance.cancel_order(&symbol(), "28").unwrap();
+        let req = &mock.recorded_requests()[0];
+        assert_eq!(req.method, HttpMethod::Delete);
+        assert!(req.url.contains("orderId=28"));
+        assert!(req.url.contains("signature="));
+    }
+
+    #[test]
+    fn query_order_computes_average_fill_price() {
+        let (binance, mock) = signed_client(1000);
+        mock.push_json(
+            200,
+            r#"{"symbol":"BTCUSDT","orderId":28,"clientOrderId":"","price":"0.00000000",
+            "origQty":"2.0","executedQty":"2.0","cummulativeQuoteQty":"200.0",
+            "status":"FILLED","type":"MARKET","side":"SELL"}"#,
+        );
+        let order = binance.query_order(&symbol(), "28").unwrap();
+        assert_eq!(order.status, OrderStatus::Filled);
+        assert_eq!(order.side, OrderSide::Sell);
+        assert_eq!(order.order_type, OrderType::Market);
+        assert_eq!(order.average_price, Some(dec!(100))); // 200 / 2
+        assert_eq!(order.price, None); // 0 -> None
+        assert_eq!(order.client_order_id, None); // empty -> None
+        assert_eq!(order.filled_quantity, dec!(2));
+    }
+
+    #[test]
+    fn balances_parse() {
+        let (binance, mock) = signed_client(1000);
+        mock.push_json(
+            200,
+            r#"{"balances":[{"asset":"USDT","free":"100.5","locked":"25.5"},
+            {"asset":"BTC","free":"0.1","locked":"0"}]}"#,
+        );
+        let bals = binance.balances().unwrap();
+        assert_eq!(bals.len(), 2);
+        assert_eq!(bals[0].asset, "USDT");
+        assert_eq!(bals[0].total(), dec!(126));
+        assert_eq!(bals[1].asset, "BTC");
+    }
+
+    #[test]
+    fn system_clock_is_sane() {
+        // Covers the production timestamp source: a plausible 2023+ epoch ms.
+        assert!(system_now_ms() > 1_600_000_000_000);
     }
 }
