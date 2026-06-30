@@ -1,0 +1,44 @@
+# Single source of truth for repo-level identity (org slug, maintainer email,
+# canonical URLs). Mirrors the convention used in the main `wickra` repository.
+
+[repo]
+org          = "wickra-lib"
+name         = "wickra-exchange"
+url          = "https://github.com/wickra-lib/wickra-exchange"
+homepage     = "https://wickra.org"
+issues_url   = "https://github.com/wickra-lib/wickra-exchange/issues"
+security_url = "https://github.com/wickra-lib/wickra-exchange/security/advisories/new"
+
+[maintainer]
+# `handle` is the natural-person credit shown in package manifests; it does not
+# move with a GitHub org transfer. `github` is the org @-mention slug used in
+# CODEOWNERS and prose.
+handle = "kingchenc"
+email  = "support@wickra.org"
+github = "wickra-lib"
+
+[badges]
+ci_workflow = "ci.yml"
+
+[audit]
+# Forbidden substrings that must not appear in source (the pre-org-migration
+# repo path). Kept in lock-step with the main repository's convention.
+forbidden = [
+    "kingchenc/wickra-exchange",
+]
+
+# Paths exempt from the forbidden-substring scan: auto-generated / lockfiles and
+# the two files that legitimately spell the forbidden value out (this file
+# defines it; the audit script matches against it).
+allowlist = [
+    "target/",
+    "node_modules/",
+    "fuzz/target/",
+    ".venv/",
+    "Cargo.lock",
+    "package-lock.json",
+    "bindings/node/index.js",
+    "bindings/node/index.d.ts",
+    "repo-metadata.toml",
+    ".github/scripts/sync-metadata.py",
+]

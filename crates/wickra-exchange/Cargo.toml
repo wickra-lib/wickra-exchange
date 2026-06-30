@@ -1,0 +1,19 @@
+[package]
+name = "wickra-exchange"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Streaming-native, typed, unified connectivity for the ten largest crypto exchanges (market data + signed order execution), built on the Wickra core."
+
+[lints]
+workspace = true
+
+[dependencies]
+wickra-exchange-core = { workspace = true }

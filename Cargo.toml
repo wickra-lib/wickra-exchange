@@ -1,0 +1,71 @@
+# Wickra Exchange — workspace.
+# Streaming-native crypto-exchange connectivity built on the Wickra core. One
+# typed, unified API over the ten largest exchanges (market data + signed order
+# execution), mirroring the Wickra tiering: Rust core -> native Python/Node +
+# a C ABI hub for C/C++/C#/Go/Java/R. No WASM binding (auth trading needs raw
+# sockets and secret keys, which the browser sandbox forbids).
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/wickra-exchange-core",
+    "crates/wickra-exchange",
+]
+# The fuzz crate is its own (detached) workspace — cargo-fuzz builds it on its
+# own with sanitizer flags on a nightly toolchain.
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.86"
+license = "MIT OR Apache-2.0"
+authors = ["kingchenc"]
+repository = "https://github.com/wickra-lib/wickra-exchange"
+homepage = "https://wickra.org"
+readme = "README.md"
+keywords = ["crypto", "exchange", "trading", "connectivity", "streaming"]
+categories = ["finance", "api-bindings", "asynchronous"]
+
+[workspace.dependencies]
+wickra-core = "0.9"
+wickra-exchange-core = { version = "0.1.0", path = "crates/wickra-exchange-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+# Exact decimal arithmetic for price/qty (never f64 in the order layer).
+rust_decimal = { version = "1", features = ["serde"] }
+rust_decimal_macros = "1"
+# Secret-key hygiene.
+zeroize = { version = "1", features = ["derive"] }
+# Observability.
+tracing = "0.1"
+# Async runtime + I/O (driven internally; the public stream API stays pull-based).
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+futures-util = "0.3"
+# HTTP + WebSocket transport (rustls TLS, no OpenSSL system dependency).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["rustls-tls-webpki-roots", "connect"] }
+url = "2"
+# Request signing primitives (HMAC-SHA256/512, base64, hex).
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+hex = "0.4"
+# Test/dev.
+proptest = "1"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Allowed pedantic lints (same precedent as the wickra core).
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+cast_possible_truncation = "allow"
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+too_many_lines = "allow"
+similar_names = "allow"
+many_single_char_names = "allow"
