@@ -4,4 +4,4 @@ too-many-arguments-threshold = 8
 
 # Proper nouns with embedded capitals that the doc_markdown lint would otherwise
 # flag as un-backticked identifiers. `..` keeps clippy's default list.
-doc-valid-idents = ["KuCoin", "BitMEX", "BingX", ".."]
+doc-valid-idents = ["KuCoin", "BitMEX", "BingX", "PnL", ".."]
