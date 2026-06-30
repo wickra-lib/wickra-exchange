@@ -18,6 +18,10 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 rust_decimal = { workspace = true }
 zeroize = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
