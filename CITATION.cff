@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "wickra-exchange"
+abstract: >-
+  A streaming-native crypto-exchange connectivity library built on the Wickra
+  core: one typed, unified API over the ten largest exchanges (market data and
+  signed order execution), reachable natively from Rust, Python, Node.js and,
+  through a C ABI, from C, C++, C#, Go, Java and R.
+type: software
+authors:
+  - alias: kingchenc
+    website: "https://wickra.org"
+repository-code: "https://github.com/wickra-lib/wickra-exchange"
+url: "https://wickra.org"
+license:
+  - MIT
+  - Apache-2.0
+keywords:
+  - crypto
+  - exchange
+  - trading
+  - connectivity
+  - streaming
