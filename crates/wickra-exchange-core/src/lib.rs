@@ -17,17 +17,30 @@
 
 mod credentials;
 mod error;
+mod events;
 mod options;
 mod symbol;
+mod traits;
+mod transport;
 mod types;
 
 pub use credentials::Credentials;
 pub use error::{Error, Result};
+pub use events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
 pub use options::{ExchangeOptions, MarginMode, MarketType, PositionMode};
 pub use symbol::Symbol;
+pub use traits::{Exchange, Execution, MarketData};
+pub use transport::{
+    HttpMethod, HttpRequest, HttpResponse, HttpTransport, MockHttpTransport, MockWsConnection,
+    MockWsTransport, WsConnection, WsTransport,
+};
 pub use types::{
     Balance, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker, TimeInForce,
 };
+
+/// Re-export of [`wickra_core::Candle`], the candle type returned by
+/// [`MarketData::klines`] so market data feeds the indicator core directly.
+pub use wickra_core::Candle;
 
 /// The crate version, sourced from `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
