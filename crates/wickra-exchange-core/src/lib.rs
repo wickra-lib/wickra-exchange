@@ -4,8 +4,8 @@
 //! streaming-native crypto-exchange connectivity library built on the Wickra
 //! core.
 //!
-//! The crate exposes one typed, unified API — [`Exchange`] = [`MarketData`] +
-//! [`Execution`] — implemented per exchange behind bespoke auth and WebSocket
+//! The crate exposes one typed, unified API — `Exchange` = `MarketData` +
+//! `Execution` — implemented per exchange behind bespoke auth and WebSocket
 //! state machines. Market-data streams are **pull-based** (`poll_events`), so
 //! the same surface crosses the C ABI to every binding (including single-threaded
 //! R) as trivially as a synchronous call.
@@ -14,9 +14,20 @@
 //! reject mis-rounded prices and quantities, and float drift loses money.
 //!
 //! [`wickra-exchange`]: https://github.com/wickra-lib/wickra-exchange
-//! [`Exchange`]: crate
-//! [`MarketData`]: crate
-//! [`Execution`]: crate
+
+mod credentials;
+mod error;
+mod options;
+mod symbol;
+mod types;
+
+pub use credentials::Credentials;
+pub use error::{Error, Result};
+pub use options::{ExchangeOptions, MarginMode, MarketType, PositionMode};
+pub use symbol::Symbol;
+pub use types::{
+    Balance, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker, TimeInForce,
+};
 
 /// The crate version, sourced from `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
