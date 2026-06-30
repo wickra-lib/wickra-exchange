@@ -1,0 +1,115 @@
+version: 2
+updates:
+  # Rust workspace (root Cargo.toml + all member crates).
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "deps(cargo)"
+    groups:
+      # napi-rs (napi / napi-derive / napi-build) is a coordinated major
+      # migration that must move with @napi-rs/cli on the npm side — keep it in
+      # its own PR rather than bundled with unrelated crate bumps.
+      napi:
+        patterns: ["napi", "napi-derive", "napi-build"]
+      cargo:
+        patterns: ["*"]
+        exclude-patterns: ["napi", "napi-derive", "napi-build"]
+
+  # Node binding npm dependencies.
+  - package-ecosystem: npm
+    directory: "/bindings/node"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "deps(npm)"
+    groups:
+      node-binding:
+        patterns: ["*"]
+
+  # Python binding pip dependencies.
+  - package-ecosystem: pip
+    directory: "/bindings/python"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "deps(pip)"
+    groups:
+      python-binding:
+        patterns: ["*"]
+
+  # GitHub Actions — keeps the SHA-pinned actions current (Dependabot reads
+  # the version comment after each pinned SHA and bumps both together).
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "deps(actions)"
+    # dtolnay/rust-toolchain@<channel> pins a Rust toolchain (e.g. 1.86 for the
+    # MSRV job, 1.88 for the Node binding), not an action version. Dependabot
+    # misreads the channel as a version and proposes non-existent Rust releases
+    # (e.g. 1.100). The toolchain pins are managed manually with the MSRV policy.
+    ignore:
+      - dependency-name: "dtolnay/rust-toolchain"
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  # Java binding (Maven) — tracks the C-ABI binding's build/publishing plugins.
+  - package-ecosystem: maven
+    directory: "/bindings/java"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "deps(maven)"
+    groups:
+      maven:
+        patterns: ["*"]
+
+  # C# binding (NuGet). The published WickraExchange.csproj is a thin C-ABI
+  # wrapper with no external packages; the test project pulls xunit and
+  # Microsoft.NET.Test.Sdk.
+  - package-ecosystem: nuget
+    directory: "/bindings/csharp/WickraExchange.Tests"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "deps(nuget)"
+    groups:
+      nuget:
+        patterns: ["*"]
+
+  # Go binding (Go modules). The binding's own go.mod has no external deps but
+  # Dependabot keeps the toolchain/directive current.
+  - package-ecosystem: gomod
+    directory: "/bindings/go"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "deps(gomod)"
+    groups:
+      go-binding:
+        patterns: ["*"]

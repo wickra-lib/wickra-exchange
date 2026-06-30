@@ -1,0 +1,38 @@
+name: Benchmark
+
+# The Criterion benchmark adds several minutes of build + bench time with no
+# consumer of the resulting artefact, so it runs on a nightly schedule and on
+# demand rather than gating every push / PR. ci.yml still verifies build / tests
+# / lints on every push and pull-request.
+on:
+  schedule:
+    - cron: "0 3 * * *" # nightly at 03:00 UTC
+  workflow_dispatch:
+
+# Least-privilege default: the single job only builds and uploads an artifact.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+jobs:
+  bench:
+    name: Criterion benchmark
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Run the Criterion benchmark
+        run: cargo bench -p wickra-exchange-bench | tee benchmark.txt
+      - name: Upload report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: benchmark
+          path: benchmark.txt

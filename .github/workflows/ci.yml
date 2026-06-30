@@ -1,0 +1,413 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      # The PyO3 extension cdylib is built and tested by the `python` job via
+      # maturin (which supplies the platform link flags); exclude it here.
+      - run: cargo build --workspace --all-features --exclude wickra-exchange-python
+      - run: cargo test --workspace --all-features --exclude wickra-exchange-python
+
+  lint:
+    name: Format & Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  msrv:
+    name: MSRV workspace (1.86)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: "1.86"
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      # The Node binding (napi 3) requires Rust 1.88 and is checked separately
+      # below; the Python binding needs maturin's platform link flags and is
+      # built by the `python` job.
+      - run: cargo build --workspace --exclude wickra-exchange-python --exclude wickra-exchange-node
+
+  msrv-node:
+    name: MSRV node binding (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo build -p wickra-exchange-node
+
+  supply-chain:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@8b3c737da4b541bf0fb5a3e0488ff20535badac9 # v2.82.1
+        with:
+          tool: cargo-deny
+      - run: cargo deny check
+
+  python:
+    name: Python binding (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+      - uses: ./.github/actions/setup-rust
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: pip install maturin pytest
+      - run: maturin build --out dist
+        working-directory: bindings/python
+      - run: pip install --no-index --find-links bindings/python/dist wickra-exchange
+      - run: pytest bindings/python/tests -q
+
+  go:
+    name: Go on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: "stable"
+          cache: false
+      - uses: ./.github/actions/setup-rust
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      # The binding links against the C ABI hub via cgo; build it first and stage
+      # the platform library under bindings/go/lib so cgo's LDFLAGS find it.
+      - name: Build the C ABI library
+        run: cargo build -p wickra-exchange-c --release
+
+      - name: Vendored header in sync with the C ABI
+        shell: bash
+        # bindings/go/include/wickra_exchange.h is a committed copy of the C ABI
+        # header (the parent ../c/include is outside the Go module, so it must be
+        # vendored). Fail if it drifts from the source of truth.
+        run: |
+          if ! diff -u bindings/c/include/wickra_exchange.h bindings/go/include/wickra_exchange.h; then
+            echo "::error::bindings/go/include/wickra_exchange.h is stale — copy bindings/c/include/wickra_exchange.h over it"
+            exit 1
+          fi
+
+      - name: Stage the native library
+        shell: bash
+        # Stage into lib/<goos>_<goarch>/ to match the per-platform cgo LDFLAGS.
+        run: |
+          case "$RUNNER_ARCH" in
+            X64) arch=amd64 ;;
+            ARM64) arch=arm64 ;;
+            *) echo "::error::unsupported RUNNER_ARCH '$RUNNER_ARCH'"; exit 1 ;;
+          esac
+          case "$RUNNER_OS" in
+            Linux)   dir="linux_$arch";   lib=target/release/libwickra_exchange.so ;;
+            macOS)   dir="darwin_$arch";  lib=target/release/libwickra_exchange.dylib ;;
+            Windows) dir="windows_$arch"; lib=target/release/wickra_exchange.dll ;;
+          esac
+          mkdir -p "bindings/go/lib/$dir"
+          cp "$lib" "bindings/go/lib/$dir/"
+          echo "WICKRA_GO_LIBDIR=$PWD/bindings/go/lib/$dir" >> "$GITHUB_ENV"
+
+      - name: Check gofmt
+        shell: bash
+        run: |
+          unformatted="$(gofmt -l bindings/go)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needed on:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: Vet and test the Go binding
+        shell: bash
+        # On Windows there is no rpath; the loader resolves wickra_exchange.dll via
+        # PATH (WICKRA_GO_LIBDIR is the per-platform staged lib dir). Linux/macOS
+        # use the rpath baked by the per-platform cgo LDFLAGS.
+        run: |
+          export PATH="$WICKRA_GO_LIBDIR:$PATH"
+          cd bindings/go
+          go vet ./...
+          go test ./...
+
+  node:
+    name: Node ${{ matrix.node-version }} on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node-version: ["22", "24"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+          cache-dependency-path: bindings/node/package-lock.json
+      # npm install (not npm ci): the per-platform optionalDependencies point at
+      # native packages that are not published until the first release, so they
+      # are absent from the lock file and `npm ci` would reject the tree as out
+      # of sync. install treats the missing optional packages as non-fatal.
+      - name: Install Node dependencies
+        run: cd bindings/node && npm install --no-audit --no-fund
+      # --platform puts the target triple into the filename so the loader finds
+      # the freshly built binary instead of a per-platform npm subpackage.
+      - name: Build native module
+        run: cd bindings/node && npx napi build --platform --release
+      - name: Run Node tests
+        run: cd bindings/node && node --test
+
+  c-abi:
+    name: C ABI on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Install cbindgen
+        uses: taiki-e/install-action@8b3c737da4b541bf0fb5a3e0488ff20535badac9 # v2.82.1
+        with:
+          tool: cbindgen
+      - name: Build the C ABI library (cdylib + staticlib)
+        run: cargo build -p wickra-exchange-c --release
+      - name: Rust unit tests
+        run: cargo test -p wickra-exchange-c
+      # The generated header is platform-independent, so checking drift on one OS
+      # is enough — and avoids a spurious CRLF/LF diff on the Windows runner.
+      - name: Check the committed header is in sync with cbindgen
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cbindgen --config bindings/c/cbindgen.toml --crate wickra-exchange-c --output bindings/c/include/wickra_exchange.h
+          if ! git diff --quiet -- bindings/c/include/wickra_exchange.h; then
+            echo "::error::bindings/c/include/wickra_exchange.h is out of sync — run cbindgen and commit the result"
+            git --no-pager diff -- bindings/c/include/wickra_exchange.h
+            exit 1
+          fi
+      # The real cross-language test: a foreign C consumer links the generated
+      # header + the compiled library and runs. If this passes on all three OSes,
+      # every C-capable language can link the same way.
+      - name: Build and run the C example (CMake + ctest)
+        shell: bash
+        run: |
+          cmake -S examples/c -B examples/c/build
+          cmake --build examples/c/build --config Release
+          ctest --test-dir examples/c/build -C Release --output-on-failure
+
+  csharp:
+    name: C# on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: actions/setup-dotnet@9a946fdbd5fb07b82b2f5a4466058b876ab72bb2 # v5.3.0
+        with:
+          dotnet-version: "8.0"
+      # The test project copies the native library next to the test assembly from
+      # target/debug (see the <Content> items in the .csproj), so build it in the
+      # debug profile here.
+      - name: Build the C ABI library
+        run: cargo build -p wickra-exchange-c
+      - name: Test the C# binding
+        run: dotnet test bindings/csharp/WickraExchange.Tests/WickraExchange.Tests.csproj -c Release
+
+  java:
+    name: Java on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      # The binding loads the C ABI hub via the Java FFM API; the pom points
+      # java.library.path at target/debug (the <native.lib.dir> property), so
+      # build it in the debug profile here. The pom pins bytecode to release 25.
+      - name: Build the C ABI library
+        run: cargo build -p wickra-exchange-c
+      - uses: actions/setup-java@ad2b38190b15e4d6bdf0c97fb4fca8412226d287 # v5.3.0
+        with:
+          distribution: temurin
+          java-version: "25"
+          cache: maven
+      - name: Java info
+        run: java -version
+      - name: Test the Java binding
+        run: mvn -B -f bindings/java test
+
+  r:
+    name: R on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      WKEX_INC: ${{ github.workspace }}/bindings/c/include
+      WKEX_LIB: ${{ github.workspace }}/target/release
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      # The package compiles a thin .Call glue layer against the C ABI hub and
+      # links -lwickra_exchange from WKEX_LIB; build the library first.
+      - name: Build the C ABI library
+        run: cargo build -p wickra-exchange-c --release
+      - uses: r-lib/actions/setup-r@a51a8012b0aab7c32ef9d19bf54da93f3254335e # v2.12.0
+        with:
+          r-version: "release"
+          use-public-rspm: true
+      - name: Install and test the R binding
+        shell: bash
+        # github.workspace is a backslash path on Windows; Makevars(.win) (sh) and
+        # mingw need forward slashes. The Makevars do not bake an rpath, so the
+        # native library must be on the loader path at run time: LD_LIBRARY_PATH
+        # (Linux), DYLD_LIBRARY_PATH (macOS) and PATH (Windows).
+        run: |
+          export WKEX_INC="${WKEX_INC//\\//}"
+          export WKEX_LIB="${WKEX_LIB//\\//}"
+          if command -v cygpath >/dev/null 2>&1; then
+            # Windows (rtools bash): add the lib dir to PATH in msys form so the
+            # ':' in the drive letter is not parsed as a PATH separator and msys
+            # translates it to the Windows PATH the DLL loader searches.
+            export PATH="$(cygpath -u "$WKEX_LIB"):$PATH"
+          else
+            export LD_LIBRARY_PATH="$WKEX_LIB:$LD_LIBRARY_PATH"
+            export DYLD_LIBRARY_PATH="$WKEX_LIB:$DYLD_LIBRARY_PATH"
+          fi
+          R CMD INSTALL bindings/r
+          Rscript bindings/r/tests/run_tests.R
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@8b3c737da4b541bf0fb5a3e0488ff20535badac9 # v2.82.1
+        with:
+          tool: cargo-llvm-cov
+      - name: Generate coverage (lcov)
+        run: >
+          cargo llvm-cov
+          -p wickra-exchange-core -p wickra-exchange
+          --lcov --output-path lcov.info
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  fuzz-smoke:
+    name: Fuzz (smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: fuzz
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@8b3c737da4b541bf0fb5a3e0488ff20535badac9 # v2.82.1
+        with:
+          tool: cargo-fuzz
+      - name: Fuzz response_parse (30 s)
+        run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu response_parse -- -max_total_time=30
+        working-directory: fuzz
+      - name: Fuzz credentials_parse (30 s)
+        run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu credentials_parse -- -max_total_time=30
+        working-directory: fuzz
+      - name: Fuzz filter_round (30 s)
+        run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu filter_round -- -max_total_time=30
+        working-directory: fuzz
+      - name: Fuzz ws_frame (30 s)
+        run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ws_frame -- -max_total_time=30
+        working-directory: fuzz
+      - name: Fuzz orderbook_diff (30 s)
+        run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu orderbook_diff -- -max_total_time=30
+        working-directory: fuzz
