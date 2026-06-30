@@ -12,5 +12,15 @@ keywords.workspace = true
 categories.workspace = true
 description = "Core traits, types and shared connectivity machinery for wickra-exchange: a typed, unified API over the ten largest crypto exchanges."
 
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+rust_decimal = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+rust_decimal_macros = { workspace = true }
+
 [lints]
 workspace = true
