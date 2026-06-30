@@ -15,6 +15,7 @@
 //!
 //! [`wickra-exchange`]: https://github.com/wickra-lib/wickra-exchange
 
+mod clock;
 mod credentials;
 mod error;
 mod events;
@@ -22,11 +23,14 @@ mod idempotency;
 mod instruments;
 mod options;
 mod orderbook;
+mod ratelimiter;
+mod retry;
 mod symbol;
 mod traits;
 mod transport;
 mod types;
 
+pub use clock::{NonceGenerator, ServerClock, TokenTtl};
 pub use credentials::Credentials;
 pub use error::{Error, Result};
 pub use events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
@@ -34,6 +38,8 @@ pub use idempotency::ClientIdGenerator;
 pub use instruments::{Instrument, InstrumentCache, InstrumentFilters};
 pub use options::{ExchangeOptions, MarginMode, MarketType, PositionMode};
 pub use orderbook::{BookUpdate, OrderBookBuilder};
+pub use ratelimiter::{Acquire, WeightedRateLimiter};
+pub use retry::Backoff;
 pub use symbol::Symbol;
 pub use traits::{Exchange, Execution, MarketData};
 pub use transport::{
