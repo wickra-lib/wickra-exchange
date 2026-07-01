@@ -11,6 +11,8 @@
 
 pub use wickra_exchange_core::*;
 
+mod factory;
 mod net;
 
+pub use factory::connect;
 pub use net::{ReqwestHttpTransport, TungsteniteWsTransport};

@@ -1,0 +1,94 @@
+//! Construct a ready-to-use, real-socket exchange client by name.
+//!
+//! [`connect`] is the one-call entry point for applications: give it a venue
+//! name, credentials and options, and it wires the real [`ReqwestHttpTransport`]
+//! and [`TungsteniteWsTransport`] into the matching venue client and hands back a
+//! boxed [`Exchange`] trait object. Everything below the trait — signing, symbol
+//! mapping, the WebSocket state machine — is already covered by the core's
+//! offline suite; this module only performs name dispatch and transport wiring,
+//! so it lives in the facade and is excluded from coverage (name dispatch is the
+//! one deterministic path a unit test can exercise without a network).
+
+use crate::{ReqwestHttpTransport, TungsteniteWsTransport};
+use wickra_exchange_core::{
+    Binance, Bitget, Bybit, Coinbase, Credentials, Error, Exchange, ExchangeOptions, Gate,
+    HttpTransport, Htx, Kraken, KuCoin, Okx, Result, Upbit, WsTransport,
+};
+
+/// Build a real-socket, authenticated client for `name`, ready to stream and
+/// trade.
+///
+/// `name` is matched case-insensitively against the canonical venue keys:
+/// `binance`, `bybit`, `okx`, `bitget`, `kucoin`, `gateio`, `htx`, `kraken`,
+/// `coinbase` and `upbit`. The returned client carries a blocking HTTP transport
+/// and a pull-based WebSocket transport, so it needs no async runtime on the
+/// caller's side.
+///
+/// # Errors
+///
+/// Returns [`Error::UnsupportedExchange`] if `name` is not a known venue, or
+/// [`Error::Network`] if the HTTP client cannot be constructed from `options`.
+pub fn connect(
+    name: &str,
+    credentials: Credentials,
+    options: &ExchangeOptions,
+) -> Result<Box<dyn Exchange>> {
+    let http = Box::new(ReqwestHttpTransport::new(options)?) as Box<dyn HttpTransport>;
+    let ws = Box::new(TungsteniteWsTransport::new()) as Box<dyn WsTransport>;
+
+    let exchange: Box<dyn Exchange> = match name.to_ascii_lowercase().as_str() {
+        "binance" => Box::new(Binance::with_credentials(http, options, credentials).with_ws(ws)),
+        "bybit" => Box::new(Bybit::with_credentials(http, options, credentials).with_ws(ws)),
+        "okx" => Box::new(Okx::with_credentials(http, options, credentials).with_ws(ws)),
+        "bitget" => Box::new(Bitget::with_credentials(http, options, credentials).with_ws(ws)),
+        "kucoin" => Box::new(KuCoin::with_credentials(http, options, credentials).with_ws(ws)),
+        "gateio" => Box::new(Gate::with_credentials(http, options, credentials).with_ws(ws)),
+        "htx" => Box::new(Htx::with_credentials(http, options, credentials).with_ws(ws)),
+        "kraken" => Box::new(Kraken::with_credentials(http, options, credentials).with_ws(ws)),
+        "coinbase" => Box::new(Coinbase::with_credentials(http, options, credentials).with_ws(ws)),
+        "upbit" => Box::new(Upbit::with_credentials(http, options, credentials).with_ws(ws)),
+        other => return Err(Error::UnsupportedExchange(other.to_string())),
+    };
+    Ok(exchange)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wickra_exchange_core::MarketType;
+
+    fn opts() -> ExchangeOptions {
+        ExchangeOptions::mainnet(MarketType::Spot)
+    }
+
+    fn creds() -> Credentials {
+        Credentials::new("key", "secret")
+    }
+
+    #[test]
+    fn dispatches_every_known_venue() {
+        // Construction is offline (no socket is opened until the client is used),
+        // so the full name table is deterministic to exercise here.
+        for name in [
+            "binance", "bybit", "okx", "bitget", "kucoin", "gateio", "htx", "kraken", "coinbase",
+            "upbit",
+        ] {
+            let client = connect(name, creds(), &opts()).unwrap();
+            assert!(!client.name().is_empty());
+        }
+    }
+
+    #[test]
+    fn name_match_is_case_insensitive() {
+        assert!(connect("BinAnce", creds(), &opts()).is_ok());
+    }
+
+    #[test]
+    fn unknown_venue_is_rejected() {
+        // `Box<dyn Exchange>` is not `Debug`, so match rather than `unwrap_err`.
+        match connect("ftx", creds(), &opts()) {
+            Err(Error::UnsupportedExchange(name)) => assert_eq!(name, "ftx"),
+            _ => panic!("unknown venue must be rejected"),
+        }
+    }
+}
