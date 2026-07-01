@@ -101,6 +101,8 @@ final class Native {
             FunctionDescriptor.ofVoid(C_PTR));
     static final MethodHandle DERIVATIVES_POSITION = handle("wickra_derivatives_position",
             FunctionDescriptor.of(C_INT, C_PTR, C_PTR, C_PTR));
+    static final MethodHandle DERIVATIVES_POSITIONS = handle("wickra_derivatives_positions",
+            FunctionDescriptor.of(C_INT, C_PTR, C_PTR, C_PTR, C_SIZE));
     static final MethodHandle DERIVATIVES_SET_LEVERAGE = handle("wickra_derivatives_set_leverage",
             FunctionDescriptor.of(C_INT, C_PTR, C_PTR, C_INT));
     static final MethodHandle DERIVATIVES_SET_MARGIN_MODE = handle("wickra_derivatives_set_margin_mode",
@@ -116,6 +118,10 @@ final class Native {
             FunctionDescriptor.of(C_INT, C_PTR, C_PTR, C_PTR, C_DOUBLE, C_DOUBLE, C_PTR));
     static final MethodHandle ADVANCED_CANCEL_BATCH = handle("wickra_advanced_cancel_batch",
             FunctionDescriptor.of(C_INT, C_PTR, C_PTR, C_PTR, C_SIZE));
+    static final MethodHandle ADVANCED_PLACE_OCO = handle("wickra_advanced_place_oco",
+            FunctionDescriptor.of(C_INT, C_PTR, C_PTR, C_INT, C_DOUBLE, C_DOUBLE, C_DOUBLE, C_DOUBLE, C_PTR, C_SIZE));
+    static final MethodHandle ADVANCED_PLACE_BATCH = handle("wickra_advanced_place_batch",
+            FunctionDescriptor.of(C_INT, C_PTR, C_PTR, C_PTR, C_PTR, C_PTR, C_SIZE, C_PTR, C_PTR, C_SIZE));
 
     private static SymbolLookup loadLibrary() {
         String dir = System.getProperty("native.lib.dir");
