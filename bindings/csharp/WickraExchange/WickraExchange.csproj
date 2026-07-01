@@ -1,0 +1,36 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RootNamespace>WickraExchange</RootNamespace>
+    <AssemblyName>WickraExchange</AssemblyName>
+
+    <PackageId>WickraExchange</PackageId>
+    <Version>0.1.0</Version>
+    <Authors>kingchenc</Authors>
+    <Description>Streaming-native, unified connectivity for the ten largest crypto exchanges, with paper and replay simulators — for .NET over the Wickra C ABI.</Description>
+    <PackageLicenseExpression>MIT OR Apache-2.0</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/wickra-lib/wickra-exchange</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/wickra-lib/wickra-exchange</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageTags>crypto;exchange;trading;connectivity;streaming;ffi;native</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <NoWarn>$(NoWarn);NU5128;CS1591</NoWarn>
+  </PropertyGroup>
+
+  <!--
+    Supported native runtime identifiers. The release pipeline builds the C ABI
+    per target triple and stages the libraries under
+    WickraExchange/runtimes/<rid>/native/ before `dotnet pack`:
+      win-x64   win-arm64   linux-x64   linux-arm64   osx-x64   osx-arm64
+  -->
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="\" />
+    <None Include="runtimes/**/native/*" Pack="true" PackagePath="runtimes/" Condition="Exists('runtimes')" />
+  </ItemGroup>
+
+</Project>
