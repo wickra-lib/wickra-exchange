@@ -23,7 +23,9 @@ use crate::options::{ExchangeOptions, MarketType};
 use crate::signing::hmac_sha256_hex;
 use crate::symbol::Symbol;
 use crate::transport::{HttpMethod, HttpRequest, HttpTransport};
-use crate::types::{Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker, TimeInForce};
+use crate::types::{
+    Balance, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker, TimeInForce,
+};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use wickra_core::Candle;
@@ -254,6 +256,58 @@ impl Bybit {
             .next()
             .ok_or_else(|| Error::NotFound(format!("order {order_id}")))?;
         order_from_raw(symbol.clone(), &raw)
+    }
+
+    /// All open orders, optionally filtered to one `symbol`. When unfiltered, the
+    /// venue's wire symbol is mapped back to a canonical [`Symbol`].
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if credentials are missing or the request fails.
+    pub fn open_orders(&self, symbol: Option<&Symbol>) -> Result<Vec<Order>> {
+        let mut query = format!("category={}", self.category);
+        if let Some(s) = symbol {
+            query.push_str("&symbol=");
+            query.push_str(&Self::wire_symbol(s));
+        }
+        let result = self.signed_request(HttpMethod::Get, "/v5/order/realtime", &query, "")?;
+        let list: OrderList = parse_result(result)?;
+        list.list
+            .iter()
+            .map(|raw| {
+                let sym = symbol
+                    .cloned()
+                    .unwrap_or_else(|| split_wire_symbol(&raw.symbol));
+                order_from_raw(sym, raw)
+            })
+            .collect()
+    }
+
+    /// Unified-account balances (assets are reported as the venue lists them).
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if credentials are missing or the request fails.
+    pub fn balances(&self) -> Result<Vec<Balance>> {
+        let result = self.signed_request(
+            HttpMethod::Get,
+            "/v5/account/wallet-balance",
+            "accountType=UNIFIED",
+            "",
+        )?;
+        let wallet: WalletBalance = parse_result(result)?;
+        let account = wallet
+            .list
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::NotFound("no wallet account".to_string()))?;
+        Ok(account
+            .coin
+            .iter()
+            .map(|c| Balance {
+                asset: c.coin.clone(),
+                free: dec_or_zero(&c.available_to_withdraw),
+                locked: dec_or_zero(&c.locked),
+            })
+            .collect())
     }
 
     /// GET a public endpoint and unwrap the `{retCode, retMsg, result}` envelope.
@@ -525,6 +579,8 @@ struct OrderList {
 
 #[derive(Deserialize)]
 struct RawOrder {
+    #[serde(default)]
+    symbol: String,
     #[serde(rename = "orderId")]
     order_id: String,
     #[serde(rename = "orderLinkId", default)]
@@ -541,6 +597,40 @@ struct RawOrder {
     price: String,
     #[serde(rename = "avgPrice", default)]
     avg_price: String,
+}
+
+#[derive(Deserialize)]
+struct WalletBalance {
+    list: Vec<WalletAccount>,
+}
+
+#[derive(Deserialize)]
+struct WalletAccount {
+    coin: Vec<CoinBalance>,
+}
+
+#[derive(Deserialize)]
+struct CoinBalance {
+    coin: String,
+    #[serde(rename = "availableToWithdraw", default)]
+    available_to_withdraw: String,
+    #[serde(default)]
+    locked: String,
+}
+
+/// Quote assets used to split a concatenated wire symbol (`BTCUSDT` -> `BTC/USDT`).
+const KNOWN_QUOTES: &[&str] = &["USDT", "USDC", "EUR", "BTC", "ETH", "USD"];
+
+/// Map a concatenated Bybit wire symbol back to a canonical [`Symbol`].
+fn split_wire_symbol(wire: &str) -> Symbol {
+    for quote in KNOWN_QUOTES {
+        if let Some(base) = wire.strip_suffix(quote) {
+            if !base.is_empty() {
+                return Symbol::new(base, *quote);
+            }
+        }
+    }
+    Symbol::new(wire, "")
 }
 
 #[cfg(test)]
@@ -788,5 +878,56 @@ mod tests {
     #[test]
     fn system_clock_is_sane() {
         assert!(system_now_ms() > 1_600_000_000_000);
+    }
+
+    #[test]
+    fn split_wire_symbol_uses_known_quotes() {
+        assert_eq!(split_wire_symbol("BTCUSDT"), Symbol::new("BTC", "USDT"));
+        assert_eq!(split_wire_symbol("ETHBTC"), Symbol::new("ETH", "BTC"));
+        assert_eq!(split_wire_symbol("WEIRD"), Symbol::new("WEIRD", ""));
+    }
+
+    #[test]
+    fn open_orders_filtered_and_unfiltered() {
+        let (bybit, mock) = signed_client(1000);
+        mock.push_json(
+            200,
+            r#"{"retCode":0,"result":{"list":[{"symbol":"BTCUSDT","orderId":"1","orderLinkId":"a",
+            "side":"Buy","orderType":"Limit","orderStatus":"New","qty":"1","cumExecQty":"0",
+            "price":"100","avgPrice":"0"}]}}"#,
+        );
+        let orders = bybit.open_orders(Some(&symbol())).unwrap();
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].symbol, symbol());
+
+        mock.push_json(
+            200,
+            r#"{"retCode":0,"result":{"list":[{"symbol":"ETHUSDT","orderId":"2","orderLinkId":"",
+            "side":"Sell","orderType":"Market","orderStatus":"New","qty":"2","cumExecQty":"0",
+            "price":"0","avgPrice":"0"}]}}"#,
+        );
+        let orders = bybit.open_orders(None).unwrap();
+        assert_eq!(orders[0].symbol, Symbol::new("ETH", "USDT"));
+        assert!(!mock.recorded_requests()[1].url.contains("symbol="));
+    }
+
+    #[test]
+    fn balances_parse_unified_wallet() {
+        let (bybit, mock) = signed_client(1000);
+        mock.push_json(
+            200,
+            r#"{"retCode":0,"result":{"list":[{"coin":[
+            {"coin":"USDT","availableToWithdraw":"100.5","locked":"25.5"},
+            {"coin":"BTC","availableToWithdraw":"0.1","locked":"0"}]}]}}"#,
+        );
+        let bals = bybit.balances().unwrap();
+        assert_eq!(bals.len(), 2);
+        assert_eq!(bals[0].asset, "USDT");
+        assert_eq!(bals[0].free, dec!(100.5));
+        assert_eq!(bals[0].locked, dec!(25.5));
+        assert_eq!(bals[0].total(), dec!(126));
+        let req = &mock.recorded_requests()[0];
+        assert!(req.url.contains("accountType=UNIFIED"));
+        assert!(req.headers.iter().any(|(k, _)| k == "X-BAPI-SIGN"));
     }
 }
