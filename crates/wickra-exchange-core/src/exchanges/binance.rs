@@ -7,13 +7,15 @@
 //!
 //! Covered here: the public REST market data (ticker, klines, depth), the
 //! URL/symbol mapping, the Binance error taxonomy, HMAC-SHA256 signed execution
-//! (place/cancel/query order, account balances), and the pull-based WebSocket
-//! market streams (trade/depth/ticker subscribe + `poll_events`). The user-data
-//! stream (listenKey) and the exchangeInfo/filter wiring land in a later slice.
+//! (place/cancel/query/open orders, balances) with `exchangeInfo` filter
+//! validation, and the pull-based WebSocket market streams (trade/depth/ticker
+//! subscribe + `poll_events`). The user-data stream (listenKey) and the real
+//! socket adapter land in a later slice.
 
 use crate::credentials::Credentials;
 use crate::error::{Error, Result};
 use crate::events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
+use crate::instruments::{Instrument, InstrumentCache, InstrumentFilters};
 use crate::normalize::{format_decimal, parse_decimal};
 use crate::options::{ExchangeOptions, MarketType};
 use crate::signing::hmac_sha256_hex;
@@ -52,6 +54,7 @@ pub struct Binance {
     connection: Option<Box<dyn WsConnection>>,
     subscriptions: Vec<(String, Symbol)>,
     sub_id: u64,
+    instruments: InstrumentCache,
 }
 
 impl Binance {
@@ -72,6 +75,7 @@ impl Binance {
             connection: None,
             subscriptions: Vec::new(),
             sub_id: 0,
+            instruments: InstrumentCache::new(),
         }
     }
 
@@ -164,6 +168,28 @@ impl Binance {
         })
     }
 
+    /// Fetch `exchangeInfo` and populate the instrument/filter cache, so that
+    /// [`place_order`](Self::place_order) validates against the venue's per-symbol
+    /// filters (lot size, price tick, min-notional).
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the request fails or the response cannot be parsed.
+    pub fn load_instruments(&mut self) -> Result<()> {
+        let body = self.get("/api/v3/exchangeInfo", "")?;
+        let raw: RawExchangeInfo = deserialize(&body)?;
+        let now = (self.now_ms)();
+        let instruments: Vec<Instrument> = raw.symbols.iter().map(parse_instrument).collect();
+        self.instruments.replace(instruments, now);
+        Ok(())
+    }
+
+    /// The cached instrument metadata for `symbol`, if [`load_instruments`](Self::load_instruments)
+    /// has been called.
+    #[must_use]
+    pub fn instrument(&self, symbol: &Symbol) -> Option<&Instrument> {
+        self.instruments.get(symbol)
+    }
+
     /// Subscribe to the public trade stream for `symbol`.
     ///
     /// # Errors
@@ -244,6 +270,13 @@ impl Binance {
     /// the venue rejects it.
     pub fn place_order(&self, request: &OrderRequest) -> Result<Order> {
         request.validate()?;
+        // When exchangeInfo has been loaded, reject filter violations before the
+        // round trip.
+        if let Some(instrument) = self.instruments.get(&request.symbol) {
+            instrument
+                .filters
+                .validate(request.quantity, request.price)?;
+        }
         let type_str = if request.post_only && request.order_type == OrderType::Limit {
             "LIMIT_MAKER"
         } else {
@@ -344,7 +377,11 @@ impl Binance {
     /// Issue a GET and return the body, mapping non-2xx responses onto the error
     /// taxonomy.
     fn get(&self, path: &str, query: &str) -> Result<String> {
-        let url = format!("{}{path}?{query}", self.rest_base);
+        let url = if query.is_empty() {
+            format!("{}{path}", self.rest_base)
+        } else {
+            format!("{}{path}?{query}", self.rest_base)
+        };
         let response = self.http.execute(&HttpRequest::get(url))?;
         if response.is_success() {
             Ok(response.body)
@@ -696,6 +733,60 @@ struct RawBalance {
     asset: String,
     free: String,
     locked: String,
+}
+
+#[derive(Deserialize)]
+struct RawExchangeInfo {
+    symbols: Vec<RawSymbol>,
+}
+
+#[derive(Deserialize)]
+struct RawSymbol {
+    #[serde(rename = "baseAsset")]
+    base_asset: String,
+    #[serde(rename = "quoteAsset")]
+    quote_asset: String,
+    #[serde(rename = "baseAssetPrecision", default)]
+    base_asset_precision: u32,
+    #[serde(rename = "quoteAssetPrecision", default)]
+    quote_asset_precision: u32,
+    #[serde(default)]
+    filters: Vec<serde_json::Value>,
+}
+
+fn find_filter<'a>(filters: &'a [serde_json::Value], kind: &str) -> Option<&'a serde_json::Value> {
+    filters
+        .iter()
+        .find(|f| f.get("filterType").and_then(serde_json::Value::as_str) == Some(kind))
+}
+
+fn filter_decimal(filter: Option<&serde_json::Value>, key: &str) -> Decimal {
+    filter
+        .and_then(|f| f.get(key))
+        .and_then(serde_json::Value::as_str)
+        .and_then(|s| parse_decimal(s).ok())
+        .unwrap_or(Decimal::ZERO)
+}
+
+fn parse_instrument(raw: &RawSymbol) -> Instrument {
+    let lot = find_filter(&raw.filters, "LOT_SIZE");
+    let price = find_filter(&raw.filters, "PRICE_FILTER");
+    let notional =
+        find_filter(&raw.filters, "NOTIONAL").or_else(|| find_filter(&raw.filters, "MIN_NOTIONAL"));
+    Instrument {
+        symbol: Symbol::new(&raw.base_asset, &raw.quote_asset),
+        base_precision: raw.base_asset_precision,
+        quote_precision: raw.quote_asset_precision,
+        filters: InstrumentFilters {
+            min_quantity: filter_decimal(lot, "minQty"),
+            max_quantity: filter_decimal(lot, "maxQty"),
+            step_size: filter_decimal(lot, "stepSize"),
+            min_price: filter_decimal(price, "minPrice"),
+            max_price: filter_decimal(price, "maxPrice"),
+            tick_size: filter_decimal(price, "tickSize"),
+            min_notional: filter_decimal(notional, "minNotional"),
+        },
+    }
 }
 
 fn deserialize<T: for<'de> Deserialize<'de>>(body: &str) -> Result<T> {
@@ -1285,5 +1376,59 @@ mod tests {
             .place_order(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)))
             .unwrap();
         assert_eq!(order.id, "28");
+    }
+
+    const EXCHANGE_INFO: &str = r#"{"symbols":[{"symbol":"BTCUSDT","baseAsset":"BTC",
+        "quoteAsset":"USDT","baseAssetPrecision":8,"quoteAssetPrecision":8,"filters":[
+        {"filterType":"LOT_SIZE","minQty":"0.001","maxQty":"1000","stepSize":"0.001"},
+        {"filterType":"PRICE_FILTER","minPrice":"0.01","maxPrice":"1000000","tickSize":"0.01"},
+        {"filterType":"NOTIONAL","minNotional":"10"}]}]}"#;
+
+    #[test]
+    fn load_instruments_populates_filters() {
+        let (mut binance, mock) = signed_client(1000);
+        mock.push_json(200, EXCHANGE_INFO);
+        binance.load_instruments().unwrap();
+        let inst = binance.instrument(&symbol()).unwrap();
+        assert_eq!(inst.filters.step_size, dec!(0.001));
+        assert_eq!(inst.filters.min_notional, dec!(10));
+        assert_eq!(inst.filters.tick_size, dec!(0.01));
+        assert_eq!(inst.base_precision, 8);
+        // The request hit exchangeInfo with no query string.
+        assert!(mock.recorded_requests()[0]
+            .url
+            .ends_with("/api/v3/exchangeInfo"));
+    }
+
+    #[test]
+    fn place_order_rejects_filter_violation_when_loaded() {
+        let (mut binance, mock) = signed_client(1000);
+        mock.push_json(200, EXCHANGE_INFO);
+        binance.load_instruments().unwrap();
+        // quantity 0.0005 < min 0.001 -> rejected locally, no order sent.
+        let err = binance
+            .place_order(&OrderRequest::limit_buy(
+                symbol(),
+                dec!(0.0005),
+                dec!(20000),
+            ))
+            .unwrap_err();
+        assert!(matches!(err, Error::Filter(_)));
+        assert_eq!(mock.recorded_requests().len(), 1); // only exchangeInfo
+    }
+
+    #[test]
+    fn place_order_skips_filter_check_without_instruments() {
+        let (binance, mock) = signed_client(1000);
+        mock.push_json(200, ORDER_JSON);
+        // No load_instruments: the order is sent (best effort).
+        binance
+            .place_order(&OrderRequest::limit_buy(
+                symbol(),
+                dec!(0.0005),
+                dec!(20000),
+            ))
+            .unwrap();
+        assert!(mock.recorded_requests()[0].url.contains("/api/v3/order"));
     }
 }
