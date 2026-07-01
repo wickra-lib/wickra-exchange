@@ -61,6 +61,26 @@
 #define WICKRA_SIDE_SELL 1
 
 /**
+ * Margin mode: cross (margin shared across positions).
+ */
+#define WICKRA_MARGIN_CROSS 0
+
+/**
+ * Margin mode: isolated (margin isolated per position).
+ */
+#define WICKRA_MARGIN_ISOLATED 1
+
+/**
+ * Position side: long.
+ */
+#define WICKRA_POSITION_LONG 0
+
+/**
+ * Position side: short.
+ */
+#define WICKRA_POSITION_SHORT 1
+
+/**
  * Order status codes (mirror `OrderStatus`).
  */
 #define WICKRA_STATUS_NEW 0
@@ -95,6 +115,18 @@
  * `#[repr(C)]` result structs.
  */
 #define WICKRA_STR_CAP 64
+
+/**
+ * An opaque advanced-orders handle over a live client. Construct with
+ * `wickra_connect_advanced`; release with `wickra_advanced_free`.
+ */
+typedef struct WickraAdvanced WickraAdvanced;
+
+/**
+ * An opaque derivatives handle over a live futures client. Construct with
+ * `wickra_connect_derivatives`; release with `wickra_derivatives_free`.
+ */
+typedef struct WickraDerivatives WickraDerivatives;
 
 /**
  * An opaque exchange handle. Construct with `wickra_paper_new` /
@@ -165,6 +197,44 @@ typedef struct {
      */
     WickraOrder order;
 } WickraEvent;
+
+/**
+ * A derivatives position (C-ABI mirror of `Position`).
+ */
+typedef struct {
+    /**
+     * Market symbol, NUL-terminated (`base/quote`).
+     */
+    char symbol[WICKRA_STR_CAP];
+    /**
+     * `WICKRA_POSITION_*` (long / short).
+     */
+    int32_t side;
+    /**
+     * Position size in base units (magnitude, always positive).
+     */
+    double quantity;
+    /**
+     * Average entry price.
+     */
+    double entry_price;
+    /**
+     * Current mark price (may be `0` where the venue omits it).
+     */
+    double mark_price;
+    /**
+     * Account leverage for this position.
+     */
+    double leverage;
+    /**
+     * Unrealized PnL as reported by the venue.
+     */
+    double unrealized_pnl;
+    /**
+     * `WICKRA_MARGIN_*` (cross / isolated).
+     */
+    int32_t margin_mode;
+} WickraPosition;
 
 #ifdef __cplusplus
 extern "C" {
@@ -299,6 +369,126 @@ int32_t wickra_exchange_balance(WickraExchange *handle, const char *asset, doubl
  * `handle` must be valid; `out` must be writable for `cap` elements.
  */
 int32_t wickra_exchange_poll(WickraExchange *handle, WickraEvent *out, uintptr_t cap);
+
+/**
+ * Connect a live **derivatives** (USDⓈ-M futures) client for `name`, returning
+ * an opaque [`WickraDerivatives`] handle (positions / leverage / margin / close).
+ * Returns null on failure or for a spot-only venue (`coinbase`, `upbit`).
+ *
+ * # Safety
+ * The non-null string arguments must be valid C strings.
+ */
+WickraDerivatives *wickra_connect_derivatives(const char *name,
+                                              const char *api_key,
+                                              const char *api_secret,
+                                              const char *passphrase,
+                                              const char *private_key,
+                                              bool testnet);
+
+/**
+ * Release a derivatives handle. Safe to call with null.
+ *
+ * # Safety
+ * `handle` must be null or a pointer from `wickra_connect_derivatives`, freed
+ * exactly once.
+ */
+void wickra_derivatives_free(WickraDerivatives *handle);
+
+/**
+ * Write the open position in `market` into `out`. Returns
+ * [`WICKRA_ERR_NOT_FOUND`] if the position is flat.
+ *
+ * # Safety
+ * `handle` and `out` must be valid; `market` must be a valid C string.
+ */
+int32_t wickra_derivatives_position(WickraDerivatives *handle,
+                                    const char *market,
+                                    WickraPosition *out);
+
+/**
+ * Set the leverage for `market`.
+ *
+ * # Safety
+ * `handle` must be valid; `market` must be a valid C string.
+ */
+int32_t wickra_derivatives_set_leverage(WickraDerivatives *handle,
+                                        const char *market,
+                                        uint32_t leverage);
+
+/**
+ * Set the margin mode for `market` (`mode` is `WICKRA_MARGIN_*`).
+ *
+ * # Safety
+ * `handle` must be valid; `market` must be a valid C string.
+ */
+int32_t wickra_derivatives_set_margin_mode(WickraDerivatives *handle,
+                                           const char *market,
+                                           int32_t mode);
+
+/**
+ * Flatten the open position in `market` with a reduce-only market order; writes
+ * the resulting order into `out`.
+ *
+ * # Safety
+ * `handle` and `out` must be valid; `market` must be a valid C string.
+ */
+int32_t wickra_derivatives_close_position(WickraDerivatives *handle,
+                                          const char *market,
+                                          WickraOrder *out);
+
+/**
+ * Connect a live client for `name` as an advanced-orders handle (amend / batch
+ * cancel). `futures` selects the USDⓈ-M futures market. Returns null on failure
+ * or for a venue without an advanced-order surface (`coinbase`, `upbit`).
+ *
+ * # Safety
+ * The non-null string arguments must be valid C strings.
+ */
+WickraAdvanced *wickra_connect_advanced(const char *name,
+                                        const char *api_key,
+                                        const char *api_secret,
+                                        const char *passphrase,
+                                        const char *private_key,
+                                        bool testnet,
+                                        bool futures);
+
+/**
+ * Release an advanced-orders handle. Safe to call with null.
+ *
+ * # Safety
+ * `handle` must be null or a pointer from `wickra_connect_advanced`, freed
+ * exactly once.
+ */
+void wickra_advanced_free(WickraAdvanced *handle);
+
+/**
+ * Amend a resting order's price and/or quantity in place; writes the refreshed
+ * order into `out`. Pass `NaN` for `new_price` / `new_quantity` to leave that
+ * field unchanged. Returns [`WICKRA_ERR_UNSUPPORTED`] on a venue without a
+ * native amend.
+ *
+ * # Safety
+ * `handle` and `out` must be valid; `market` and `order_id` must be valid C strings.
+ */
+int32_t wickra_advanced_amend_order(WickraAdvanced *handle,
+                                    const char *market,
+                                    const char *order_id,
+                                    double new_price,
+                                    double new_quantity,
+                                    WickraOrder *out);
+
+/**
+ * Cancel several orders on `market` in one request. `order_ids` is an array of
+ * `n` NUL-terminated C strings.
+ *
+ * # Safety
+ * `handle` must be valid; `market` must be a valid C string; `order_ids` must
+ * point to `n` valid C strings (or be null when `n == 0`).
+ */
+int32_t wickra_advanced_cancel_batch(WickraAdvanced *handle,
+                                     const char *market,
+                                     const char *const *order_ids,
+                                     uintptr_t n);
 
 #ifdef __cplusplus
 }  // extern "C"
