@@ -11,6 +11,7 @@ members = [
     "crates/wickra-exchange-core",
     "crates/wickra-exchange",
     "bindings/python",
+    "bindings/node",
 ]
 # The fuzz crate is its own (detached) workspace — cargo-fuzz builds it on its
 # own with sanitizer flags on a nightly toolchain.

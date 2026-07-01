@@ -1,0 +1,24 @@
+{
+  "name": "wickra-exchange-darwin-arm64",
+  "version": "0.1.0",
+  "description": "Native binding for wickra-exchange (macOS arm64). Installed automatically as an optional dependency of wickra-exchange on matching platforms.",
+  "main": "wickra-exchange.darwin-arm64.node",
+  "files": [
+    "wickra-exchange.darwin-arm64.node"
+  ],
+  "license": "MIT OR Apache-2.0",
+  "engines": {
+    "node": ">= 18"
+  },
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wickra-lib/wickra-exchange"
+  },
+  "homepage": "https://github.com/wickra-lib/wickra-exchange"
+}

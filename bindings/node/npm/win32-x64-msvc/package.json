@@ -1,0 +1,24 @@
+{
+  "name": "wickra-exchange-win32-x64-msvc",
+  "version": "0.1.0",
+  "description": "Native binding for wickra-exchange (Windows x64 MSVC). Installed automatically as an optional dependency of wickra-exchange on matching platforms.",
+  "main": "wickra-exchange.win32-x64-msvc.node",
+  "files": [
+    "wickra-exchange.win32-x64-msvc.node"
+  ],
+  "license": "MIT OR Apache-2.0",
+  "engines": {
+    "node": ">= 18"
+  },
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wickra-lib/wickra-exchange"
+  },
+  "homepage": "https://github.com/wickra-lib/wickra-exchange"
+}

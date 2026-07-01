@@ -1,0 +1,24 @@
+{
+  "name": "wickra-exchange-linux-arm64-gnu",
+  "version": "0.1.0",
+  "description": "Native binding for wickra-exchange (Linux arm64 GNU). Installed automatically as an optional dependency of wickra-exchange on matching platforms.",
+  "main": "wickra-exchange.linux-arm64-gnu.node",
+  "files": [
+    "wickra-exchange.linux-arm64-gnu.node"
+  ],
+  "license": "MIT OR Apache-2.0",
+  "engines": {
+    "node": ">= 18"
+  },
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wickra-lib/wickra-exchange"
+  },
+  "homepage": "https://github.com/wickra-lib/wickra-exchange"
+}
