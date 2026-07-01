@@ -21,10 +21,11 @@ use crate::credentials::Credentials;
 use crate::error::{Error, Result};
 use crate::events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
 use crate::normalize::{format_decimal, parse_decimal};
-use crate::options::{ExchangeOptions, MarketType};
+use crate::options::{ExchangeOptions, MarginMode, MarketType};
+use crate::positions::{Position, PositionSide};
 use crate::signing::hmac_sha256_hex;
 use crate::symbol::Symbol;
-use crate::traits::{Exchange, Execution, MarketData};
+use crate::traits::{Derivatives, Exchange, Execution, MarketData};
 use crate::transport::{HttpMethod, HttpRequest, HttpTransport, WsConnection, WsTransport};
 use crate::types::{
     Balance, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker, TimeInForce,
@@ -888,10 +889,162 @@ impl Execution for Bybit {
     }
 }
 
+impl Bybit {
+    /// Open positions (`/v5/position/list`). Without a symbol filter, linear
+    /// positions are queried by settle coin (USDT).
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if credentials are missing or the request fails.
+    pub fn positions(&self, symbol: Option<&Symbol>) -> Result<Vec<Position>> {
+        let query = match symbol {
+            Some(s) => format!("category={}&symbol={}", self.category, Self::wire_symbol(s)),
+            None => format!("category={}&settleCoin=USDT", self.category),
+        };
+        let result = self.signed_request(HttpMethod::Get, "/v5/position/list", &query, "")?;
+        let list: PositionList = parse_result(result)?;
+        list.list.iter().filter_map(parse_bybit_position).collect()
+    }
+
+    /// Set the leverage for `symbol` (`/v5/position/set-leverage`).
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the leverage is rejected or the request fails.
+    pub fn set_leverage(&self, symbol: &Symbol, leverage: u32) -> Result<()> {
+        let lev = leverage.to_string();
+        let body = serde_json::json!({
+            "category": self.category,
+            "symbol": Self::wire_symbol(symbol),
+            "buyLeverage": lev,
+            "sellLeverage": lev,
+        });
+        self.signed_request(
+            HttpMethod::Post,
+            "/v5/position/set-leverage",
+            "",
+            &body.to_string(),
+        )?;
+        Ok(())
+    }
+
+    /// Set the margin mode for `symbol` (`/v5/position/switch-isolated`). Bybit
+    /// couples the mode with the leverage, so the current leverage is preserved.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the change is rejected or the request fails.
+    pub fn set_margin_mode(&self, symbol: &Symbol, mode: MarginMode) -> Result<()> {
+        let leverage = self
+            .positions(Some(symbol))?
+            .first()
+            .map_or_else(|| "10".to_string(), |p| p.leverage.normalize().to_string());
+        let trade_mode = match mode {
+            MarginMode::Cross => 0,
+            MarginMode::Isolated => 1,
+        };
+        let body = serde_json::json!({
+            "category": self.category,
+            "symbol": Self::wire_symbol(symbol),
+            "tradeMode": trade_mode,
+            "buyLeverage": leverage,
+            "sellLeverage": leverage,
+        });
+        self.signed_request(
+            HttpMethod::Post,
+            "/v5/position/switch-isolated",
+            "",
+            &body.to_string(),
+        )?;
+        Ok(())
+    }
+
+    /// Flatten the open position in `symbol` with a reduce-only market order.
+    ///
+    /// # Errors
+    /// Returns [`Error::NotFound`] if there is no open position, or another
+    /// [`Error`] if the request fails.
+    pub fn close_position(&self, symbol: &Symbol) -> Result<Order> {
+        let position = self
+            .positions(Some(symbol))?
+            .into_iter()
+            .find(|p| &p.symbol == symbol)
+            .ok_or_else(|| Error::NotFound(format!("no open position for {symbol}")))?;
+        let request = match position.side {
+            PositionSide::Long => OrderRequest::market_sell(symbol.clone(), position.quantity),
+            PositionSide::Short => OrderRequest::market_buy(symbol.clone(), position.quantity),
+        }
+        .reduce_only();
+        self.place_order(&request)
+    }
+}
+
 impl Exchange for Bybit {
     fn name(&self) -> &'static str {
         "bybit"
     }
+}
+
+impl Derivatives for Bybit {
+    fn positions(&mut self, symbol: Option<&Symbol>) -> Result<Vec<Position>> {
+        Bybit::positions(self, symbol)
+    }
+    fn set_leverage(&mut self, symbol: &Symbol, leverage: u32) -> Result<()> {
+        Bybit::set_leverage(self, symbol, leverage)
+    }
+    fn set_margin_mode(&mut self, symbol: &Symbol, mode: MarginMode) -> Result<()> {
+        Bybit::set_margin_mode(self, symbol, mode)
+    }
+    fn close_position(&mut self, symbol: &Symbol) -> Result<Order> {
+        Bybit::close_position(self, symbol)
+    }
+}
+
+#[derive(Deserialize)]
+struct PositionList {
+    list: Vec<RawBybitPosition>,
+}
+
+#[derive(Deserialize)]
+struct RawBybitPosition {
+    symbol: String,
+    side: String,
+    size: String,
+    #[serde(rename = "avgPrice")]
+    avg_price: String,
+    #[serde(rename = "markPrice")]
+    mark_price: String,
+    leverage: String,
+    #[serde(rename = "unrealisedPnl")]
+    unrealised_pnl: String,
+    #[serde(rename = "tradeMode", default)]
+    trade_mode: i64,
+}
+
+fn parse_bybit_position(raw: &RawBybitPosition) -> Option<Result<Position>> {
+    let size = match parse_decimal(&raw.size) {
+        Ok(size) if !size.is_zero() => size,
+        Ok(_) => return None, // flat position
+        Err(e) => return Some(Err(e)),
+    };
+    let side = match raw.side.as_str() {
+        "Sell" => PositionSide::Short,
+        _ => PositionSide::Long,
+    };
+    let build = || -> Result<Position> {
+        Ok(Position {
+            symbol: split_wire_symbol(&raw.symbol),
+            side,
+            quantity: size,
+            entry_price: parse_decimal(&raw.avg_price)?,
+            mark_price: parse_decimal(&raw.mark_price)?,
+            leverage: parse_decimal(&raw.leverage)?,
+            unrealized_pnl: parse_decimal(&raw.unrealised_pnl)?,
+            margin_mode: if raw.trade_mode == 1 {
+                MarginMode::Isolated
+            } else {
+                MarginMode::Cross
+            },
+        })
+    };
+    Some(build())
 }
 
 #[cfg(test)]
@@ -1048,6 +1201,84 @@ mod tests {
         )
         .with_clock(Box::new(move || now_ms));
         (bybit, mock)
+    }
+
+    fn signed_futures_client(now_ms: i64) -> (Bybit, Arc<MockHttpTransport>) {
+        let mock = Arc::new(MockHttpTransport::new());
+        let opts = ExchangeOptions::mainnet(MarketType::UsdMFutures);
+        let bybit = Bybit::with_credentials(
+            Box::new(ArcTransport(Arc::clone(&mock))),
+            &opts,
+            Credentials::new("APIKEY", "SECRET"),
+        )
+        .with_clock(Box::new(move || now_ms));
+        (bybit, mock)
+    }
+
+    const POSITION_ENVELOPE: &str = r#"{"retCode":0,"retMsg":"OK","result":{"list":[
+        {"symbol":"BTCUSDT","side":"Buy","size":"0.5","avgPrice":"20000","markPrice":"20100","leverage":"10","unrealisedPnl":"50","tradeMode":1}
+    ],"category":"linear"}}"#;
+
+    #[test]
+    fn derivatives_positions_parse() {
+        let (mut bybit, mock) = signed_futures_client(1000);
+        mock.push_json(200, POSITION_ENVELOPE);
+        let positions = Derivatives::positions(&mut bybit, Some(&symbol())).unwrap();
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].symbol, Symbol::new("BTC", "USDT"));
+        assert_eq!(positions[0].side, PositionSide::Long);
+        assert_eq!(positions[0].quantity, dec!(0.5));
+        assert_eq!(positions[0].leverage, dec!(10));
+        assert_eq!(positions[0].margin_mode, MarginMode::Isolated);
+        assert!(mock.recorded_requests()[0]
+            .url
+            .contains("/v5/position/list"));
+        assert!(mock.recorded_requests()[0].url.contains("category=linear"));
+    }
+
+    #[test]
+    fn derivatives_set_leverage_hits_endpoint() {
+        let (mut bybit, mock) = signed_futures_client(1000);
+        mock.push_json(200, r#"{"retCode":0,"retMsg":"OK","result":{}}"#);
+        Derivatives::set_leverage(&mut bybit, &symbol(), 20).unwrap();
+        let req = &mock.recorded_requests()[0];
+        assert!(req.url.contains("/v5/position/set-leverage"));
+        assert!(req
+            .body
+            .as_deref()
+            .unwrap()
+            .contains(r#""buyLeverage":"20""#));
+    }
+
+    #[test]
+    fn derivatives_set_margin_mode_switches_isolated() {
+        let (mut bybit, mock) = signed_futures_client(1000);
+        mock.push_json(200, POSITION_ENVELOPE); // leverage lookup
+        mock.push_json(200, r#"{"retCode":0,"retMsg":"OK","result":{}}"#);
+        Derivatives::set_margin_mode(&mut bybit, &symbol(), MarginMode::Isolated).unwrap();
+        let reqs = mock.recorded_requests();
+        assert!(reqs[1].url.contains("/v5/position/switch-isolated"));
+        assert!(reqs[1]
+            .body
+            .as_deref()
+            .unwrap()
+            .contains(r#""tradeMode":1"#));
+    }
+
+    #[test]
+    fn derivatives_close_position_reduce_only() {
+        let (mut bybit, mock) = signed_futures_client(1000);
+        mock.push_json(200, POSITION_ENVELOPE);
+        mock.push_json(
+            200,
+            r#"{"retCode":0,"retMsg":"OK","result":{"orderId":"9","orderLinkId":""}}"#,
+        );
+        Derivatives::close_position(&mut bybit, &symbol()).unwrap();
+        let reqs = mock.recorded_requests();
+        assert!(reqs[1].url.contains("/v5/order/create"));
+        let body = reqs[1].body.as_deref().unwrap();
+        assert!(body.contains(r#""side":"Sell""#));
+        assert!(body.contains(r#""reduceOnly":true"#));
     }
 
     fn header<'a>(req: &'a HttpRequest, name: &str) -> &'a str {

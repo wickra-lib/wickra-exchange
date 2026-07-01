@@ -11,10 +11,11 @@ use crate::credentials::Credentials;
 use crate::error::{Error, Result};
 use crate::events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
 use crate::normalize::{format_decimal, parse_decimal};
-use crate::options::{ExchangeOptions, MarketType};
+use crate::options::{ExchangeOptions, MarginMode, MarketType};
+use crate::positions::{Position, PositionSide};
 use crate::signing::hmac_sha256_base64;
 use crate::symbol::Symbol;
-use crate::traits::{Exchange, Execution, MarketData};
+use crate::traits::{Derivatives, Exchange, Execution, MarketData};
 use crate::transport::{HttpMethod, HttpRequest, HttpTransport, WsConnection, WsTransport};
 use crate::types::{Balance, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker};
 use rust_decimal::Decimal;
@@ -132,12 +133,28 @@ impl Okx {
         format!("{}-{}", symbol.base(), symbol.quote())
     }
 
+    /// Whether this client targets a perpetual-swap market (instId gets a
+    /// `-SWAP` suffix and requests carry `instType=SWAP`).
+    fn is_swap(&self) -> bool {
+        self.inst_type == "SWAP"
+    }
+
+    /// The OKX instrument id for `symbol` in this client's market: `BTC-USDT` for
+    /// spot, `BTC-USDT-SWAP` for the USDⓈ-M perpetual.
+    fn inst_id(&self, symbol: &Symbol) -> String {
+        if self.is_swap() {
+            format!("{}-{}-SWAP", symbol.base(), symbol.quote())
+        } else {
+            format!("{}-{}", symbol.base(), symbol.quote())
+        }
+    }
+
     /// A ticker for `symbol`.
     ///
     /// # Errors
     /// Returns an [`Error`] if the request fails or the symbol is unknown.
     pub fn ticker(&self, symbol: &Symbol) -> Result<Ticker> {
-        let query = format!("instId={}", Self::wire_symbol(symbol));
+        let query = format!("instId={}", self.inst_id(symbol));
         let data = self.get("/api/v5/market/ticker", &query)?;
         let list: Vec<RawTicker> = parse_json(data)?;
         let entry = list
@@ -161,7 +178,7 @@ impl Okx {
     pub fn klines(&self, symbol: &Symbol, interval: &str, limit: u32) -> Result<Vec<Candle>> {
         let query = format!(
             "instId={}&bar={}&limit={limit}",
-            Self::wire_symbol(symbol),
+            self.inst_id(symbol),
             map_bar(interval),
         );
         let data = self.get("/api/v5/market/candles", &query)?;
@@ -179,7 +196,7 @@ impl Okx {
     /// # Errors
     /// Returns an [`Error`] if the request fails or the response cannot be parsed.
     pub fn order_book(&self, symbol: &Symbol, depth: u32) -> Result<OrderBookSnapshot> {
-        let query = format!("instId={}&sz={depth}", Self::wire_symbol(symbol));
+        let query = format!("instId={}&sz={depth}", self.inst_id(symbol));
         let data = self.get("/api/v5/market/books", &query)?;
         let list: Vec<RawDepth> = parse_json(data)?;
         let raw = list
@@ -220,7 +237,7 @@ impl Okx {
     }
 
     fn subscribe(&mut self, symbol: &Symbol, channel: &str) -> Result<()> {
-        let wire = Self::wire_symbol(symbol);
+        let wire = self.inst_id(symbol);
         if self.connection.is_none() {
             let ws = self.ws.as_ref().ok_or(Error::NotConnected)?;
             let connection = ws.connect(ws_url(self.testnet))?;
@@ -248,7 +265,7 @@ impl Okx {
             subscriptions
                 .get(wire)
                 .cloned()
-                .unwrap_or_else(|| wire.parse().unwrap_or_else(|_| Symbol::new(wire, "")))
+                .unwrap_or_else(|| symbol_from_inst_id(wire))
         };
         let mut events = Vec::new();
         if let Some(connection) = self.connection.as_mut() {
@@ -282,7 +299,7 @@ impl Okx {
             ord_type_str(request.order_type)
         };
         let mut body = serde_json::json!({
-            "instId": Self::wire_symbol(&request.symbol),
+            "instId": self.inst_id(&request.symbol),
             "tdMode": self.td_mode,
             "side": side_str(request.side),
             "ordType": ord_type,
@@ -334,7 +351,7 @@ impl Okx {
     /// Returns an [`Error`] if credentials are missing or the venue rejects it.
     pub fn cancel_order(&self, symbol: &Symbol, order_id: &str) -> Result<()> {
         let body = serde_json::json!({
-            "instId": Self::wire_symbol(symbol),
+            "instId": self.inst_id(symbol),
             "ordId": order_id,
         });
         self.signed_request(
@@ -351,7 +368,7 @@ impl Okx {
     /// # Errors
     /// Returns an [`Error`] if credentials are missing or the order is unknown.
     pub fn query_order(&self, symbol: &Symbol, order_id: &str) -> Result<Order> {
-        let query = format!("instId={}&ordId={order_id}", Self::wire_symbol(symbol));
+        let query = format!("instId={}&ordId={order_id}", self.inst_id(symbol));
         let data = self.signed_request(HttpMethod::Get, "/api/v5/trade/order", &query, "")?;
         let list: Vec<RawOrder> = parse_json(data)?;
         let raw = list
@@ -369,18 +386,16 @@ impl Okx {
         let mut query = format!("instType={}", self.inst_type);
         if let Some(s) = symbol {
             query.push_str("&instId=");
-            query.push_str(&Self::wire_symbol(s));
+            query.push_str(&self.inst_id(s));
         }
         let data =
             self.signed_request(HttpMethod::Get, "/api/v5/trade/orders-pending", &query, "")?;
         let list: Vec<RawOrder> = parse_json(data)?;
         list.iter()
             .map(|raw| {
-                let sym = symbol.cloned().unwrap_or_else(|| {
-                    raw.inst_id
-                        .parse()
-                        .unwrap_or_else(|_| Symbol::new(&raw.inst_id, ""))
-                });
+                let sym = symbol
+                    .cloned()
+                    .unwrap_or_else(|| symbol_from_inst_id(&raw.inst_id));
                 order_from_raw(sym, raw)
             })
             .collect()
@@ -867,6 +882,164 @@ impl Exchange for Okx {
     }
 }
 
+/// Map an OKX instrument id back to a canonical [`Symbol`], dropping any market
+/// suffix (`BTC-USDT-SWAP` / `BTC-USDT-240329` -> `BTC/USDT`).
+fn symbol_from_inst_id(inst_id: &str) -> Symbol {
+    let mut parts = inst_id.split('-');
+    match (parts.next(), parts.next()) {
+        (Some(base), Some(quote)) if !base.is_empty() && !quote.is_empty() => {
+            Symbol::new(base, quote)
+        }
+        _ => Symbol::new(inst_id, ""),
+    }
+}
+
+impl Okx {
+    /// Open positions (`/api/v5/account/positions`); flat positions are omitted.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if credentials are missing or the request fails.
+    pub fn positions(&self, symbol: Option<&Symbol>) -> Result<Vec<Position>> {
+        let query = match symbol {
+            Some(s) => format!("instType={}&instId={}", self.inst_type, self.inst_id(s)),
+            None => format!("instType={}", self.inst_type),
+        };
+        let data = self.signed_request(HttpMethod::Get, "/api/v5/account/positions", &query, "")?;
+        let raw: Vec<RawOkxPosition> = parse_json(data)?;
+        raw.iter().filter_map(parse_okx_position).collect()
+    }
+
+    /// Set the leverage for `symbol` (`/api/v5/account/set-leverage`), preserving
+    /// the current margin mode.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the leverage is rejected or the request fails.
+    pub fn set_leverage(&self, symbol: &Symbol, leverage: u32) -> Result<()> {
+        let mgn_mode = self.current_margin_mode(symbol)?;
+        self.apply_leverage(symbol, &leverage.to_string(), mgn_mode)
+    }
+
+    /// Set the margin mode for `symbol`. OKX couples the mode with the leverage,
+    /// so the current leverage is preserved.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the change is rejected or the request fails.
+    pub fn set_margin_mode(&self, symbol: &Symbol, mode: MarginMode) -> Result<()> {
+        let leverage = self
+            .positions(Some(symbol))?
+            .first()
+            .map_or_else(|| "3".to_string(), |p| p.leverage.normalize().to_string());
+        self.apply_leverage(symbol, &leverage, mode)
+    }
+
+    fn current_margin_mode(&self, symbol: &Symbol) -> Result<MarginMode> {
+        Ok(self
+            .positions(Some(symbol))?
+            .first()
+            .map_or(MarginMode::Cross, |p| p.margin_mode))
+    }
+
+    fn apply_leverage(&self, symbol: &Symbol, leverage: &str, mode: MarginMode) -> Result<()> {
+        let mgn_mode = match mode {
+            MarginMode::Cross => "cross",
+            MarginMode::Isolated => "isolated",
+        };
+        let body = serde_json::json!({
+            "instId": self.inst_id(symbol),
+            "lever": leverage,
+            "mgnMode": mgn_mode,
+        });
+        self.signed_request(
+            HttpMethod::Post,
+            "/api/v5/account/set-leverage",
+            "",
+            &body.to_string(),
+        )?;
+        Ok(())
+    }
+
+    /// Flatten the open position in `symbol` with a reduce-only market order.
+    ///
+    /// # Errors
+    /// Returns [`Error::NotFound`] if there is no open position, or another
+    /// [`Error`] if the request fails.
+    pub fn close_position(&self, symbol: &Symbol) -> Result<Order> {
+        let position = self
+            .positions(Some(symbol))?
+            .into_iter()
+            .find(|p| &p.symbol == symbol)
+            .ok_or_else(|| Error::NotFound(format!("no open position for {symbol}")))?;
+        let request = match position.side {
+            PositionSide::Long => OrderRequest::market_sell(symbol.clone(), position.quantity),
+            PositionSide::Short => OrderRequest::market_buy(symbol.clone(), position.quantity),
+        }
+        .reduce_only();
+        self.place_order(&request)
+    }
+}
+
+impl Derivatives for Okx {
+    fn positions(&mut self, symbol: Option<&Symbol>) -> Result<Vec<Position>> {
+        Okx::positions(self, symbol)
+    }
+    fn set_leverage(&mut self, symbol: &Symbol, leverage: u32) -> Result<()> {
+        Okx::set_leverage(self, symbol, leverage)
+    }
+    fn set_margin_mode(&mut self, symbol: &Symbol, mode: MarginMode) -> Result<()> {
+        Okx::set_margin_mode(self, symbol, mode)
+    }
+    fn close_position(&mut self, symbol: &Symbol) -> Result<Order> {
+        Okx::close_position(self, symbol)
+    }
+}
+
+#[derive(Deserialize)]
+struct RawOkxPosition {
+    #[serde(rename = "instId")]
+    inst_id: String,
+    #[serde(rename = "posSide", default)]
+    pos_side: String,
+    pos: String,
+    #[serde(rename = "avgPx", default)]
+    avg_px: String,
+    #[serde(rename = "markPx", default)]
+    mark_px: String,
+    lever: String,
+    upl: String,
+    #[serde(rename = "mgnMode")]
+    mgn_mode: String,
+}
+
+fn parse_okx_position(raw: &RawOkxPosition) -> Option<Result<Position>> {
+    let pos = match parse_decimal(&raw.pos) {
+        Ok(pos) if !pos.is_zero() => pos,
+        Ok(_) => return None, // flat position
+        Err(e) => return Some(Err(e)),
+    };
+    let side = if raw.pos_side == "short" || pos.is_sign_negative() {
+        PositionSide::Short
+    } else {
+        PositionSide::Long
+    };
+    let build = || -> Result<Position> {
+        Ok(Position {
+            symbol: symbol_from_inst_id(&raw.inst_id),
+            side,
+            quantity: pos.abs(),
+            entry_price: parse_decimal(&raw.avg_px)?,
+            mark_price: parse_decimal(&raw.mark_px)?,
+            leverage: parse_decimal(&raw.lever)?,
+            unrealized_pnl: parse_decimal(&raw.upl)?,
+            margin_mode: if raw.mgn_mode.eq_ignore_ascii_case("isolated") {
+                MarginMode::Isolated
+            } else {
+                MarginMode::Cross
+            },
+        })
+    };
+    Some(build())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -910,6 +1083,83 @@ mod tests {
         )
         .with_clock(Box::new(move || now_ms));
         (okx, mock)
+    }
+
+    fn signed_futures_client(now_ms: i64) -> (Okx, Arc<MockHttpTransport>) {
+        let mock = Arc::new(MockHttpTransport::new());
+        let opts = ExchangeOptions::mainnet(MarketType::UsdMFutures);
+        let okx = Okx::with_credentials(
+            Box::new(ArcTransport(Arc::clone(&mock))),
+            &opts,
+            Credentials::new("APIKEY", "SECRET").with_passphrase("PASS"),
+        )
+        .with_clock(Box::new(move || now_ms));
+        (okx, mock)
+    }
+
+    const OKX_POSITIONS: &str = r#"{"code":"0","msg":"","data":[
+        {"instId":"BTC-USDT-SWAP","posSide":"net","pos":"0.5","avgPx":"20000","markPx":"20100","lever":"10","upl":"50","mgnMode":"isolated"}
+    ]}"#;
+
+    #[test]
+    fn swap_client_appends_swap_to_inst_id() {
+        let (okx, mock) = signed_futures_client(1000);
+        mock.push_json(
+            200,
+            r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT-SWAP","last":"20000","bidPx":"19999","askPx":"20001","vol24h":"1000"}]}"#,
+        );
+        okx.ticker(&symbol()).unwrap();
+        assert!(mock.recorded_requests()[0]
+            .url
+            .contains("instId=BTC-USDT-SWAP"));
+    }
+
+    #[test]
+    fn derivatives_positions_parse() {
+        let (mut okx, mock) = signed_futures_client(1000);
+        mock.push_json(200, OKX_POSITIONS);
+        let positions = Derivatives::positions(&mut okx, Some(&symbol())).unwrap();
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].symbol, Symbol::new("BTC", "USDT"));
+        assert_eq!(positions[0].side, PositionSide::Long);
+        assert_eq!(positions[0].quantity, dec!(0.5));
+        assert_eq!(positions[0].margin_mode, MarginMode::Isolated);
+        assert!(mock.recorded_requests()[0]
+            .url
+            .contains("/api/v5/account/positions"));
+        assert!(mock.recorded_requests()[0].url.contains("instType=SWAP"));
+    }
+
+    #[test]
+    fn derivatives_set_leverage_preserves_margin_mode() {
+        let (mut okx, mock) = signed_futures_client(1000);
+        mock.push_json(200, OKX_POSITIONS); // current mgnMode lookup
+        mock.push_json(
+            200,
+            r#"{"code":"0","msg":"","data":[{"lever":"20","mgnMode":"isolated","instId":"BTC-USDT-SWAP"}]}"#,
+        );
+        Derivatives::set_leverage(&mut okx, &symbol(), 20).unwrap();
+        let reqs = mock.recorded_requests();
+        assert!(reqs[1].url.contains("/api/v5/account/set-leverage"));
+        let body = reqs[1].body.as_deref().unwrap();
+        assert!(body.contains(r#""lever":"20""#));
+        assert!(body.contains(r#""mgnMode":"isolated""#));
+    }
+
+    #[test]
+    fn derivatives_close_position_reduce_only() {
+        let (mut okx, mock) = signed_futures_client(1000);
+        mock.push_json(200, OKX_POSITIONS);
+        mock.push_json(
+            200,
+            r#"{"code":"0","msg":"","data":[{"ordId":"9","clOrdId":"","sCode":"0","sMsg":""}]}"#,
+        );
+        Derivatives::close_position(&mut okx, &symbol()).unwrap();
+        let reqs = mock.recorded_requests();
+        assert!(reqs[1].url.contains("/api/v5/trade/order"));
+        let body = reqs[1].body.as_deref().unwrap();
+        assert!(body.contains(r#""side":"sell""#));
+        assert!(body.contains(r#""reduceOnly":true"#));
     }
 
     #[test]
