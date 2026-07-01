@@ -23,9 +23,10 @@
 //! `set_margin_mode(Isolated)` is unsupported within the flex (cross) account.
 //!
 //! [`AdvancedOrders`]: native in-place amend (`/0/private/EditOrder`, which
-//! assigns a new txid) and sequential `cancel_batch`. Kraken's `AddOrderBatch`
-//! uses indexed form-array fields that do not fit this binding's form helper, and
-//! it has no OCO order-list, so `place_batch`/`place_oco` are documented gaps.
+//! assigns a new txid), native batch placement (`/0/private/AddOrderBatch`, whose
+//! indexed `orders[i][…]` form array is built by a dedicated encoder) and native
+//! batch cancel (`/0/private/CancelOrderBatch`). Kraken has no OCO order-list (it
+//! uses conditional-close orders), so `place_oco` is a documented gap.
 
 use crate::credentials::Credentials;
 use crate::error::{Error, Result};
@@ -741,6 +742,20 @@ impl Kraken {
     /// Sign a private POST: `API-Sign = base64(HMAC-SHA512(base64decode(secret),
     /// path ++ SHA256(nonce ++ postdata)))`, form-encoded body with the nonce.
     fn signed_post(&self, path: &str, params: &[(&str, String)]) -> Result<serde_json::Value> {
+        let owned: Vec<(String, String)> = params
+            .iter()
+            .map(|(key, val)| ((*key).to_string(), val.clone()))
+            .collect();
+        self.signed_post_pairs(path, &owned)
+    }
+
+    /// Signed POST with owned form keys, for endpoints whose field names are built
+    /// dynamically (e.g. `AddOrderBatch`'s `orders[i][…]` indexed array).
+    fn signed_post_pairs(
+        &self,
+        path: &str,
+        params: &[(String, String)],
+    ) -> Result<serde_json::Value> {
         let creds = self.credentials.as_ref().ok_or(Error::InvalidCredentials(
             "signed endpoint requires credentials",
         ))?;
@@ -1306,6 +1321,41 @@ fn order_type_str(order_type: OrderType) -> &'static str {
     }
 }
 
+/// Build one `place_batch` outcome from an `AddOrderBatch` per-order entry: a
+/// `txid` marks acceptance (mapped to a fresh [`OrderStatus::New`] order carrying
+/// the request's own fields), an `error` marks a per-order rejection.
+fn kraken_batch_order(request: &OrderRequest, entry: &serde_json::Value) -> Result<Order> {
+    if let Some(error) = entry.get("error").and_then(serde_json::Value::as_str) {
+        if !error.is_empty() {
+            return Err(map_error(error));
+        }
+    }
+    let txid = entry
+        .get("txid")
+        .and_then(|value| {
+            value.as_str().map(str::to_string).or_else(|| {
+                value
+                    .as_array()
+                    .and_then(|ids| ids.first())
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+        })
+        .ok_or_else(|| Error::Deserialization("missing txid in AddOrderBatch entry".to_string()))?;
+    Ok(Order {
+        id: txid,
+        client_order_id: request.client_order_id.clone(),
+        symbol: request.symbol.clone(),
+        side: request.side,
+        order_type: request.order_type,
+        status: OrderStatus::New,
+        quantity: request.quantity,
+        filled_quantity: Decimal::ZERO,
+        price: request.price,
+        average_price: None,
+    })
+}
+
 fn parse_side(raw: &str) -> Result<OrderSide> {
     match raw {
         "buy" => Ok(OrderSide::Buy),
@@ -1758,15 +1808,83 @@ impl Kraken {
         self.query_order(symbol, &new_txid)
     }
 
-    /// Cancel several orders by id. Kraken cancels one txid per call, so the ids
-    /// are cancelled sequentially.
+    /// Place several orders in one `AddOrderBatch` request. Kraken batches share a
+    /// single `pair`, so the first order's symbol sets the pair for the batch; each
+    /// order contributes its own indexed `orders[i][…]` fields. The per-order
+    /// results are returned individually, so a partially-accepted batch keeps the
+    /// successes.
     ///
     /// # Errors
-    /// Returns an [`Error`] if any cancel fails.
-    pub fn cancel_batch(&self, symbol: &Symbol, order_ids: &[String]) -> Result<()> {
-        for id in order_ids {
-            self.cancel_order(symbol, id)?;
+    /// Returns an [`Error`] if any order is invalid, credentials are missing, or
+    /// the request itself fails (a per-order rejection is carried in its own
+    /// [`Result`], not the outer one).
+    pub fn place_batch(&self, requests: &[OrderRequest]) -> Result<Vec<Result<Order>>> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
         }
+        for request in requests {
+            request.validate()?;
+        }
+        // Kraken's `AddOrderBatch` carries one shared `pair` plus an indexed
+        // `orders[i][…]` array — a form shape the flat helper cannot express.
+        let mut params: Vec<(String, String)> =
+            vec![("pair".to_string(), Self::wire_symbol(&requests[0].symbol))];
+        for (index, request) in requests.iter().enumerate() {
+            params.push((
+                format!("orders[{index}][ordertype]"),
+                order_type_str(request.order_type).to_string(),
+            ));
+            params.push((
+                format!("orders[{index}][type]"),
+                side_str(request.side).to_string(),
+            ));
+            params.push((
+                format!("orders[{index}][volume]"),
+                format_decimal(request.quantity),
+            ));
+            if let Some(price) = request.price {
+                params.push((format!("orders[{index}][price]"), format_decimal(price)));
+            }
+            if request.post_only {
+                params.push((format!("orders[{index}][oflags]"), "post".to_string()));
+            }
+            if let Some(id) = &request.client_order_id {
+                params.push((format!("orders[{index}][cl_ord_id]"), id.clone()));
+            }
+        }
+        let result = self.signed_post_pairs("/0/private/AddOrderBatch", &params)?;
+        let orders = result
+            .get("orders")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| Error::Deserialization("missing orders in AddOrderBatch".to_string()))?;
+        Ok(requests
+            .iter()
+            .zip(orders)
+            .map(|(request, entry)| kraken_batch_order(request, entry))
+            .collect())
+    }
+
+    /// Cancel several orders by id. The spot API cancels the whole set in one
+    /// `CancelOrderBatch` request; the futures client has no such endpoint and
+    /// cancels sequentially.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the request fails.
+    pub fn cancel_batch(&self, symbol: &Symbol, order_ids: &[String]) -> Result<()> {
+        if order_ids.is_empty() {
+            return Ok(());
+        }
+        if self.is_futures() {
+            for id in order_ids {
+                self.cancel_order(symbol, id)?;
+            }
+            return Ok(());
+        }
+        let params: Vec<(String, String)> = order_ids
+            .iter()
+            .map(|id| ("orders[]".to_string(), id.clone()))
+            .collect();
+        self.signed_post_pairs("/0/private/CancelOrderBatch", &params)?;
         Ok(())
     }
 }
@@ -1781,14 +1899,8 @@ impl AdvancedOrders for Kraken {
     ) -> Result<Order> {
         Kraken::amend_order(self, symbol, order_id, new_price, new_quantity)
     }
-    /// Kraken's `AddOrderBatch` encodes its order array as indexed form fields,
-    /// which does not fit this binding's form helper, so batch placement is a
-    /// documented gap (place orders individually).
-    fn place_batch(&mut self, _requests: &[OrderRequest]) -> Result<Vec<Result<Order>>> {
-        Err(Error::Exchange {
-            code: "unsupported".to_string(),
-            message: "Kraken AddOrderBatch is not yet wired; place orders individually".to_string(),
-        })
+    fn place_batch(&mut self, requests: &[OrderRequest]) -> Result<Vec<Result<Order>>> {
+        Kraken::place_batch(self, requests)
     }
     fn cancel_batch(&mut self, symbol: &Symbol, order_ids: &[String]) -> Result<()> {
         Kraken::cancel_batch(self, symbol, order_ids)
@@ -2093,27 +2205,59 @@ mod tests {
     }
 
     #[test]
-    fn cancel_batch_is_sequential() {
+    fn cancel_batch_uses_the_native_endpoint() {
         let (kraken, mock) = signed_client(1000);
-        mock.push_json(200, r#"{"error":[],"result":{"count":1}}"#);
-        mock.push_json(200, r#"{"error":[],"result":{"count":1}}"#);
+        mock.push_json(200, r#"{"error":[],"result":{"count":2}}"#);
         kraken
-            .cancel_batch(&symbol(), &["1".to_string(), "2".to_string()])
+            .cancel_batch(&symbol(), &["OID1".to_string(), "OID2".to_string()])
             .unwrap();
-        assert_eq!(mock.recorded_requests().len(), 2);
+        let reqs = mock.recorded_requests();
+        // One CancelOrderBatch request carries both ids as a form array.
+        assert_eq!(reqs.len(), 1);
+        assert!(reqs[0].url.contains("/0/private/CancelOrderBatch"));
+        let body = reqs[0].body.as_ref().unwrap();
+        assert!(body.contains("orders[]=OID1"));
+        assert!(body.contains("orders[]=OID2"));
     }
 
     #[test]
-    fn place_batch_and_oco_are_unsupported() {
-        let (mut kraken, _mock) = signed_client(1000);
+    fn place_batch_uses_the_indexed_add_order_batch_form() {
+        let (mut kraken, mock) = signed_client(1000);
+        mock.push_json(
+            200,
+            r#"{"error":[],"result":{"orders":[{"txid":"OID1","descr":{"order":"buy"}},
+            {"error":"EOrder:Insufficient funds"}]}}"#,
+        );
+        let results = AdvancedOrders::place_batch(
+            &mut kraken,
+            &[
+                OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)),
+                OrderRequest::limit_buy(symbol(), dec!(2), dec!(90)),
+            ],
+        )
+        .unwrap();
+        // The first order is accepted; the second carries its own rejection.
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].as_ref().unwrap().id, "OID1");
         assert!(matches!(
-            AdvancedOrders::place_batch(
-                &mut kraken,
-                &[OrderRequest::limit_buy(symbol(), dec!(1), dec!(100))]
-            )
-            .unwrap_err(),
-            Error::Exchange { .. }
+            results[1].as_ref().unwrap_err(),
+            Error::InsufficientBalance
         ));
+        let reqs = mock.recorded_requests();
+        assert!(reqs[0].url.contains("/0/private/AddOrderBatch"));
+        let body = reqs[0].body.as_ref().unwrap();
+        assert!(body.contains("pair=XBTUSDT"));
+        assert!(body.contains("orders[0][ordertype]=limit"));
+        assert!(body.contains("orders[0][type]=buy"));
+        assert!(body.contains("orders[0][volume]=1"));
+        assert!(body.contains("orders[0][price]=100"));
+        assert!(body.contains("orders[1][volume]=2"));
+        assert!(body.contains("orders[1][price]=90"));
+    }
+
+    #[test]
+    fn place_oco_is_unsupported() {
+        let (mut kraken, _mock) = signed_client(1000);
         assert!(matches!(
             AdvancedOrders::place_oco(
                 &mut kraken,
