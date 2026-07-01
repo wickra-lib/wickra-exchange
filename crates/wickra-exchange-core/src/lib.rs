@@ -20,6 +20,7 @@ mod credentials;
 mod error;
 mod events;
 mod exchanges;
+mod feeds;
 mod idempotency;
 mod instruments;
 mod normalize;
@@ -41,7 +42,12 @@ pub use credentials::Credentials;
 pub use error::{Error, Result};
 pub use events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
 pub use exchanges::{
-    Binance, Bitget, Bybit, Coinbase, Gate, Htx, Kraken, KuCoin, Okx, PaperExchange, Upbit,
+    Binance, Bitget, Bybit, Coinbase, Gate, Htx, Kraken, KuCoin, Okx, PaperExchange,
+    ReplayExchange, Upbit,
+};
+pub use feeds::{
+    cross_section, order_book_from_snapshot, trade_from_print, BreadthMember, DerivativesFeed,
+    DerivativesTickBuilder, FundingRate, Liquidation, LongShortRatio, MarkIndex, OpenInterest,
 };
 pub use idempotency::ClientIdGenerator;
 pub use instruments::{Instrument, InstrumentCache, InstrumentFilters};
