@@ -7,9 +7,11 @@
 //! mock transport.
 
 mod binance;
+mod bitget;
 mod bybit;
 mod okx;
 
 pub use binance::Binance;
+pub use bitget::Bitget;
 pub use bybit::Bybit;
 pub use okx::Okx;
