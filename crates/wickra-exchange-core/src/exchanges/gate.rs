@@ -27,7 +27,7 @@ use crate::options::{ExchangeOptions, MarginMode, MarketType, SelfTradePreventio
 use crate::positions::{Position, PositionSide};
 use crate::signing::{hmac_sha512_hex, sha512_hex};
 use crate::symbol::Symbol;
-use crate::traits::{AdvancedOrders, Derivatives, Exchange, Execution, MarketData};
+use crate::traits::{AdvancedOrders, Derivatives, Exchange, Execution, MarketData, WsUserData};
 use crate::transport::{
     HttpMethod, HttpRequest, HttpResponse, HttpTransport, WsConnection, WsTransport,
 };
@@ -63,6 +63,10 @@ pub struct Gate {
     /// margin mode with its leverage endpoint (`leverage=0` = cross), so
     /// [`set_leverage`](Self::set_leverage) records the value here.
     leverage: u32,
+    /// The private user-data connection, opened by
+    /// [`subscribe_user_data`](Self::subscribe_user_data) and drained by
+    /// [`poll_events`](Self::poll_events) alongside the public stream.
+    private_connection: Option<Box<dyn WsConnection>>,
 }
 
 impl Gate {
@@ -82,6 +86,7 @@ impl Gate {
             sub_messages: Vec::new(),
             subscriptions: Vec::new(),
             leverage: 1,
+            private_connection: None,
         }
     }
 
@@ -287,8 +292,17 @@ impl Gate {
         let mut events = Vec::new();
         if let Some(connection) = self.connection.as_mut() {
             while let Ok(Some(frame)) = connection.recv() {
-                if let Ok(Some(event)) = parse_ws_message(&frame, &resolve) {
-                    events.push(event);
+                if let Ok(mut parsed) = parse_ws_message(&frame, &resolve) {
+                    events.append(&mut parsed);
+                }
+            }
+        }
+        // Drain the private user-data stream (spot.orders/spot.balances), if open.
+        // Re-authenticating a dropped private stream is a keepalive follow-up.
+        if let Some(connection) = self.private_connection.as_mut() {
+            while let Ok(Some(frame)) = connection.recv() {
+                if let Ok(mut parsed) = parse_ws_message(&frame, &resolve) {
+                    events.append(&mut parsed);
                 }
             }
         }
@@ -301,6 +315,40 @@ impl Gate {
             &mut events,
         );
         events
+    }
+
+    /// Open the private user-data stream (`wss://api.gateio.ws/ws/v4/`). Sends
+    /// signed `subscribe` frames for the `spot.orders` and `spot.balances`
+    /// channels (each carries an `auth` object whose `SIGN` is HMAC-SHA512 over
+    /// `channel=<channel>&event=subscribe&time=<time>`). Afterwards
+    /// [`poll_events`](Self::poll_events) also surfaces the account's own
+    /// [`Event::OrderUpdate`] and [`Event::BalanceUpdate`].
+    ///
+    /// Re-authenticating a dropped private stream is a keepalive follow-up.
+    ///
+    /// # Errors
+    /// Returns [`Error::InvalidCredentials`] without credentials,
+    /// [`Error::NotConnected`] without a WebSocket transport, or another
+    /// [`Error`] if the request fails.
+    pub fn subscribe_user_data(&mut self) -> Result<()> {
+        let creds = self.credentials.as_ref().ok_or(Error::InvalidCredentials(
+            "user-data stream requires credentials",
+        ))?;
+        let time = (self.now_ms)() / 1000;
+        let ws = self.ws.as_ref().ok_or(Error::NotConnected)?;
+        let mut connection = ws.connect("wss://api.gateio.ws/ws/v4/")?;
+        // `spot.orders` takes `!all` to cover every pair; `spot.balances` takes no payload.
+        for (channel, payload) in [("spot.orders", r#"["!all"]"#), ("spot.balances", "[]")] {
+            let sign_string = format!("channel={channel}&event=subscribe&time={time}");
+            let sign = hmac_sha512_hex(creds.api_secret.as_bytes(), sign_string.as_bytes());
+            let message = format!(
+                r#"{{"time":{time},"channel":"{channel}","event":"subscribe","payload":{payload},"auth":{{"method":"api_key","KEY":"{}","SIGN":"{sign}"}}}}"#,
+                creds.api_key
+            );
+            connection.send(&message)?;
+        }
+        self.private_connection = Some(connection);
+        Ok(())
     }
 
     /// Place an order.
@@ -669,6 +717,14 @@ fn parse_side(raw: &str) -> Result<OrderSide> {
     }
 }
 
+/// Split a Gate wire pair (`BTC_USDT`) into a canonical [`Symbol`].
+fn symbol_from_wire(wire: &str) -> Symbol {
+    match wire.split_once('_') {
+        Some((base, quote)) if !base.is_empty() && !quote.is_empty() => Symbol::new(base, quote),
+        _ => Symbol::new(wire, ""),
+    }
+}
+
 fn parse_order_type(raw: &str) -> Result<OrderType> {
     match raw {
         "market" => Ok(OrderType::Market),
@@ -724,7 +780,13 @@ fn parse_kline_row(row: &[String]) -> Result<Candle> {
 }
 
 fn order_from_raw(symbol: Symbol, raw: &RawOrder) -> Result<Order> {
-    let filled = dec_or_zero(&raw.filled_amount);
+    // REST reports `filled_amount` directly; the `spot.orders` stream reports the
+    // remaining `left`, so the filled quantity is `amount - left`.
+    let filled = if raw.filled_amount.is_empty() && !raw.left.is_empty() {
+        (dec_or_zero(&raw.amount) - dec_or_zero(&raw.left)).max(Decimal::ZERO)
+    } else {
+        dec_or_zero(&raw.filled_amount)
+    };
     let status = match raw.status.as_str() {
         "cancelled" => OrderStatus::Canceled,
         "closed" => OrderStatus::Filled,
@@ -809,44 +871,80 @@ fn parse_ws_levels(value: Option<&serde_json::Value>) -> Result<Vec<BookLevel>> 
         .collect()
 }
 
-fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Option<Event>> {
+fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Vec<Event>> {
     let value: serde_json::Value =
         serde_json::from_str(text).map_err(|e| Error::Deserialization(e.to_string()))?;
     if value.get("event").and_then(serde_json::Value::as_str) != Some("update") {
-        return Ok(None); // subscribe ack / other events
+        return Ok(Vec::new()); // subscribe ack / other events
     }
     let Some(channel) = value.get("channel").and_then(serde_json::Value::as_str) else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
     let null = serde_json::Value::Null;
     let result = value.get("result").unwrap_or(&null);
 
     match channel {
-        "spot.trades" => Ok(Some(Event::Trade(TradePrint {
+        "spot.trades" => Ok(vec![Event::Trade(TradePrint {
             symbol: resolve(field_str(result, "currency_pair")?),
             price: parse_decimal(field_str(result, "price")?)?,
             quantity: parse_decimal(field_str(result, "amount")?)?,
             aggressor: parse_side(field_str(result, "side")?)?,
             timestamp: opt_i64(result, "create_time_ms"),
-        }))),
-        "spot.tickers" => Ok(Some(Event::Ticker(Ticker {
+        })]),
+        "spot.tickers" => Ok(vec![Event::Ticker(Ticker {
             symbol: resolve(field_str(result, "currency_pair")?),
             last: parse_decimal(field_str(result, "last")?)?,
             bid: dec_or_zero(opt_str(result, "highest_bid")),
             ask: dec_or_zero(opt_str(result, "lowest_ask")),
             volume: dec_or_zero(opt_str(result, "base_volume")),
-        }))),
+        })]),
         "spot.order_book_update" => {
             let update_id = opt_u64(result, "u");
-            Ok(Some(Event::BookDelta(BookDelta {
+            Ok(vec![Event::BookDelta(BookDelta {
                 symbol: resolve(opt_str(result, "s")),
                 first_update_id: update_id,
                 final_update_id: update_id,
                 bids: parse_ws_levels(result.get("b"))?,
                 asks: parse_ws_levels(result.get("a"))?,
-            })))
+            })])
         }
-        _ => Ok(None),
+        // Private order channel: `result` is an array of order objects, each
+        // carrying its own `currency_pair`.
+        "spot.orders" => result
+            .as_array()
+            .ok_or_else(|| Error::Deserialization("spot.orders result not an array".to_string()))?
+            .iter()
+            .map(|order| {
+                // The private stream carries no public subscription, so the wire
+                // `currency_pair` is split directly.
+                let symbol = symbol_from_wire(field_str(order, "currency_pair")?);
+                let raw: RawOrder = serde_json::from_value(order.clone())
+                    .map_err(|e| Error::Deserialization(e.to_string()))?;
+                Ok(Event::OrderUpdate(order_from_raw(symbol, &raw)?))
+            })
+            .collect(),
+        // Private balance channel: `result` is an array of per-currency balances,
+        // emitted together as one balance-update snapshot.
+        "spot.balances" => {
+            let balances = result
+                .as_array()
+                .ok_or_else(|| {
+                    Error::Deserialization("spot.balances result not an array".to_string())
+                })?
+                .iter()
+                .map(|entry| {
+                    let total = dec_or_zero(opt_str(entry, "total"));
+                    let available = dec_or_zero(opt_str(entry, "available"));
+                    Ok(Balance {
+                        asset: field_str(entry, "currency")?.to_string(),
+                        free: available,
+                        locked: (total - available).max(Decimal::ZERO),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(vec![Event::BalanceUpdate(balances)])
+        }
+        _ => Ok(Vec::new()),
     }
 }
 
@@ -886,6 +984,10 @@ struct RawOrder {
     amount: String,
     #[serde(rename = "filled_amount", default)]
     filled_amount: String,
+    // The private `spot.orders` stream reports the remaining size as `left`
+    // rather than the filled amount; the filled quantity is derived from it.
+    #[serde(default)]
+    left: String,
     #[serde(default)]
     price: String,
     #[serde(rename = "avg_deal_price", default)]
@@ -1141,6 +1243,12 @@ impl Exchange for Gate {
     }
 }
 
+impl WsUserData for Gate {
+    fn subscribe_user_data(&mut self) -> Result<()> {
+        Gate::subscribe_user_data(self)
+    }
+}
+
 impl Derivatives for Gate {
     fn positions(&mut self, symbol: Option<&Symbol>) -> Result<Vec<Position>> {
         Gate::positions(self, symbol)
@@ -1335,6 +1443,78 @@ mod tests {
         )
         .with_clock(Box::new(move || now_ms));
         (gate, mock)
+    }
+
+    fn signed_ws_client(now_ms: i64) -> (Gate, Arc<MockWsTransport>) {
+        let http = Arc::new(MockHttpTransport::new());
+        let ws = Arc::new(MockWsTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::Spot);
+        let gate = Gate::with_credentials(
+            Box::new(ArcTransport(http)),
+            &opts,
+            Credentials::new("APIKEY", "SECRET"),
+        )
+        .with_ws(Box::new(ArcWs(Arc::clone(&ws))))
+        .with_clock(Box::new(move || now_ms));
+        (gate, ws)
+    }
+
+    #[test]
+    fn subscribe_user_data_authenticates_and_streams_orders_and_balances() {
+        let (mut gate, ws) = signed_ws_client(1_700_000_000_000);
+        ws.push_connection(vec![
+            Ok(Some(r#"{"channel":"spot.orders","event":"subscribe"}"#.to_string())),
+            Ok(Some(r#"{"channel":"spot.balances","event":"subscribe"}"#.to_string())),
+            Ok(Some(
+                r#"{"time":1,"channel":"spot.orders","event":"update","result":[{"id":"55",
+                "text":"my","currency_pair":"BTC_USDT","side":"buy","type":"limit","status":"closed",
+                "amount":"1","left":"0","price":"100","avg_deal_price":"100"}]}"#
+                    .to_string(),
+            )),
+            Ok(Some(
+                r#"{"time":2,"channel":"spot.balances","event":"update","result":[{"currency":"USDT",
+                "available":"900","total":"950"}]}"#
+                    .to_string(),
+            )),
+        ]);
+        gate.subscribe_user_data().unwrap();
+        assert_eq!(ws.connected_urls()[0], "wss://api.gateio.ws/ws/v4/");
+        assert!(ws.sent()[0].contains(r#""channel":"spot.orders""#));
+        assert!(ws.sent()[0].contains(r#""KEY":"APIKEY""#));
+        assert!(ws.sent()[0].contains(r#""SIGN""#));
+        assert!(ws.sent()[1].contains(r#""channel":"spot.balances""#));
+
+        let events = gate.poll_events();
+        assert_eq!(events.len(), 2);
+        let Event::OrderUpdate(order) = &events[0] else {
+            panic!("first event must be an order update");
+        };
+        assert_eq!(order.id, "55");
+        assert_eq!(order.symbol, symbol());
+        assert_eq!(order.side, OrderSide::Buy);
+        assert_eq!(order.status, OrderStatus::Filled);
+        assert_eq!(order.filled_quantity, dec!(1));
+        assert_eq!(order.average_price, Some(dec!(100)));
+        let Event::BalanceUpdate(balances) = &events[1] else {
+            panic!("second event must be a balance update");
+        };
+        assert_eq!(balances.len(), 1);
+        assert_eq!(balances[0].asset, "USDT");
+        assert_eq!(balances[0].free, dec!(900));
+        assert_eq!(balances[0].locked, dec!(50));
+    }
+
+    #[test]
+    fn subscribe_user_data_requires_credentials() {
+        let http = Arc::new(MockHttpTransport::new());
+        let ws = Arc::new(MockWsTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::Spot);
+        let mut gate = Gate::with_http(Box::new(ArcTransport(http)), &opts)
+            .with_ws(Box::new(ArcWs(Arc::clone(&ws))));
+        assert!(matches!(
+            gate.subscribe_user_data().unwrap_err(),
+            Error::InvalidCredentials(_)
+        ));
     }
 
     fn signed_futures_client(now_ms: i64) -> (Gate, Arc<MockHttpTransport>) {
