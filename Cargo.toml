@@ -41,7 +41,7 @@ zeroize = { version = "1", features = ["derive"] }
 # Observability.
 tracing = "0.1"
 # Async runtime + I/O (driven internally; the public stream API stays pull-based).
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "macros"] }
 futures-util = "0.3"
 # HTTP + WebSocket transport (rustls TLS, no OpenSSL system dependency).
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }

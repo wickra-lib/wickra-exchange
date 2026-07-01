@@ -13,4 +13,4 @@ pub use wickra_exchange_core::*;
 
 mod net;
 
-pub use net::ReqwestHttpTransport;
+pub use net::{ReqwestHttpTransport, TungsteniteWsTransport};

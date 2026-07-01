@@ -21,3 +21,6 @@ wickra-exchange-core = { workspace = true }
 # Transport traits; they are excluded from coverage (only exercised by gated
 # integration tests against live testnets).
 reqwest = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
