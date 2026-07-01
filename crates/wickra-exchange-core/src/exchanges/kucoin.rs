@@ -59,6 +59,9 @@ pub struct KuCoin {
     /// [`subscribe_user_data`](Self::subscribe_user_data) and drained by
     /// [`poll_events`](Self::poll_events) alongside the public stream.
     private_connection: Option<Box<dyn WsConnection>>,
+    /// Set once the private stream is subscribed, so [`poll_events`](Self::poll_events)
+    /// re-subscribes it (re-negotiating a fresh bullet token) after a drop.
+    user_data_active: bool,
 }
 
 impl KuCoin {
@@ -84,6 +87,7 @@ impl KuCoin {
             subscriptions: Vec::new(),
             leverage: 1,
             private_connection: None,
+            user_data_active: false,
         }
     }
 
@@ -263,12 +267,26 @@ impl KuCoin {
             }
         }
         // Drain the private user-data stream (tradeOrders/account.balance), if open.
-        // Re-negotiating a fresh bullet token on reconnect is a keepalive follow-up.
         if let Some(connection) = self.private_connection.as_mut() {
             while let Ok(Some(frame)) = connection.recv() {
                 if let Ok(Some(event)) = parse_ws_message(&frame, &resolve) {
                     events.push(event);
                 }
+            }
+        }
+        // A dropped private stream is re-subscribed by re-negotiating a fresh
+        // bullet-private token over REST (the previous token is single-use and
+        // time-bound, so it cannot be replayed).
+        if self.user_data_active
+            && self
+                .private_connection
+                .as_ref()
+                .is_some_and(|c| !c.is_connected())
+        {
+            events.push(Event::Disconnected);
+            self.private_connection = None;
+            if self.subscribe_user_data().is_ok() {
+                events.push(Event::Reconnected);
             }
         }
         let url = "wss://ws-api-spot.kucoin.com/";
@@ -289,8 +307,10 @@ impl KuCoin {
     /// channels. Afterwards [`poll_events`](Self::poll_events) also surfaces the
     /// account's own [`Event::OrderUpdate`] and [`Event::BalanceUpdate`].
     ///
-    /// The bullet token expires (KuCoin pings keep it alive); re-negotiating it on
-    /// reconnect is a keepalive follow-up.
+    /// The bullet token expires;
+    /// [`keepalive_user_data`](Self::keepalive_user_data) sends KuCoin's ping to
+    /// keep it alive, and a dropped stream is re-subscribed automatically on the
+    /// next [`poll_events`](Self::poll_events), which re-negotiates a fresh token.
     ///
     /// # Errors
     /// Returns [`Error::InvalidCredentials`] without credentials or a passphrase,
@@ -319,6 +339,21 @@ impl KuCoin {
         connection.send(&orders)?;
         connection.send(&account)?;
         self.private_connection = Some(connection);
+        self.user_data_active = true;
+        Ok(())
+    }
+
+    /// Send KuCoin's application-level heartbeat (`{"id":..,"type":"ping"}`) on the
+    /// private stream so the bullet token is not dropped for inactivity. A no-op
+    /// before [`subscribe_user_data`](Self::subscribe_user_data).
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the ping cannot be sent.
+    pub fn keepalive_user_data(&mut self) -> Result<()> {
+        let ping = format!(r#"{{"id":"{}","type":"ping"}}"#, (self.now_ms)());
+        if let Some(connection) = self.private_connection.as_mut() {
+            connection.send(&ping)?;
+        }
         Ok(())
     }
 
@@ -1152,6 +1187,9 @@ impl WsUserData for KuCoin {
     fn subscribe_user_data(&mut self) -> Result<()> {
         KuCoin::subscribe_user_data(self)
     }
+    fn keepalive_user_data(&mut self) -> Result<()> {
+        KuCoin::keepalive_user_data(self)
+    }
 }
 
 impl WsExecution for KuCoin {
@@ -1382,6 +1420,61 @@ mod tests {
             kucoin.subscribe_user_data().unwrap_err(),
             Error::InvalidCredentials(_)
         ));
+    }
+
+    #[test]
+    fn keepalive_user_data_pings_the_private_stream() {
+        let (mut kucoin, http, ws) = signed_ws_client(1000);
+        http.push_json(
+            200,
+            r#"{"code":"200000","data":{"token":"tok","instanceServers":[
+            {"endpoint":"wss://push.kucoin.com/endpoint"}]}}"#,
+        );
+        ws.push_connection(vec![]);
+        kucoin.subscribe_user_data().unwrap();
+        kucoin.keepalive_user_data().unwrap();
+        assert!(ws.sent().iter().any(|f| f.contains(r#""type":"ping""#)));
+    }
+
+    #[test]
+    fn keepalive_user_data_is_a_noop_before_subscribe() {
+        let (mut kucoin, _http, ws) = signed_ws_client(1000);
+        kucoin.keepalive_user_data().unwrap();
+        assert!(ws.sent().is_empty());
+    }
+
+    #[test]
+    fn dropped_user_data_stream_reconnects_with_a_fresh_bullet_token() {
+        let (mut kucoin, http, ws) = signed_ws_client(1000);
+        http.push_json(
+            200,
+            r#"{"code":"200000","data":{"token":"tok-1","instanceServers":[
+            {"endpoint":"wss://push.kucoin.com/endpoint"}]}}"#,
+        );
+        // The first private connection closes on the first recv; the reconnect
+        // target is a fresh open connection.
+        ws.push_connection(vec![Ok(None)]);
+        ws.push_connection(vec![]);
+        kucoin.subscribe_user_data().unwrap();
+        // The reconnect re-negotiates a fresh bullet token over REST.
+        http.push_json(
+            200,
+            r#"{"code":"200000","data":{"token":"tok-2","instanceServers":[
+            {"endpoint":"wss://push.kucoin.com/endpoint"}]}}"#,
+        );
+
+        let events = kucoin.poll_events();
+        assert!(events.contains(&Event::Disconnected));
+        assert!(events.contains(&Event::Reconnected));
+        // Two bullet-private POSTs (initial + reconnect) and a second WS connection.
+        let bullets = http
+            .recorded_requests()
+            .into_iter()
+            .filter(|r| r.url.contains("/api/v1/bullet-private"))
+            .count();
+        assert_eq!(bullets, 2);
+        assert_eq!(ws.connected_urls().len(), 2);
+        assert!(ws.connected_urls()[1].contains("token=tok-2"));
     }
 
     #[test]
