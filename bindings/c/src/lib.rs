@@ -20,10 +20,10 @@ use std::sync::OnceLock;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use wickra_exchange::{
-    connect, connect_advanced, connect_derivatives, AdvancedOrders, Credentials, Derivatives,
-    Error, Event, Exchange, ExchangeOptions, MarginMode, MarketType, OcoRequest, Order,
-    OrderRequest, OrderSide, OrderStatus, PaperExchange, Position, PositionSide, ReplayExchange,
-    Symbol, TradePrint,
+    connect, connect_advanced, connect_derivatives, connect_user_data, connect_ws_execution,
+    AdvancedOrders, Credentials, Derivatives, Error, Event, Exchange, ExchangeOptions, MarginMode,
+    MarketType, OcoRequest, Order, OrderRequest, OrderSide, OrderStatus, PaperExchange, Position,
+    PositionSide, ReplayExchange, Symbol, TradePrint, WsExecution, WsUserData,
 };
 
 /// Success.
@@ -168,6 +168,18 @@ pub struct WickraDerivatives {
 /// `wickra_connect_advanced`; release with `wickra_advanced_free`.
 pub struct WickraAdvanced {
     inner: Box<dyn AdvancedOrders>,
+}
+
+/// An opaque private user-data handle over a live client. Construct with
+/// `wickra_connect_user_data`; release with `wickra_user_data_free`.
+pub struct WickraUserData {
+    inner: Box<dyn WsUserData>,
+}
+
+/// An opaque WebSocket order-API handle over a live client. Construct with
+/// `wickra_connect_ws_execution`; release with `wickra_ws_execution_free`.
+pub struct WickraWsExecution {
+    inner: Box<dyn WsExecution>,
 }
 
 // ------------------------------- helpers -------------------------------------
@@ -1242,6 +1254,225 @@ pub unsafe extern "C" fn wickra_advanced_place_batch(
     }
 }
 
+// ------------------------------ user data ------------------------------------
+
+/// Connect a private user-data client for `name`. `futures` selects the USDⓈ-M
+/// futures market. Returns null for an unknown / spot-only venue or bad UTF-8.
+///
+/// # Safety
+/// The string arguments must be null or valid NUL-terminated C strings.
+#[no_mangle]
+pub unsafe extern "C" fn wickra_connect_user_data(
+    name: *const c_char,
+    api_key: *const c_char,
+    api_secret: *const c_char,
+    passphrase: *const c_char,
+    private_key: *const c_char,
+    testnet: bool,
+    futures: bool,
+) -> *mut WickraUserData {
+    let (Some(name), Some(api_key), Some(api_secret)) =
+        (unsafe { (opt_str(name), opt_str(api_key), opt_str(api_secret)) })
+    else {
+        return core::ptr::null_mut();
+    };
+    let mut credentials = Credentials::new(api_key, api_secret);
+    if let Some(passphrase) = unsafe { opt_str(passphrase) } {
+        credentials = credentials.with_passphrase(passphrase);
+    }
+    if let Some(private_key) = unsafe { opt_str(private_key) } {
+        credentials = credentials.with_private_key(private_key);
+    }
+    let market_type = if futures {
+        MarketType::UsdMFutures
+    } else {
+        MarketType::Spot
+    };
+    let options = if testnet {
+        ExchangeOptions::testnet(market_type)
+    } else {
+        ExchangeOptions::mainnet(market_type)
+    };
+    match connect_user_data(name, credentials, &options) {
+        Ok(inner) => Box::into_raw(Box::new(WickraUserData { inner })),
+        Err(_) => core::ptr::null_mut(),
+    }
+}
+
+/// Release a user-data handle. Safe to call with null.
+///
+/// # Safety
+/// `handle` must be null or a pointer from `wickra_connect_user_data`, freed
+/// exactly once.
+#[no_mangle]
+pub unsafe extern "C" fn wickra_user_data_free(handle: *mut WickraUserData) {
+    if !handle.is_null() {
+        drop(unsafe { Box::from_raw(handle) });
+    }
+}
+
+/// Open the private user-data stream. Afterwards `wickra_user_data_poll` also
+/// drains the account's own order/balance events.
+///
+/// # Safety
+/// `handle` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn wickra_user_data_subscribe(handle: *mut WickraUserData) -> i32 {
+    let Some(handle) = (unsafe { handle.as_mut() }) else {
+        return WICKRA_ERR_NULL;
+    };
+    match handle.inner.subscribe_user_data() {
+        Ok(()) => WICKRA_OK,
+        Err(e) => error_code(&e),
+    }
+}
+
+/// Drain buffered user-data events into `out` (capacity `cap`). Returns the
+/// number written (`>= 0`) or a negative error code.
+///
+/// # Safety
+/// `handle` must be valid; `out` must be writable for `cap` elements.
+#[no_mangle]
+pub unsafe extern "C" fn wickra_user_data_poll(
+    handle: *mut WickraUserData,
+    out: *mut WickraEvent,
+    cap: usize,
+) -> i32 {
+    let Some(handle) = (unsafe { handle.as_mut() }) else {
+        return WICKRA_ERR_NULL;
+    };
+    if out.is_null() && cap != 0 {
+        return WICKRA_ERR_NULL;
+    }
+    // `WsUserData: MarketData`, so the handle can poll directly.
+    let events = handle.inner.poll_events();
+    let count = events.len().min(cap);
+    for (i, event) in events.iter().take(count).enumerate() {
+        fill_event(unsafe { &mut *out.add(i) }, event);
+    }
+    i32::try_from(count).unwrap_or(i32::MAX)
+}
+
+// ---------------------------- ws execution -----------------------------------
+
+/// Connect a WebSocket order-API client for `name`. `futures` selects the USDⓈ-M
+/// futures market. Returns null for an unknown / spot-only venue or bad UTF-8.
+///
+/// # Safety
+/// The string arguments must be null or valid NUL-terminated C strings.
+#[no_mangle]
+pub unsafe extern "C" fn wickra_connect_ws_execution(
+    name: *const c_char,
+    api_key: *const c_char,
+    api_secret: *const c_char,
+    passphrase: *const c_char,
+    private_key: *const c_char,
+    testnet: bool,
+    futures: bool,
+) -> *mut WickraWsExecution {
+    let (Some(name), Some(api_key), Some(api_secret)) =
+        (unsafe { (opt_str(name), opt_str(api_key), opt_str(api_secret)) })
+    else {
+        return core::ptr::null_mut();
+    };
+    let mut credentials = Credentials::new(api_key, api_secret);
+    if let Some(passphrase) = unsafe { opt_str(passphrase) } {
+        credentials = credentials.with_passphrase(passphrase);
+    }
+    if let Some(private_key) = unsafe { opt_str(private_key) } {
+        credentials = credentials.with_private_key(private_key);
+    }
+    let market_type = if futures {
+        MarketType::UsdMFutures
+    } else {
+        MarketType::Spot
+    };
+    let options = if testnet {
+        ExchangeOptions::testnet(market_type)
+    } else {
+        ExchangeOptions::mainnet(market_type)
+    };
+    match connect_ws_execution(name, credentials, &options) {
+        Ok(inner) => Box::into_raw(Box::new(WickraWsExecution { inner })),
+        Err(_) => core::ptr::null_mut(),
+    }
+}
+
+/// Release a ws-execution handle. Safe to call with null.
+///
+/// # Safety
+/// `handle` must be null or a pointer from `wickra_connect_ws_execution`, freed
+/// exactly once.
+#[no_mangle]
+pub unsafe extern "C" fn wickra_ws_execution_free(handle: *mut WickraWsExecution) {
+    if !handle.is_null() {
+        drop(unsafe { Box::from_raw(handle) });
+    }
+}
+
+/// Place an order over the WebSocket order API; writes the resulting order into
+/// `out`. A `NaN` `price` places a market order, a finite value a limit order.
+///
+/// # Safety
+/// `handle` and `out` must be valid; `market` must be a valid C string.
+#[no_mangle]
+pub unsafe extern "C" fn wickra_ws_place_order(
+    handle: *mut WickraWsExecution,
+    market: *const c_char,
+    side: i32,
+    quantity: f64,
+    price: f64,
+    out: *mut WickraOrder,
+) -> i32 {
+    let Some(handle) = (unsafe { handle.as_mut() }) else {
+        return WICKRA_ERR_NULL;
+    };
+    if out.is_null() {
+        return WICKRA_ERR_NULL;
+    }
+    let Some(market) = (unsafe { opt_str(market) }) else {
+        return WICKRA_ERR_INVALID_ARG;
+    };
+    let Some(symbol) = parse_symbol(market) else {
+        return WICKRA_ERR_INVALID_ARG;
+    };
+    let Some(request) = build_request(symbol, side, quantity, price) else {
+        return WICKRA_ERR_INVALID_ARG;
+    };
+    match handle.inner.place_order_ws(&request) {
+        Ok(order) => {
+            fill_order(unsafe { &mut *out }, &order);
+            WICKRA_OK
+        }
+        Err(e) => error_code(&e),
+    }
+}
+
+/// Cancel an order over the WebSocket order API by venue id.
+///
+/// # Safety
+/// `handle` must be valid; `market` and `order_id` must be valid C strings.
+#[no_mangle]
+pub unsafe extern "C" fn wickra_ws_cancel_order(
+    handle: *mut WickraWsExecution,
+    market: *const c_char,
+    order_id: *const c_char,
+) -> i32 {
+    let Some(handle) = (unsafe { handle.as_mut() }) else {
+        return WICKRA_ERR_NULL;
+    };
+    let (Some(market), Some(order_id)) = (unsafe { (opt_str(market), opt_str(order_id)) }) else {
+        return WICKRA_ERR_INVALID_ARG;
+    };
+    let Some(symbol) = parse_symbol(market) else {
+        return WICKRA_ERR_INVALID_ARG;
+    };
+    match handle.inner.cancel_order_ws(&symbol, order_id) {
+        Ok(()) => WICKRA_OK,
+        Err(e) => error_code(&e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1520,6 +1751,120 @@ mod tests {
             )
         };
         assert!(handle.is_null(), "upbit has no advanced-order surface");
+    }
+
+    fn live_user_data(name: &str) -> *mut WickraUserData {
+        let (name, key, secret) = (cstr(name), cstr("k"), cstr("s"));
+        unsafe {
+            wickra_connect_user_data(
+                name.as_ptr(),
+                key.as_ptr(),
+                secret.as_ptr(),
+                core::ptr::null(),
+                core::ptr::null(),
+                false,
+                false,
+            )
+        }
+    }
+
+    fn live_ws_execution(name: &str) -> *mut WickraWsExecution {
+        let (name, key, secret) = (cstr(name), cstr("k"), cstr("s"));
+        unsafe {
+            wickra_connect_ws_execution(
+                name.as_ptr(),
+                key.as_ptr(),
+                secret.as_ptr(),
+                core::ptr::null(),
+                core::ptr::null(),
+                false,
+                false,
+            )
+        }
+    }
+
+    #[test]
+    fn user_data_spot_only_is_null_and_trading_venue_polls() {
+        assert!(
+            live_user_data("coinbase").is_null(),
+            "coinbase has no private user-data stream"
+        );
+        let handle = live_user_data("binance");
+        assert!(!handle.is_null());
+        // `WsUserData: MarketData`, so the handle polls (nothing buffered offline).
+        let mut buf: [WickraEvent; 4] = unsafe { core::mem::zeroed() };
+        assert_eq!(
+            unsafe { wickra_user_data_poll(handle, buf.as_mut_ptr(), buf.len()) },
+            0
+        );
+        unsafe { wickra_user_data_free(handle) };
+    }
+
+    #[test]
+    fn user_data_null_handle_guards() {
+        assert_eq!(
+            unsafe { wickra_user_data_subscribe(core::ptr::null_mut()) },
+            WICKRA_ERR_NULL
+        );
+        let mut buf: [WickraEvent; 1] = unsafe { core::mem::zeroed() };
+        assert_eq!(
+            unsafe { wickra_user_data_poll(core::ptr::null_mut(), buf.as_mut_ptr(), buf.len()) },
+            WICKRA_ERR_NULL
+        );
+        unsafe { wickra_user_data_free(core::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn ws_execution_spot_only_is_null_and_bad_arg_is_rejected() {
+        assert!(
+            live_ws_execution("upbit").is_null(),
+            "upbit has no WebSocket order API"
+        );
+        let handle = live_ws_execution("binance");
+        assert!(!handle.is_null());
+        // A malformed market is rejected before any request.
+        let bad = cstr("BTCUSDT");
+        let mut out = empty_order();
+        assert_eq!(
+            unsafe {
+                wickra_ws_place_order(
+                    handle,
+                    bad.as_ptr(),
+                    WICKRA_SIDE_BUY,
+                    1.0,
+                    100.0,
+                    &raw mut out,
+                )
+            },
+            WICKRA_ERR_INVALID_ARG
+        );
+        unsafe { wickra_ws_execution_free(handle) };
+    }
+
+    #[test]
+    fn ws_execution_null_handle_guards() {
+        let (market, order_id) = (cstr("BTC/USDT"), cstr("1"));
+        let mut out = empty_order();
+        assert_eq!(
+            unsafe {
+                wickra_ws_place_order(
+                    core::ptr::null_mut(),
+                    market.as_ptr(),
+                    WICKRA_SIDE_BUY,
+                    1.0,
+                    100.0,
+                    &raw mut out,
+                )
+            },
+            WICKRA_ERR_NULL
+        );
+        assert_eq!(
+            unsafe {
+                wickra_ws_cancel_order(core::ptr::null_mut(), market.as_ptr(), order_id.as_ptr())
+            },
+            WICKRA_ERR_NULL
+        );
+        unsafe { wickra_ws_execution_free(core::ptr::null_mut()) };
     }
 
     #[test]

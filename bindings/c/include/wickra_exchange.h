@@ -135,6 +135,18 @@ typedef struct WickraDerivatives WickraDerivatives;
 typedef struct WickraExchange WickraExchange;
 
 /**
+ * An opaque private user-data handle over a live client. Construct with
+ * `wickra_connect_user_data`; release with `wickra_user_data_free`.
+ */
+typedef struct WickraUserData WickraUserData;
+
+/**
+ * An opaque WebSocket order-API handle over a live client. Construct with
+ * `wickra_connect_ws_execution`; release with `wickra_ws_execution_free`.
+ */
+typedef struct WickraWsExecution WickraWsExecution;
+
+/**
  * An order as reported by the exchange (C-ABI mirror of `Order`).
  */
 typedef struct {
@@ -550,6 +562,94 @@ int32_t wickra_advanced_place_batch(WickraAdvanced *handle,
                                     WickraOrder *out,
                                     int32_t *out_codes,
                                     uintptr_t cap);
+
+/**
+ * Connect a private user-data client for `name`. `futures` selects the USDⓈ-M
+ * futures market. Returns null for an unknown / spot-only venue or bad UTF-8.
+ *
+ * # Safety
+ * The string arguments must be null or valid NUL-terminated C strings.
+ */
+WickraUserData *wickra_connect_user_data(const char *name,
+                                         const char *api_key,
+                                         const char *api_secret,
+                                         const char *passphrase,
+                                         const char *private_key,
+                                         bool testnet,
+                                         bool futures);
+
+/**
+ * Release a user-data handle. Safe to call with null.
+ *
+ * # Safety
+ * `handle` must be null or a pointer from `wickra_connect_user_data`, freed
+ * exactly once.
+ */
+void wickra_user_data_free(WickraUserData *handle);
+
+/**
+ * Open the private user-data stream. Afterwards `wickra_user_data_poll` also
+ * drains the account's own order/balance events.
+ *
+ * # Safety
+ * `handle` must be valid.
+ */
+int32_t wickra_user_data_subscribe(WickraUserData *handle);
+
+/**
+ * Drain buffered user-data events into `out` (capacity `cap`). Returns the
+ * number written (`>= 0`) or a negative error code.
+ *
+ * # Safety
+ * `handle` must be valid; `out` must be writable for `cap` elements.
+ */
+int32_t wickra_user_data_poll(WickraUserData *handle, WickraEvent *out, uintptr_t cap);
+
+/**
+ * Connect a WebSocket order-API client for `name`. `futures` selects the USDⓈ-M
+ * futures market. Returns null for an unknown / spot-only venue or bad UTF-8.
+ *
+ * # Safety
+ * The string arguments must be null or valid NUL-terminated C strings.
+ */
+WickraWsExecution *wickra_connect_ws_execution(const char *name,
+                                               const char *api_key,
+                                               const char *api_secret,
+                                               const char *passphrase,
+                                               const char *private_key,
+                                               bool testnet,
+                                               bool futures);
+
+/**
+ * Release a ws-execution handle. Safe to call with null.
+ *
+ * # Safety
+ * `handle` must be null or a pointer from `wickra_connect_ws_execution`, freed
+ * exactly once.
+ */
+void wickra_ws_execution_free(WickraWsExecution *handle);
+
+/**
+ * Place an order over the WebSocket order API; writes the resulting order into
+ * `out`. A `NaN` `price` places a market order, a finite value a limit order.
+ *
+ * # Safety
+ * `handle` and `out` must be valid; `market` must be a valid C string.
+ */
+int32_t wickra_ws_place_order(WickraWsExecution *handle,
+                              const char *market,
+                              int32_t side,
+                              double quantity,
+                              double price,
+                              WickraOrder *out);
+
+/**
+ * Cancel an order over the WebSocket order API by venue id.
+ *
+ * # Safety
+ * `handle` must be valid; `market` and `order_id` must be valid C strings.
+ */
+int32_t wickra_ws_cancel_order(WickraWsExecution *handle, const char *market, const char *order_id);
 
 #ifdef __cplusplus
 }  // extern "C"
