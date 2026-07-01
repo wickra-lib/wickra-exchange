@@ -6,7 +6,7 @@ largest crypto exchanges, plus offline paper and replay simulators that share th
 same API.
 
 ```r
-library(wickra.exchange)
+library(wickraexchange)
 
 ex <- wkex_paper(c(USDT = 100000), taker_bps = 5)
 wkex_set_price(ex, "BTC/USDT", 20000)

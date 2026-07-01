@@ -1,4 +1,4 @@
-useDynLib(wickra.exchange, .registration = TRUE, .fixes = "C_")
+useDynLib(wickraexchange, .registration = TRUE, .fixes = "C_")
 export(wkex_version)
 export(wkex_paper)
 export(wkex_replay_trades)
