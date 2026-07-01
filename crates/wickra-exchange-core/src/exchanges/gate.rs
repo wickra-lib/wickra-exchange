@@ -10,9 +10,9 @@
 //! `place_order`, `balances` and the [`Derivatives`] trait route to the
 //! USDT-margined perpetual endpoints (`/api/v4/futures/usdt/*`), where orders
 //! carry a signed integer contract `size`. `query_order`/`cancel_order`/
-//! `open_orders` still target the spot order shape; the futures order object
-//! (numeric id, signed `size`, `finish_as`) differs and is a documented
-//! follow-up.
+//! `open_orders` route to the futures order endpoints too, parsing the futures
+//! order object (numeric id, signed `size`, `finish_as`) via
+//! `futures_order_from_raw`.
 //!
 //! [`AdvancedOrders`]: STP via `stp_act` on order create, native in-place amend
 //! (`PATCH /api/v4/spot/orders/{id}`) and native spot batch place/cancel
@@ -351,6 +351,11 @@ impl Gate {
     /// # Errors
     /// Returns an [`Error`] if credentials are missing or the venue rejects it.
     pub fn cancel_order(&self, symbol: &Symbol, order_id: &str) -> Result<()> {
+        if self.is_futures() {
+            let path = format!("/api/v4/futures/usdt/orders/{order_id}");
+            self.signed_request(HttpMethod::Delete, &path, "", "")?;
+            return Ok(());
+        }
         let path = format!("/api/v4/spot/orders/{order_id}");
         let query = format!("currency_pair={}", Self::wire_symbol(symbol));
         self.signed_request(HttpMethod::Delete, &path, &query, "")?;
@@ -362,6 +367,12 @@ impl Gate {
     /// # Errors
     /// Returns an [`Error`] if credentials are missing or the order is unknown.
     pub fn query_order(&self, symbol: &Symbol, order_id: &str) -> Result<Order> {
+        if self.is_futures() {
+            let path = format!("/api/v4/futures/usdt/orders/{order_id}");
+            let value = self.signed_request(HttpMethod::Get, &path, "", "")?;
+            let raw: RawFuturesOrder = parse_json(value)?;
+            return futures_order_from_raw(symbol.clone(), &raw);
+        }
         let path = format!("/api/v4/spot/orders/{order_id}");
         let query = format!("currency_pair={}", Self::wire_symbol(symbol));
         let value = self.signed_request(HttpMethod::Get, &path, &query, "")?;
@@ -369,13 +380,23 @@ impl Gate {
         order_from_raw(symbol.clone(), &raw)
     }
 
-    /// Open orders for one `symbol` (Gate requires a currency pair here).
+    /// Open orders for one `symbol` (Gate requires a currency pair / contract here).
     ///
     /// # Errors
     /// Returns an [`Error`] if credentials are missing, no symbol is given, or the
     /// request fails.
     pub fn open_orders(&self, symbol: Option<&Symbol>) -> Result<Vec<Order>> {
         let sym = symbol.ok_or(Error::InvalidOrder("Gate open_orders requires a symbol"))?;
+        if self.is_futures() {
+            let query = format!("contract={}&status=open", Self::wire_symbol(sym));
+            let value =
+                self.signed_request(HttpMethod::Get, "/api/v4/futures/usdt/orders", &query, "")?;
+            let list: Vec<RawFuturesOrder> = parse_json(value)?;
+            return list
+                .iter()
+                .map(|raw| futures_order_from_raw(sym.clone(), raw))
+                .collect();
+        }
         let query = format!("currency_pair={}&status=open", Self::wire_symbol(sym));
         let value = self.signed_request(HttpMethod::Get, "/api/v4/spot/orders", &query, "")?;
         let list: Vec<RawOrder> = parse_json(value)?;
@@ -1597,6 +1618,53 @@ mod tests {
         assert!(mock.recorded_requests()[0]
             .url
             .contains("/api/v4/futures/usdt/accounts"));
+    }
+
+    #[test]
+    fn futures_query_order_uses_futures_endpoint_and_shape() {
+        let (gate, mock) = signed_futures_client(1_000_000);
+        mock.push_json(
+            200,
+            r#"{"id":88,"size":2,"left":0,"price":"100","fill_price":"100",
+            "status":"finished","finish_as":"filled","text":""}"#,
+        );
+        let order = gate.query_order(&symbol(), "88").unwrap();
+        assert_eq!(order.id, "88");
+        assert_eq!(order.side, OrderSide::Buy);
+        assert_eq!(order.status, OrderStatus::Filled);
+        assert!(mock.recorded_requests()[0]
+            .url
+            .contains("/api/v4/futures/usdt/orders/88"));
+    }
+
+    #[test]
+    fn futures_cancel_order_targets_futures_endpoint() {
+        let (gate, mock) = signed_futures_client(1_000_000);
+        mock.push_json(
+            200,
+            r#"{"id":88,"size":0,"left":0,"status":"finished","finish_as":"cancelled"}"#,
+        );
+        gate.cancel_order(&symbol(), "88").unwrap();
+        let req = &mock.recorded_requests()[0];
+        assert_eq!(req.method, HttpMethod::Delete);
+        assert!(req.url.contains("/api/v4/futures/usdt/orders/88"));
+    }
+
+    #[test]
+    fn futures_open_orders_parse_contract_shape() {
+        let (gate, mock) = signed_futures_client(1_000_000);
+        mock.push_json(
+            200,
+            r#"[{"id":90,"size":-3,"left":3,"price":"21000","fill_price":"0",
+            "status":"open","finish_as":"","text":""}]"#,
+        );
+        let orders = gate.open_orders(Some(&symbol())).unwrap();
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].side, OrderSide::Sell);
+        assert_eq!(orders[0].status, OrderStatus::New);
+        assert!(mock.recorded_requests()[0]
+            .url
+            .contains("/api/v4/futures/usdt/orders?contract=BTC_USDT&status=open"));
     }
 
     #[test]
