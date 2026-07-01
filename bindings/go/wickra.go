@@ -623,3 +623,136 @@ func (a *Advanced) Close() {
 		runtime.SetFinalizer(a, nil)
 	}
 }
+
+// --- user data ---
+
+// UserData is a live private user-data client. After SubscribeUserData, Poll
+// surfaces the account's own order and balance updates alongside the public
+// market-data stream. Construct with ConnectUserData; call Close to release.
+type UserData struct {
+	handle *C.WickraUserData
+}
+
+// ConnectUserData opens a user-data client for name. futures selects the USDⓈ-M
+// futures market. It fails for a venue without a private user-data stream.
+func ConnectUserData(name, apiKey, apiSecret, passphrase, privateKey string, testnet, futures bool) (*UserData, error) {
+	cName := C.CString(name)
+	cKey := C.CString(apiKey)
+	cSecret := C.CString(apiSecret)
+	defer C.free(unsafe.Pointer(cName))
+	defer C.free(unsafe.Pointer(cKey))
+	defer C.free(unsafe.Pointer(cSecret))
+	var cPass, cPriv *C.char
+	if passphrase != "" {
+		cPass = C.CString(passphrase)
+		defer C.free(unsafe.Pointer(cPass))
+	}
+	if privateKey != "" {
+		cPriv = C.CString(privateKey)
+		defer C.free(unsafe.Pointer(cPriv))
+	}
+	handle := C.wickra_connect_user_data(cName, cKey, cSecret, cPass, cPriv, C.bool(testnet), C.bool(futures))
+	if handle == nil {
+		return nil, fmt.Errorf("wickra: failed to connect user-data client for %s", name)
+	}
+	u := &UserData{handle: handle}
+	runtime.SetFinalizer(u, (*UserData).Close)
+	return u, nil
+}
+
+// SubscribeUserData opens the private user-data stream. Afterwards Poll also
+// drains the account's own order/balance events.
+func (u *UserData) SubscribeUserData() error {
+	return codeError(C.wickra_user_data_subscribe(u.handle))
+}
+
+// Poll drains buffered user-data events (up to capacity per call).
+func (u *UserData) Poll(capacity int) ([]Event, error) {
+	buf := make([]C.WickraEvent, capacity)
+	count := C.wickra_user_data_poll(u.handle, &buf[0], C.size_t(capacity))
+	if count < 0 {
+		return nil, fmt.Errorf("wickra: user-data poll failed with code %d", int(count))
+	}
+	events := make([]Event, int(count))
+	for i := 0; i < int(count); i++ {
+		events[i] = readEvent(&buf[i])
+	}
+	return events, nil
+}
+
+// Close releases the native user-data handle.
+func (u *UserData) Close() {
+	if u.handle != nil {
+		C.wickra_user_data_free(u.handle)
+		u.handle = nil
+		runtime.SetFinalizer(u, nil)
+	}
+}
+
+// --- ws execution ---
+
+// WsExecution is a live WebSocket order-API client: place and cancel orders over
+// the venue's WebSocket order API. Native on Binance/Bybit/OKX/Gate/Kraken; on
+// Bitget, KuCoin and HTX the methods return an error (no WebSocket order-entry
+// API — use REST). Construct with ConnectWsExecution; call Close to release.
+type WsExecution struct {
+	handle *C.WickraWsExecution
+}
+
+// ConnectWsExecution opens a WebSocket order-API client for name. futures selects
+// the USDⓈ-M futures market. It fails for a venue without a WebSocket order API.
+func ConnectWsExecution(name, apiKey, apiSecret, passphrase, privateKey string, testnet, futures bool) (*WsExecution, error) {
+	cName := C.CString(name)
+	cKey := C.CString(apiKey)
+	cSecret := C.CString(apiSecret)
+	defer C.free(unsafe.Pointer(cName))
+	defer C.free(unsafe.Pointer(cKey))
+	defer C.free(unsafe.Pointer(cSecret))
+	var cPass, cPriv *C.char
+	if passphrase != "" {
+		cPass = C.CString(passphrase)
+		defer C.free(unsafe.Pointer(cPass))
+	}
+	if privateKey != "" {
+		cPriv = C.CString(privateKey)
+		defer C.free(unsafe.Pointer(cPriv))
+	}
+	handle := C.wickra_connect_ws_execution(cName, cKey, cSecret, cPass, cPriv, C.bool(testnet), C.bool(futures))
+	if handle == nil {
+		return nil, fmt.Errorf("wickra: failed to connect ws-execution client for %s", name)
+	}
+	w := &WsExecution{handle: handle}
+	runtime.SetFinalizer(w, (*WsExecution).Close)
+	return w, nil
+}
+
+// PlaceOrderWs places an order over the WebSocket order API. A NaN price places a
+// market order; a finite price places a limit order.
+func (w *WsExecution) PlaceOrderWs(market string, side Side, quantity, price float64) (Order, error) {
+	cMarket := C.CString(market)
+	defer C.free(unsafe.Pointer(cMarket))
+	var out C.WickraOrder
+	rc := C.wickra_ws_place_order(w.handle, cMarket, C.int(side), C.double(quantity), C.double(price), &out)
+	if err := codeError(rc); err != nil {
+		return Order{}, err
+	}
+	return readOrder(&out), nil
+}
+
+// CancelOrderWs cancels an order over the WebSocket order API by venue id.
+func (w *WsExecution) CancelOrderWs(market, orderID string) error {
+	cMarket := C.CString(market)
+	cOrder := C.CString(orderID)
+	defer C.free(unsafe.Pointer(cMarket))
+	defer C.free(unsafe.Pointer(cOrder))
+	return codeError(C.wickra_ws_cancel_order(w.handle, cMarket, cOrder))
+}
+
+// Close releases the native ws-execution handle.
+func (w *WsExecution) Close() {
+	if w.handle != nil {
+		C.wickra_ws_execution_free(w.handle)
+		w.handle = nil
+		runtime.SetFinalizer(w, nil)
+	}
+}
