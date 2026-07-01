@@ -16,9 +16,11 @@
 //! reused), and the [`Derivatives`] trait plus `place_order`/`balances` via the
 //! **cross-margin** `/linear-swap-api/v1/swap_cross_*` family, where orders carry
 //! an integer contract `volume`, a `direction`, an `offset` (open/close) and a
-//! `lever_rate`. `query_order`/`cancel_order`/`open_orders` keep the spot order
-//! shape on futures, and `set_margin_mode(Isolated)` is unsupported within the
-//! cross family — both documented gaps.
+//! `lever_rate`. `query_order`/`cancel_order`/`open_orders` route to the
+//! cross-swap order endpoints (`swap_cross_order_info` / `swap_cross_cancel` /
+//! `swap_cross_openorders`) with the swap order shape (`order_id_str`,
+//! `direction`, numeric `status`). `set_margin_mode(Isolated)` is unsupported
+//! within the cross family — a documented gap.
 //!
 //! [`AdvancedOrders`]: native spot batch place/cancel (`/v1/order/batch-orders`,
 //! `/v1/order/orders/batchcancel`, per-order `err-code`). HTX has no STP field,
@@ -452,7 +454,20 @@ impl Htx {
     ///
     /// # Errors
     /// Returns an [`Error`] if credentials are missing or the venue rejects it.
-    pub fn cancel_order(&self, _symbol: &Symbol, order_id: &str) -> Result<()> {
+    pub fn cancel_order(&self, symbol: &Symbol, order_id: &str) -> Result<()> {
+        if self.is_futures() {
+            let body = serde_json::json!({
+                "contract_code": Self::contract_code(symbol),
+                "order_id": order_id,
+            });
+            self.signed_request(
+                HttpMethod::Post,
+                "/linear-swap-api/v1/swap_cross_cancel",
+                &[],
+                &body.to_string(),
+            )?;
+            return Ok(());
+        }
         let path = format!("/v1/order/orders/{order_id}/submitcancel");
         self.signed_request(HttpMethod::Post, &path, &[], "{}")?;
         Ok(())
@@ -463,6 +478,24 @@ impl Htx {
     /// # Errors
     /// Returns an [`Error`] if credentials are missing or the order is unknown.
     pub fn query_order(&self, symbol: &Symbol, order_id: &str) -> Result<Order> {
+        if self.is_futures() {
+            let body = serde_json::json!({
+                "contract_code": Self::contract_code(symbol),
+                "order_id": order_id,
+            });
+            let value = self.signed_request(
+                HttpMethod::Post,
+                "/linear-swap-api/v1/swap_cross_order_info",
+                &[],
+                &body.to_string(),
+            )?;
+            let order = value
+                .get("data")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|a| a.first())
+                .ok_or_else(|| Error::NotFound(format!("order {order_id}")))?;
+            return swap_order_from_value(symbol.clone(), order);
+        }
         let path = format!("/v1/order/orders/{order_id}");
         let value = self.signed_request(HttpMethod::Get, &path, &[], "")?;
         let data = value
@@ -476,6 +509,27 @@ impl Htx {
     /// # Errors
     /// Returns an [`Error`] if credentials are missing or the request fails.
     pub fn open_orders(&self, symbol: Option<&Symbol>) -> Result<Vec<Order>> {
+        if self.is_futures() {
+            let sym = symbol.ok_or(Error::InvalidOrder(
+                "HTX futures open_orders requires a symbol",
+            ))?;
+            let body = serde_json::json!({ "contract_code": Self::contract_code(sym) });
+            let value = self.signed_request(
+                HttpMethod::Post,
+                "/linear-swap-api/v1/swap_cross_openorders",
+                &[],
+                &body.to_string(),
+            )?;
+            let orders = value
+                .get("data")
+                .and_then(|d| d.get("orders"))
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| Error::Deserialization("missing orders".to_string()))?;
+            return orders
+                .iter()
+                .map(|order| swap_order_from_value(sym.clone(), order))
+                .collect();
+        }
         let account_id = self.account_id()?;
         let wire = symbol.map(Self::wire_symbol);
         let mut params: Vec<(&str, &str)> = vec![("account-id", &account_id)];
@@ -996,6 +1050,67 @@ fn order_from_value(symbol: Symbol, data: &serde_json::Value) -> Result<Order> {
     })
 }
 
+/// Map an HTX linear-swap order `status` integer to the unified status.
+fn swap_status(code: i64) -> OrderStatus {
+    match code {
+        3 => OrderStatus::PartiallyFilled,
+        6 => OrderStatus::Filled,
+        4 | 7 => OrderStatus::Canceled,
+        _ => OrderStatus::New,
+    }
+}
+
+/// Parse an HTX linear-swap order object (`swap_cross_order_info` / openorders).
+fn swap_order_from_value(symbol: Symbol, data: &serde_json::Value) -> Result<Order> {
+    let id = data
+        .get("order_id_str")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            data.get("order_id")
+                .and_then(serde_json::Value::as_i64)
+                .map(|n| n.to_string())
+        })
+        .unwrap_or_default();
+    let direction = data
+        .get("direction")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let price_type = data
+        .get("order_price_type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let order_type = if price_type.contains("limit") || price_type == "post_only" {
+        OrderType::Limit
+    } else {
+        OrderType::Market
+    };
+    let status = swap_status(
+        data.get("status")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0),
+    );
+    let filled = decimal_field(data, "trade_volume").unwrap_or(Decimal::ZERO);
+    let avg = decimal_field(data, "trade_avg_price")
+        .ok()
+        .filter(|d| *d > Decimal::ZERO);
+    let price = decimal_field(data, "price")
+        .ok()
+        .filter(|d| *d > Decimal::ZERO);
+    Ok(Order {
+        id,
+        client_order_id: None,
+        symbol,
+        side: parse_side(direction)?,
+        order_type,
+        status,
+        quantity: decimal_field(data, "volume").unwrap_or(Decimal::ZERO),
+        filled_quantity: filled,
+        price,
+        average_price: avg,
+    })
+}
+
 const KNOWN_QUOTES: &[&str] = &["usdt", "usdc", "eur", "btc", "eth", "usd"];
 
 fn split_wire_symbol(wire: &str) -> Symbol {
@@ -1478,6 +1593,56 @@ mod tests {
         assert!(body.contains(r#""order_price_type":"optimal_5""#));
         assert!(body.contains(r#""volume":2"#));
         assert!(body.contains(r#""lever_rate":1"#));
+    }
+
+    #[test]
+    fn futures_query_order_uses_swap_order_info() {
+        let (htx, mock) = signed_futures_client(0);
+        mock.push_json(
+            200,
+            r#"{"status":"ok","data":[{"order_id":88,"order_id_str":"88","direction":"buy",
+            "offset":"open","order_price_type":"limit","status":6,"volume":3,"trade_volume":3,
+            "price":100,"trade_avg_price":100}]}"#,
+        );
+        let order = htx.query_order(&symbol(), "88").unwrap();
+        assert_eq!(order.id, "88");
+        assert_eq!(order.side, OrderSide::Buy);
+        assert_eq!(order.order_type, OrderType::Limit);
+        assert_eq!(order.status, OrderStatus::Filled);
+        assert_eq!(order.quantity, dec!(3));
+        let req = &mock.recorded_requests()[0];
+        assert!(req
+            .url
+            .contains("/linear-swap-api/v1/swap_cross_order_info"));
+        assert!(req
+            .body
+            .as_ref()
+            .unwrap()
+            .contains(r#""contract_code":"BTC-USDT""#));
+    }
+
+    #[test]
+    fn futures_cancel_and_open_orders_use_swap_endpoints() {
+        let (htx, mock) = signed_futures_client(0);
+        mock.push_json(200, r#"{"status":"ok","data":{"successes":"88"}}"#);
+        htx.cancel_order(&symbol(), "88").unwrap();
+        mock.push_json(
+            200,
+            r#"{"status":"ok","data":{"orders":[{"order_id":90,"order_id_str":"90",
+            "direction":"sell","offset":"open","order_price_type":"limit","status":3,
+            "volume":5,"trade_volume":2,"price":21000,"trade_avg_price":21000}]}}"#,
+        );
+        let orders = htx.open_orders(Some(&symbol())).unwrap();
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].side, OrderSide::Sell);
+        assert_eq!(orders[0].status, OrderStatus::PartiallyFilled);
+        let reqs = mock.recorded_requests();
+        assert!(reqs[0]
+            .url
+            .contains("/linear-swap-api/v1/swap_cross_cancel"));
+        assert!(reqs[1]
+            .url
+            .contains("/linear-swap-api/v1/swap_cross_openorders"));
     }
 
     #[test]
