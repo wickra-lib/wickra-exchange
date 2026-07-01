@@ -282,6 +282,19 @@ func readOrder(o *C.WickraOrder) Order {
 	}
 }
 
+func readPosition(p *C.WickraPosition) Position {
+	return Position{
+		Symbol:        C.GoString(&p.symbol[0]),
+		Side:          PositionSide(p.side),
+		Quantity:      float64(p.quantity),
+		EntryPrice:    float64(p.entry_price),
+		MarkPrice:     float64(p.mark_price),
+		Leverage:      float64(p.leverage),
+		UnrealizedPnl: float64(p.unrealized_pnl),
+		MarginMode:    MarginMode(p.margin_mode),
+	}
+}
+
 func readEvent(e *C.WickraEvent) Event {
 	return Event{
 		Kind:     Kind(e.kind),
@@ -374,16 +387,36 @@ func (d *Derivatives) Position(market string) (Position, error) {
 	if err := codeError(C.wickra_derivatives_position(d.handle, cMarket, &out)); err != nil {
 		return Position{}, err
 	}
-	return Position{
-		Symbol:        C.GoString(&out.symbol[0]),
-		Side:          PositionSide(out.side),
-		Quantity:      float64(out.quantity),
-		EntryPrice:    float64(out.entry_price),
-		MarkPrice:     float64(out.mark_price),
-		Leverage:      float64(out.leverage),
-		UnrealizedPnl: float64(out.unrealized_pnl),
-		MarginMode:    MarginMode(out.margin_mode),
-	}, nil
+	return readPosition(&out), nil
+}
+
+// Positions lists every open position. Pass a market to scope to one symbol, or
+// "" for all. It grows its buffer and re-queries if the venue reports more
+// positions than fit.
+func (d *Derivatives) Positions(market string) ([]Position, error) {
+	var cMarket *C.char
+	if market != "" {
+		cMarket = C.CString(market)
+		defer C.free(unsafe.Pointer(cMarket))
+	}
+	capN := 16
+	for {
+		buf := make([]C.WickraPosition, capN)
+		rc := C.wickra_derivatives_positions(d.handle, cMarket, &buf[0], C.uintptr_t(capN))
+		if rc < 0 {
+			return nil, fmt.Errorf("wickra: positions failed with code %d", int(rc))
+		}
+		total := int(rc)
+		if total > capN {
+			capN = total
+			continue
+		}
+		positions := make([]Position, total)
+		for i := 0; i < total; i++ {
+			positions[i] = readPosition(&buf[i])
+		}
+		return positions, nil
+	}
 }
 
 // SetLeverage sets the leverage for market.
@@ -468,6 +501,102 @@ func (a *Advanced) AmendOrder(market, orderID string, newPrice, newQuantity floa
 		return Order{}, err
 	}
 	return readOrder(&out), nil
+}
+
+// OrderRequest describes one order for PlaceBatch. A NaN Price places a market
+// order; a finite Price places a limit order.
+type OrderRequest struct {
+	Market   string
+	Side     Side
+	Quantity float64
+	Price    float64
+}
+
+// BatchResult is one order's outcome in a batch placement: Err is nil and Order
+// is populated on success, or Err is set and Order is zero on a per-order
+// rejection.
+type BatchResult struct {
+	Order Order
+	Err   error
+}
+
+// PlaceOco places a one-cancels-other bracket on market: a take-profit limit leg
+// at price paired with a stop leg triggered at stopPrice. A finite stopLimitPrice
+// makes the stop leg a stop-limit; pass NaN to leave it a stop-market. It returns
+// the resulting order legs.
+func (a *Advanced) PlaceOco(market string, side Side, quantity, price, stopPrice, stopLimitPrice float64) ([]Order, error) {
+	cMarket := C.CString(market)
+	defer C.free(unsafe.Pointer(cMarket))
+	capN := 4
+	for {
+		buf := make([]C.WickraOrder, capN)
+		rc := C.wickra_advanced_place_oco(
+			a.handle, cMarket, C.int32_t(side),
+			C.double(quantity), C.double(price), C.double(stopPrice), C.double(stopLimitPrice),
+			&buf[0], C.uintptr_t(capN))
+		if rc < 0 {
+			return nil, fmt.Errorf("wickra: place_oco failed with code %d", int(rc))
+		}
+		total := int(rc)
+		if total > capN {
+			capN = total
+			continue
+		}
+		orders := make([]Order, total)
+		for i := 0; i < total; i++ {
+			orders[i] = readOrder(&buf[i])
+		}
+		return orders, nil
+	}
+}
+
+// PlaceBatch places several orders in one request. It returns one BatchResult per
+// request, in the same order: a whole-request failure (auth, transport) is
+// returned as the error, while a per-order rejection surfaces in that result's
+// Err.
+func (a *Advanced) PlaceBatch(requests []OrderRequest) ([]BatchResult, error) {
+	n := len(requests)
+	if n == 0 {
+		return nil, nil
+	}
+	markets := make([]*C.char, n)
+	sides := make([]C.int32_t, n)
+	quantities := make([]C.double, n)
+	prices := make([]C.double, n)
+	for i, req := range requests {
+		markets[i] = C.CString(req.Market)
+		sides[i] = C.int32_t(req.Side)
+		quantities[i] = C.double(req.Quantity)
+		prices[i] = C.double(req.Price)
+	}
+	defer func() {
+		for _, p := range markets {
+			C.free(unsafe.Pointer(p))
+		}
+	}()
+	out := make([]C.WickraOrder, n)
+	outCodes := make([]C.int32_t, n)
+	rc := C.wickra_advanced_place_batch(
+		a.handle,
+		(**C.char)(unsafe.Pointer(&markets[0])),
+		(*C.int32_t)(unsafe.Pointer(&sides[0])),
+		(*C.double)(unsafe.Pointer(&quantities[0])),
+		(*C.double)(unsafe.Pointer(&prices[0])),
+		C.uintptr_t(n),
+		&out[0], &outCodes[0], C.uintptr_t(n))
+	if rc < 0 {
+		return nil, fmt.Errorf("wickra: place_batch failed with code %d", int(rc))
+	}
+	total := int(rc)
+	results := make([]BatchResult, total)
+	for i := 0; i < total; i++ {
+		if outCodes[i] == C.WICKRA_OK {
+			results[i] = BatchResult{Order: readOrder(&out[i])}
+		} else {
+			results[i] = BatchResult{Err: fmt.Errorf("wickra: order rejected with code %d", int(outCodes[i]))}
+		}
+	}
+	return results, nil
 }
 
 // CancelBatch cancels several orders on market in one request.
