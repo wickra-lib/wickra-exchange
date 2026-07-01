@@ -24,9 +24,11 @@ use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 
 use wickra_exchange::{
-    connect, Credentials as CoreCredentials, Event, Exchange as CoreExchange, ExchangeOptions,
-    MarketType, Order, OrderRequest as CoreOrderRequest, OrderSide, OrderStatus, PaperExchange,
-    ReplayExchange, Symbol, TradePrint,
+    connect, connect_advanced, connect_derivatives, AdvancedOrders as CoreAdvancedOrders,
+    Credentials as CoreCredentials, Derivatives as CoreDerivatives, Event,
+    Exchange as CoreExchange, ExchangeOptions, MarginMode, MarketType, OcoRequest, Order,
+    OrderRequest as CoreOrderRequest, OrderSide, OrderStatus, PaperExchange, Position,
+    PositionSide, ReplayExchange, Symbol, TradePrint,
 };
 
 fn err(message: impl Into<String>) -> NapiError {
@@ -106,6 +108,64 @@ impl From<&Order> for OrderInfo {
             filled_quantity: to_float(order.filled_quantity),
             price: order.price.map(to_float),
             average_price: order.average_price.map(to_float),
+        }
+    }
+}
+
+fn position_side_str(side: PositionSide) -> String {
+    match side {
+        PositionSide::Long => "long",
+        PositionSide::Short => "short",
+    }
+    .to_string()
+}
+
+fn margin_mode_from_str(mode: &str) -> napi::Result<MarginMode> {
+    match mode {
+        "cross" => Ok(MarginMode::Cross),
+        "isolated" => Ok(MarginMode::Isolated),
+        other => Err(err(format!(
+            "margin_mode must be 'cross' or 'isolated', got {other:?}"
+        ))),
+    }
+}
+
+fn side_from_str(side: &str) -> napi::Result<OrderSide> {
+    match side {
+        "buy" => Ok(OrderSide::Buy),
+        "sell" => Ok(OrderSide::Sell),
+        other => Err(err(format!("side must be 'buy' or 'sell', got {other:?}"))),
+    }
+}
+
+/// A derivatives position.
+#[napi(object)]
+pub struct PositionInfo {
+    pub symbol: String,
+    pub side: String,
+    pub quantity: f64,
+    pub entry_price: f64,
+    pub mark_price: f64,
+    pub leverage: f64,
+    pub unrealized_pnl: f64,
+    pub margin_mode: String,
+}
+
+impl From<&Position> for PositionInfo {
+    fn from(position: &Position) -> Self {
+        Self {
+            symbol: position.symbol.to_string(),
+            side: position_side_str(position.side),
+            quantity: to_float(position.quantity),
+            entry_price: to_float(position.entry_price),
+            mark_price: to_float(position.mark_price),
+            leverage: to_float(position.leverage),
+            unrealized_pnl: to_float(position.unrealized_pnl),
+            margin_mode: match position.margin_mode {
+                MarginMode::Cross => "cross",
+                MarginMode::Isolated => "isolated",
+            }
+            .to_string(),
         }
     }
 }
@@ -447,5 +507,163 @@ impl Exchange {
             .iter()
             .map(StreamEvent::from_event)
             .collect()
+    }
+}
+
+/// A live derivatives (futures/perpetual) client: positions, leverage, margin
+/// mode and reduce-only close. Available on the eight venues with futures markets.
+#[napi]
+pub struct Derivatives {
+    inner: Box<dyn CoreDerivatives>,
+}
+
+#[napi]
+impl Derivatives {
+    /// Connect a USDⓈ-M futures client for `name`. Throws for a spot-only venue.
+    #[napi(factory)]
+    pub fn connect(
+        name: String,
+        credentials: &Credentials,
+        testnet: Option<bool>,
+    ) -> napi::Result<Self> {
+        let options = if testnet.unwrap_or(false) {
+            ExchangeOptions::testnet(MarketType::UsdMFutures)
+        } else {
+            ExchangeOptions::mainnet(MarketType::UsdMFutures)
+        };
+        let inner =
+            connect_derivatives(&name, credentials.inner.clone(), &options).map_err(map_err)?;
+        Ok(Self { inner })
+    }
+
+    /// Open positions, optionally filtered to one `market`.
+    #[napi]
+    pub fn positions(&mut self, market: Option<String>) -> napi::Result<Vec<PositionInfo>> {
+        let symbol = market.map(|m| parse_symbol(&m)).transpose()?;
+        Ok(self
+            .inner
+            .positions(symbol.as_ref())
+            .map_err(map_err)?
+            .iter()
+            .map(PositionInfo::from)
+            .collect())
+    }
+
+    /// Set the leverage for `market`.
+    #[napi]
+    pub fn set_leverage(&mut self, market: String, leverage: u32) -> napi::Result<()> {
+        self.inner
+            .set_leverage(&parse_symbol(&market)?, leverage)
+            .map_err(map_err)
+    }
+
+    /// Set the margin mode for `market` (`"cross"` or `"isolated"`).
+    #[napi]
+    pub fn set_margin_mode(&mut self, market: String, mode: String) -> napi::Result<()> {
+        self.inner
+            .set_margin_mode(&parse_symbol(&market)?, margin_mode_from_str(&mode)?)
+            .map_err(map_err)
+    }
+
+    /// Flatten the open position in `market` with a reduce-only market order.
+    #[napi]
+    pub fn close_position(&mut self, market: String) -> napi::Result<OrderInfo> {
+        let order = self
+            .inner
+            .close_position(&parse_symbol(&market)?)
+            .map_err(map_err)?;
+        Ok(OrderInfo::from(&order))
+    }
+}
+
+/// A live advanced-orders client: amend, batch place/cancel and OCO. Available
+/// on the eight trading venues (native where supported, else a thrown error).
+#[napi]
+pub struct AdvancedOrders {
+    inner: Box<dyn CoreAdvancedOrders>,
+}
+
+#[napi]
+impl AdvancedOrders {
+    /// Connect an advanced-orders client for `name`. `futures` selects the
+    /// USDⓈ-M futures market. Throws for a venue without an advanced-order surface.
+    #[napi(factory)]
+    pub fn connect(
+        name: String,
+        credentials: &Credentials,
+        testnet: Option<bool>,
+        futures: Option<bool>,
+    ) -> napi::Result<Self> {
+        let market_type = if futures.unwrap_or(false) {
+            MarketType::UsdMFutures
+        } else {
+            MarketType::Spot
+        };
+        let options = if testnet.unwrap_or(false) {
+            ExchangeOptions::testnet(market_type)
+        } else {
+            ExchangeOptions::mainnet(market_type)
+        };
+        let inner =
+            connect_advanced(&name, credentials.inner.clone(), &options).map_err(map_err)?;
+        Ok(Self { inner })
+    }
+
+    /// Amend a resting order's price and/or quantity in place; `null`/`undefined`
+    /// leaves that field unchanged. Returns the refreshed order.
+    #[napi]
+    pub fn amend_order(
+        &mut self,
+        market: String,
+        order_id: String,
+        new_price: Option<f64>,
+        new_quantity: Option<f64>,
+    ) -> napi::Result<OrderInfo> {
+        let price = new_price.map(to_decimal).transpose()?;
+        let quantity = new_quantity.map(to_decimal).transpose()?;
+        let order = self
+            .inner
+            .amend_order(&parse_symbol(&market)?, &order_id, price, quantity)
+            .map_err(map_err)?;
+        Ok(OrderInfo::from(&order))
+    }
+
+    /// Cancel several orders on `market` in one request.
+    #[napi]
+    pub fn cancel_batch(&mut self, market: String, order_ids: Vec<String>) -> napi::Result<()> {
+        self.inner
+            .cancel_batch(&parse_symbol(&market)?, &order_ids)
+            .map_err(map_err)
+    }
+
+    /// Place a one-cancels-other bracket (take-profit `price` + `stopPrice`
+    /// trigger, optional `stopLimitPrice`); returns the resulting order legs.
+    #[napi]
+    pub fn place_oco(
+        &mut self,
+        market: String,
+        side: String,
+        quantity: f64,
+        price: f64,
+        stop_price: f64,
+        stop_limit_price: Option<f64>,
+    ) -> napi::Result<Vec<OrderInfo>> {
+        let mut request = OcoRequest::new(
+            parse_symbol(&market)?,
+            side_from_str(&side)?,
+            to_decimal(quantity)?,
+            to_decimal(price)?,
+            to_decimal(stop_price)?,
+        );
+        if let Some(slp) = stop_limit_price {
+            request = request.with_stop_limit_price(to_decimal(slp)?);
+        }
+        Ok(self
+            .inner
+            .place_oco(&request)
+            .map_err(map_err)?
+            .iter()
+            .map(OrderInfo::from)
+            .collect())
     }
 }
