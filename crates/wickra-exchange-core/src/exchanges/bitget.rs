@@ -9,10 +9,11 @@ use crate::credentials::Credentials;
 use crate::error::{Error, Result};
 use crate::events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
 use crate::normalize::{format_decimal, parse_decimal};
-use crate::options::ExchangeOptions;
+use crate::options::{ExchangeOptions, MarginMode, MarketType};
+use crate::positions::{Position, PositionSide};
 use crate::signing::hmac_sha256_base64;
 use crate::symbol::Symbol;
-use crate::traits::{Exchange, Execution, MarketData};
+use crate::traits::{Derivatives, Exchange, Execution, MarketData};
 use crate::transport::{HttpMethod, HttpRequest, HttpTransport, WsConnection, WsTransport};
 use crate::types::{
     Balance, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker, TimeInForce,
@@ -36,6 +37,7 @@ pub struct Bitget {
     http: Box<dyn HttpTransport>,
     ws: Option<Box<dyn WsTransport>>,
     rest_base: String,
+    market_type: MarketType,
     credentials: Option<Credentials>,
     now_ms: Box<dyn Fn() -> i64 + Send + Sync>,
     connection: Option<Box<dyn WsConnection>>,
@@ -46,19 +48,26 @@ pub struct Bitget {
 impl Bitget {
     fn build(
         http: Box<dyn HttpTransport>,
-        _options: &ExchangeOptions,
+        options: &ExchangeOptions,
         credentials: Option<Credentials>,
     ) -> Self {
         Self {
             http,
             ws: None,
             rest_base: "https://api.bitget.com".to_string(),
+            market_type: options.market_type,
             credentials,
             now_ms: Box::new(system_now_ms),
             connection: None,
             sub_messages: Vec::new(),
             subscriptions: Vec::new(),
         }
+    }
+
+    /// Whether this client targets a USDⓈ-M futures market (Bitget's `mix`
+    /// product line, `USDT-FUTURES` / margin coin `USDT`) rather than spot.
+    fn is_futures(&self) -> bool {
+        self.market_type.is_derivatives()
     }
 
     /// Build a public Bitget client.
@@ -102,8 +111,21 @@ impl Bitget {
     /// # Errors
     /// Returns an [`Error`] if the request fails or the symbol is unknown.
     pub fn ticker(&self, symbol: &Symbol) -> Result<Ticker> {
-        let query = format!("symbol={}", Self::wire_symbol(symbol));
-        let data = self.get("/api/v2/spot/market/tickers", &query)?;
+        let (path, query) = if self.is_futures() {
+            (
+                "/api/v2/mix/market/ticker",
+                format!(
+                    "symbol={}&productType=USDT-FUTURES",
+                    Self::wire_symbol(symbol)
+                ),
+            )
+        } else {
+            (
+                "/api/v2/spot/market/tickers",
+                format!("symbol={}", Self::wire_symbol(symbol)),
+            )
+        };
+        let data = self.get(path, &query)?;
         let list: Vec<RawTicker> = parse_json(data)?;
         let entry = list
             .into_iter()
@@ -124,12 +146,17 @@ impl Bitget {
     /// # Errors
     /// Returns an [`Error`] if the request fails or a row cannot be parsed.
     pub fn klines(&self, symbol: &Symbol, interval: &str, limit: u32) -> Result<Vec<Candle>> {
+        let (path, extra) = if self.is_futures() {
+            ("/api/v2/mix/market/candles", "&productType=USDT-FUTURES")
+        } else {
+            ("/api/v2/spot/market/candles", "")
+        };
         let query = format!(
-            "symbol={}&granularity={}&limit={limit}",
+            "symbol={}&granularity={}&limit={limit}{extra}",
             Self::wire_symbol(symbol),
             map_granularity(interval),
         );
-        let data = self.get("/api/v2/spot/market/candles", &query)?;
+        let data = self.get(path, &query)?;
         let rows: Vec<Vec<String>> = parse_json(data)?;
         rows.iter().map(|row| parse_kline_row(row)).collect()
     }
@@ -139,8 +166,21 @@ impl Bitget {
     /// # Errors
     /// Returns an [`Error`] if the request fails or the response cannot be parsed.
     pub fn order_book(&self, symbol: &Symbol, depth: u32) -> Result<OrderBookSnapshot> {
-        let query = format!("symbol={}&limit={depth}", Self::wire_symbol(symbol));
-        let data = self.get("/api/v2/spot/market/orderbook", &query)?;
+        let (path, query) = if self.is_futures() {
+            (
+                "/api/v2/mix/market/merge-depth",
+                format!(
+                    "symbol={}&productType=USDT-FUTURES&limit={depth}",
+                    Self::wire_symbol(symbol)
+                ),
+            )
+        } else {
+            (
+                "/api/v2/spot/market/orderbook",
+                format!("symbol={}&limit={depth}", Self::wire_symbol(symbol)),
+            )
+        };
+        let data = self.get(path, &query)?;
         let raw: RawDepth = parse_json(data)?;
         Ok(OrderBookSnapshot {
             symbol: symbol.clone(),
@@ -250,12 +290,18 @@ impl Bitget {
         if let Some(id) = &request.client_order_id {
             body["clientOid"] = serde_json::json!(id.clone());
         }
-        let data = self.signed_request(
-            HttpMethod::Post,
-            "/api/v2/spot/trade/place-order",
-            "",
-            &body.to_string(),
-        )?;
+        let path = if self.is_futures() {
+            body["productType"] = serde_json::json!("USDT-FUTURES");
+            body["marginMode"] = serde_json::json!("crossed");
+            body["marginCoin"] = serde_json::json!("USDT");
+            if request.reduce_only {
+                body["reduceOnly"] = serde_json::json!("YES");
+            }
+            "/api/v2/mix/order/place-order"
+        } else {
+            "/api/v2/spot/trade/place-order"
+        };
+        let data = self.signed_request(HttpMethod::Post, path, "", &body.to_string())?;
         let placed: PlaceResult = parse_json(data)?;
         Ok(Order {
             id: placed.order_id,
@@ -336,6 +382,23 @@ impl Bitget {
     /// # Errors
     /// Returns an [`Error`] if credentials are missing or the request fails.
     pub fn balances(&self) -> Result<Vec<Balance>> {
+        if self.is_futures() {
+            let data = self.signed_request(
+                HttpMethod::Get,
+                "/api/v2/mix/account/accounts",
+                "productType=USDT-FUTURES",
+                "",
+            )?;
+            let list: Vec<RawMixAccount> = parse_json(data)?;
+            return Ok(list
+                .iter()
+                .map(|a| Balance {
+                    asset: a.margin_coin.clone(),
+                    free: dec_or_zero(&a.available),
+                    locked: dec_or_zero(&a.locked),
+                })
+                .collect());
+        }
         let data = self.signed_request(HttpMethod::Get, "/api/v2/spot/account/assets", "", "")?;
         let list: Vec<RawAsset> = parse_json(data)?;
         Ok(list
@@ -779,10 +842,165 @@ impl Execution for Bitget {
     }
 }
 
+impl Bitget {
+    /// Open positions on the USDⓈ-M futures account (`/api/v2/mix/position/all-position`).
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if credentials are missing or the request fails.
+    pub fn positions(&self, symbol: Option<&Symbol>) -> Result<Vec<Position>> {
+        let data = self.signed_request(
+            HttpMethod::Get,
+            "/api/v2/mix/position/all-position",
+            "productType=USDT-FUTURES&marginCoin=USDT",
+            "",
+        )?;
+        let list: Vec<RawBitgetPosition> = parse_json(data)?;
+        list.iter()
+            .filter(|p| symbol.is_none_or(|s| p.symbol == Self::wire_symbol(s)))
+            .filter_map(parse_bitget_position)
+            .collect()
+    }
+
+    /// Set the leverage for `symbol` (`/api/v2/mix/account/set-leverage`).
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the leverage is rejected or the request fails.
+    pub fn set_leverage(&self, symbol: &Symbol, leverage: u32) -> Result<()> {
+        let body = serde_json::json!({
+            "symbol": Self::wire_symbol(symbol),
+            "productType": "USDT-FUTURES",
+            "marginCoin": "USDT",
+            "leverage": leverage.to_string(),
+        });
+        self.signed_request(
+            HttpMethod::Post,
+            "/api/v2/mix/account/set-leverage",
+            "",
+            &body.to_string(),
+        )?;
+        Ok(())
+    }
+
+    /// Set the margin mode for `symbol` (`/api/v2/mix/account/set-margin-mode`).
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the change is rejected or the request fails.
+    pub fn set_margin_mode(&self, symbol: &Symbol, mode: MarginMode) -> Result<()> {
+        let margin = match mode {
+            MarginMode::Cross => "crossed",
+            MarginMode::Isolated => "isolated",
+        };
+        let body = serde_json::json!({
+            "symbol": Self::wire_symbol(symbol),
+            "productType": "USDT-FUTURES",
+            "marginCoin": "USDT",
+            "marginMode": margin,
+        });
+        self.signed_request(
+            HttpMethod::Post,
+            "/api/v2/mix/account/set-margin-mode",
+            "",
+            &body.to_string(),
+        )?;
+        Ok(())
+    }
+
+    /// Flatten the open position in `symbol` with a reduce-only market order.
+    ///
+    /// # Errors
+    /// Returns [`Error::NotFound`] if there is no open position, or another
+    /// [`Error`] if the request fails.
+    pub fn close_position(&self, symbol: &Symbol) -> Result<Order> {
+        let position = self
+            .positions(Some(symbol))?
+            .into_iter()
+            .find(|p| &p.symbol == symbol)
+            .ok_or_else(|| Error::NotFound(format!("no open position for {symbol}")))?;
+        let request = match position.side {
+            PositionSide::Long => OrderRequest::market_sell(symbol.clone(), position.quantity),
+            PositionSide::Short => OrderRequest::market_buy(symbol.clone(), position.quantity),
+        }
+        .reduce_only();
+        self.place_order(&request)
+    }
+}
+
 impl Exchange for Bitget {
     fn name(&self) -> &'static str {
         "bitget"
     }
+}
+
+impl Derivatives for Bitget {
+    fn positions(&mut self, symbol: Option<&Symbol>) -> Result<Vec<Position>> {
+        Bitget::positions(self, symbol)
+    }
+    fn set_leverage(&mut self, symbol: &Symbol, leverage: u32) -> Result<()> {
+        Bitget::set_leverage(self, symbol, leverage)
+    }
+    fn set_margin_mode(&mut self, symbol: &Symbol, mode: MarginMode) -> Result<()> {
+        Bitget::set_margin_mode(self, symbol, mode)
+    }
+    fn close_position(&mut self, symbol: &Symbol) -> Result<Order> {
+        Bitget::close_position(self, symbol)
+    }
+}
+
+#[derive(Deserialize)]
+struct RawMixAccount {
+    #[serde(rename = "marginCoin")]
+    margin_coin: String,
+    #[serde(default)]
+    available: String,
+    #[serde(default)]
+    locked: String,
+}
+
+#[derive(Deserialize)]
+struct RawBitgetPosition {
+    symbol: String,
+    #[serde(rename = "holdSide")]
+    hold_side: String,
+    total: String,
+    #[serde(rename = "openPriceAvg", default)]
+    open_price_avg: String,
+    #[serde(rename = "markPrice", default)]
+    mark_price: String,
+    leverage: String,
+    #[serde(rename = "unrealizedPL", default)]
+    unrealized_pl: String,
+    #[serde(rename = "marginMode", default)]
+    margin_mode: String,
+}
+
+fn parse_bitget_position(raw: &RawBitgetPosition) -> Option<Result<Position>> {
+    let total = match parse_decimal(&raw.total) {
+        Ok(total) if !total.is_zero() => total,
+        Ok(_) => return None, // flat position
+        Err(e) => return Some(Err(e)),
+    };
+    let side = if raw.hold_side == "short" {
+        PositionSide::Short
+    } else {
+        PositionSide::Long
+    };
+    let build = || -> Result<Position> {
+        Ok(Position {
+            symbol: split_wire_symbol(&raw.symbol),
+            side,
+            quantity: total,
+            entry_price: parse_decimal(&raw.open_price_avg)?,
+            mark_price: parse_decimal(&raw.mark_price)?,
+            leverage: parse_decimal(&raw.leverage)?,
+            unrealized_pnl: parse_decimal(&raw.unrealized_pl)?,
+            margin_mode: if raw.margin_mode.eq_ignore_ascii_case("isolated") {
+                MarginMode::Isolated
+            } else {
+                MarginMode::Cross
+            },
+        })
+    };
+    Some(build())
 }
 
 #[cfg(test)]
@@ -828,6 +1046,93 @@ mod tests {
         )
         .with_clock(Box::new(move || now_ms));
         (bitget, mock)
+    }
+
+    fn signed_futures_client(now_ms: i64) -> (Bitget, Arc<MockHttpTransport>) {
+        let mock = Arc::new(MockHttpTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::UsdMFutures);
+        let bitget = Bitget::with_credentials(
+            Box::new(ArcTransport(Arc::clone(&mock))),
+            &opts,
+            Credentials::new("APIKEY", "SECRET").with_passphrase("PASS"),
+        )
+        .with_clock(Box::new(move || now_ms));
+        (bitget, mock)
+    }
+
+    const MIX_POSITIONS: &str = r#"{"code":"00000","msg":"success","data":[
+        {"symbol":"BTCUSDT","holdSide":"long","total":"0.5","openPriceAvg":"20000","markPrice":"20100","leverage":"10","unrealizedPL":"50","marginMode":"isolated"}
+    ]}"#;
+
+    #[test]
+    fn futures_ticker_uses_mix_path() {
+        let (bitget, mock) = signed_futures_client(1000);
+        mock.push_json(
+            200,
+            r#"{"code":"00000","msg":"success","data":[{"symbol":"BTCUSDT","lastPr":"20000","bidPr":"19999","askPr":"20001","baseVolume":"1000"}]}"#,
+        );
+        let ticker = bitget.ticker(&symbol()).unwrap();
+        assert_eq!(ticker.last, dec!(20000));
+        let url = &mock.recorded_requests()[0].url;
+        assert!(url.contains("/api/v2/mix/market/ticker"));
+        assert!(url.contains("productType=USDT-FUTURES"));
+    }
+
+    #[test]
+    fn futures_place_order_uses_mix_path() {
+        let (bitget, mock) = signed_futures_client(1000);
+        mock.push_json(
+            200,
+            r#"{"code":"00000","msg":"success","data":{"orderId":"9","clientOid":""}}"#,
+        );
+        bitget
+            .place_order(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(20000)))
+            .unwrap();
+        let req = &mock.recorded_requests()[0];
+        assert!(req.url.contains("/api/v2/mix/order/place-order"));
+        assert!(req.body.as_deref().unwrap().contains("USDT-FUTURES"));
+    }
+
+    #[test]
+    fn derivatives_positions_parse() {
+        let (mut bitget, mock) = signed_futures_client(1000);
+        mock.push_json(200, MIX_POSITIONS);
+        let positions = Derivatives::positions(&mut bitget, Some(&symbol())).unwrap();
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].symbol, Symbol::new("BTC", "USDT"));
+        assert_eq!(positions[0].side, PositionSide::Long);
+        assert_eq!(positions[0].quantity, dec!(0.5));
+        assert_eq!(positions[0].leverage, dec!(10));
+        assert_eq!(positions[0].margin_mode, MarginMode::Isolated);
+        assert!(mock.recorded_requests()[0]
+            .url
+            .contains("/api/v2/mix/position/all-position"));
+    }
+
+    #[test]
+    fn derivatives_set_leverage_hits_endpoint() {
+        let (mut bitget, mock) = signed_futures_client(1000);
+        mock.push_json(200, r#"{"code":"00000","msg":"success","data":{}}"#);
+        Derivatives::set_leverage(&mut bitget, &symbol(), 20).unwrap();
+        let req = &mock.recorded_requests()[0];
+        assert!(req.url.contains("/api/v2/mix/account/set-leverage"));
+        assert!(req.body.as_deref().unwrap().contains(r#""leverage":"20""#));
+    }
+
+    #[test]
+    fn derivatives_close_position_reduce_only() {
+        let (mut bitget, mock) = signed_futures_client(1000);
+        mock.push_json(200, MIX_POSITIONS);
+        mock.push_json(
+            200,
+            r#"{"code":"00000","msg":"success","data":{"orderId":"9","clientOid":""}}"#,
+        );
+        Derivatives::close_position(&mut bitget, &symbol()).unwrap();
+        let req = &mock.recorded_requests()[1];
+        assert!(req.url.contains("/api/v2/mix/order/place-order"));
+        let body = req.body.as_deref().unwrap();
+        assert!(body.contains(r#""side":"sell""#));
+        assert!(body.contains(r#""reduceOnly":"YES""#));
     }
 
     #[test]
