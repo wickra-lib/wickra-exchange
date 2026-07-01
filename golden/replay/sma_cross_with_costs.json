@@ -1,0 +1,10 @@
+{
+  "description": "Same tape with 5 bps taker fee and 10 bps slippage, pinning the exact cost math.",
+  "market": "BTC/USDT",
+  "tape": [100.0, 101.0, 102.0, 110.0, 112.0],
+  "balances": { "USDT": 100000.0 },
+  "sma_period": 3,
+  "maker_bps": 1.0,
+  "taker_bps": 5.0,
+  "slippage_bps": 10.0
+}
