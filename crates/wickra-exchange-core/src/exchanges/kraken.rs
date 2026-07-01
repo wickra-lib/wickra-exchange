@@ -15,9 +15,11 @@
 //! (`Authent = base64(HMAC-SHA512(b64secret, SHA256(postData ++ nonce ++
 //! path)))`). Market data uses `/derivatives/api/v3/{tickers,orderbook}` and the
 //! `/api/charts/v1` OHLC feed; execution and the [`Derivatives`] trait use
-//! `sendorder`/`openpositions`/`leveragepreferences`. Documented gaps: the WS
-//! stream stays on the spot v2 feed, `query_order`/`cancel_order`/`open_orders`
-//! keep the spot shape, `openpositions` omits mark price and unrealized PnL, and
+//! `sendorder`/`openpositions`/`leveragepreferences`, and
+//! `query_order`/`cancel_order`/`open_orders` route to
+//! `/derivatives/api/v3/{orders/status,cancelorder,openorders}` with the Kraken
+//! Futures order shape. Documented gaps: the WS stream stays on the spot v2 feed,
+//! `openpositions` omits mark price and unrealized PnL, and
 //! `set_margin_mode(Isolated)` is unsupported within the flex (cross) account.
 //!
 //! [`AdvancedOrders`]: native in-place amend (`/0/private/EditOrder`, which
@@ -362,6 +364,14 @@ impl Kraken {
     /// # Errors
     /// Returns an [`Error`] if credentials are missing or the venue rejects it.
     pub fn cancel_order(&self, _symbol: &Symbol, order_id: &str) -> Result<()> {
+        if self.is_futures() {
+            self.signed_futures(
+                HttpMethod::Post,
+                "/derivatives/api/v3/cancelorder",
+                &[("order_id", order_id.to_string())],
+            )?;
+            return Ok(());
+        }
         self.signed_post("/0/private/CancelOrder", &[("txid", order_id.to_string())])?;
         Ok(())
     }
@@ -371,6 +381,19 @@ impl Kraken {
     /// # Errors
     /// Returns an [`Error`] if credentials are missing or the order is unknown.
     pub fn query_order(&self, symbol: &Symbol, order_id: &str) -> Result<Order> {
+        if self.is_futures() {
+            let value = self.signed_futures(
+                HttpMethod::Post,
+                "/derivatives/api/v3/orders/status",
+                &[("orderIds", format!("[\"{order_id}\"]"))],
+            )?;
+            let order = value
+                .get("orders")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|a| a.first())
+                .ok_or_else(|| Error::NotFound(format!("order {order_id}")))?;
+            return kraken_futures_order(symbol.clone(), order_id, order);
+        }
         let result =
             self.signed_post("/0/private/QueryOrders", &[("txid", order_id.to_string())])?;
         let order = result
@@ -384,6 +407,41 @@ impl Kraken {
     /// # Errors
     /// Returns an [`Error`] if credentials are missing or the request fails.
     pub fn open_orders(&self, symbol: Option<&Symbol>) -> Result<Vec<Order>> {
+        if self.is_futures() {
+            let value =
+                self.signed_futures(HttpMethod::Get, "/derivatives/api/v3/openorders", &[])?;
+            let open = value
+                .get("openOrders")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| Error::Deserialization("missing openOrders".to_string()))?;
+            let want = symbol.map(Self::futures_symbol);
+            return open
+                .iter()
+                .filter(|order| {
+                    want.as_ref().is_none_or(|w| {
+                        order
+                            .get("symbol")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|s| s.eq_ignore_ascii_case(w))
+                    })
+                })
+                .map(|order| {
+                    let sym = symbol.cloned().unwrap_or_else(|| {
+                        symbol_from_futures(
+                            order
+                                .get("symbol")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or(""),
+                        )
+                    });
+                    let id = order
+                        .get("order_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
+                    kraken_futures_order(sym, id, order)
+                })
+                .collect();
+        }
         let result = self.signed_post("/0/private/OpenOrders", &[])?;
         let open = result
             .get("open")
@@ -895,6 +953,78 @@ fn symbol_from_futures(contract: &str) -> Symbol {
         }
     }
     Symbol::new(core, "")
+}
+
+/// Map a Kraken Futures order status string onto the unified status. Tolerant of
+/// both the `orders/status` (`ENTERED_BOOK` / `FULLY_EXECUTED`) and `openorders`
+/// (`untouched` / `partiallyFilled`) casings.
+fn kraken_futures_status(raw: &str) -> OrderStatus {
+    let s = raw.to_ascii_lowercase();
+    if s.contains("cancel") || s.contains("expired") {
+        OrderStatus::Canceled
+    } else if s.contains("reject") {
+        OrderStatus::Rejected
+    } else if s.contains("partial") {
+        OrderStatus::PartiallyFilled
+    } else if s.contains("fully") || s.contains("filled") || s.contains("executed") {
+        OrderStatus::Filled
+    } else {
+        OrderStatus::New
+    }
+}
+
+fn kraken_futures_order_type(raw: &str) -> OrderType {
+    let s = raw.to_ascii_lowercase();
+    if s.contains("lmt") || s.contains("limit") || s.contains("post") {
+        OrderType::Limit
+    } else {
+        OrderType::Market
+    }
+}
+
+/// Parse a Kraken Futures order object. The `orders/status` endpoint nests the
+/// detail under `order`; `openorders` is flat and reports `filledSize` /
+/// `unfilledSize` instead of a total `quantity`.
+fn kraken_futures_order(symbol: Symbol, id: &str, obj: &serde_json::Value) -> Result<Order> {
+    let detail = obj.get("order").unwrap_or(obj);
+    let side = detail
+        .get("side")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let order_type = detail
+        .get("orderType")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let status = obj
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let filled = decimal_field(detail, "filled")
+        .or_else(|_| decimal_field(detail, "filledSize"))
+        .unwrap_or(Decimal::ZERO);
+    let quantity = decimal_field(detail, "quantity").unwrap_or_else(|_| {
+        filled + decimal_field(detail, "unfilledSize").unwrap_or(Decimal::ZERO)
+    });
+    let price = decimal_field(detail, "limitPrice")
+        .ok()
+        .filter(|d| *d > Decimal::ZERO);
+    let client_order_id = detail
+        .get("cliOrdId")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    Ok(Order {
+        id: id.to_string(),
+        client_order_id,
+        symbol,
+        side: parse_side(side)?,
+        order_type: kraken_futures_order_type(order_type),
+        status: kraken_futures_status(status),
+        quantity,
+        filled_quantity: filled,
+        price,
+        average_price: None,
+    })
 }
 
 fn map_error(error: &str) -> Error {
@@ -1539,6 +1669,50 @@ mod tests {
             .map(|(_, v)| v.as_str())
             .unwrap();
         assert_eq!(sign, expected);
+    }
+
+    #[test]
+    fn futures_query_order_uses_orders_status() {
+        let (kraken, mock) = signed_futures_client(1000);
+        mock.push_json(
+            200,
+            r#"{"result":"success","orders":[{"order_id":"o-1","status":"FULLY_EXECUTED",
+            "order":{"orderType":"lmt","side":"buy","quantity":3,"filled":3,"limitPrice":100,
+            "symbol":"pf_xbtusd","cliOrdId":""}}]}"#,
+        );
+        let order = kraken.query_order(&symbol(), "o-1").unwrap();
+        assert_eq!(order.id, "o-1");
+        assert_eq!(order.side, OrderSide::Buy);
+        assert_eq!(order.order_type, OrderType::Limit);
+        assert_eq!(order.status, OrderStatus::Filled);
+        assert_eq!(order.quantity, dec!(3));
+        let req = &mock.recorded_requests()[0];
+        assert!(req.url.contains("/derivatives/api/v3/orders/status"));
+    }
+
+    #[test]
+    fn futures_cancel_and_open_orders_use_derivatives_endpoints() {
+        let (kraken, mock) = signed_futures_client(1000);
+        mock.push_json(
+            200,
+            r#"{"result":"success","cancelStatus":{"status":"cancelled"}}"#,
+        );
+        kraken.cancel_order(&symbol(), "o-1").unwrap();
+        mock.push_json(
+            200,
+            r#"{"result":"success","openOrders":[{"order_id":"o-2","symbol":"pf_xbtusd",
+            "side":"sell","orderType":"lmt","limitPrice":21000,"filledSize":1,"unfilledSize":2,
+            "status":"partiallyFilled","cliOrdId":""}]}"#,
+        );
+        let orders = kraken.open_orders(Some(&symbol())).unwrap();
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].side, OrderSide::Sell);
+        assert_eq!(orders[0].status, OrderStatus::PartiallyFilled);
+        assert_eq!(orders[0].quantity, dec!(3)); // filledSize + unfilledSize
+        assert_eq!(orders[0].filled_quantity, dec!(1));
+        let reqs = mock.recorded_requests();
+        assert!(reqs[0].url.contains("/derivatives/api/v3/cancelorder"));
+        assert!(reqs[1].url.contains("/derivatives/api/v3/openorders"));
     }
 
     #[test]
