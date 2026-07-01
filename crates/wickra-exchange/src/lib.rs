@@ -14,5 +14,5 @@ pub use wickra_exchange_core::*;
 mod factory;
 mod net;
 
-pub use factory::connect;
+pub use factory::{connect, connect_advanced, connect_derivatives};
 pub use net::{ReqwestHttpTransport, TungsteniteWsTransport};
