@@ -71,6 +71,43 @@ func TestBatchRequestShape(t *testing.T) {
 	}
 }
 
+func TestUserDataAndWsExecutionRejectSpotOnly(t *testing.T) {
+	for _, name := range []string{"coinbase", "upbit", "ftx"} {
+		if u, err := ConnectUserData(name, "k", "s", "", "", false, false); err == nil {
+			u.Close()
+			t.Fatalf("%s must be rejected for user-data", name)
+		}
+		if w, err := ConnectWsExecution(name, "k", "s", "", "", false, false); err == nil {
+			w.Close()
+			t.Fatalf("%s must be rejected for ws-execution", name)
+		}
+	}
+}
+
+func TestUserDataConstructsAndPolls(t *testing.T) {
+	u, err := ConnectUserData("binance", "k", "s", "", "", false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer u.Close()
+	// WsUserData: MarketData, so the client can poll (nothing buffered offline).
+	events, err := u.Poll(4)
+	if err != nil {
+		t.Fatalf("poll must not error: %v", err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("want no buffered events, got %d", len(events))
+	}
+}
+
+func TestWsExecutionConstructs(t *testing.T) {
+	w, err := ConnectWsExecution("bybit", "k", "s", "", "", false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+}
+
 func TestMarginModeConstants(t *testing.T) {
 	if MarginCross == MarginIsolated {
 		t.Fatal("margin mode constants must differ")
