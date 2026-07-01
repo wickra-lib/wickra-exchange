@@ -7,5 +7,7 @@
 //! mock transport.
 
 mod binance;
+mod bybit;
 
 pub use binance::Binance;
+pub use bybit::Bybit;
