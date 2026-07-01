@@ -10,6 +10,7 @@ mod binance;
 mod bitget;
 mod bybit;
 mod gate;
+mod htx;
 mod kucoin;
 mod okx;
 
@@ -17,5 +18,6 @@ pub use binance::Binance;
 pub use bitget::Bitget;
 pub use bybit::Bybit;
 pub use gate::Gate;
+pub use htx::Htx;
 pub use kucoin::KuCoin;
 pub use okx::Okx;
