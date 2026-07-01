@@ -101,5 +101,5 @@ pub trait Execution {
 /// A full exchange connection: market data and execution behind one typed API.
 pub trait Exchange: MarketData + Execution {
     /// The venue's lowercase identifier (e.g. `"binance"`).
-    fn name(&self) -> &str;
+    fn name(&self) -> &'static str;
 }
