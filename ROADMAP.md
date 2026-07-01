@@ -32,6 +32,31 @@ below is updated as phases complete.
    migration guide, and one runnable example per language.
 10. **Release** — version 0.1.0 to seven registries.
 
+## Derivatives & advanced orders
+
+Landed after the initial spot build (the venue clients were spot-only; a
+derivatives `MarketType` only changed the host). Now futures-capable and
+extended, tracked per venue in [docs/CAPABILITIES.md](docs/CAPABILITIES.md) with
+a deep-dive in [docs/DERIVATIVES.md](docs/DERIVATIVES.md):
+
+- **`Derivatives`** (positions / leverage / margin mode / reduce-only close) on
+  all eight futures venues — Binance, Bybit, OKX, Bitget, KuCoin, Gate.io, HTX,
+  Kraken. Coinbase and Upbit stay spot-only.
+- **`AdvancedOrders`** (amend, batch place/cancel, OCO) + a self-trade-prevention
+  field on `OrderRequest`, on all eight trading venues — native where the API
+  supports it, a documented `Error::Exchange` where it does not.
+- **`WsExecution`** (order placement over the ws-api) on Binance as the reference.
+
+### Follow-ups
+
+- Futures order shape for `query_order`/`cancel_order`/`open_orders` on Gate,
+  Bitget, HTX and Kraken (currently spot-shaped on futures clients).
+- WS order placement beyond Binance; native batch where currently sequential
+  (KuCoin/Kraken cancel, Bitget futures batch, Kraken `AddOrderBatch`).
+- WS user-data (private account/order) streams.
+- Surfacing the derivatives + advanced-order + ws-execution traits through every
+  language binding.
+
 ## Non-goals
 
 - **Breadth over ccxt.** The goal is a typed, unified API over the largest venues
