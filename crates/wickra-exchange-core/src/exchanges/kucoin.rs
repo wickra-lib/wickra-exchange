@@ -6,18 +6,26 @@
 //! passphrase))`, key version 2). Symbols are dash-form (`BTC-USDT`); the
 //! envelope success code is the string `"200000"`. KuCoin candles are
 //! newest-first and ordered `[time, open, close, high, low, volume, turnover]`.
+//!
+//! [`AdvancedOrders`]: STP via the `stp` flag on order create, native spot batch
+//! place (`/api/v1/orders/multi`, per-order results), native OCO
+//! (`/api/v3/oco/order`, returned as one order-list). KuCoin has no
+//! batch-cancel-by-id (so `cancel_batch` cancels sequentially) and no in-place
+//! amend (`amend_order` is a documented gap).
 
 use crate::credentials::Credentials;
 use crate::error::{Error, Result};
 use crate::events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
 use crate::normalize::{format_decimal, parse_decimal};
-use crate::options::{ExchangeOptions, MarginMode, MarketType};
+use crate::options::{ExchangeOptions, MarginMode, MarketType, SelfTradePrevention};
 use crate::positions::{Position, PositionSide};
 use crate::signing::hmac_sha256_base64;
 use crate::symbol::Symbol;
-use crate::traits::{Derivatives, Exchange, Execution, MarketData};
+use crate::traits::{AdvancedOrders, Derivatives, Exchange, Execution, MarketData};
 use crate::transport::{HttpMethod, HttpRequest, HttpTransport, WsConnection, WsTransport};
-use crate::types::{Balance, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker};
+use crate::types::{
+    Balance, OcoRequest, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker,
+};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -288,6 +296,9 @@ impl KuCoin {
         if request.post_only {
             body["postOnly"] = serde_json::json!(true);
         }
+        if let Some(stp) = stp_flag(request.stp) {
+            body["stp"] = serde_json::json!(stp);
+        }
         if self.is_futures() {
             // Futures orders carry the per-order leverage; size is in contracts.
             body["leverage"] = serde_json::json!(self.leverage.to_string());
@@ -479,6 +490,17 @@ fn order_type_str(order_type: OrderType) -> &'static str {
     match order_type {
         OrderType::Market | OrderType::StopMarket => "market",
         OrderType::Limit | OrderType::StopLimit => "limit",
+    }
+}
+
+/// The KuCoin `stp` flag for a self-trade-prevention policy, or `None` to omit.
+/// KuCoin cancels the oldest (`CO`), newest (`CN`) or both (`CB`) order.
+fn stp_flag(stp: SelfTradePrevention) -> Option<&'static str> {
+    match stp {
+        SelfTradePrevention::None => None,
+        SelfTradePrevention::ExpireMaker => Some("CO"),
+        SelfTradePrevention::ExpireTaker => Some("CN"),
+        SelfTradePrevention::ExpireBoth => Some("CB"),
     }
 }
 
@@ -842,6 +864,175 @@ impl KuCoin {
         .reduce_only();
         self.place_order(&request)
     }
+
+    /// Place several spot orders on one symbol in one request
+    /// (`/api/v1/orders/multi`). KuCoin returns the results in request order, so
+    /// each element maps to its request's own [`Result`].
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the batch request itself fails, or if called on a
+    /// futures client (multi is a spot endpoint).
+    pub fn place_batch(&self, requests: &[OrderRequest]) -> Result<Vec<Result<Order>>> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        if self.is_futures() {
+            return Err(Error::Exchange {
+                code: "unsupported".to_string(),
+                message: "KuCoin multi-order is a spot endpoint".to_string(),
+            });
+        }
+        let wire = Self::wire_symbol(&requests[0].symbol);
+        let order_list: Vec<serde_json::Value> = requests
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let coid = r
+                    .client_order_id
+                    .clone()
+                    .unwrap_or_else(|| format!("wkex-{i}"));
+                let mut o = serde_json::json!({
+                    "clientOid": coid,
+                    "side": side_str(r.side),
+                    "type": order_type_str(r.order_type),
+                    "size": format_decimal(r.quantity),
+                });
+                if let Some(price) = r.price {
+                    o["price"] = serde_json::json!(format_decimal(price));
+                }
+                o
+            })
+            .collect();
+        let body = serde_json::json!({ "symbol": wire, "orderList": order_list });
+        let data = self.signed_request(
+            HttpMethod::Post,
+            "/api/v1/orders/multi",
+            "",
+            &body.to_string(),
+        )?;
+        let batch: MultiBatch = parse_json(data)?;
+        Ok(requests
+            .iter()
+            .zip(batch.data)
+            .map(|(req, res)| {
+                if res.order_id.is_empty() || res.status == "fail" {
+                    return Err(Error::OrderRejected {
+                        code: "batch".to_string(),
+                        message: if res.fail_msg.is_empty() {
+                            "order rejected in batch".to_string()
+                        } else {
+                            res.fail_msg
+                        },
+                    });
+                }
+                Ok(Order {
+                    id: res.order_id,
+                    client_order_id: req.client_order_id.clone(),
+                    symbol: req.symbol.clone(),
+                    side: req.side,
+                    order_type: req.order_type,
+                    status: OrderStatus::New,
+                    quantity: req.quantity,
+                    filled_quantity: Decimal::ZERO,
+                    price: req.price,
+                    average_price: None,
+                })
+            })
+            .collect())
+    }
+
+    /// Cancel several orders by id. KuCoin has no batch-cancel-by-id endpoint, so
+    /// the ids are cancelled sequentially.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if any cancel fails.
+    pub fn cancel_batch(&self, symbol: &Symbol, order_ids: &[String]) -> Result<()> {
+        for id in order_ids {
+            self.cancel_order(symbol, id)?;
+        }
+        Ok(())
+    }
+
+    /// Place a one-cancels-other bracket (`/api/v3/oco/order`). KuCoin models an
+    /// OCO as one order-list, so the returned vector holds one order carrying the
+    /// list id.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the OCO is invalid or rejected.
+    pub fn place_oco(&self, request: &OcoRequest) -> Result<Vec<Order>> {
+        request.validate()?;
+        let client_oid = request
+            .client_order_id
+            .clone()
+            .unwrap_or_else(|| format!("woco-{}", (self.now_ms)()));
+        let stop_limit = request.stop_limit_price.unwrap_or(request.stop_price);
+        let body = serde_json::json!({
+            "symbol": Self::wire_symbol(&request.symbol),
+            "side": side_str(request.side),
+            "size": format_decimal(request.quantity),
+            "price": format_decimal(request.price),
+            "stopPrice": format_decimal(request.stop_price),
+            "limitPrice": format_decimal(stop_limit),
+            "clientOid": client_oid,
+        });
+        let data =
+            self.signed_request(HttpMethod::Post, "/api/v3/oco/order", "", &body.to_string())?;
+        let placed: PlaceResult = parse_json(data)?;
+        Ok(vec![Order {
+            id: placed.order_id,
+            client_order_id: Some(client_oid),
+            symbol: request.symbol.clone(),
+            side: request.side,
+            order_type: OrderType::StopLimit,
+            status: OrderStatus::New,
+            quantity: request.quantity,
+            filled_quantity: Decimal::ZERO,
+            price: Some(request.price),
+            average_price: None,
+        }])
+    }
+}
+
+impl AdvancedOrders for KuCoin {
+    /// KuCoin has no in-place amend (orders are cancelled and re-placed), so this
+    /// returns an [`Error::Exchange`].
+    fn amend_order(
+        &mut self,
+        _symbol: &Symbol,
+        _order_id: &str,
+        _new_price: Option<Decimal>,
+        _new_quantity: Option<Decimal>,
+    ) -> Result<Order> {
+        Err(Error::Exchange {
+            code: "unsupported".to_string(),
+            message: "KuCoin has no in-place amend; cancel and re-place the order".to_string(),
+        })
+    }
+    fn place_batch(&mut self, requests: &[OrderRequest]) -> Result<Vec<Result<Order>>> {
+        KuCoin::place_batch(self, requests)
+    }
+    fn cancel_batch(&mut self, symbol: &Symbol, order_ids: &[String]) -> Result<()> {
+        KuCoin::cancel_batch(self, symbol, order_ids)
+    }
+    fn place_oco(&mut self, request: &OcoRequest) -> Result<Vec<Order>> {
+        KuCoin::place_oco(self, request)
+    }
+}
+
+#[derive(Deserialize)]
+struct MultiBatch {
+    #[serde(default)]
+    data: Vec<MultiResult>,
+}
+
+#[derive(Deserialize)]
+struct MultiResult {
+    #[serde(rename = "orderId", default)]
+    order_id: String,
+    #[serde(default)]
+    status: String,
+    #[serde(rename = "failMsg", default)]
+    fail_msg: String,
 }
 
 impl Exchange for KuCoin {
@@ -985,6 +1176,90 @@ mod tests {
     const KU_POSITIONS: &str = r#"{"code":"200000","data":[
         {"symbol":"XBTUSDTM","currentQty":3,"avgEntryPrice":20000.0,"markPrice":20100.0,"realLeverage":10.0,"unrealisedPnl":30.0,"crossMode":false}
     ]}"#;
+
+    #[test]
+    fn stp_maps_to_stp_flag() {
+        let (kucoin, mock) = signed_client(1000);
+        mock.push_json(200, r#"{"code":"200000","data":{"orderId":"1"}}"#);
+        kucoin
+            .place_order(
+                &OrderRequest::limit_buy(symbol(), dec!(1), dec!(100))
+                    .with_stp(SelfTradePrevention::ExpireBoth),
+            )
+            .unwrap();
+        let reqs = mock.recorded_requests();
+        assert!(reqs[0].body.as_ref().unwrap().contains(r#""stp":"CB""#));
+    }
+
+    #[test]
+    fn place_batch_multi_per_order_results() {
+        let (kucoin, mock) = signed_client(1000);
+        mock.push_json(
+            200,
+            r#"{"code":"200000","data":{"data":[
+            {"orderId":"o1","status":"success"},
+            {"orderId":"","status":"fail","failMsg":"insufficient"}]}}"#,
+        );
+        let results = kucoin
+            .place_batch(&[
+                OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)),
+                OrderRequest::limit_buy(symbol(), dec!(1), dec!(101)),
+            ])
+            .unwrap();
+        assert_eq!(results[0].as_ref().unwrap().id, "o1");
+        assert!(matches!(
+            results[1].as_ref().unwrap_err(),
+            Error::OrderRejected { .. }
+        ));
+        assert!(mock.recorded_requests()[0]
+            .url
+            .contains("/api/v1/orders/multi"));
+    }
+
+    #[test]
+    fn cancel_batch_is_sequential() {
+        let (kucoin, mock) = signed_client(1000);
+        mock.push_json(200, r#"{"code":"200000","data":{}}"#);
+        mock.push_json(200, r#"{"code":"200000","data":{}}"#);
+        kucoin
+            .cancel_batch(&symbol(), &["1".to_string(), "2".to_string()])
+            .unwrap();
+        assert_eq!(mock.recorded_requests().len(), 2);
+    }
+
+    #[test]
+    fn place_oco_is_a_single_order_list() {
+        let (kucoin, mock) = signed_client(1000);
+        mock.push_json(200, r#"{"code":"200000","data":{"orderId":"oco1"}}"#);
+        let legs = kucoin
+            .place_oco(&OcoRequest::new(
+                symbol(),
+                OrderSide::Sell,
+                dec!(1),
+                dec!(110),
+                dec!(95),
+            ))
+            .unwrap();
+        assert_eq!(legs.len(), 1);
+        assert_eq!(legs[0].id, "oco1");
+        let reqs = mock.recorded_requests();
+        assert!(reqs[0].url.contains("/api/v3/oco/order"));
+        assert!(reqs[0]
+            .body
+            .as_ref()
+            .unwrap()
+            .contains(r#""stopPrice":"95""#));
+    }
+
+    #[test]
+    fn amend_is_unsupported() {
+        let (mut kucoin, _mock) = signed_client(1000);
+        assert!(matches!(
+            AdvancedOrders::amend_order(&mut kucoin, &symbol(), "1", Some(dec!(1)), None)
+                .unwrap_err(),
+            Error::Exchange { .. }
+        ));
+    }
 
     #[test]
     fn futures_client_uses_futures_host_and_contract_symbol() {
