@@ -20,8 +20,9 @@ use std::sync::OnceLock;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use wickra_exchange::{
-    connect, Credentials, Error, Event, Exchange, ExchangeOptions, MarketType, Order, OrderRequest,
-    OrderSide, OrderStatus, PaperExchange, ReplayExchange, Symbol, TradePrint,
+    connect, connect_derivatives, Credentials, Derivatives, Error, Event, Exchange,
+    ExchangeOptions, MarginMode, MarketType, Order, OrderRequest, OrderSide, OrderStatus,
+    PaperExchange, PositionSide, ReplayExchange, Symbol, TradePrint,
 };
 
 /// Success.
@@ -45,6 +46,16 @@ pub const WICKRA_ERR_OTHER: i32 = -7;
 pub const WICKRA_SIDE_BUY: i32 = 0;
 /// Order side: sell.
 pub const WICKRA_SIDE_SELL: i32 = 1;
+
+/// Margin mode: cross (margin shared across positions).
+pub const WICKRA_MARGIN_CROSS: i32 = 0;
+/// Margin mode: isolated (margin isolated per position).
+pub const WICKRA_MARGIN_ISOLATED: i32 = 1;
+
+/// Position side: long.
+pub const WICKRA_POSITION_LONG: i32 = 0;
+/// Position side: short.
+pub const WICKRA_POSITION_SHORT: i32 = 1;
 
 /// Order status codes (mirror `OrderStatus`).
 pub const WICKRA_STATUS_NEW: i32 = 0;
@@ -123,6 +134,33 @@ impl Inner {
 /// `wickra_replay_new` / `wickra_connect`; release with `wickra_exchange_free`.
 pub struct WickraExchange {
     inner: Inner,
+}
+
+/// A derivatives position (C-ABI mirror of `Position`).
+#[repr(C)]
+pub struct WickraPosition {
+    /// Market symbol, NUL-terminated (`base/quote`).
+    pub symbol: [c_char; WICKRA_STR_CAP],
+    /// `WICKRA_POSITION_*` (long / short).
+    pub side: i32,
+    /// Position size in base units (magnitude, always positive).
+    pub quantity: f64,
+    /// Average entry price.
+    pub entry_price: f64,
+    /// Current mark price (may be `0` where the venue omits it).
+    pub mark_price: f64,
+    /// Account leverage for this position.
+    pub leverage: f64,
+    /// Unrealized PnL as reported by the venue.
+    pub unrealized_pnl: f64,
+    /// `WICKRA_MARGIN_*` (cross / isolated).
+    pub margin_mode: i32,
+}
+
+/// An opaque derivatives handle over a live futures client. Construct with
+/// `wickra_connect_derivatives`; release with `wickra_derivatives_free`.
+pub struct WickraDerivatives {
+    inner: Box<dyn Derivatives>,
 }
 
 // ------------------------------- helpers -------------------------------------
@@ -209,6 +247,21 @@ fn fill_order(dst: &mut WickraOrder, order: &Order) {
     dst.filled_quantity = to_float(order.filled_quantity);
     dst.price = order.price.map_or(f64::NAN, to_float);
     dst.average_price = order.average_price.map_or(f64::NAN, to_float);
+}
+
+fn margin_mode_from_code(code: i32) -> Option<MarginMode> {
+    match code {
+        WICKRA_MARGIN_CROSS => Some(MarginMode::Cross),
+        WICKRA_MARGIN_ISOLATED => Some(MarginMode::Isolated),
+        _ => None,
+    }
+}
+
+fn position_side_code(side: PositionSide) -> i32 {
+    match side {
+        PositionSide::Long => WICKRA_POSITION_LONG,
+        PositionSide::Short => WICKRA_POSITION_SHORT,
+    }
 }
 
 /// Collect `(asset, amount)` pairs from parallel C arrays into a paper account.
@@ -641,6 +694,189 @@ fn fill_event(slot: &mut WickraEvent, event: &Event) {
     }
 }
 
+// ------------------------- derivatives (futures) -----------------------------
+
+/// Connect a live **derivatives** (USDⓈ-M futures) client for `name`, returning
+/// an opaque [`WickraDerivatives`] handle (positions / leverage / margin / close).
+/// Returns null on failure or for a spot-only venue (`coinbase`, `upbit`).
+///
+/// # Safety
+/// The non-null string arguments must be valid C strings.
+#[no_mangle]
+pub unsafe extern "C" fn wickra_connect_derivatives(
+    name: *const c_char,
+    api_key: *const c_char,
+    api_secret: *const c_char,
+    passphrase: *const c_char,
+    private_key: *const c_char,
+    testnet: bool,
+) -> *mut WickraDerivatives {
+    let (Some(name), Some(api_key), Some(api_secret)) =
+        (unsafe { (opt_str(name), opt_str(api_key), opt_str(api_secret)) })
+    else {
+        return core::ptr::null_mut();
+    };
+    let mut credentials = Credentials::new(api_key, api_secret);
+    if let Some(passphrase) = unsafe { opt_str(passphrase) } {
+        credentials = credentials.with_passphrase(passphrase);
+    }
+    if let Some(private_key) = unsafe { opt_str(private_key) } {
+        credentials = credentials.with_private_key(private_key);
+    }
+    let options = if testnet {
+        ExchangeOptions::testnet(MarketType::UsdMFutures)
+    } else {
+        ExchangeOptions::mainnet(MarketType::UsdMFutures)
+    };
+    match connect_derivatives(name, credentials, &options) {
+        Ok(inner) => Box::into_raw(Box::new(WickraDerivatives { inner })),
+        Err(_) => core::ptr::null_mut(),
+    }
+}
+
+/// Release a derivatives handle. Safe to call with null.
+///
+/// # Safety
+/// `handle` must be null or a pointer from `wickra_connect_derivatives`, freed
+/// exactly once.
+#[no_mangle]
+pub unsafe extern "C" fn wickra_derivatives_free(handle: *mut WickraDerivatives) {
+    if !handle.is_null() {
+        drop(unsafe { Box::from_raw(handle) });
+    }
+}
+
+/// Write the open position in `market` into `out`. Returns
+/// [`WICKRA_ERR_NOT_FOUND`] if the position is flat.
+///
+/// # Safety
+/// `handle` and `out` must be valid; `market` must be a valid C string.
+#[no_mangle]
+pub unsafe extern "C" fn wickra_derivatives_position(
+    handle: *mut WickraDerivatives,
+    market: *const c_char,
+    out: *mut WickraPosition,
+) -> i32 {
+    let Some(handle) = (unsafe { handle.as_mut() }) else {
+        return WICKRA_ERR_NULL;
+    };
+    if out.is_null() {
+        return WICKRA_ERR_NULL;
+    }
+    let Some(market) = (unsafe { opt_str(market) }) else {
+        return WICKRA_ERR_INVALID_ARG;
+    };
+    let Some(symbol) = parse_symbol(market) else {
+        return WICKRA_ERR_INVALID_ARG;
+    };
+    match handle.inner.positions(Some(&symbol)) {
+        Ok(positions) => match positions.into_iter().find(|p| p.symbol == symbol) {
+            Some(position) => {
+                let dst = unsafe { &mut *out };
+                write_cstr(&mut dst.symbol, &position.symbol.to_string());
+                dst.side = position_side_code(position.side);
+                dst.quantity = to_float(position.quantity);
+                dst.entry_price = to_float(position.entry_price);
+                dst.mark_price = to_float(position.mark_price);
+                dst.leverage = to_float(position.leverage);
+                dst.unrealized_pnl = to_float(position.unrealized_pnl);
+                dst.margin_mode = match position.margin_mode {
+                    MarginMode::Cross => WICKRA_MARGIN_CROSS,
+                    MarginMode::Isolated => WICKRA_MARGIN_ISOLATED,
+                };
+                WICKRA_OK
+            }
+            None => WICKRA_ERR_NOT_FOUND,
+        },
+        Err(e) => error_code(&e),
+    }
+}
+
+/// Set the leverage for `market`.
+///
+/// # Safety
+/// `handle` must be valid; `market` must be a valid C string.
+#[no_mangle]
+pub unsafe extern "C" fn wickra_derivatives_set_leverage(
+    handle: *mut WickraDerivatives,
+    market: *const c_char,
+    leverage: u32,
+) -> i32 {
+    let Some(handle) = (unsafe { handle.as_mut() }) else {
+        return WICKRA_ERR_NULL;
+    };
+    let Some(market) = (unsafe { opt_str(market) }) else {
+        return WICKRA_ERR_INVALID_ARG;
+    };
+    let Some(symbol) = parse_symbol(market) else {
+        return WICKRA_ERR_INVALID_ARG;
+    };
+    match handle.inner.set_leverage(&symbol, leverage) {
+        Ok(()) => WICKRA_OK,
+        Err(e) => error_code(&e),
+    }
+}
+
+/// Set the margin mode for `market` (`mode` is `WICKRA_MARGIN_*`).
+///
+/// # Safety
+/// `handle` must be valid; `market` must be a valid C string.
+#[no_mangle]
+pub unsafe extern "C" fn wickra_derivatives_set_margin_mode(
+    handle: *mut WickraDerivatives,
+    market: *const c_char,
+    mode: i32,
+) -> i32 {
+    let Some(handle) = (unsafe { handle.as_mut() }) else {
+        return WICKRA_ERR_NULL;
+    };
+    let Some(market) = (unsafe { opt_str(market) }) else {
+        return WICKRA_ERR_INVALID_ARG;
+    };
+    let Some(symbol) = parse_symbol(market) else {
+        return WICKRA_ERR_INVALID_ARG;
+    };
+    let Some(mode) = margin_mode_from_code(mode) else {
+        return WICKRA_ERR_INVALID_ARG;
+    };
+    match handle.inner.set_margin_mode(&symbol, mode) {
+        Ok(()) => WICKRA_OK,
+        Err(e) => error_code(&e),
+    }
+}
+
+/// Flatten the open position in `market` with a reduce-only market order; writes
+/// the resulting order into `out`.
+///
+/// # Safety
+/// `handle` and `out` must be valid; `market` must be a valid C string.
+#[no_mangle]
+pub unsafe extern "C" fn wickra_derivatives_close_position(
+    handle: *mut WickraDerivatives,
+    market: *const c_char,
+    out: *mut WickraOrder,
+) -> i32 {
+    let Some(handle) = (unsafe { handle.as_mut() }) else {
+        return WICKRA_ERR_NULL;
+    };
+    if out.is_null() {
+        return WICKRA_ERR_NULL;
+    }
+    let Some(market) = (unsafe { opt_str(market) }) else {
+        return WICKRA_ERR_INVALID_ARG;
+    };
+    let Some(symbol) = parse_symbol(market) else {
+        return WICKRA_ERR_INVALID_ARG;
+    };
+    match handle.inner.close_position(&symbol) {
+        Ok(order) => {
+            unsafe { fill_order(&mut *out, &order) };
+            WICKRA_OK
+        }
+        Err(e) => error_code(&e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -840,5 +1076,67 @@ mod tests {
         assert!(!ptr.is_null());
         let version = unsafe { CStr::from_ptr(ptr) }.to_str().unwrap();
         assert_eq!(version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn derivatives_spot_only_venue_is_null() {
+        let (name, key, secret) = (cstr("coinbase"), cstr("k"), cstr("s"));
+        let handle = unsafe {
+            wickra_connect_derivatives(
+                name.as_ptr(),
+                key.as_ptr(),
+                secret.as_ptr(),
+                core::ptr::null(),
+                core::ptr::null(),
+                false,
+            )
+        };
+        assert!(handle.is_null(), "coinbase has no derivatives market");
+    }
+
+    #[test]
+    fn derivatives_null_handle_guards() {
+        let market = cstr("BTC/USDT");
+        assert_eq!(
+            unsafe { wickra_derivatives_set_leverage(core::ptr::null_mut(), market.as_ptr(), 5) },
+            WICKRA_ERR_NULL
+        );
+        assert_eq!(
+            unsafe {
+                wickra_derivatives_position(
+                    core::ptr::null_mut(),
+                    market.as_ptr(),
+                    core::ptr::null_mut(),
+                )
+            },
+            WICKRA_ERR_NULL
+        );
+        // Freeing null is a no-op.
+        unsafe { wickra_derivatives_free(core::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn derivatives_bad_margin_mode_is_invalid_arg() {
+        // Construction is offline (no socket until an RPC is issued), so a live
+        // handle can be built and the argument validation exercised without a
+        // network — an out-of-range margin mode is rejected before any request.
+        let (name, key, secret) = (cstr("binance"), cstr("k"), cstr("s"));
+        let handle = unsafe {
+            wickra_connect_derivatives(
+                name.as_ptr(),
+                key.as_ptr(),
+                secret.as_ptr(),
+                core::ptr::null(),
+                core::ptr::null(),
+                false,
+            )
+        };
+        assert!(!handle.is_null());
+        let market = cstr("BTC/USDT");
+        assert_eq!(
+            unsafe { wickra_derivatives_set_margin_mode(handle, market.as_ptr(), 99) },
+            WICKRA_ERR_INVALID_ARG
+        );
+        unsafe { wickra_derivatives_free(handle) };
     }
 }
