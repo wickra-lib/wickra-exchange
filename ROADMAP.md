@@ -52,9 +52,10 @@ a deep-dive in [docs/DERIVATIVES.md](docs/DERIVATIVES.md):
 - **`WsExecution`** (order placement over the WebSocket order API) — native on
   Binance, Bybit, OKX, Gate.io and Kraken; a documented `Error::Exchange` on
   Bitget, KuCoin and HTX (no WebSocket order-entry API).
-- All five surfaces are reachable through the facade factory: `connect`,
+- All five surfaces are reachable through the facade factory (`connect`,
   `connect_derivatives`, `connect_advanced`, `connect_user_data`,
-  `connect_ws_execution`.
+  `connect_ws_execution`) **and through all nine language bindings** — Python,
+  Node.js, the C ABI hub and the Go / C# / Java / R wrappers over it.
 
 ### Follow-ups
 
@@ -64,8 +65,6 @@ a deep-dive in [docs/DERIVATIVES.md](docs/DERIVATIVES.md):
   `AddOrderBatch` indexed form).
 - Kraken Futures WebSocket (separate challenge/response feed on
   `futures.kraken.com`).
-- Surfacing the user-data + ws-execution traits through every language binding
-  (the derivatives + advanced-order traits already are).
 
 ## Non-goals
 

@@ -42,9 +42,10 @@ Per-symbol filters (lot step, price tick, min-notional) are enforced through
 > WebSocket order API; Bitget, KuCoin and HTX have no such API and return a
 > documented `Error::Exchange`. Coinbase and Upbit do not implement it.
 >
-> All three surfaces are reachable through the facade factory:
-> `connect`, `connect_derivatives`, `connect_advanced`, `connect_user_data` and
-> `connect_ws_execution`.
+> All three surfaces are reachable through the facade factory
+> (`connect`, `connect_derivatives`, `connect_advanced`, `connect_user_data`,
+> `connect_ws_execution`) **and through all nine language bindings** — Python,
+> Node.js, the C ABI hub, and the Go / C# / Java / R wrappers over it.
 
 ## Derivatives (`Derivatives` trait)
 
