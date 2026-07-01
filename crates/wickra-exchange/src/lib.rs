@@ -10,3 +10,7 @@
 //! model.
 
 pub use wickra_exchange_core::*;
+
+mod net;
+
+pub use net::ReqwestHttpTransport;

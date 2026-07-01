@@ -44,7 +44,7 @@ tracing = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
 futures-util = "0.3"
 # HTTP + WebSocket transport (rustls TLS, no OpenSSL system dependency).
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["rustls-tls-webpki-roots", "connect"] }
 url = "2"
 # Request signing primitives (HMAC-SHA256/512, base64, hex).

@@ -17,3 +17,7 @@ workspace = true
 
 [dependencies]
 wickra-exchange-core = { workspace = true }
+# Real-socket transport adapters. These are thin I/O wrappers around the core's
+# Transport traits; they are excluded from coverage (only exercised by gated
+# integration tests against live testnets).
+reqwest = { workspace = true }
