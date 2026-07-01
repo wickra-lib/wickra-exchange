@@ -77,6 +77,9 @@ pub struct Kraken {
     /// [`subscribe_user_data`](Self::subscribe_user_data) and drained by
     /// [`poll_events`](Self::poll_events) alongside the public stream.
     private_connection: Option<Box<dyn WsConnection>>,
+    /// Set once the private stream is subscribed, so [`poll_events`](Self::poll_events)
+    /// re-subscribes it (re-fetching a fresh single-use token) after a drop.
+    user_data_active: bool,
     /// A dedicated connection to the v2 authenticated order API, opened lazily on
     /// the first [`place_order_ws`](Self::place_order_ws) / [`cancel_order_ws`](Self::cancel_order_ws)
     /// call, together with the WebSocket token each request carries.
@@ -102,6 +105,7 @@ impl Kraken {
             sub_messages: Vec::new(),
             leverage: Cell::new(1),
             private_connection: None,
+            user_data_active: false,
             ws_api_connection: None,
             ws_api_token: None,
         }
@@ -316,12 +320,26 @@ impl Kraken {
             }
         }
         // Drain the private user-data (executions/balances) stream, if open.
-        // Re-issuing a fresh WebSockets token on reconnect is a keepalive follow-up.
         if let Some(connection) = self.private_connection.as_mut() {
             while let Ok(Some(frame)) = connection.recv() {
                 if let Ok(mut parsed) = parse_ws_message(&frame) {
                     events.append(&mut parsed);
                 }
+            }
+        }
+        // A dropped private stream is re-subscribed by re-fetching a fresh
+        // single-use WebSockets token over REST (the previous token cannot be
+        // replayed).
+        if self.user_data_active
+            && self
+                .private_connection
+                .as_ref()
+                .is_some_and(|c| !c.is_connected())
+        {
+            events.push(Event::Disconnected);
+            self.private_connection = None;
+            if self.subscribe_user_data().is_ok() {
+                events.push(Event::Reconnected);
             }
         }
         let url = "wss://ws.kraken.com/v2";
@@ -342,7 +360,10 @@ impl Kraken {
     /// [`poll_events`](Self::poll_events) also surfaces the account's own
     /// [`Event::OrderUpdate`] and [`Event::BalanceUpdate`].
     ///
-    /// Re-issuing a fresh token on reconnect is a keepalive follow-up.
+    /// A dropped private stream is re-subscribed automatically on the next
+    /// [`poll_events`](Self::poll_events), which re-fetches a fresh token; call
+    /// [`keepalive_user_data`](Self::keepalive_user_data) periodically to keep it
+    /// from being dropped for inactivity.
     ///
     /// # Errors
     /// Returns [`Error::Exchange`] on the **futures** client (Kraken Futures uses
@@ -376,6 +397,20 @@ impl Kraken {
         connection.send(&executions)?;
         connection.send(&balances)?;
         self.private_connection = Some(connection);
+        self.user_data_active = true;
+        Ok(())
+    }
+
+    /// Send the Kraken v2 application-level heartbeat (`{"method":"ping"}`) on the
+    /// private stream so it is not dropped for inactivity. A no-op before
+    /// [`subscribe_user_data`](Self::subscribe_user_data).
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the ping cannot be sent.
+    pub fn keepalive_user_data(&mut self) -> Result<()> {
+        if let Some(connection) = self.private_connection.as_mut() {
+            connection.send(r#"{"method":"ping"}"#)?;
+        }
         Ok(())
     }
 
@@ -1654,6 +1689,9 @@ impl WsUserData for Kraken {
     fn subscribe_user_data(&mut self) -> Result<()> {
         Kraken::subscribe_user_data(self)
     }
+    fn keepalive_user_data(&mut self) -> Result<()> {
+        Kraken::keepalive_user_data(self)
+    }
 }
 
 impl WsExecution for Kraken {
@@ -1907,6 +1945,59 @@ mod tests {
             kraken.subscribe_user_data().unwrap_err(),
             Error::Exchange { .. }
         ));
+    }
+
+    #[test]
+    fn keepalive_user_data_pings_the_private_stream() {
+        let (mut kraken, http, ws) = signed_ws_client(1000);
+        http.push_json(
+            200,
+            r#"{"error":[],"result":{"token":"tok","expires":900}}"#,
+        );
+        ws.push_connection(vec![]);
+        kraken.subscribe_user_data().unwrap();
+        kraken.keepalive_user_data().unwrap();
+        assert!(ws.sent().iter().any(|f| f == r#"{"method":"ping"}"#));
+    }
+
+    #[test]
+    fn keepalive_user_data_is_a_noop_before_subscribe() {
+        let (mut kraken, _http, ws) = signed_ws_client(1000);
+        kraken.keepalive_user_data().unwrap();
+        assert!(ws.sent().is_empty());
+    }
+
+    #[test]
+    fn dropped_user_data_stream_reconnects_with_a_fresh_token() {
+        let (mut kraken, http, ws) = signed_ws_client(1000);
+        http.push_json(
+            200,
+            r#"{"error":[],"result":{"token":"tok-1","expires":900}}"#,
+        );
+        // The first private connection closes on the first recv; the reconnect
+        // target is a fresh open connection.
+        ws.push_connection(vec![Ok(None)]);
+        ws.push_connection(vec![]);
+        kraken.subscribe_user_data().unwrap();
+        // The reconnect re-fetches a fresh single-use token over REST.
+        http.push_json(
+            200,
+            r#"{"error":[],"result":{"token":"tok-2","expires":900}}"#,
+        );
+
+        let events = kraken.poll_events();
+        assert!(events.contains(&Event::Disconnected));
+        assert!(events.contains(&Event::Reconnected));
+        // Two token POSTs (initial + reconnect) and a second WS connection whose
+        // subscribe carries the fresh token.
+        let tokens = http
+            .recorded_requests()
+            .into_iter()
+            .filter(|r| r.url.contains("/0/private/GetWebSocketsToken"))
+            .count();
+        assert_eq!(tokens, 2);
+        assert_eq!(ws.connected_urls().len(), 2);
+        assert!(ws.sent().iter().any(|f| f.contains(r#""token":"tok-2""#)));
     }
 
     #[test]

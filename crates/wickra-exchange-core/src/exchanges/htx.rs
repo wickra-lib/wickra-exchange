@@ -125,6 +125,9 @@ pub struct Htx {
     /// [`subscribe_user_data`](Self::subscribe_user_data) and drained by
     /// [`poll_events`](Self::poll_events) alongside the public stream.
     private_connection: Option<Box<dyn WsConnection>>,
+    /// Set once the private stream is subscribed, so [`poll_events`](Self::poll_events)
+    /// re-subscribes it after a drop.
+    user_data_active: bool,
 }
 
 impl Htx {
@@ -152,6 +155,7 @@ impl Htx {
             account_id: RefCell::new(None),
             leverage: Cell::new(1),
             private_connection: None,
+            user_data_active: false,
         }
     }
 
@@ -371,13 +375,26 @@ impl Htx {
                 }
             }
         }
-        // Drain the private user-data (v2 `orders`/`accounts.update`) stream, if
-        // open. Re-authenticating a dropped private stream is a keepalive follow-up.
+        // Drain the private user-data (v2 `orders`/`accounts.update`) stream, if open.
         if let Some(connection) = self.private_connection.as_mut() {
             while let Ok(Some(frame)) = connection.recv() {
                 if let Ok(mut parsed) = parse_ws_message(&frame, &resolve) {
                     events.append(&mut parsed);
                 }
+            }
+        }
+        // A dropped private stream is re-subscribed with a fresh v2 auth handshake
+        // (the signature is time-bound, so a stale replay would be rejected).
+        if self.user_data_active
+            && self
+                .private_connection
+                .as_ref()
+                .is_some_and(|c| !c.is_connected())
+        {
+            events.push(Event::Disconnected);
+            self.private_connection = None;
+            if self.subscribe_user_data().is_ok() {
+                events.push(Event::Reconnected);
             }
         }
         let url = "wss://api.huobi.pro/ws";
@@ -398,7 +415,10 @@ impl Htx {
     /// [`poll_events`](Self::poll_events) also surfaces the account's own
     /// [`Event::OrderUpdate`] and [`Event::BalanceUpdate`].
     ///
-    /// Re-authenticating a dropped private stream is a keepalive follow-up.
+    /// A dropped private stream is re-subscribed automatically on the next
+    /// [`poll_events`](Self::poll_events); call
+    /// [`keepalive_user_data`](Self::keepalive_user_data) periodically to keep it
+    /// from being dropped for inactivity.
     ///
     /// # Errors
     /// Returns [`Error::InvalidCredentials`] without credentials,
@@ -434,6 +454,20 @@ impl Htx {
         connection.send(r#"{"action":"sub","ch":"orders#*"}"#)?;
         connection.send(r#"{"action":"sub","ch":"accounts.update#2"}"#)?;
         self.private_connection = Some(connection);
+        self.user_data_active = true;
+        Ok(())
+    }
+
+    /// Send the HTX v2 application-level heartbeat (`{"action":"ping"}`) on the
+    /// private stream so it is not dropped for inactivity. A no-op before
+    /// [`subscribe_user_data`](Self::subscribe_user_data).
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the ping cannot be sent.
+    pub fn keepalive_user_data(&mut self) -> Result<()> {
+        if let Some(connection) = self.private_connection.as_mut() {
+            connection.send(r#"{"action":"ping"}"#)?;
+        }
         Ok(())
     }
 
@@ -1384,6 +1418,9 @@ impl WsUserData for Htx {
     fn subscribe_user_data(&mut self) -> Result<()> {
         Htx::subscribe_user_data(self)
     }
+    fn keepalive_user_data(&mut self) -> Result<()> {
+        Htx::keepalive_user_data(self)
+    }
 }
 
 impl WsExecution for Htx {
@@ -1744,6 +1781,45 @@ mod tests {
             htx.subscribe_user_data().unwrap_err(),
             Error::InvalidCredentials(_)
         ));
+    }
+
+    #[test]
+    fn keepalive_user_data_pings_the_private_stream() {
+        let (mut htx, ws) = signed_ws_client(1_700_000_000_000);
+        ws.push_connection(vec![]);
+        htx.subscribe_user_data().unwrap();
+        htx.keepalive_user_data().unwrap();
+        assert!(ws.sent().iter().any(|f| f == r#"{"action":"ping"}"#));
+    }
+
+    #[test]
+    fn keepalive_user_data_is_a_noop_before_subscribe() {
+        let (mut htx, ws) = signed_ws_client(1_700_000_000_000);
+        htx.keepalive_user_data().unwrap();
+        assert!(ws.sent().is_empty());
+    }
+
+    #[test]
+    fn dropped_user_data_stream_reconnects_with_a_fresh_auth() {
+        let (mut htx, ws) = signed_ws_client(1_700_000_000_000);
+        // The first private connection closes on the first recv; the reconnect
+        // target is a fresh open connection.
+        ws.push_connection(vec![Ok(None)]);
+        ws.push_connection(vec![]);
+        htx.subscribe_user_data().unwrap();
+
+        let events = htx.poll_events();
+        assert!(events.contains(&Event::Disconnected));
+        assert!(events.contains(&Event::Reconnected));
+        // Two private connections (initial + reconnect), each re-signing the v2 auth.
+        let auth_frames = ws
+            .sent()
+            .into_iter()
+            .filter(|f| f.contains(r#""ch":"auth""#))
+            .count();
+        assert_eq!(auth_frames, 2);
+        assert_eq!(ws.connected_urls().len(), 2);
+        assert_eq!(ws.connected_urls()[1], "wss://api.huobi.pro/ws/v2");
     }
 
     #[test]
