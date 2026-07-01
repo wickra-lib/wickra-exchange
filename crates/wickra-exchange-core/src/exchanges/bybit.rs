@@ -8,8 +8,10 @@
 //! recvWindow + payload` rather than a signed query string.
 //!
 //! Covered here: the public REST market data (ticker, klines, depth), the
-//! `{retCode, retMsg, result}` envelope handling, the error taxonomy, and
-//! `X-BAPI-*`-header signed execution (place/cancel/query order).
+//! `{retCode, retMsg, result}` envelope handling, the error taxonomy,
+//! `X-BAPI-*`-header signed execution (place/cancel/query/open orders, balances),
+//! the pull-based WebSocket market streams (`op:subscribe`, topic-routed frames),
+//! and the [`Exchange`] trait — so Bybit is usable as `Box<dyn Exchange>`.
 
 // Bybit `retCode`s are externally-defined numeric codes; grouping their digits
 // with underscores would obscure them rather than aid reading.
@@ -17,17 +19,19 @@
 
 use crate::credentials::Credentials;
 use crate::error::{Error, Result};
-use crate::events::{BookLevel, OrderBookSnapshot};
+use crate::events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
 use crate::normalize::{format_decimal, parse_decimal};
 use crate::options::{ExchangeOptions, MarketType};
 use crate::signing::hmac_sha256_hex;
 use crate::symbol::Symbol;
-use crate::transport::{HttpMethod, HttpRequest, HttpTransport};
+use crate::traits::{Exchange, Execution, MarketData};
+use crate::transport::{HttpMethod, HttpRequest, HttpTransport, WsConnection, WsTransport};
 use crate::types::{
     Balance, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker, TimeInForce,
 };
 use rust_decimal::Decimal;
 use serde::Deserialize;
+use std::collections::HashMap;
 use wickra_core::Candle;
 
 /// The current Unix time in milliseconds, from the system clock.
@@ -42,11 +46,15 @@ fn system_now_ms() -> i64 {
 /// A Bybit client over an injected HTTP transport.
 pub struct Bybit {
     http: Box<dyn HttpTransport>,
+    ws: Option<Box<dyn WsTransport>>,
     rest_base: String,
     category: &'static str,
+    testnet: bool,
     credentials: Option<Credentials>,
     recv_window_ms: u64,
     now_ms: Box<dyn Fn() -> i64 + Send + Sync>,
+    connection: Option<Box<dyn WsConnection>>,
+    subscriptions: Vec<(String, Symbol)>,
 }
 
 impl Bybit {
@@ -57,16 +65,27 @@ impl Bybit {
     ) -> Self {
         Self {
             http,
+            ws: None,
             rest_base: if options.testnet {
                 "https://api-testnet.bybit.com".to_string()
             } else {
                 "https://api.bybit.com".to_string()
             },
             category: category(options.market_type),
+            testnet: options.testnet,
             credentials,
             recv_window_ms: options.recv_window_ms,
             now_ms: Box::new(system_now_ms),
+            connection: None,
+            subscriptions: Vec::new(),
         }
+    }
+
+    /// Attach a WebSocket transport, enabling the streaming subscriptions.
+    #[must_use]
+    pub fn with_ws(mut self, ws: Box<dyn WsTransport>) -> Self {
+        self.ws = Some(ws);
+        self
     }
 
     /// Build a public Bybit client over the given transport and options.
@@ -174,6 +193,76 @@ impl Bybit {
             bids: parse_levels(&raw.bids)?,
             asks: parse_levels(&raw.asks)?,
         })
+    }
+
+    /// Subscribe to the public trade stream for `symbol`.
+    ///
+    /// # Errors
+    /// Returns [`Error::NotConnected`] if no WebSocket transport is configured,
+    /// or a transport error if the connection or subscription fails.
+    pub fn subscribe_trades(&mut self, symbol: &Symbol) -> Result<()> {
+        let topic = format!("publicTrade.{}", Self::wire_symbol(symbol));
+        self.subscribe(symbol, &topic)
+    }
+
+    /// Subscribe to the order-book stream for `symbol`.
+    ///
+    /// # Errors
+    /// See [`subscribe_trades`](Self::subscribe_trades).
+    pub fn subscribe_book(&mut self, symbol: &Symbol) -> Result<()> {
+        let topic = format!("orderbook.50.{}", Self::wire_symbol(symbol));
+        self.subscribe(symbol, &topic)
+    }
+
+    /// Subscribe to the ticker stream for `symbol`.
+    ///
+    /// # Errors
+    /// See [`subscribe_trades`](Self::subscribe_trades).
+    pub fn subscribe_ticker(&mut self, symbol: &Symbol) -> Result<()> {
+        let topic = format!("tickers.{}", Self::wire_symbol(symbol));
+        self.subscribe(symbol, &topic)
+    }
+
+    /// Open the connection if needed, send an `op:subscribe` for `topic`, and
+    /// register the symbol for wire-name resolution.
+    fn subscribe(&mut self, symbol: &Symbol, topic: &str) -> Result<()> {
+        let wire = Self::wire_symbol(symbol);
+        if self.connection.is_none() {
+            let ws = self.ws.as_ref().ok_or(Error::NotConnected)?;
+            let connection = ws.connect(&ws_base_url(self.category, self.testnet))?;
+            self.connection = Some(connection);
+        }
+        let message = format!(r#"{{"op":"subscribe","args":["{topic}"]}}"#);
+        self.connection
+            .as_mut()
+            .expect("connection just ensured")
+            .send(&message)?;
+        if !self.subscriptions.iter().any(|(w, _)| w == &wire) {
+            self.subscriptions.push((wire, symbol.clone()));
+        }
+        Ok(())
+    }
+
+    /// Drain all stream events available since the last call. Non-blocking;
+    /// frames that fail to parse are skipped.
+    pub fn poll_events(&mut self) -> Vec<Event> {
+        let subscriptions: HashMap<String, Symbol> = self.subscriptions.iter().cloned().collect();
+        let resolve = |wire: &str| {
+            subscriptions
+                .get(wire)
+                .cloned()
+                .unwrap_or_else(|| Symbol::new(wire, ""))
+        };
+        let mut events = Vec::new();
+        let Some(connection) = self.connection.as_mut() else {
+            return events;
+        };
+        while let Ok(Some(frame)) = connection.recv() {
+            if let Ok(mut parsed) = parse_ws_message(&frame, &resolve) {
+                events.append(&mut parsed);
+            }
+        }
+        events
     }
 
     /// Place an order. Validated locally, then sent signed. Bybit's create
@@ -633,10 +722,170 @@ fn split_wire_symbol(wire: &str) -> Symbol {
     Symbol::new(wire, "")
 }
 
+/// The public WebSocket base URL for a category and network.
+fn ws_base_url(category: &str, testnet: bool) -> String {
+    let host = if testnet {
+        "wss://stream-testnet.bybit.com"
+    } else {
+        "wss://stream.bybit.com"
+    };
+    format!("{host}/v5/public/{category}")
+}
+
+fn field_str<'a>(value: &'a serde_json::Value, key: &str) -> Result<&'a str> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| Error::Deserialization(format!("missing string field {key:?}")))
+}
+
+fn opt_str<'a>(value: &'a serde_json::Value, key: &str) -> &'a str {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+}
+
+fn parse_ws_levels(value: Option<&serde_json::Value>) -> Result<Vec<BookLevel>> {
+    let array = value
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| Error::Deserialization("missing depth levels".to_string()))?;
+    array
+        .iter()
+        .map(|level| {
+            let pair = level
+                .as_array()
+                .ok_or_else(|| Error::Deserialization("depth level not an array".to_string()))?;
+            let price = parse_decimal(
+                pair.first()
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| Error::Deserialization("depth price missing".to_string()))?,
+            )?;
+            let quantity =
+                parse_decimal(pair.get(1).and_then(serde_json::Value::as_str).ok_or_else(
+                    || Error::Deserialization("depth quantity missing".to_string()),
+                )?)?;
+            Ok(BookLevel { price, quantity })
+        })
+        .collect()
+}
+
+/// Parse one Bybit WebSocket frame into zero or more [`Event`]s, routing by the
+/// `topic` prefix. `op` responses and unhandled topics yield an empty vector.
+fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Vec<Event>> {
+    let value: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| Error::Deserialization(e.to_string()))?;
+    let Some(topic) = value.get("topic").and_then(serde_json::Value::as_str) else {
+        return Ok(Vec::new());
+    };
+    let null = serde_json::Value::Null;
+    let data = value.get("data").unwrap_or(&null);
+
+    if topic.starts_with("publicTrade.") {
+        let trades = data
+            .as_array()
+            .ok_or_else(|| Error::Deserialization("trade data not an array".to_string()))?;
+        trades
+            .iter()
+            .map(|t| {
+                Ok(Event::Trade(TradePrint {
+                    symbol: resolve(field_str(t, "s")?),
+                    price: parse_decimal(field_str(t, "p")?)?,
+                    quantity: parse_decimal(field_str(t, "v")?)?,
+                    aggressor: parse_side(field_str(t, "S")?)?,
+                    timestamp: t.get("T").and_then(serde_json::Value::as_i64).unwrap_or(0),
+                }))
+            })
+            .collect()
+    } else if topic.starts_with("tickers.") {
+        Ok(vec![Event::Ticker(Ticker {
+            symbol: resolve(field_str(data, "symbol")?),
+            last: parse_decimal(field_str(data, "lastPrice")?)?,
+            bid: dec_or_zero(opt_str(data, "bid1Price")),
+            ask: dec_or_zero(opt_str(data, "ask1Price")),
+            volume: dec_or_zero(opt_str(data, "volume24h")),
+        })])
+    } else if topic.starts_with("orderbook.") {
+        let symbol = resolve(field_str(data, "s")?);
+        let update_id = data
+            .get("u")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let bids = parse_ws_levels(data.get("b"))?;
+        let asks = parse_ws_levels(data.get("a"))?;
+        if value.get("type").and_then(serde_json::Value::as_str) == Some("snapshot") {
+            Ok(vec![Event::BookSnapshot(OrderBookSnapshot {
+                symbol,
+                last_update_id: update_id,
+                bids,
+                asks,
+            })])
+        } else {
+            Ok(vec![Event::BookDelta(BookDelta {
+                symbol,
+                first_update_id: update_id,
+                final_update_id: update_id,
+                bids,
+                asks,
+            })])
+        }
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+impl MarketData for Bybit {
+    fn ticker(&mut self, symbol: &Symbol) -> Result<Ticker> {
+        Bybit::ticker(self, symbol)
+    }
+    fn klines(&mut self, symbol: &Symbol, interval: &str, limit: u32) -> Result<Vec<Candle>> {
+        Bybit::klines(self, symbol, interval, limit)
+    }
+    fn order_book(&mut self, symbol: &Symbol, depth: u32) -> Result<OrderBookSnapshot> {
+        Bybit::order_book(self, symbol, depth)
+    }
+    fn subscribe_trades(&mut self, symbol: &Symbol) -> Result<()> {
+        Bybit::subscribe_trades(self, symbol)
+    }
+    fn subscribe_book(&mut self, symbol: &Symbol) -> Result<()> {
+        Bybit::subscribe_book(self, symbol)
+    }
+    fn subscribe_ticker(&mut self, symbol: &Symbol) -> Result<()> {
+        Bybit::subscribe_ticker(self, symbol)
+    }
+    fn poll_events(&mut self) -> Vec<Event> {
+        Bybit::poll_events(self)
+    }
+}
+
+impl Execution for Bybit {
+    fn place_order(&mut self, request: &OrderRequest) -> Result<Order> {
+        Bybit::place_order(self, request)
+    }
+    fn cancel_order(&mut self, symbol: &Symbol, order_id: &str) -> Result<()> {
+        Bybit::cancel_order(self, symbol, order_id)
+    }
+    fn query_order(&mut self, symbol: &Symbol, order_id: &str) -> Result<Order> {
+        Bybit::query_order(self, symbol, order_id)
+    }
+    fn open_orders(&mut self, symbol: Option<&Symbol>) -> Result<Vec<Order>> {
+        Bybit::open_orders(self, symbol)
+    }
+    fn balances(&mut self) -> Result<Vec<Balance>> {
+        Bybit::balances(self)
+    }
+}
+
+impl Exchange for Bybit {
+    fn name(&self) -> &'static str {
+        "bybit"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::{HttpResponse, MockHttpTransport};
+    use crate::transport::{HttpResponse, MockHttpTransport, MockWsTransport};
     use rust_decimal_macros::dec;
     use std::sync::Arc;
 
@@ -644,6 +893,13 @@ mod tests {
     impl HttpTransport for ArcTransport {
         fn execute(&self, request: &HttpRequest) -> Result<HttpResponse> {
             self.0.execute(request)
+        }
+    }
+
+    struct ArcWs(Arc<MockWsTransport>);
+    impl WsTransport for ArcWs {
+        fn connect(&self, url: &str) -> Result<Box<dyn WsConnection>> {
+            self.0.connect(url)
         }
     }
 
@@ -929,5 +1185,111 @@ mod tests {
         let req = &mock.recorded_requests()[0];
         assert!(req.url.contains("accountType=UNIFIED"));
         assert!(req.headers.iter().any(|(k, _)| k == "X-BAPI-SIGN"));
+    }
+
+    fn streaming_client(ws: &Arc<MockWsTransport>) -> Bybit {
+        let http = Arc::new(MockHttpTransport::new());
+        let opts = ExchangeOptions::mainnet(MarketType::Spot);
+        Bybit::with_http(Box::new(ArcTransport(http)), &opts)
+            .with_ws(Box::new(ArcWs(Arc::clone(ws))))
+    }
+
+    #[test]
+    fn subscribe_sends_op_and_poll_parses_trades_and_book() {
+        let ws = Arc::new(MockWsTransport::new());
+        ws.push_connection(vec![
+            Ok(Some(
+                r#"{"topic":"publicTrade.BTCUSDT","type":"snapshot","data":[
+                {"T":1,"s":"BTCUSDT","S":"Buy","v":"0.5","p":"100"},
+                {"T":2,"s":"BTCUSDT","S":"Sell","v":"1","p":"101"}]}"#
+                    .to_string(),
+            )),
+            Ok(Some(
+                r#"{"topic":"orderbook.50.BTCUSDT","type":"snapshot","data":{"s":"BTCUSDT","u":10,
+                "b":[["100","1"]],"a":[["101","2"]]}}"#
+                    .to_string(),
+            )),
+            Ok(Some(r#"{"success":true,"op":"subscribe"}"#.to_string())),
+        ]);
+        let mut bybit = streaming_client(&ws);
+        bybit.subscribe_trades(&symbol()).unwrap();
+        assert_eq!(
+            ws.connected_urls(),
+            vec!["wss://stream.bybit.com/v5/public/spot".to_string()]
+        );
+        assert!(ws.sent()[0].contains(r#""op":"subscribe""#));
+        assert!(ws.sent()[0].contains("publicTrade.BTCUSDT"));
+
+        let events = bybit.poll_events();
+        // 2 trades + 1 book snapshot (the op response is ignored).
+        assert_eq!(events.len(), 3);
+        let Event::Trade(t) = &events[0] else {
+            panic!("expected trade")
+        };
+        assert_eq!(t.aggressor, OrderSide::Buy);
+        assert_eq!(t.price, dec!(100));
+        assert!(matches!(events[1], Event::Trade(_)));
+        assert!(matches!(events[2], Event::BookSnapshot(_)));
+    }
+
+    #[test]
+    fn ws_ticker_and_book_delta_parse() {
+        let ws = Arc::new(MockWsTransport::new());
+        ws.push_connection(vec![
+            Ok(Some(
+                r#"{"topic":"tickers.BTCUSDT","data":{"symbol":"BTCUSDT","lastPrice":"100",
+                "bid1Price":"99","ask1Price":"101","volume24h":"5"}}"#
+                    .to_string(),
+            )),
+            Ok(Some(
+                r#"{"topic":"orderbook.50.BTCUSDT","type":"delta","data":{"s":"BTCUSDT","u":11,
+                "b":[["100","0"]],"a":[]}}"#
+                    .to_string(),
+            )),
+        ]);
+        let mut bybit = streaming_client(&ws);
+        bybit.subscribe_ticker(&symbol()).unwrap();
+        bybit.subscribe_book(&symbol()).unwrap();
+        assert_eq!(ws.connected_urls().len(), 1); // one connection reused
+
+        let events = bybit.poll_events();
+        assert_eq!(events.len(), 2);
+        let Event::Ticker(ticker) = &events[0] else {
+            panic!("expected ticker")
+        };
+        assert_eq!(ticker.last, dec!(100));
+        assert_eq!(ticker.bid, dec!(99));
+        let Event::BookDelta(delta) = &events[1] else {
+            panic!("expected book delta")
+        };
+        assert_eq!(delta.final_update_id, 11);
+        assert_eq!(delta.bids[0].quantity, dec!(0));
+    }
+
+    #[test]
+    fn subscribe_without_ws_errors_and_poll_empty() {
+        let http = Arc::new(MockHttpTransport::new());
+        let opts = ExchangeOptions::mainnet(MarketType::Spot);
+        let mut bybit = Bybit::with_http(Box::new(ArcTransport(http)), &opts);
+        assert!(matches!(
+            bybit.subscribe_trades(&symbol()).unwrap_err(),
+            Error::NotConnected
+        ));
+        assert!(bybit.poll_events().is_empty());
+    }
+
+    #[test]
+    fn works_as_a_boxed_exchange() {
+        let (bybit, mock) = signed_client(1000);
+        mock.push_json(
+            200,
+            r#"{"retCode":0,"result":{"orderId":"1","orderLinkId":""}}"#,
+        );
+        let mut exchange: Box<dyn Exchange> = Box::new(bybit);
+        assert_eq!(exchange.name(), "bybit");
+        let order = exchange
+            .place_order(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)))
+            .unwrap();
+        assert_eq!(order.id, "1");
     }
 }
