@@ -1,0 +1,66 @@
+{
+  "name": "wickra-exchange",
+  "version": "0.1.0",
+  "description": "Streaming-native, unified connectivity for the ten largest crypto exchanges (market data + signed order execution), with paper and replay simulators. Node bindings powered by Rust.",
+  "author": "kingchenc <support@wickra.org>",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "license": "MIT OR Apache-2.0",
+  "keywords": [
+    "crypto",
+    "exchange",
+    "trading",
+    "connectivity",
+    "streaming",
+    "rust"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wickra-lib/wickra-exchange"
+  },
+  "bugs": {
+    "url": "https://github.com/wickra-lib/wickra-exchange/issues"
+  },
+  "homepage": "https://github.com/wickra-lib/wickra-exchange",
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "npm",
+    "*.node"
+  ],
+  "napi": {
+    "name": "wickra-exchange",
+    "triples": {
+      "defaults": false,
+      "additional": [
+        "x86_64-unknown-linux-gnu",
+        "aarch64-unknown-linux-gnu",
+        "x86_64-apple-darwin",
+        "aarch64-apple-darwin",
+        "x86_64-pc-windows-msvc",
+        "aarch64-pc-windows-msvc"
+      ]
+    }
+  },
+  "engines": {
+    "node": ">= 18"
+  },
+  "optionalDependencies": {
+    "wickra-exchange-linux-x64-gnu": "0.1.0",
+    "wickra-exchange-linux-arm64-gnu": "0.1.0",
+    "wickra-exchange-darwin-x64": "0.1.0",
+    "wickra-exchange-darwin-arm64": "0.1.0",
+    "wickra-exchange-win32-x64-msvc": "0.1.0",
+    "wickra-exchange-win32-arm64-msvc": "0.1.0"
+  },
+  "scripts": {
+    "build": "napi build --platform --release",
+    "build:debug": "napi build --platform",
+    "artifacts": "napi artifacts",
+    "version": "napi version",
+    "test": "node --test"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^3.7.2"
+  }
+}
