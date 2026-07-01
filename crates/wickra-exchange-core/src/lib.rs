@@ -56,7 +56,7 @@ pub use idempotency::ClientIdGenerator;
 pub use instruments::{Instrument, InstrumentCache, InstrumentFilters};
 pub use normalize::{format_decimal, parse_decimal, parse_opt_decimal};
 pub use observability::{redact, Health};
-pub use options::{ExchangeOptions, MarginMode, MarketType, PositionMode};
+pub use options::{ExchangeOptions, MarginMode, MarketType, PositionMode, SelfTradePrevention};
 pub use orderbook::{BookUpdate, OrderBookBuilder};
 pub use positions::{Position, PositionSide};
 pub use ratelimiter::{Acquire, WeightedRateLimiter};
@@ -67,13 +67,14 @@ pub use signing::{
     hmac_sha512_bytes, hmac_sha512_hex, sha256, sha512_hex,
 };
 pub use symbol::Symbol;
-pub use traits::{Derivatives, Exchange, Execution, MarketData};
+pub use traits::{AdvancedOrders, Derivatives, Exchange, Execution, MarketData};
 pub use transport::{
     HttpMethod, HttpRequest, HttpResponse, HttpTransport, MockHttpTransport, MockWsConnection,
     MockWsTransport, WsConnection, WsTransport,
 };
 pub use types::{
-    Balance, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker, TimeInForce,
+    Balance, OcoRequest, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker,
+    TimeInForce,
 };
 
 /// Re-export of [`wickra_core::Candle`], the candle type returned by

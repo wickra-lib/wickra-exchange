@@ -18,7 +18,8 @@ use crate::events::{Event, OrderBookSnapshot};
 use crate::options::MarginMode;
 use crate::positions::Position;
 use crate::symbol::Symbol;
-use crate::types::{Balance, Order, OrderRequest, Ticker};
+use crate::types::{Balance, OcoRequest, Order, OrderRequest, Ticker};
+use rust_decimal::Decimal;
 use wickra_core::Candle;
 
 /// Read-only market data: REST snapshots plus pull-based streaming.
@@ -135,4 +136,46 @@ pub trait Derivatives {
     /// Returns [`Error::NotFound`](crate::Error::NotFound) if there is no open
     /// position, or another [`Error`](crate::Error) if the request fails.
     fn close_position(&mut self, symbol: &Symbol) -> Result<Order>;
+}
+
+/// Advanced order operations beyond single placement: amend-in-place, batched
+/// placement and cancellation, and one-cancels-other (OCO) brackets. Implemented
+/// per venue where the underlying API supports each operation; venues document
+/// any operation they cannot express natively.
+pub trait AdvancedOrders {
+    /// Amend a resting order's price and/or quantity in place, returning the
+    /// order as the venue reports it afterwards. `None` leaves that field
+    /// unchanged. Venues without a native amend emulate it as cancel-replace.
+    ///
+    /// # Errors
+    /// Returns an [`Error`](crate::Error) if the order is unknown, the amend is
+    /// rejected, or the request fails.
+    fn amend_order(
+        &mut self,
+        symbol: &Symbol,
+        order_id: &str,
+        new_price: Option<Decimal>,
+        new_quantity: Option<Decimal>,
+    ) -> Result<Order>;
+
+    /// Place several orders in one request. The outer [`Result`] covers a
+    /// transport/auth failure; each inner [`Result`] is that order's own outcome,
+    /// so a partially-accepted batch still returns the successes.
+    ///
+    /// # Errors
+    /// Returns an [`Error`](crate::Error) if the whole request fails.
+    fn place_batch(&mut self, requests: &[OrderRequest]) -> Result<Vec<Result<Order>>>;
+
+    /// Cancel several orders on one `symbol` in a single request.
+    ///
+    /// # Errors
+    /// Returns an [`Error`](crate::Error) if the request fails.
+    fn cancel_batch(&mut self, symbol: &Symbol, order_ids: &[String]) -> Result<()>;
+
+    /// Place a one-cancels-other bracket, returning the resulting order legs.
+    ///
+    /// # Errors
+    /// Returns an [`Error`](crate::Error) if the OCO is invalid, rejected, or the
+    /// request fails.
+    fn place_oco(&mut self, request: &OcoRequest) -> Result<Vec<Order>>;
 }
