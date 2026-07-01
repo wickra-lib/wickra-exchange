@@ -4,19 +4,25 @@
 //! but over a **millisecond** timestamp rather than ISO-8601, with `ACCESS-*`
 //! headers, concatenated symbols (`BTCUSDT`) and a `{code, msg, data}` envelope
 //! whose success code is the string `"00000"`.
+//!
+//! [`AdvancedOrders`]: STP via `stpMode` on order create and native spot batch
+//! place/cancel (`/api/v2/spot/trade/batch-orders`, `.../batch-cancel-order`,
+//! per-order results). Bitget has no in-place amend and no OCO order-list, and
+//! the mix (futures) batch endpoints are not yet wired — all documented gaps.
 
 use crate::credentials::Credentials;
 use crate::error::{Error, Result};
 use crate::events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
 use crate::normalize::{format_decimal, parse_decimal};
-use crate::options::{ExchangeOptions, MarginMode, MarketType};
+use crate::options::{ExchangeOptions, MarginMode, MarketType, SelfTradePrevention};
 use crate::positions::{Position, PositionSide};
 use crate::signing::hmac_sha256_base64;
 use crate::symbol::Symbol;
-use crate::traits::{Derivatives, Exchange, Execution, MarketData};
+use crate::traits::{AdvancedOrders, Derivatives, Exchange, Execution, MarketData};
 use crate::transport::{HttpMethod, HttpRequest, HttpTransport, WsConnection, WsTransport};
 use crate::types::{
-    Balance, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker, TimeInForce,
+    Balance, OcoRequest, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker,
+    TimeInForce,
 };
 use rust_decimal::Decimal;
 use serde::Deserialize;
@@ -290,6 +296,9 @@ impl Bitget {
         if let Some(id) = &request.client_order_id {
             body["clientOid"] = serde_json::json!(id.clone());
         }
+        if let Some(mode) = stp_mode_str(request.stp) {
+            body["stpMode"] = serde_json::json!(mode);
+        }
         let path = if self.is_futures() {
             body["productType"] = serde_json::json!("USDT-FUTURES");
             body["marginMode"] = serde_json::json!("crossed");
@@ -518,6 +527,16 @@ fn force_str(tif: TimeInForce) -> &'static str {
         TimeInForce::Gtc => "gtc",
         TimeInForce::Ioc => "ioc",
         TimeInForce::Fok => "fok",
+    }
+}
+
+/// The Bitget `stpMode` value for a self-trade-prevention policy, or `None` to omit.
+fn stp_mode_str(stp: SelfTradePrevention) -> Option<&'static str> {
+    match stp {
+        SelfTradePrevention::None => None,
+        SelfTradePrevention::ExpireMaker => Some("cancel_maker"),
+        SelfTradePrevention::ExpireTaker => Some("cancel_taker"),
+        SelfTradePrevention::ExpireBoth => Some("cancel_both"),
     }
 }
 
@@ -923,6 +942,187 @@ impl Bitget {
         .reduce_only();
         self.place_order(&request)
     }
+
+    /// Place several orders on one symbol in one request
+    /// (`/api/v2/spot/trade/batch-orders`). Bitget returns separate success and
+    /// failure lists, so a synthetic `clientOid` per index re-aligns them to each
+    /// request's own [`Result`]. Batch requires a single symbol (that of the
+    /// first request).
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the batch request itself fails, or if called on a
+    /// futures client (mix batch is a documented follow-up).
+    pub fn place_batch(&self, requests: &[OrderRequest]) -> Result<Vec<Result<Order>>> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        if self.is_futures() {
+            return Err(Error::Exchange {
+                code: "unsupported".to_string(),
+                message: "Bitget mix batch (/api/v2/mix/order/batch-place-order) is not yet wired"
+                    .to_string(),
+            });
+        }
+        let wire = Self::wire_symbol(&requests[0].symbol);
+        let order_list: Vec<serde_json::Value> = requests
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let coid = batch_client_oid(r, i);
+                let mut o = serde_json::json!({
+                    "side": side_str(r.side),
+                    "orderType": order_type_str(r.order_type),
+                    "force": force_str(r.time_in_force),
+                    "size": format_decimal(r.quantity),
+                    "clientOid": coid,
+                });
+                if let Some(price) = r.price {
+                    o["price"] = serde_json::json!(format_decimal(price));
+                }
+                o
+            })
+            .collect();
+        let body = serde_json::json!({ "symbol": wire, "orderList": order_list });
+        let data = self.signed_request(
+            HttpMethod::Post,
+            "/api/v2/spot/trade/batch-orders",
+            "",
+            &body.to_string(),
+        )?;
+        let result: BatchOrdersResult = parse_json(data)?;
+        let ok_map: HashMap<String, String> = result
+            .success_list
+            .into_iter()
+            .map(|s| (s.client_oid, s.order_id))
+            .collect();
+        let fail_map: HashMap<String, String> = result
+            .failure_list
+            .into_iter()
+            .map(|f| (f.client_oid, f.error_msg))
+            .collect();
+        Ok(requests
+            .iter()
+            .enumerate()
+            .map(|(i, req)| {
+                let coid = batch_client_oid(req, i);
+                if let Some(order_id) = ok_map.get(&coid) {
+                    Ok(Order {
+                        id: order_id.clone(),
+                        client_order_id: req.client_order_id.clone(),
+                        symbol: req.symbol.clone(),
+                        side: req.side,
+                        order_type: req.order_type,
+                        status: OrderStatus::New,
+                        quantity: req.quantity,
+                        filled_quantity: Decimal::ZERO,
+                        price: req.price,
+                        average_price: None,
+                    })
+                } else {
+                    Err(Error::OrderRejected {
+                        code: "batch".to_string(),
+                        message: fail_map
+                            .get(&coid)
+                            .cloned()
+                            .unwrap_or_else(|| "order rejected in batch".to_string()),
+                    })
+                }
+            })
+            .collect())
+    }
+
+    /// Cancel several orders on one `symbol` in one request
+    /// (`/api/v2/spot/trade/batch-cancel-order`).
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the request fails, or if called on a futures client.
+    pub fn cancel_batch(&self, symbol: &Symbol, order_ids: &[String]) -> Result<()> {
+        if self.is_futures() {
+            return Err(Error::Exchange {
+                code: "unsupported".to_string(),
+                message: "Bitget mix batch-cancel is not yet wired".to_string(),
+            });
+        }
+        let order_list: Vec<serde_json::Value> = order_ids
+            .iter()
+            .map(|id| serde_json::json!({ "orderId": id }))
+            .collect();
+        let body = serde_json::json!({
+            "symbol": Self::wire_symbol(symbol),
+            "orderList": order_list,
+        });
+        self.signed_request(
+            HttpMethod::Post,
+            "/api/v2/spot/trade/batch-cancel-order",
+            "",
+            &body.to_string(),
+        )?;
+        Ok(())
+    }
+}
+
+impl AdvancedOrders for Bitget {
+    /// Bitget spot has no in-place amend (orders are cancelled and re-placed),
+    /// so this returns an [`Error::Exchange`].
+    fn amend_order(
+        &mut self,
+        _symbol: &Symbol,
+        _order_id: &str,
+        _new_price: Option<Decimal>,
+        _new_quantity: Option<Decimal>,
+    ) -> Result<Order> {
+        Err(Error::Exchange {
+            code: "unsupported".to_string(),
+            message: "Bitget has no in-place amend; cancel and re-place the order".to_string(),
+        })
+    }
+    fn place_batch(&mut self, requests: &[OrderRequest]) -> Result<Vec<Result<Order>>> {
+        Bitget::place_batch(self, requests)
+    }
+    fn cancel_batch(&mut self, symbol: &Symbol, order_ids: &[String]) -> Result<()> {
+        Bitget::cancel_batch(self, symbol, order_ids)
+    }
+    /// Bitget has no OCO order-list (it uses standalone plan/trigger orders), so
+    /// this returns an [`Error::Exchange`].
+    fn place_oco(&mut self, _request: &OcoRequest) -> Result<Vec<Order>> {
+        Err(Error::Exchange {
+            code: "unsupported".to_string(),
+            message: "Bitget has no OCO order-list; use plan/trigger orders".to_string(),
+        })
+    }
+}
+
+/// The client order id used to align a batch element to its request: the
+/// caller's `clientOid` if set, else a synthetic index-based one.
+fn batch_client_oid(request: &OrderRequest, index: usize) -> String {
+    request
+        .client_order_id
+        .clone()
+        .unwrap_or_else(|| format!("wbatch-{index}"))
+}
+
+#[derive(Deserialize)]
+struct BatchOrdersResult {
+    #[serde(rename = "successList", default)]
+    success_list: Vec<BatchSuccess>,
+    #[serde(rename = "failureList", default)]
+    failure_list: Vec<BatchFailure>,
+}
+
+#[derive(Deserialize)]
+struct BatchSuccess {
+    #[serde(rename = "orderId", default)]
+    order_id: String,
+    #[serde(rename = "clientOid", default)]
+    client_oid: String,
+}
+
+#[derive(Deserialize)]
+struct BatchFailure {
+    #[serde(rename = "clientOid", default)]
+    client_oid: String,
+    #[serde(rename = "errorMsg", default)]
+    error_msg: String,
 }
 
 impl Exchange for Bitget {
@@ -1063,6 +1263,99 @@ mod tests {
     const MIX_POSITIONS: &str = r#"{"code":"00000","msg":"success","data":[
         {"symbol":"BTCUSDT","holdSide":"long","total":"0.5","openPriceAvg":"20000","markPrice":"20100","leverage":"10","unrealizedPL":"50","marginMode":"isolated"}
     ]}"#;
+
+    #[test]
+    fn stp_maps_to_stp_mode() {
+        let (bitget, mock) = signed_client(1000);
+        mock.push_json(
+            200,
+            r#"{"code":"00000","data":{"orderId":"1","clientOid":""}}"#,
+        );
+        bitget
+            .place_order(
+                &OrderRequest::limit_buy(symbol(), dec!(1), dec!(100))
+                    .with_stp(SelfTradePrevention::ExpireBoth),
+            )
+            .unwrap();
+        let reqs = mock.recorded_requests();
+        assert!(reqs[0]
+            .body
+            .as_ref()
+            .unwrap()
+            .contains(r#""stpMode":"cancel_both""#));
+    }
+
+    #[test]
+    fn place_batch_aligns_success_and_failure() {
+        let (bitget, mock) = signed_client(1000);
+        mock.push_json(
+            200,
+            r#"{"code":"00000","data":{
+            "successList":[{"orderId":"o1","clientOid":"wbatch-0"}],
+            "failureList":[{"clientOid":"wbatch-1","errorMsg":"insufficient"}]}}"#,
+        );
+        let results = bitget
+            .place_batch(&[
+                OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)),
+                OrderRequest::limit_buy(symbol(), dec!(1), dec!(101)),
+            ])
+            .unwrap();
+        assert_eq!(results[0].as_ref().unwrap().id, "o1");
+        assert!(matches!(
+            results[1].as_ref().unwrap_err(),
+            Error::OrderRejected { .. }
+        ));
+        let reqs = mock.recorded_requests();
+        assert!(reqs[0].url.contains("/api/v2/spot/trade/batch-orders"));
+        assert!(reqs[0]
+            .body
+            .as_ref()
+            .unwrap()
+            .contains(r#""clientOid":"wbatch-0""#));
+    }
+
+    #[test]
+    fn cancel_batch_is_one_call() {
+        let (bitget, mock) = signed_client(1000);
+        mock.push_json(200, r#"{"code":"00000","data":{"successList":[]}}"#);
+        bitget
+            .cancel_batch(&symbol(), &["1".to_string(), "2".to_string()])
+            .unwrap();
+        let reqs = mock.recorded_requests();
+        assert_eq!(reqs.len(), 1);
+        assert!(reqs[0]
+            .url
+            .contains("/api/v2/spot/trade/batch-cancel-order"));
+    }
+
+    #[test]
+    fn amend_and_oco_are_unsupported() {
+        let (mut bitget, _mock) = signed_client(1000);
+        assert!(matches!(
+            AdvancedOrders::amend_order(&mut bitget, &symbol(), "1", Some(dec!(1)), None)
+                .unwrap_err(),
+            Error::Exchange { .. }
+        ));
+        assert!(matches!(
+            AdvancedOrders::place_oco(
+                &mut bitget,
+                &OcoRequest::new(symbol(), OrderSide::Sell, dec!(1), dec!(110), dec!(95))
+            )
+            .unwrap_err(),
+            Error::Exchange { .. }
+        ));
+    }
+
+    #[test]
+    fn futures_batch_is_a_documented_gap() {
+        let (bitget, _mock) = signed_futures_client(1000);
+        assert!(matches!(
+            bitget
+                .place_batch(&[OrderRequest::limit_buy(symbol(), dec!(1), dec!(100))])
+                .unwrap_err(),
+            Error::Exchange { .. }
+        ));
+    }
 
     #[test]
     fn futures_ticker_uses_mix_path() {
