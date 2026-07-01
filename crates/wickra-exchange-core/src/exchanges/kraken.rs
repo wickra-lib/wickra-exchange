@@ -19,6 +19,11 @@
 //! stream stays on the spot v2 feed, `query_order`/`cancel_order`/`open_orders`
 //! keep the spot shape, `openpositions` omits mark price and unrealized PnL, and
 //! `set_margin_mode(Isolated)` is unsupported within the flex (cross) account.
+//!
+//! [`AdvancedOrders`]: native in-place amend (`/0/private/EditOrder`, which
+//! assigns a new txid) and sequential `cancel_batch`. Kraken's `AddOrderBatch`
+//! uses indexed form-array fields that do not fit this binding's form helper, and
+//! it has no OCO order-list, so `place_batch`/`place_oco` are documented gaps.
 
 use crate::credentials::Credentials;
 use crate::error::{Error, Result};
@@ -28,9 +33,11 @@ use crate::options::{ExchangeOptions, MarginMode, MarketType};
 use crate::positions::{Position, PositionSide};
 use crate::signing::{hmac_sha512_base64_with_b64_secret, sha256};
 use crate::symbol::Symbol;
-use crate::traits::{Derivatives, Exchange, Execution, MarketData};
+use crate::traits::{AdvancedOrders, Derivatives, Exchange, Execution, MarketData};
 use crate::transport::{HttpMethod, HttpRequest, HttpTransport, WsConnection, WsTransport};
-use crate::types::{Balance, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker};
+use crate::types::{
+    Balance, OcoRequest, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker,
+};
 use rust_decimal::Decimal;
 use std::cell::Cell;
 use wickra_core::Candle;
@@ -1234,6 +1241,91 @@ impl Derivatives for Kraken {
     }
 }
 
+impl Kraken {
+    /// Amend a resting spot order's price and/or volume in place
+    /// (`/0/private/EditOrder`), then return the refreshed order (Kraken assigns a
+    /// new txid on edit).
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the order is unknown, the amend is rejected, or the
+    /// client targets Kraken Futures (a separate product).
+    pub fn amend_order(
+        &self,
+        symbol: &Symbol,
+        order_id: &str,
+        new_price: Option<Decimal>,
+        new_quantity: Option<Decimal>,
+    ) -> Result<Order> {
+        if self.is_futures() {
+            return Err(Error::Exchange {
+                code: "unsupported".to_string(),
+                message: "Kraken Futures edit is a separate endpoint".to_string(),
+            });
+        }
+        let mut params: Vec<(&str, String)> = vec![
+            ("txid", order_id.to_string()),
+            ("pair", Self::wire_symbol(symbol)),
+        ];
+        if let Some(p) = new_price {
+            params.push(("price", format_decimal(p)));
+        }
+        if let Some(q) = new_quantity {
+            params.push(("volume", format_decimal(q)));
+        }
+        let result = self.signed_post("/0/private/EditOrder", &params)?;
+        let new_txid = result
+            .get("txid")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| Error::Deserialization("missing txid".to_string()))?
+            .to_string();
+        self.query_order(symbol, &new_txid)
+    }
+
+    /// Cancel several orders by id. Kraken cancels one txid per call, so the ids
+    /// are cancelled sequentially.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if any cancel fails.
+    pub fn cancel_batch(&self, symbol: &Symbol, order_ids: &[String]) -> Result<()> {
+        for id in order_ids {
+            self.cancel_order(symbol, id)?;
+        }
+        Ok(())
+    }
+}
+
+impl AdvancedOrders for Kraken {
+    fn amend_order(
+        &mut self,
+        symbol: &Symbol,
+        order_id: &str,
+        new_price: Option<Decimal>,
+        new_quantity: Option<Decimal>,
+    ) -> Result<Order> {
+        Kraken::amend_order(self, symbol, order_id, new_price, new_quantity)
+    }
+    /// Kraken's `AddOrderBatch` encodes its order array as indexed form fields,
+    /// which does not fit this binding's form helper, so batch placement is a
+    /// documented gap (place orders individually).
+    fn place_batch(&mut self, _requests: &[OrderRequest]) -> Result<Vec<Result<Order>>> {
+        Err(Error::Exchange {
+            code: "unsupported".to_string(),
+            message: "Kraken AddOrderBatch is not yet wired; place orders individually".to_string(),
+        })
+    }
+    fn cancel_batch(&mut self, symbol: &Symbol, order_ids: &[String]) -> Result<()> {
+        Kraken::cancel_batch(self, symbol, order_ids)
+    }
+    /// Kraken has no OCO order-list (it uses conditional-close orders), so this
+    /// returns an [`Error::Exchange`].
+    fn place_oco(&mut self, _request: &OcoRequest) -> Result<Vec<Order>> {
+        Err(Error::Exchange {
+            code: "unsupported".to_string(),
+            message: "Kraken has no OCO order-list; use conditional-close orders".to_string(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1299,6 +1391,63 @@ mod tests {
         )
         .with_clock(Box::new(move || now_ms));
         (kraken, mock)
+    }
+
+    #[test]
+    fn amend_order_edits_then_reads_new_txid() {
+        let (kraken, mock) = signed_client(1000);
+        mock.push_json(
+            200,
+            r#"{"error":[],"result":{"status":"ok","txid":"NEW1"}}"#,
+        );
+        mock.push_json(
+            200,
+            r#"{"error":[],"result":{"NEW1":{"status":"open","vol":"2","vol_exec":"0",
+            "price":"101","descr":{"pair":"XBTUSDT","type":"buy","ordertype":"limit","price":"101"}}}}"#,
+        );
+        let order = kraken
+            .amend_order(&symbol(), "OLD1", Some(dec!(101)), Some(dec!(2)))
+            .unwrap();
+        assert_eq!(order.id, "NEW1");
+        assert_eq!(order.quantity, dec!(2));
+        let reqs = mock.recorded_requests();
+        assert!(reqs[0].url.contains("/0/private/EditOrder"));
+        let body = reqs[0].body.as_ref().unwrap();
+        assert!(body.contains("txid=OLD1"));
+        assert!(body.contains("volume=2"));
+        assert!(body.contains("price=101"));
+    }
+
+    #[test]
+    fn cancel_batch_is_sequential() {
+        let (kraken, mock) = signed_client(1000);
+        mock.push_json(200, r#"{"error":[],"result":{"count":1}}"#);
+        mock.push_json(200, r#"{"error":[],"result":{"count":1}}"#);
+        kraken
+            .cancel_batch(&symbol(), &["1".to_string(), "2".to_string()])
+            .unwrap();
+        assert_eq!(mock.recorded_requests().len(), 2);
+    }
+
+    #[test]
+    fn place_batch_and_oco_are_unsupported() {
+        let (mut kraken, _mock) = signed_client(1000);
+        assert!(matches!(
+            AdvancedOrders::place_batch(
+                &mut kraken,
+                &[OrderRequest::limit_buy(symbol(), dec!(1), dec!(100))]
+            )
+            .unwrap_err(),
+            Error::Exchange { .. }
+        ));
+        assert!(matches!(
+            AdvancedOrders::place_oco(
+                &mut kraken,
+                &OcoRequest::new(symbol(), OrderSide::Sell, dec!(1), dec!(110), dec!(95))
+            )
+            .unwrap_err(),
+            Error::Exchange { .. }
+        ));
     }
 
     #[test]

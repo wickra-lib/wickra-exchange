@@ -13,20 +13,27 @@
 //! `open_orders` still target the spot order shape; the futures order object
 //! (numeric id, signed `size`, `finish_as`) differs and is a documented
 //! follow-up.
+//!
+//! [`AdvancedOrders`]: STP via `stp_act` on order create, native in-place amend
+//! (`PATCH /api/v4/spot/orders/{id}`) and native spot batch place/cancel
+//! (`/api/v4/spot/batch_orders`, `/cancel_batch_orders`, per-order `succeeded`
+//! flag). Gate has no OCO order-list, so `place_oco` is a documented gap.
 
 use crate::credentials::Credentials;
 use crate::error::{Error, Result};
 use crate::events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
 use crate::normalize::{format_decimal, parse_decimal};
-use crate::options::{ExchangeOptions, MarginMode, MarketType};
+use crate::options::{ExchangeOptions, MarginMode, MarketType, SelfTradePrevention};
 use crate::positions::{Position, PositionSide};
 use crate::signing::{hmac_sha512_hex, sha512_hex};
 use crate::symbol::Symbol;
-use crate::traits::{Derivatives, Exchange, Execution, MarketData};
+use crate::traits::{AdvancedOrders, Derivatives, Exchange, Execution, MarketData};
 use crate::transport::{
     HttpMethod, HttpRequest, HttpResponse, HttpTransport, WsConnection, WsTransport,
 };
-use crate::types::{Balance, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker};
+use crate::types::{
+    Balance, OcoRequest, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker,
+};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::Deserialize;
@@ -326,6 +333,9 @@ impl Gate {
             };
             body["text"] = serde_json::json!(text);
         }
+        if let Some(act) = stp_act_str(request.stp) {
+            body["stp_act"] = serde_json::json!(act);
+        }
         let value = self.signed_request(
             HttpMethod::Post,
             "/api/v4/spot/orders",
@@ -609,6 +619,17 @@ fn side_str(side: OrderSide) -> &'static str {
     match side {
         OrderSide::Buy => "buy",
         OrderSide::Sell => "sell",
+    }
+}
+
+/// The Gate `stp_act` value for a self-trade-prevention policy, or `None` to omit.
+/// Gate cancels the oldest (`co`), newest (`cn`) or both (`cb`) order.
+fn stp_act_str(stp: SelfTradePrevention) -> Option<&'static str> {
+    match stp {
+        SelfTradePrevention::None => None,
+        SelfTradePrevention::ExpireMaker => Some("co"),
+        SelfTradePrevention::ExpireTaker => Some("cn"),
+        SelfTradePrevention::ExpireBoth => Some("cb"),
     }
 }
 
@@ -1114,6 +1135,142 @@ impl Derivatives for Gate {
     }
 }
 
+impl Gate {
+    /// Amend a resting spot order's price and/or amount in place
+    /// (`PATCH /api/v4/spot/orders/{id}`).
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the order is unknown or the amend is rejected.
+    pub fn amend_order(
+        &self,
+        symbol: &Symbol,
+        order_id: &str,
+        new_price: Option<Decimal>,
+        new_quantity: Option<Decimal>,
+    ) -> Result<Order> {
+        let mut body = serde_json::json!({});
+        if let Some(q) = new_quantity {
+            body["amount"] = serde_json::json!(format_decimal(q));
+        }
+        if let Some(p) = new_price {
+            body["price"] = serde_json::json!(format_decimal(p));
+        }
+        let path = format!("/api/v4/spot/orders/{order_id}");
+        let query = format!("currency_pair={}", Self::wire_symbol(symbol));
+        let value = self.signed_request(HttpMethod::Patch, &path, &query, &body.to_string())?;
+        let raw: RawOrder = parse_json(value)?;
+        order_from_raw(symbol.clone(), &raw)
+    }
+
+    /// Place several spot orders in one request (`/api/v4/spot/batch_orders`).
+    /// Each element carries a `succeeded` flag, so each request's own [`Result`]
+    /// is preserved.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the batch request itself fails.
+    pub fn place_batch(&self, requests: &[OrderRequest]) -> Result<Vec<Result<Order>>> {
+        let items: Vec<serde_json::Value> = requests
+            .iter()
+            .map(|r| {
+                let mut o = serde_json::json!({
+                    "currency_pair": Self::wire_symbol(&r.symbol),
+                    "side": side_str(r.side),
+                    "type": order_type_str(r.order_type),
+                    "amount": format_decimal(r.quantity),
+                });
+                if let Some(price) = r.price {
+                    o["price"] = serde_json::json!(format_decimal(price));
+                }
+                if let Some(id) = &r.client_order_id {
+                    let text = if id.starts_with("t-") {
+                        id.clone()
+                    } else {
+                        format!("t-{id}")
+                    };
+                    o["text"] = serde_json::json!(text);
+                }
+                o
+            })
+            .collect();
+        let body = serde_json::Value::Array(items).to_string();
+        let value =
+            self.signed_request(HttpMethod::Post, "/api/v4/spot/batch_orders", "", &body)?;
+        let elements: Vec<serde_json::Value> = parse_json(value)?;
+        Ok(requests
+            .iter()
+            .zip(elements)
+            .map(|(req, elem)| {
+                let succeeded = elem
+                    .get("succeeded")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(true);
+                if !succeeded {
+                    let message = elem
+                        .get("message")
+                        .or_else(|| elem.get("label"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("order rejected in batch")
+                        .to_string();
+                    return Err(Error::OrderRejected {
+                        code: "batch".to_string(),
+                        message,
+                    });
+                }
+                let raw: RawOrder = serde_json::from_value(elem)
+                    .map_err(|e| Error::Deserialization(e.to_string()))?;
+                order_from_raw(req.symbol.clone(), &raw)
+            })
+            .collect())
+    }
+
+    /// Cancel several orders on one `symbol` in one request
+    /// (`/api/v4/spot/cancel_batch_orders`).
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the request fails.
+    pub fn cancel_batch(&self, symbol: &Symbol, order_ids: &[String]) -> Result<()> {
+        let pair = Self::wire_symbol(symbol);
+        let items: Vec<serde_json::Value> = order_ids
+            .iter()
+            .map(|id| serde_json::json!({ "currency_pair": pair, "id": id }))
+            .collect();
+        let body = serde_json::Value::Array(items).to_string();
+        self.signed_request(
+            HttpMethod::Post,
+            "/api/v4/spot/cancel_batch_orders",
+            "",
+            &body,
+        )?;
+        Ok(())
+    }
+}
+
+impl AdvancedOrders for Gate {
+    fn amend_order(
+        &mut self,
+        symbol: &Symbol,
+        order_id: &str,
+        new_price: Option<Decimal>,
+        new_quantity: Option<Decimal>,
+    ) -> Result<Order> {
+        Gate::amend_order(self, symbol, order_id, new_price, new_quantity)
+    }
+    fn place_batch(&mut self, requests: &[OrderRequest]) -> Result<Vec<Result<Order>>> {
+        Gate::place_batch(self, requests)
+    }
+    fn cancel_batch(&mut self, symbol: &Symbol, order_ids: &[String]) -> Result<()> {
+        Gate::cancel_batch(self, symbol, order_ids)
+    }
+    /// Gate has no OCO order-list (it uses standalone price-triggered orders), so
+    /// this returns an [`Error::Exchange`].
+    fn place_oco(&mut self, _request: &OcoRequest) -> Result<Vec<Order>> {
+        Err(Error::Exchange {
+            code: "unsupported".to_string(),
+            message: "Gate has no OCO order-list; use price-triggered orders".to_string(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1169,6 +1326,94 @@ mod tests {
         )
         .with_clock(Box::new(move || now_ms));
         (gate, mock)
+    }
+
+    const GATE_ORDER: &str = r#"{"id":"1","text":"","side":"buy","type":"limit","status":"open",
+        "amount":"1","filled_amount":"0","price":"100","avg_deal_price":"0"}"#;
+
+    #[test]
+    fn stp_maps_to_stp_act() {
+        let (gate, mock) = signed_client(1_000_000);
+        mock.push_json(200, GATE_ORDER);
+        gate.place_order(
+            &OrderRequest::limit_buy(symbol(), dec!(1), dec!(100))
+                .with_stp(SelfTradePrevention::ExpireBoth),
+        )
+        .unwrap();
+        let reqs = mock.recorded_requests();
+        assert!(reqs[0].body.as_ref().unwrap().contains(r#""stp_act":"cb""#));
+    }
+
+    #[test]
+    fn amend_order_patches_in_place() {
+        let (gate, mock) = signed_client(1_000_000);
+        mock.push_json(
+            200,
+            r#"{"id":"1","text":"","side":"buy","type":"limit","status":"open",
+            "amount":"2","filled_amount":"0","price":"101","avg_deal_price":"0"}"#,
+        );
+        let order = gate
+            .amend_order(&symbol(), "1", Some(dec!(101)), Some(dec!(2)))
+            .unwrap();
+        assert_eq!(order.quantity, dec!(2));
+        assert_eq!(order.price, Some(dec!(101)));
+        let reqs = mock.recorded_requests();
+        assert_eq!(reqs[0].method, HttpMethod::Patch);
+        assert!(reqs[0]
+            .url
+            .contains("/api/v4/spot/orders/1?currency_pair=BTC_USDT"));
+        let body = reqs[0].body.as_ref().unwrap();
+        assert!(body.contains(r#""amount":"2""#));
+        assert!(body.contains(r#""price":"101""#));
+    }
+
+    #[test]
+    fn place_batch_reads_succeeded_flag() {
+        let (gate, mock) = signed_client(1_000_000);
+        mock.push_json(
+            200,
+            r#"[{"succeeded":true,"id":"o1","text":"","side":"buy","type":"limit","status":"open",
+            "amount":"1","filled_amount":"0","price":"100","avg_deal_price":"0"},
+            {"succeeded":false,"label":"BALANCE_NOT_ENOUGH","message":"no funds"}]"#,
+        );
+        let results = gate
+            .place_batch(&[
+                OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)),
+                OrderRequest::limit_buy(symbol(), dec!(1), dec!(101)),
+            ])
+            .unwrap();
+        assert_eq!(results[0].as_ref().unwrap().id, "o1");
+        assert!(matches!(
+            results[1].as_ref().unwrap_err(),
+            Error::OrderRejected { .. }
+        ));
+        assert!(mock.recorded_requests()[0]
+            .url
+            .contains("/api/v4/spot/batch_orders"));
+    }
+
+    #[test]
+    fn cancel_batch_is_one_call() {
+        let (gate, mock) = signed_client(1_000_000);
+        mock.push_json(200, "[]");
+        gate.cancel_batch(&symbol(), &["1".to_string(), "2".to_string()])
+            .unwrap();
+        let reqs = mock.recorded_requests();
+        assert_eq!(reqs.len(), 1);
+        assert!(reqs[0].url.contains("/api/v4/spot/cancel_batch_orders"));
+    }
+
+    #[test]
+    fn place_oco_is_unsupported() {
+        let (mut gate, _mock) = signed_client(1_000_000);
+        assert!(matches!(
+            AdvancedOrders::place_oco(
+                &mut gate,
+                &OcoRequest::new(symbol(), OrderSide::Sell, dec!(1), dec!(110), dec!(95))
+            )
+            .unwrap_err(),
+            Error::Exchange { .. }
+        ));
     }
 
     fn futures_client() -> (Gate, Arc<MockHttpTransport>) {

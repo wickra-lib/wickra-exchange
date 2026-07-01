@@ -21,6 +21,8 @@ pub enum HttpMethod {
     Post,
     /// `PUT`.
     Put,
+    /// `PATCH`.
+    Patch,
     /// `DELETE`.
     Delete,
 }
@@ -33,6 +35,7 @@ impl HttpMethod {
             HttpMethod::Get => "GET",
             HttpMethod::Post => "POST",
             HttpMethod::Put => "PUT",
+            HttpMethod::Patch => "PATCH",
             HttpMethod::Delete => "DELETE",
         }
     }
@@ -331,6 +334,7 @@ mod tests {
         assert_eq!(HttpMethod::Get.as_str(), "GET");
         assert_eq!(HttpMethod::Post.as_str(), "POST");
         assert_eq!(HttpMethod::Put.as_str(), "PUT");
+        assert_eq!(HttpMethod::Patch.as_str(), "PATCH");
         assert_eq!(HttpMethod::Delete.as_str(), "DELETE");
     }
 
