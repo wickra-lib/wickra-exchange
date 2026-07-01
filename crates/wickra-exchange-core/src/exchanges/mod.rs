@@ -11,6 +11,7 @@ mod bitget;
 mod bybit;
 mod gate;
 mod htx;
+mod kraken;
 mod kucoin;
 mod okx;
 
@@ -19,5 +20,6 @@ pub use bitget::Bitget;
 pub use bybit::Bybit;
 pub use gate::Gate;
 pub use htx::Htx;
+pub use kraken::Kraken;
 pub use kucoin::KuCoin;
 pub use okx::Okx;
