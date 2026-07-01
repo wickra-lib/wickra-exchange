@@ -311,7 +311,7 @@ public sealed unsafe class Exchange : IDisposable
         return new OrderInfo(id, (Side)order.Side, (OrderStatus)order.Status, order.Quantity, order.FilledQuantity, price, avg);
     }
 
-    private static EventInfo ReadEvent(Native.Event ev)
+    internal static EventInfo ReadEvent(Native.Event ev)
     {
         string? symbol = null;
         var span = new Span<byte>(ev.Symbol, Native.StrCap);
