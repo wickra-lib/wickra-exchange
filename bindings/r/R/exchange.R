@@ -182,6 +182,17 @@ wkex_position <- function(deriv, market) {
   .wkex_position(.Call(C_wkex_derivatives_position, deriv$handle, market))
 }
 
+#' Every open position (list-all).
+#'
+#' Pass a `market` to scope to one symbol, or `NULL` for all.
+#' @param deriv A `wickra_derivatives` object.
+#' @param market Optional market symbol, or NULL for all positions.
+#' @return A list of position lists.
+#' @export
+wkex_positions <- function(deriv, market = NULL) {
+  lapply(.Call(C_wkex_derivatives_positions, deriv$handle, market), .wkex_position)
+}
+
 #' Set the leverage for a market.
 #' @param deriv A `wickra_derivatives` object.
 #' @param market Market symbol.
@@ -246,4 +257,49 @@ wkex_amend_order <- function(adv, market, order_id, new_price = NA_real_, new_qu
 #' @export
 wkex_cancel_batch <- function(adv, market, order_ids) {
   invisible(.Call(C_wkex_advanced_cancel_batch, adv$handle, market, as.character(order_ids)))
+}
+
+#' Place a one-cancels-other bracket.
+#'
+#' A take-profit limit leg at `price` paired with a stop leg triggered at
+#' `stop_price`. A finite `stop_limit_price` makes the stop leg a stop-limit;
+#' `NA` leaves it a stop-market.
+#' @param adv A `wickra_advanced` object.
+#' @param market Market symbol.
+#' @param side "buy" or "sell".
+#' @param quantity Order quantity.
+#' @param price Take-profit limit price.
+#' @param stop_price Stop trigger price.
+#' @param stop_limit_price Stop-leg limit price, or NA for a stop-market.
+#' @return A list of the resulting order legs.
+#' @export
+wkex_place_oco <- function(adv, market, side, quantity, price, stop_price, stop_limit_price = NA_real_) {
+  legs <- .Call(C_wkex_advanced_place_oco, adv$handle, market, .wkex_side(side),
+                as.numeric(quantity), as.numeric(price), as.numeric(stop_price),
+                as.numeric(stop_limit_price))
+  lapply(legs, .wkex_order)
+}
+
+#' Place several orders in one request.
+#'
+#' The orders are described by parallel vectors. `prices` uses `NA` for a market
+#' order and a finite value for a limit order.
+#' @param adv A `wickra_advanced` object.
+#' @param markets Character vector of market symbols.
+#' @param sides Character or integer vector of sides ("buy"/"sell").
+#' @param quantities Numeric vector of quantities.
+#' @param prices Numeric vector of prices (NA for a market order).
+#' @return A list of results, each `list(order = , error = )`: `order` on success
+#'   or `error` (an integer status code) on a per-order rejection.
+#' @export
+wkex_place_batch <- function(adv, markets, sides, quantities, prices) {
+  sides_int <- vapply(sides, .wkex_side, integer(1), USE.NAMES = FALSE)
+  results <- .Call(C_wkex_advanced_place_batch, adv$handle, as.character(markets),
+                   as.integer(sides_int), as.numeric(quantities), as.numeric(prices))
+  lapply(results, function(r) {
+    if (!is.null(r$order)) {
+      r$order <- .wkex_order(r$order)
+    }
+    r
+  })
 }
