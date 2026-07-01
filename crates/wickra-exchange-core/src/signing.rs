@@ -50,6 +50,12 @@ pub fn hmac_sha512_base64(secret: &[u8], message: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(hmac_sha512(secret, message))
 }
 
+/// The raw HMAC-SHA512 digest of `message` under `secret` (Upbit's JWT HS512).
+#[must_use]
+pub fn hmac_sha512_bytes(secret: &[u8], message: &[u8]) -> Vec<u8> {
+    hmac_sha512(secret, message)
+}
+
 /// The raw SHA-256 digest of `data` (Kraken hashes `nonce + body` before the HMAC).
 #[must_use]
 pub fn sha256(data: &[u8]) -> Vec<u8> {

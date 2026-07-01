@@ -15,6 +15,7 @@ mod htx;
 mod kraken;
 mod kucoin;
 mod okx;
+mod upbit;
 
 pub use binance::Binance;
 pub use bitget::Bitget;
@@ -25,3 +26,4 @@ pub use htx::Htx;
 pub use kraken::Kraken;
 pub use kucoin::KuCoin;
 pub use okx::Okx;
+pub use upbit::Upbit;
