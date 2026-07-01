@@ -6,8 +6,15 @@
 //! exercised only by gated `#[ignore]` integration tests against live testnets,
 //! never by the offline unit suite that drives the mock transports.
 
+use futures_util::{SinkExt, StreamExt};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::Arc;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
+use tokio_tungstenite::tungstenite::Message;
 use wickra_exchange_core::{
     Error, ExchangeOptions, HttpMethod, HttpRequest, HttpResponse, HttpTransport, Result,
+    WsConnection, WsTransport,
 };
 
 /// A synchronous HTTP transport backed by `reqwest`'s blocking client (rustls
@@ -70,6 +77,134 @@ impl HttpTransport for ReqwestHttpTransport {
     }
 }
 
+/// A pull-based WebSocket transport backed by tokio-tungstenite.
+///
+/// Each connection spawns a dedicated thread running a current-thread tokio
+/// runtime that owns the socket: it reads frames into a channel, answers pings,
+/// and forwards outbound messages. The synchronous [`WsConnection`] drains the
+/// inbound channel non-blockingly (`recv` returns `Ok(None)` when nothing is
+/// pending), so the pull model needs no runtime on the caller's side. Dropping
+/// the connection closes the outbound channel, which shuts the reader down.
+#[derive(Default)]
+pub struct TungsteniteWsTransport;
+
+impl TungsteniteWsTransport {
+    /// A new transport.
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl WsTransport for TungsteniteWsTransport {
+    fn connect(&self, url: &str) -> Result<Box<dyn WsConnection>> {
+        let (inbound_tx, inbound_rx) = mpsc::channel::<Result<Option<String>>>();
+        let (outbound_tx, mut outbound_rx) = unbounded_channel::<String>();
+        let closed = Arc::new(AtomicBool::new(false));
+        let closed_task = Arc::clone(&closed);
+        let url = url.to_string();
+
+        std::thread::spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(e) => {
+                    let _ = inbound_tx.send(Err(Error::Network(e.to_string())));
+                    return;
+                }
+            };
+            runtime.block_on(async move {
+                let stream = match tokio_tungstenite::connect_async(url.as_str()).await {
+                    Ok((stream, _response)) => stream,
+                    Err(e) => {
+                        let _ = inbound_tx.send(Err(Error::Network(e.to_string())));
+                        return;
+                    }
+                };
+                let (mut sink, mut source) = stream.split();
+                loop {
+                    if closed_task.load(Ordering::Relaxed) {
+                        let _ = sink.close().await;
+                        break;
+                    }
+                    tokio::select! {
+                        incoming = source.next() => match incoming {
+                            Some(Ok(Message::Text(text))) => {
+                                if inbound_tx.send(Ok(Some(text))).is_err() {
+                                    break;
+                                }
+                            }
+                            Some(Ok(Message::Binary(bytes))) => {
+                                if let Ok(text) = String::from_utf8(bytes) {
+                                    if inbound_tx.send(Ok(Some(text))).is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                            Some(Ok(Message::Ping(payload))) => {
+                                let _ = sink.send(Message::Pong(payload)).await;
+                            }
+                            Some(Ok(Message::Close(_))) | None => {
+                                let _ = inbound_tx.send(Ok(None));
+                                break;
+                            }
+                            Some(Ok(_)) => {}
+                            Some(Err(e)) => {
+                                let _ = inbound_tx.send(Err(Error::Network(e.to_string())));
+                                break;
+                            }
+                        },
+                        outgoing = outbound_rx.recv() => {
+                            if let Some(text) = outgoing {
+                                if sink.send(Message::Text(text)).await.is_err() {
+                                    break;
+                                }
+                            } else {
+                                let _ = sink.close().await;
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        });
+
+        Ok(Box::new(RealWsConnection {
+            inbound: inbound_rx,
+            outbound: outbound_tx,
+            closed,
+        }))
+    }
+}
+
+struct RealWsConnection {
+    inbound: Receiver<Result<Option<String>>>,
+    outbound: UnboundedSender<String>,
+    closed: Arc<AtomicBool>,
+}
+
+impl WsConnection for RealWsConnection {
+    fn send(&mut self, text: &str) -> Result<()> {
+        self.outbound
+            .send(text.to_string())
+            .map_err(|_| Error::NotConnected)
+    }
+
+    fn recv(&mut self) -> Result<Option<String>> {
+        match self.inbound.try_recv() {
+            Ok(item) => item,
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => Ok(None),
+        }
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.closed.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,5 +227,32 @@ mod tests {
         let response = transport.execute(&request).unwrap();
         assert!(response.is_success());
         assert!(response.body.contains("serverTime"));
+    }
+
+    #[test]
+    fn ws_transport_constructs() {
+        let _transport = TungsteniteWsTransport::new();
+    }
+
+    #[test]
+    #[ignore = "opens a live WebSocket; run explicitly with --ignored"]
+    fn live_ws_receives_binance_trades() {
+        use std::time::Duration;
+
+        let transport = TungsteniteWsTransport::new();
+        let mut connection = transport
+            .connect("wss://stream.binance.com:9443/ws/btcusdt@trade")
+            .unwrap();
+        // Poll for a few seconds until a frame arrives.
+        let mut got = None;
+        for _ in 0..50 {
+            if let Some(frame) = connection.recv().unwrap() {
+                got = Some(frame);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        connection.close().unwrap();
+        assert!(got.is_some_and(|f| f.contains("btcusdt") || f.contains("\"e\"")));
     }
 }
