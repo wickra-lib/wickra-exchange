@@ -33,4 +33,26 @@ public class DerivativesTests
         Assert.NotNull(d);
         Assert.NotNull(a);
     }
+
+    [Fact]
+    public void PlaceBatchEmptyIsNoop()
+    {
+        // An empty batch returns without opening a socket.
+        using var a = AdvancedOrders.Connect("binance", "k", "s");
+        var results = a.PlaceBatch(System.Array.Empty<BatchOrderRequest>());
+        Assert.Empty(results);
+    }
+
+    [Fact]
+    public void BatchRequestShapeRoundTrips()
+    {
+        var requests = new[]
+        {
+            new BatchOrderRequest("BTC/USDT", Side.Buy, 0.5, 60000),
+            new BatchOrderRequest("ETH/USDT", Side.Sell, 2, null),
+        };
+        Assert.Equal(2, requests.Length);
+        Assert.Equal(Side.Buy, requests[0].Side);
+        Assert.Null(requests[1].Price);
+    }
 }

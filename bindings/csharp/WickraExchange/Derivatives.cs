@@ -72,10 +72,43 @@ public sealed unsafe class Derivatives : IDisposable
         {
             Exchange.Check(Native.wickra_derivatives_position(_handle, mp, &pos));
         }
-        var symbol = Exchange.CString(new Span<byte>(pos.Symbol, Native.StrCap));
-        return new PositionInfo(
-            symbol, (PositionSide)pos.Side, pos.Quantity, pos.EntryPrice,
-            pos.MarkPrice, pos.Leverage, pos.UnrealizedPnl, (MarginMode)pos.MarginMode);
+        return Exchange.ReadPosition(pos);
+    }
+
+    /// <summary>
+    /// Every open position. Pass a <paramref name="market"/> to scope to one
+    /// symbol, or <c>null</c> for all. Grows its buffer and re-queries if the
+    /// venue reports more positions than fit.
+    /// </summary>
+    public IReadOnlyList<PositionInfo> Positions(string? market = null)
+    {
+        byte[]? m = market is null ? null : Exchange.Utf8(market);
+        int cap = 16;
+        while (true)
+        {
+            var buffer = new Native.Position[cap];
+            int count;
+            fixed (byte* mp = m)
+            fixed (Native.Position* bp = buffer)
+            {
+                count = Native.wickra_derivatives_positions(_handle, mp, bp, (nuint)cap);
+            }
+            if (count < 0)
+            {
+                throw new WickraException($"positions failed with code {count}");
+            }
+            if (count > cap)
+            {
+                cap = count;
+                continue;
+            }
+            var result = new List<PositionInfo>(count);
+            for (int i = 0; i < count; i++)
+            {
+                result.Add(Exchange.ReadPosition(buffer[i]));
+            }
+            return result;
+        }
     }
 
     /// <summary>Set the leverage for <paramref name="market"/>.</summary>
@@ -121,8 +154,20 @@ public sealed unsafe class Derivatives : IDisposable
 }
 
 /// <summary>
-/// A live advanced-orders client: amend and batch cancel. Construct with
-/// <see cref="Connect"/>. Available on the eight trading venues.
+/// One order in a batch placement. A <c>null</c> <see cref="Price"/> places a
+/// market order; a value places a limit order.
+/// </summary>
+public sealed record BatchOrderRequest(string Market, Side Side, double Quantity, double? Price);
+
+/// <summary>
+/// One order's outcome in a batch placement: exactly one of <see cref="Order"/>
+/// (success) or <see cref="Error"/> (per-order rejection) is set.
+/// </summary>
+public sealed record BatchResult(OrderInfo? Order, string? Error);
+
+/// <summary>
+/// A live advanced-orders client: amend, batch place/cancel and OCO. Construct
+/// with <see cref="Connect"/>. Available on the eight trading venues.
 /// </summary>
 public sealed unsafe class AdvancedOrders : IDisposable
 {
@@ -195,6 +240,107 @@ public sealed unsafe class AdvancedOrders : IDisposable
         finally
         {
             foreach (var ptr in ids)
+            {
+                if (ptr != 0) { Marshal.FreeCoTaskMem(ptr); }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Place a one-cancels-other bracket: a take-profit limit leg at
+    /// <paramref name="price"/> paired with a stop leg triggered at
+    /// <paramref name="stopPrice"/>. A non-null <paramref name="stopLimitPrice"/>
+    /// makes the stop leg a stop-limit; <c>null</c> leaves it a stop-market.
+    /// Returns the resulting order legs.
+    /// </summary>
+    public IReadOnlyList<OrderInfo> PlaceOco(
+        string market, Side side, double quantity, double price, double stopPrice, double? stopLimitPrice = null)
+    {
+        var m = Exchange.Utf8(market);
+        double slp = stopLimitPrice ?? double.NaN;
+        int cap = 4;
+        while (true)
+        {
+            var buffer = new Native.Order[cap];
+            int count;
+            fixed (byte* mp = m)
+            fixed (Native.Order* bp = buffer)
+            {
+                count = Native.wickra_advanced_place_oco(
+                    _handle, mp, (int)side, quantity, price, stopPrice, slp, bp, (nuint)cap);
+            }
+            if (count < 0)
+            {
+                throw new WickraException($"place_oco failed with code {count}");
+            }
+            if (count > cap)
+            {
+                cap = count;
+                continue;
+            }
+            var result = new List<OrderInfo>(count);
+            for (int i = 0; i < count; i++)
+            {
+                result.Add(Exchange.ReadOrder(buffer[i]));
+            }
+            return result;
+        }
+    }
+
+    /// <summary>
+    /// Place several orders in one request. Returns one <see cref="BatchResult"/>
+    /// per request, in order: a per-order rejection surfaces in that result's
+    /// <see cref="BatchResult.Error"/>, while a whole-request failure throws.
+    /// </summary>
+    public IReadOnlyList<BatchResult> PlaceBatch(IReadOnlyList<BatchOrderRequest> requests)
+    {
+        int n = requests.Count;
+        if (n == 0)
+        {
+            return Array.Empty<BatchResult>();
+        }
+        var markets = new nint[n];
+        var sides = new int[n];
+        var quantities = new double[n];
+        var prices = new double[n];
+        for (int i = 0; i < n; i++)
+        {
+            markets[i] = Marshal.StringToCoTaskMemUTF8(requests[i].Market);
+            sides[i] = (int)requests[i].Side;
+            quantities[i] = requests[i].Quantity;
+            prices[i] = requests[i].Price ?? double.NaN;
+        }
+        try
+        {
+            var outBuf = new Native.Order[n];
+            var codes = new int[n];
+            int count;
+            fixed (nint* mp = markets)
+            fixed (int* sp = sides)
+            fixed (double* qp = quantities)
+            fixed (double* pp = prices)
+            fixed (Native.Order* op = outBuf)
+            fixed (int* cp = codes)
+            {
+                count = Native.wickra_advanced_place_batch(
+                    _handle, mp, sp, qp, pp, (nuint)n, op, cp, (nuint)n);
+            }
+            if (count < 0)
+            {
+                throw new WickraException($"place_batch failed with code {count}");
+            }
+            var result = new List<BatchResult>(count);
+            for (int i = 0; i < count; i++)
+            {
+                result.Add(codes[i] == Native.Ok
+                    ? new BatchResult(Exchange.ReadOrder(outBuf[i]), null)
+                    : new BatchResult(null, $"order rejected with code {codes[i]}"));
+            }
+            return result;
+        }
+        finally
+        {
+            foreach (var ptr in markets)
             {
                 if (ptr != 0) { Marshal.FreeCoTaskMem(ptr); }
             }

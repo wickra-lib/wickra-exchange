@@ -293,6 +293,14 @@ public sealed unsafe class Exchange : IDisposable
         return Encoding.UTF8.GetString(end < 0 ? buf : buf[..end]);
     }
 
+    internal static PositionInfo ReadPosition(Native.Position pos)
+    {
+        var symbol = CString(new Span<byte>(pos.Symbol, Native.StrCap));
+        return new PositionInfo(
+            symbol, (PositionSide)pos.Side, pos.Quantity, pos.EntryPrice,
+            pos.MarkPrice, pos.Leverage, pos.UnrealizedPnl, (MarginMode)pos.MarginMode);
+    }
+
     internal static OrderInfo ReadOrder(Native.Order order)
     {
         string id;
