@@ -7,19 +7,38 @@
 //! `XBT` (`XBTUSDT`) and returns a `{error, result}` envelope where `result` is
 //! keyed by the venue's own pair name; the v2 WebSocket uses slash symbols
 //! (`BTC/USDT`).
+//!
+//! When built with a futures [`MarketType`](crate::MarketType), the client
+//! targets **Kraken Futures** (`futures.kraken.com`), a separate product: flex
+//! multi-collateral perpetuals named `PF_XBTUSD` (USD-settled), a distinct
+//! `{"result":"success"|"error"}` envelope, and its own signing
+//! (`Authent = base64(HMAC-SHA512(b64secret, SHA256(postData ++ nonce ++
+//! path)))`). Market data uses `/derivatives/api/v3/{tickers,orderbook}` and the
+//! `/api/charts/v1` OHLC feed; execution and the [`Derivatives`] trait use
+//! `sendorder`/`openpositions`/`leveragepreferences`. Documented gaps: the WS
+//! stream stays on the spot v2 feed, `query_order`/`cancel_order`/`open_orders`
+//! keep the spot shape, `openpositions` omits mark price and unrealized PnL, and
+//! `set_margin_mode(Isolated)` is unsupported within the flex (cross) account.
 
 use crate::credentials::Credentials;
 use crate::error::{Error, Result};
 use crate::events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
 use crate::normalize::{format_decimal, parse_decimal};
-use crate::options::ExchangeOptions;
+use crate::options::{ExchangeOptions, MarginMode, MarketType};
+use crate::positions::{Position, PositionSide};
 use crate::signing::{hmac_sha512_base64_with_b64_secret, sha256};
 use crate::symbol::Symbol;
-use crate::traits::{Exchange, Execution, MarketData};
+use crate::traits::{Derivatives, Exchange, Execution, MarketData};
 use crate::transport::{HttpMethod, HttpRequest, HttpTransport, WsConnection, WsTransport};
 use crate::types::{Balance, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker};
 use rust_decimal::Decimal;
+use std::cell::Cell;
 use wickra_core::Candle;
+
+/// Spot REST host.
+const SPOT_HOST: &str = "https://api.kraken.com";
+/// Kraken Futures host (a separate product with its own signing and symbols).
+const FUTURES_HOST: &str = "https://futures.kraken.com";
 
 fn system_now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -34,27 +53,53 @@ pub struct Kraken {
     http: Box<dyn HttpTransport>,
     ws: Option<Box<dyn WsTransport>>,
     rest_base: String,
+    market_type: MarketType,
     credentials: Option<Credentials>,
     now_ms: Box<dyn Fn() -> i64 + Send + Sync>,
     connection: Option<Box<dyn WsConnection>>,
     sub_messages: Vec<String>,
+    /// Leverage applied on Kraken Futures (`maxLeverage` preference), recorded so
+    /// [`positions`](Self::positions) can report it (the venue omits per-position
+    /// leverage in `openpositions`).
+    leverage: Cell<u32>,
 }
 
 impl Kraken {
     fn build(
         http: Box<dyn HttpTransport>,
-        _options: &ExchangeOptions,
+        options: &ExchangeOptions,
         credentials: Option<Credentials>,
     ) -> Self {
+        let futures = options.market_type.is_derivatives();
         Self {
             http,
             ws: None,
-            rest_base: "https://api.kraken.com".to_string(),
+            rest_base: if futures { FUTURES_HOST } else { SPOT_HOST }.to_string(),
+            market_type: options.market_type,
             credentials,
             now_ms: Box::new(system_now_ms),
             connection: None,
             sub_messages: Vec::new(),
+            leverage: Cell::new(1),
         }
+    }
+
+    /// Whether this client targets Kraken Futures (`futures.kraken.com`) rather
+    /// than the spot REST API.
+    fn is_futures(&self) -> bool {
+        self.market_type.is_derivatives()
+    }
+
+    /// The Kraken **Futures** perpetual symbol for a canonical [`Symbol`]
+    /// (`BTC/USD` -> `PF_XBTUSD`). Kraken flex perpetuals are USD-settled, so a
+    /// `USDT` quote maps to the `USD` contract.
+    fn futures_symbol(symbol: &Symbol) -> String {
+        let quote = if symbol.quote() == "USDT" {
+            "USD"
+        } else {
+            symbol.quote()
+        };
+        format!("PF_{}{}", kraken_asset(symbol.base()), quote)
     }
 
     /// Build a public Kraken client.
@@ -98,6 +143,9 @@ impl Kraken {
     /// # Errors
     /// Returns an [`Error`] if the request fails or the symbol is unknown.
     pub fn ticker(&self, symbol: &Symbol) -> Result<Ticker> {
+        if self.is_futures() {
+            return self.futures_ticker(symbol);
+        }
         let query = format!("pair={}", Self::wire_symbol(symbol));
         let result = self.get("/0/public/Ticker", &query)?;
         let tick = single_result(&result)?;
@@ -110,12 +158,38 @@ impl Kraken {
         })
     }
 
+    fn futures_ticker(&self, symbol: &Symbol) -> Result<Ticker> {
+        let wanted = Self::futures_symbol(symbol);
+        let value = self.futures_get("/derivatives/api/v3/tickers", "")?;
+        let tick = value
+            .get("tickers")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|list| {
+                list.iter().find(|t| {
+                    t.get("symbol")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|s| s.eq_ignore_ascii_case(&wanted))
+                })
+            })
+            .ok_or_else(|| Error::NotFound(format!("no ticker for {symbol}")))?;
+        Ok(Ticker {
+            symbol: symbol.clone(),
+            last: decimal_field(tick, "last").or_else(|_| decimal_field(tick, "markPrice"))?,
+            bid: decimal_field(tick, "bid").unwrap_or(Decimal::ZERO),
+            ask: decimal_field(tick, "ask").unwrap_or(Decimal::ZERO),
+            volume: decimal_field(tick, "vol24h").unwrap_or(Decimal::ZERO),
+        })
+    }
+
     /// Up to `limit` candles for `symbol` at `interval` (unified). Kraken returns
     /// oldest-first.
     ///
     /// # Errors
     /// Returns an [`Error`] if the request fails or a row cannot be parsed.
     pub fn klines(&self, symbol: &Symbol, interval: &str, _limit: u32) -> Result<Vec<Candle>> {
+        if self.is_futures() {
+            return self.futures_klines(symbol, interval);
+        }
         let query = format!(
             "pair={}&interval={}",
             Self::wire_symbol(symbol),
@@ -140,6 +214,19 @@ impl Kraken {
     /// # Errors
     /// Returns an [`Error`] if the request fails or the response cannot be parsed.
     pub fn order_book(&self, symbol: &Symbol, depth: u32) -> Result<OrderBookSnapshot> {
+        if self.is_futures() {
+            let query = format!("symbol={}", Self::futures_symbol(symbol));
+            let value = self.futures_get("/derivatives/api/v3/orderbook", &query)?;
+            let book = value
+                .get("orderBook")
+                .ok_or_else(|| Error::Deserialization("missing orderBook".to_string()))?;
+            return Ok(OrderBookSnapshot {
+                symbol: symbol.clone(),
+                last_update_id: 0,
+                bids: num_pair_levels(book.get("bids"))?,
+                asks: num_pair_levels(book.get("asks"))?,
+            });
+        }
         let query = format!("pair={}&count={depth}", Self::wire_symbol(symbol));
         let result = self.get("/0/public/Depth", &query)?;
         let book = single_result(&result)?;
@@ -223,6 +310,9 @@ impl Kraken {
     /// the venue rejects it.
     pub fn place_order(&self, request: &OrderRequest) -> Result<Order> {
         request.validate()?;
+        if self.is_futures() {
+            return self.place_futures_order(request);
+        }
         let volume = format_decimal(request.quantity);
         let mut params: Vec<(&str, String)> = vec![
             ("pair", Self::wire_symbol(&request.symbol)),
@@ -312,6 +402,9 @@ impl Kraken {
     /// # Errors
     /// Returns an [`Error`] if credentials are missing or the request fails.
     pub fn balances(&self) -> Result<Vec<Balance>> {
+        if self.is_futures() {
+            return self.futures_balances();
+        }
         let result = self.signed_post("/0/private/BalanceEx", &[])?;
         let map = result
             .as_object()
@@ -361,6 +454,263 @@ impl Kraken {
             .with_body(postdata);
         let response = self.http.execute(&request)?;
         unwrap_result(&response.body)
+    }
+
+    /// Public Kraken Futures GET (no signing).
+    fn futures_get(&self, path: &str, query: &str) -> Result<serde_json::Value> {
+        let url = if query.is_empty() {
+            format!("{}{path}", self.rest_base)
+        } else {
+            format!("{}{path}?{query}", self.rest_base)
+        };
+        let response = self.http.execute(&HttpRequest::get(url))?;
+        unwrap_futures(&response.body)
+    }
+
+    /// Signed Kraken Futures request. The signature is
+    /// `Authent = base64(HMAC-SHA512(base64decode(secret), SHA256(postData ++
+    /// nonce ++ endpointPath)))`, where `endpointPath` is the path **without** the
+    /// `/derivatives` prefix. `postData` is the form body (empty for a plain GET).
+    fn signed_futures(
+        &self,
+        method: HttpMethod,
+        path: &str,
+        params: &[(&str, String)],
+    ) -> Result<serde_json::Value> {
+        let creds = self.credentials.as_ref().ok_or(Error::InvalidCredentials(
+            "signed endpoint requires credentials",
+        ))?;
+        let nonce = (self.now_ms)().to_string();
+        let post_data = params
+            .iter()
+            .map(|(key, val)| format!("{key}={val}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        // The signed endpoint path drops the leading `/derivatives`.
+        let endpoint_path = path.strip_prefix("/derivatives").unwrap_or(path);
+        let concat = format!("{post_data}{nonce}{endpoint_path}");
+        let message = sha256(concat.as_bytes());
+        let signature = hmac_sha512_base64_with_b64_secret(&creds.api_secret, &message)?;
+        let is_get = matches!(method, HttpMethod::Get);
+        let url = if is_get && !post_data.is_empty() {
+            format!("{}{path}?{post_data}", self.rest_base)
+        } else {
+            format!("{}{path}", self.rest_base)
+        };
+        let mut request = HttpRequest::new(method, url)
+            .with_header("APIKey", creds.api_key.clone())
+            .with_header("Nonce", nonce)
+            .with_header("Authent", signature);
+        if !is_get {
+            request = request
+                .with_header("Content-Type", "application/x-www-form-urlencoded")
+                .with_body(post_data);
+        }
+        let response = self.http.execute(&request)?;
+        unwrap_futures(&response.body)
+    }
+
+    fn futures_klines(&self, symbol: &Symbol, interval: &str) -> Result<Vec<Candle>> {
+        // Charts live under a separate base path (no `/derivatives`).
+        let path = format!(
+            "/api/charts/v1/trade/{}/{}",
+            Self::futures_symbol(symbol),
+            map_futures_resolution(interval),
+        );
+        let value = self.futures_get(&path, "")?;
+        let candles = value
+            .get("candles")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| Error::Deserialization("missing candles".to_string()))?;
+        candles.iter().map(parse_futures_candle).collect()
+    }
+
+    /// Place a Kraken Futures order (`/derivatives/api/v3/sendorder`): `orderType`
+    /// (`mkt`/`lmt`/`post`), `symbol`, `side`, `size`, optional `limitPrice`, and
+    /// `reduceOnly`.
+    fn place_futures_order(&self, request: &OrderRequest) -> Result<Order> {
+        let order_type = match (request.order_type, request.post_only) {
+            (OrderType::Market | OrderType::StopMarket, _) => "mkt",
+            (OrderType::Limit | OrderType::StopLimit, true) => "post",
+            (OrderType::Limit | OrderType::StopLimit, false) => "lmt",
+        };
+        let mut params: Vec<(&str, String)> = vec![
+            ("orderType", order_type.to_string()),
+            ("symbol", Self::futures_symbol(&request.symbol)),
+            ("side", side_str(request.side).to_string()),
+            ("size", format_decimal(request.quantity)),
+            ("reduceOnly", request.reduce_only.to_string()),
+        ];
+        if let Some(price) = request.price {
+            params.push(("limitPrice", format_decimal(price)));
+        }
+        if let Some(id) = &request.client_order_id {
+            params.push(("cliOrdId", id.clone()));
+        }
+        let value =
+            self.signed_futures(HttpMethod::Post, "/derivatives/api/v3/sendorder", &params)?;
+        let send_status = value
+            .get("sendStatus")
+            .ok_or_else(|| Error::Deserialization("missing sendStatus".to_string()))?;
+        let order_id = send_status
+            .get("order_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| Error::Deserialization("missing order_id".to_string()))?;
+        Ok(Order {
+            id: order_id.to_string(),
+            client_order_id: request.client_order_id.clone(),
+            symbol: request.symbol.clone(),
+            side: request.side,
+            order_type: request.order_type,
+            status: OrderStatus::New,
+            quantity: request.quantity,
+            filled_quantity: Decimal::ZERO,
+            price: request.price,
+            average_price: None,
+        })
+    }
+
+    /// Flex (multi-collateral) account balances
+    /// (`/derivatives/api/v3/accounts`).
+    fn futures_balances(&self) -> Result<Vec<Balance>> {
+        let value = self.signed_futures(HttpMethod::Get, "/derivatives/api/v3/accounts", &[])?;
+        let currencies = value
+            .get("accounts")
+            .and_then(|a| a.get("flex"))
+            .and_then(|f| f.get("currencies"))
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| Error::Deserialization("missing flex currencies".to_string()))?;
+        let mut balances: Vec<Balance> = currencies
+            .iter()
+            .map(|(asset, detail)| {
+                let quantity = decimal_field(detail, "quantity").unwrap_or(Decimal::ZERO);
+                let available = decimal_field(detail, "available").unwrap_or(quantity);
+                Balance {
+                    asset: asset.clone(),
+                    free: available,
+                    locked: (quantity - available).max(Decimal::ZERO),
+                }
+            })
+            .collect();
+        balances.sort_by(|a, b| a.asset.cmp(&b.asset));
+        Ok(balances)
+    }
+
+    /// Open positions on the futures account
+    /// (`/derivatives/api/v3/openpositions`).
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if credentials are missing or the request fails.
+    pub fn positions(&self, symbol: Option<&Symbol>) -> Result<Vec<Position>> {
+        let value =
+            self.signed_futures(HttpMethod::Get, "/derivatives/api/v3/openpositions", &[])?;
+        let list = value
+            .get("openPositions")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| Error::Deserialization("missing openPositions".to_string()))?;
+        let wanted = symbol.map(Self::futures_symbol);
+        list.iter()
+            .filter(|p| {
+                wanted.as_ref().is_none_or(|w| {
+                    p.get("symbol")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|s| s.eq_ignore_ascii_case(w))
+                })
+            })
+            .map(|p| self.parse_futures_position(p))
+            .collect()
+    }
+
+    /// Set the leverage preference for `symbol`
+    /// (`/derivatives/api/v3/leveragepreferences`, `maxLeverage`).
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the request is rejected or credentials are missing.
+    pub fn set_leverage(&self, symbol: &Symbol, leverage: u32) -> Result<()> {
+        let lever = leverage.max(1);
+        self.leverage.set(lever);
+        let params = vec![
+            ("symbol", Self::futures_symbol(symbol)),
+            ("maxLeverage", lever.to_string()),
+        ];
+        self.signed_futures(
+            HttpMethod::Put,
+            "/derivatives/api/v3/leveragepreferences",
+            &params,
+        )?;
+        Ok(())
+    }
+
+    /// Set the margin mode for `symbol`.
+    ///
+    /// Kraken Futures uses a **flex (multi-collateral, cross) account**, so
+    /// `Cross` is a no-op success; there is no per-symbol switch to isolated
+    /// within the flex account, so `Isolated` returns an [`Error::Exchange`].
+    ///
+    /// # Errors
+    /// Returns [`Error::Exchange`] when `Isolated` is requested.
+    pub fn set_margin_mode(&self, _symbol: &Symbol, mode: MarginMode) -> Result<()> {
+        match mode {
+            MarginMode::Cross => Ok(()),
+            MarginMode::Isolated => Err(Error::Exchange {
+                code: "unsupported".to_string(),
+                message: "Kraken Futures flex account is cross-margin; isolated is \
+                          not switchable per-symbol"
+                    .to_string(),
+            }),
+        }
+    }
+
+    /// Flatten the open position in `symbol` with a reduce-only market order.
+    ///
+    /// # Errors
+    /// Returns [`Error::NotFound`] if there is no open position, or another
+    /// [`Error`] if the request fails.
+    pub fn close_position(&self, symbol: &Symbol) -> Result<Order> {
+        let want = Self::futures_symbol(symbol);
+        let position = self
+            .positions(Some(symbol))?
+            .into_iter()
+            .find(|p| Self::futures_symbol(&p.symbol).eq_ignore_ascii_case(&want))
+            .ok_or_else(|| Error::NotFound(format!("no open position for {symbol}")))?;
+        let request = match position.side {
+            PositionSide::Long => OrderRequest::market_sell(symbol.clone(), position.quantity),
+            PositionSide::Short => OrderRequest::market_buy(symbol.clone(), position.quantity),
+        }
+        .reduce_only();
+        self.place_order(&request)
+    }
+
+    fn parse_futures_position(&self, data: &serde_json::Value) -> Result<Position> {
+        let side_raw = data
+            .get("side")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let side = match side_raw {
+            "long" => PositionSide::Long,
+            "short" => PositionSide::Short,
+            other => {
+                return Err(Error::Deserialization(format!(
+                    "unknown position side {other:?}"
+                )))
+            }
+        };
+        let contract = data
+            .get("symbol")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        Ok(Position {
+            symbol: symbol_from_futures(contract),
+            side,
+            quantity: decimal_field(data, "size").unwrap_or(Decimal::ZERO),
+            entry_price: decimal_field(data, "price").unwrap_or(Decimal::ZERO),
+            // `openpositions` omits mark price and unrealized PnL; leverage is a
+            // preference, not reported per-position, so the recorded value is used.
+            mark_price: Decimal::ZERO,
+            leverage: Decimal::from(self.leverage.get()),
+            unrealized_pnl: Decimal::ZERO,
+            margin_mode: MarginMode::Cross,
+        })
     }
 }
 
@@ -418,6 +768,126 @@ fn unwrap_result(body: &str) -> Result<serde_json::Value> {
         .get("result")
         .cloned()
         .ok_or_else(|| Error::Deserialization("missing result".to_string()))
+}
+
+/// Unwrap a Kraken Futures envelope: `{"result":"success", ...}` on success,
+/// `{"result":"error","error":"..."}` on failure. The payload fields are
+/// siblings of `result`, so the whole value is returned.
+fn unwrap_futures(body: &str) -> Result<serde_json::Value> {
+    let value: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| Error::Deserialization(e.to_string()))?;
+    match value.get("result").and_then(serde_json::Value::as_str) {
+        Some("error") => {
+            let error = value
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown error");
+            Err(map_futures_error(error))
+        }
+        _ => Ok(value),
+    }
+}
+
+fn map_futures_error(error: &str) -> Error {
+    match error {
+        "insufficientFunds" | "insufficientAvailableFunds" => Error::InsufficientBalance,
+        "apiLimitExceeded" => Error::RateLimited { retry_after: None },
+        "authenticationError" | "invalidAccount" => Error::Auth(error.to_string()),
+        "invalidUnit" | "invalidArgument" | "marketSuspended" => {
+            Error::InvalidSymbol(error.to_string())
+        }
+        "orderNotFound" | "notFound" => Error::NotFound(error.to_string()),
+        other => Error::Exchange {
+            code: "kraken-futures".to_string(),
+            message: other.to_string(),
+        },
+    }
+}
+
+/// Kraken Futures resolution for a unified interval.
+fn map_futures_resolution(interval: &str) -> &'static str {
+    match interval {
+        "1m" => "1m",
+        "5m" => "5m",
+        "15m" => "15m",
+        "30m" => "30m",
+        "4h" => "4h",
+        "12h" => "12h",
+        "1d" => "1d",
+        "1w" => "1w",
+        // Default (and "1h") map to the 1-hour resolution.
+        _ => "1h",
+    }
+}
+
+/// Kraken Futures order-book levels are `[price, size]` numeric arrays.
+fn num_pair_levels(value: Option<&serde_json::Value>) -> Result<Vec<BookLevel>> {
+    let array = value
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| Error::Deserialization("missing depth levels".to_string()))?;
+    array
+        .iter()
+        .map(|level| {
+            let pair = level
+                .as_array()
+                .ok_or_else(|| Error::Deserialization("depth level not an array".to_string()))?;
+            let price = decimal_value(
+                pair.first()
+                    .ok_or_else(|| Error::Deserialization("depth price missing".to_string()))?,
+            )?;
+            let quantity =
+                decimal_value(pair.get(1).ok_or_else(|| {
+                    Error::Deserialization("depth quantity missing".to_string())
+                })?)?;
+            Ok(BookLevel { price, quantity })
+        })
+        .collect()
+}
+
+fn parse_futures_candle(row: &serde_json::Value) -> Result<Candle> {
+    let ts = row
+        .get("time")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| Error::Deserialization("candle time missing".to_string()))?;
+    let f = |key: &str| -> Result<f64> {
+        let field = row
+            .get(key)
+            .ok_or_else(|| Error::Deserialization(format!("candle {key} missing")))?;
+        field
+            .as_f64()
+            .or_else(|| field.as_str().and_then(|s| s.parse().ok()))
+            .ok_or_else(|| Error::Deserialization(format!("candle {key} not a number")))
+    };
+    Candle::new(
+        f("open")?,
+        f("high")?,
+        f("low")?,
+        f("close")?,
+        f("volume")?,
+        ts,
+    )
+    .map_err(|e| Error::Deserialization(e.to_string()))
+}
+
+/// Reconstruct a canonical [`Symbol`] from a Kraken Futures perpetual symbol
+/// (`PF_XBTUSD` -> `BTC/USD`).
+fn symbol_from_futures(contract: &str) -> Symbol {
+    let core = contract
+        .strip_prefix("PF_")
+        .or_else(|| contract.strip_prefix("PI_"))
+        .or_else(|| contract.strip_prefix("pf_"))
+        .or_else(|| contract.strip_prefix("pi_"))
+        .unwrap_or(contract)
+        .to_uppercase();
+    for quote in ["USDT", "USDC", "USD", "EUR"] {
+        if let Some(base) = core.strip_suffix(quote) {
+            if !base.is_empty() {
+                let base = if base == "XBT" { "BTC" } else { base };
+                return Symbol::new(base, quote);
+            }
+        }
+    }
+    Symbol::new(core, "")
 }
 
 fn map_error(error: &str) -> Error {
@@ -749,6 +1219,21 @@ impl Exchange for Kraken {
     }
 }
 
+impl Derivatives for Kraken {
+    fn positions(&mut self, symbol: Option<&Symbol>) -> Result<Vec<Position>> {
+        Kraken::positions(self, symbol)
+    }
+    fn set_leverage(&mut self, symbol: &Symbol, leverage: u32) -> Result<()> {
+        Kraken::set_leverage(self, symbol, leverage)
+    }
+    fn set_margin_mode(&mut self, symbol: &Symbol, mode: MarginMode) -> Result<()> {
+        Kraken::set_margin_mode(self, symbol, mode)
+    }
+    fn close_position(&mut self, symbol: &Symbol) -> Result<Order> {
+        Kraken::close_position(self, symbol)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -793,6 +1278,202 @@ mod tests {
         )
         .with_clock(Box::new(move || now_ms));
         (kraken, mock)
+    }
+
+    fn futures_client() -> (Kraken, Arc<MockHttpTransport>) {
+        let mock = Arc::new(MockHttpTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::UsdMFutures);
+        (
+            Kraken::with_http(Box::new(ArcTransport(Arc::clone(&mock))), &opts),
+            mock,
+        )
+    }
+
+    fn signed_futures_client(now_ms: i64) -> (Kraken, Arc<MockHttpTransport>) {
+        let mock = Arc::new(MockHttpTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::UsdMFutures);
+        let kraken = Kraken::with_credentials(
+            Box::new(ArcTransport(Arc::clone(&mock))),
+            &opts,
+            Credentials::new("APIKEY", "c2VjcmV0"),
+        )
+        .with_clock(Box::new(move || now_ms));
+        (kraken, mock)
+    }
+
+    #[test]
+    fn futures_symbol_is_pf_usd_settled() {
+        assert_eq!(Kraken::futures_symbol(&symbol()), "PF_XBTUSD");
+        assert_eq!(
+            Kraken::futures_symbol(&Symbol::new("ETH", "USD")),
+            "PF_ETHUSD"
+        );
+    }
+
+    #[test]
+    fn futures_ticker_filters_by_symbol_on_the_futures_host() {
+        let (kraken, mock) = futures_client();
+        mock.push_json(
+            200,
+            r#"{"result":"success","tickers":[
+            {"symbol":"pf_ethusd","last":3000,"bid":2999,"ask":3001,"vol24h":10},
+            {"symbol":"pf_xbtusd","last":20000.5,"bid":19999,"ask":20001,"vol24h":1234}]}"#,
+        );
+        let ticker = kraken.ticker(&symbol()).unwrap();
+        assert_eq!(ticker.last, dec!(20000.5));
+        assert_eq!(ticker.bid, dec!(19999));
+        assert_eq!(ticker.volume, dec!(1234));
+        assert!(mock.recorded_requests()[0]
+            .url
+            .contains("futures.kraken.com/derivatives/api/v3/tickers"));
+    }
+
+    #[test]
+    fn futures_order_book_numeric_pairs() {
+        let (kraken, mock) = futures_client();
+        mock.push_json(
+            200,
+            r#"{"result":"success","orderBook":{"bids":[[100.0,1.0]],"asks":[[101.0,2.0]]}}"#,
+        );
+        let book = kraken.order_book(&symbol(), 5).unwrap();
+        assert_eq!(book.bids[0], BookLevel::new(dec!(100), dec!(1)));
+        assert_eq!(book.asks[0], BookLevel::new(dec!(101), dec!(2)));
+        assert!(mock.recorded_requests()[0]
+            .url
+            .contains("/derivatives/api/v3/orderbook?symbol=PF_XBTUSD"));
+    }
+
+    #[test]
+    fn futures_klines_from_charts_api() {
+        let (kraken, mock) = futures_client();
+        mock.push_json(
+            200,
+            r#"{"candles":[{"time":1700000000,"open":100,"high":110,"low":95,"close":105,"volume":12}]}"#,
+        );
+        let candles = kraken.klines(&symbol(), "1h", 1).unwrap();
+        assert_eq!(candles[0].timestamp, 1_700_000_000);
+        assert!((candles[0].high - 110.0).abs() < 1e-9);
+        assert!(mock.recorded_requests()[0]
+            .url
+            .contains("/api/charts/v1/trade/PF_XBTUSD/1h"));
+    }
+
+    #[test]
+    fn futures_market_order_uses_sendorder() {
+        let (kraken, mock) = signed_futures_client(1000);
+        mock.push_json(
+            200,
+            r#"{"result":"success","sendStatus":{"order_id":"abc-1","status":"placed"}}"#,
+        );
+        let order = kraken
+            .place_order(&OrderRequest::market_buy(symbol(), dec!(2)))
+            .unwrap();
+        assert_eq!(order.id, "abc-1");
+        assert_eq!(order.status, OrderStatus::New);
+        let req = &mock.recorded_requests()[0];
+        assert!(req
+            .url
+            .contains("futures.kraken.com/derivatives/api/v3/sendorder"));
+        let body = req.body.as_ref().unwrap();
+        assert!(body.contains("orderType=mkt"));
+        assert!(body.contains("symbol=PF_XBTUSD"));
+        assert!(body.contains("side=buy"));
+        assert!(body.contains("reduceOnly=false"));
+        // Reconstruct the Authent signature over SHA256(postData ++ nonce ++ path).
+        let concat = format!("{body}1000/api/v3/sendorder");
+        let expected =
+            hmac_sha512_base64_with_b64_secret("c2VjcmV0", &sha256(concat.as_bytes())).unwrap();
+        let sign = req
+            .headers
+            .iter()
+            .find(|(k, _)| k == "Authent")
+            .map(|(_, v)| v.as_str())
+            .unwrap();
+        assert_eq!(sign, expected);
+    }
+
+    #[test]
+    fn derivatives_positions_parse() {
+        let (mut kraken, mock) = signed_futures_client(1000);
+        mock.push_json(200, r#"{"result":"success"}"#);
+        kraken.set_leverage(&symbol(), 5).unwrap();
+        mock.push_json(
+            200,
+            r#"{"result":"success","openPositions":[
+            {"symbol":"pf_xbtusd","side":"long","size":3,"price":20000}]}"#,
+        );
+        let positions = Derivatives::positions(&mut kraken, Some(&symbol())).unwrap();
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].symbol, Symbol::new("BTC", "USD"));
+        assert_eq!(positions[0].side, PositionSide::Long);
+        assert_eq!(positions[0].quantity, dec!(3));
+        assert_eq!(positions[0].entry_price, dec!(20000));
+        assert_eq!(positions[0].leverage, dec!(5)); // recorded via set_leverage
+        assert_eq!(positions[0].margin_mode, MarginMode::Cross);
+        let reqs = mock.recorded_requests();
+        assert!(reqs[0]
+            .url
+            .contains("/derivatives/api/v3/leveragepreferences"));
+        assert_eq!(reqs[0].method, HttpMethod::Put);
+        assert!(reqs[1].url.contains("/derivatives/api/v3/openpositions"));
+    }
+
+    #[test]
+    fn set_margin_mode_isolated_is_unsupported() {
+        let (kraken, _mock) = signed_futures_client(1000);
+        assert!(kraken.set_margin_mode(&symbol(), MarginMode::Cross).is_ok());
+        assert!(matches!(
+            kraken
+                .set_margin_mode(&symbol(), MarginMode::Isolated)
+                .unwrap_err(),
+            Error::Exchange { .. }
+        ));
+    }
+
+    #[test]
+    fn close_position_is_reduce_only_opposite() {
+        let (mut kraken, mock) = signed_futures_client(1000);
+        mock.push_json(
+            200,
+            r#"{"result":"success","openPositions":[
+            {"symbol":"pf_xbtusd","side":"long","size":3,"price":20000}]}"#,
+        );
+        mock.push_json(
+            200,
+            r#"{"result":"success","sendStatus":{"order_id":"c-9","status":"placed"}}"#,
+        );
+        Derivatives::close_position(&mut kraken, &symbol()).unwrap();
+        let reqs = mock.recorded_requests();
+        let body = reqs[1].body.as_ref().unwrap();
+        assert!(body.contains("side=sell"));
+        assert!(body.contains("reduceOnly=true"));
+    }
+
+    #[test]
+    fn futures_balances_from_flex_currencies() {
+        let (kraken, mock) = signed_futures_client(1000);
+        mock.push_json(
+            200,
+            r#"{"result":"success","accounts":{"flex":{"currencies":{
+            "USD":{"quantity":1000,"available":800}}}}}"#,
+        );
+        let bals = kraken.balances().unwrap();
+        assert_eq!(bals[0].asset, "USD");
+        assert_eq!(bals[0].free, dec!(800));
+        assert_eq!(bals[0].locked, dec!(200));
+        assert!(mock.recorded_requests()[0]
+            .url
+            .contains("/derivatives/api/v3/accounts"));
+    }
+
+    #[test]
+    fn futures_error_envelope_maps() {
+        let (kraken, mock) = futures_client();
+        mock.push_json(200, r#"{"result":"error","error":"insufficientFunds"}"#);
+        assert!(matches!(
+            kraken.ticker(&symbol()).unwrap_err(),
+            Error::InsufficientBalance
+        ));
     }
 
     #[test]
