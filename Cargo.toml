@@ -10,9 +10,11 @@ resolver = "2"
 members = [
     "crates/wickra-exchange-core",
     "crates/wickra-exchange",
+    "crates/wickra-exchange-bench",
     "bindings/python",
     "bindings/node",
     "bindings/c",
+    "examples/rust",
 ]
 # The fuzz crate is its own (detached) workspace — cargo-fuzz builds it on its
 # own with sanitizer flags on a nightly toolchain.
