@@ -6,18 +6,26 @@
 //! **ISO-8601** timestamp plus method, request path and body, with a passphrase
 //! header. The ISO-8601 timestamp is derived from the injectable clock with a
 //! dependency-free civil-date conversion, so signing stays deterministic.
+//!
+//! [`AdvancedOrders`] is native: STP via `stpMode` on order create, amend via
+//! `/api/v5/trade/amend-order`, batch place/cancel via
+//! `/api/v5/trade/batch-orders` and `.../cancel-batch-orders`, and OCO via
+//! `/api/v5/trade/order-algo` (`ordType=oco`) — OKX models an OCO as one algo
+//! order, so `place_oco` returns a single order carrying the `algoId`.
 
 use crate::credentials::Credentials;
 use crate::error::{Error, Result};
 use crate::events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
 use crate::normalize::{format_decimal, parse_decimal};
-use crate::options::{ExchangeOptions, MarginMode, MarketType};
+use crate::options::{ExchangeOptions, MarginMode, MarketType, SelfTradePrevention};
 use crate::positions::{Position, PositionSide};
 use crate::signing::hmac_sha256_base64;
 use crate::symbol::Symbol;
-use crate::traits::{Derivatives, Exchange, Execution, MarketData};
+use crate::traits::{AdvancedOrders, Derivatives, Exchange, Execution, MarketData};
 use crate::transport::{HttpMethod, HttpRequest, HttpTransport, WsConnection, WsTransport};
-use crate::types::{Balance, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker};
+use crate::types::{
+    Balance, OcoRequest, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker,
+};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -314,6 +322,9 @@ impl Okx {
         if request.reduce_only {
             body["reduceOnly"] = serde_json::json!(true);
         }
+        if let Some(mode) = stp_mode_str(request.stp) {
+            body["stpMode"] = serde_json::json!(mode);
+        }
         let data = self.signed_request(
             HttpMethod::Post,
             "/api/v5/trade/order",
@@ -547,6 +558,16 @@ fn ord_type_str(order_type: OrderType) -> &'static str {
     match order_type {
         OrderType::Market | OrderType::StopMarket => "market",
         OrderType::Limit | OrderType::StopLimit => "limit",
+    }
+}
+
+/// The OKX `stpMode` value for a self-trade-prevention policy, or `None` to omit.
+fn stp_mode_str(stp: SelfTradePrevention) -> Option<&'static str> {
+    match stp {
+        SelfTradePrevention::None => None,
+        SelfTradePrevention::ExpireMaker => Some("cancel_maker"),
+        SelfTradePrevention::ExpireTaker => Some("cancel_taker"),
+        SelfTradePrevention::ExpireBoth => Some("cancel_both"),
     }
 }
 
@@ -976,6 +997,216 @@ impl Okx {
         .reduce_only();
         self.place_order(&request)
     }
+
+    /// Amend a resting order's price and/or quantity in place
+    /// (`/api/v5/trade/amend-order`), then return the refreshed order.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the order is unknown or the amend is rejected.
+    pub fn amend_order(
+        &self,
+        symbol: &Symbol,
+        order_id: &str,
+        new_price: Option<Decimal>,
+        new_quantity: Option<Decimal>,
+    ) -> Result<Order> {
+        let mut body = serde_json::json!({
+            "instId": self.inst_id(symbol),
+            "ordId": order_id,
+        });
+        if let Some(q) = new_quantity {
+            body["newSz"] = serde_json::json!(format_decimal(q));
+        }
+        if let Some(p) = new_price {
+            body["newPx"] = serde_json::json!(format_decimal(p));
+        }
+        let data = self.signed_request(
+            HttpMethod::Post,
+            "/api/v5/trade/amend-order",
+            "",
+            &body.to_string(),
+        )?;
+        let list: Vec<PlaceResult> = parse_json(data)?;
+        let amended = list.into_iter().next().ok_or_else(|| Error::Exchange {
+            code: "empty".to_string(),
+            message: "empty amend response".to_string(),
+        })?;
+        if amended.s_code != "0" {
+            return Err(Error::OrderRejected {
+                code: amended.s_code,
+                message: amended.s_msg,
+            });
+        }
+        self.query_order(symbol, order_id)
+    }
+
+    /// The JSON for one order in a batch (`/api/v5/trade/batch-orders`).
+    fn batch_order_json(&self, request: &OrderRequest) -> serde_json::Value {
+        let mut o = serde_json::json!({
+            "instId": self.inst_id(&request.symbol),
+            "tdMode": self.td_mode,
+            "side": side_str(request.side),
+            "ordType": ord_type_str(request.order_type),
+            "sz": format_decimal(request.quantity),
+        });
+        if let Some(price) = request.price {
+            o["px"] = serde_json::json!(format_decimal(price));
+        }
+        if let Some(id) = &request.client_order_id {
+            o["clOrdId"] = serde_json::json!(id.clone());
+        }
+        if request.reduce_only {
+            o["reduceOnly"] = serde_json::json!(true);
+        }
+        o
+    }
+
+    /// Place several orders in one request (`/api/v5/trade/batch-orders`). Each
+    /// element's `sCode` drives that leg's own [`Result`].
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the batch request itself fails.
+    pub fn place_batch(&self, requests: &[OrderRequest]) -> Result<Vec<Result<Order>>> {
+        let items: Vec<serde_json::Value> =
+            requests.iter().map(|r| self.batch_order_json(r)).collect();
+        let body = serde_json::Value::Array(items).to_string();
+        let data =
+            self.signed_request(HttpMethod::Post, "/api/v5/trade/batch-orders", "", &body)?;
+        let list: Vec<PlaceResult> = parse_json(data)?;
+        Ok(requests
+            .iter()
+            .zip(list)
+            .map(|(req, res)| {
+                if res.s_code != "0" {
+                    return Err(Error::OrderRejected {
+                        code: res.s_code,
+                        message: res.s_msg,
+                    });
+                }
+                Ok(Order {
+                    id: res.ord_id,
+                    client_order_id: (!res.cl_ord_id.is_empty()).then_some(res.cl_ord_id),
+                    symbol: req.symbol.clone(),
+                    side: req.side,
+                    order_type: req.order_type,
+                    status: OrderStatus::New,
+                    quantity: req.quantity,
+                    filled_quantity: Decimal::ZERO,
+                    price: req.price,
+                    average_price: None,
+                })
+            })
+            .collect())
+    }
+
+    /// Cancel several orders on one `symbol` in one request
+    /// (`/api/v5/trade/cancel-batch-orders`).
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the request fails.
+    pub fn cancel_batch(&self, symbol: &Symbol, order_ids: &[String]) -> Result<()> {
+        let inst = self.inst_id(symbol);
+        let items: Vec<serde_json::Value> = order_ids
+            .iter()
+            .map(|id| serde_json::json!({ "instId": inst, "ordId": id }))
+            .collect();
+        let body = serde_json::Value::Array(items).to_string();
+        self.signed_request(
+            HttpMethod::Post,
+            "/api/v5/trade/cancel-batch-orders",
+            "",
+            &body,
+        )?;
+        Ok(())
+    }
+
+    /// Place a one-cancels-other bracket. OKX models OCO as a single **algo**
+    /// order (`/api/v5/trade/order-algo`, `ordType=oco`) with take-profit and
+    /// stop-loss legs, so the returned vector holds one order carrying the
+    /// `algoId`.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the OCO is invalid or rejected.
+    pub fn place_oco(&self, request: &OcoRequest) -> Result<Vec<Order>> {
+        request.validate()?;
+        let sl_ord_px = request
+            .stop_limit_price
+            .map_or_else(|| "-1".to_string(), format_decimal); // -1 = stop-market leg
+        let mut body = serde_json::json!({
+            "instId": self.inst_id(&request.symbol),
+            "tdMode": self.td_mode,
+            "side": side_str(request.side),
+            "ordType": "oco",
+            "sz": format_decimal(request.quantity),
+            "tpTriggerPx": format_decimal(request.price),
+            "tpOrdPx": format_decimal(request.price),
+            "slTriggerPx": format_decimal(request.stop_price),
+            "slOrdPx": sl_ord_px,
+        });
+        if let Some(id) = &request.client_order_id {
+            body["algoClOrdId"] = serde_json::json!(id.clone());
+        }
+        let data = self.signed_request(
+            HttpMethod::Post,
+            "/api/v5/trade/order-algo",
+            "",
+            &body.to_string(),
+        )?;
+        let list: Vec<AlgoResult> = parse_json(data)?;
+        let algo = list.into_iter().next().ok_or_else(|| Error::Exchange {
+            code: "empty".to_string(),
+            message: "empty algo response".to_string(),
+        })?;
+        if algo.s_code != "0" {
+            return Err(Error::OrderRejected {
+                code: algo.s_code,
+                message: algo.s_msg,
+            });
+        }
+        Ok(vec![Order {
+            id: algo.algo_id,
+            client_order_id: request.client_order_id.clone(),
+            symbol: request.symbol.clone(),
+            side: request.side,
+            order_type: OrderType::StopLimit,
+            status: OrderStatus::New,
+            quantity: request.quantity,
+            filled_quantity: Decimal::ZERO,
+            price: Some(request.price),
+            average_price: None,
+        }])
+    }
+}
+
+impl AdvancedOrders for Okx {
+    fn amend_order(
+        &mut self,
+        symbol: &Symbol,
+        order_id: &str,
+        new_price: Option<Decimal>,
+        new_quantity: Option<Decimal>,
+    ) -> Result<Order> {
+        Okx::amend_order(self, symbol, order_id, new_price, new_quantity)
+    }
+    fn place_batch(&mut self, requests: &[OrderRequest]) -> Result<Vec<Result<Order>>> {
+        Okx::place_batch(self, requests)
+    }
+    fn cancel_batch(&mut self, symbol: &Symbol, order_ids: &[String]) -> Result<()> {
+        Okx::cancel_batch(self, symbol, order_ids)
+    }
+    fn place_oco(&mut self, request: &OcoRequest) -> Result<Vec<Order>> {
+        Okx::place_oco(self, request)
+    }
+}
+
+#[derive(Deserialize)]
+struct AlgoResult {
+    #[serde(rename = "algoId", default)]
+    algo_id: String,
+    #[serde(rename = "sCode", default)]
+    s_code: String,
+    #[serde(rename = "sMsg", default)]
+    s_msg: String,
 }
 
 impl Derivatives for Okx {
@@ -1100,6 +1331,103 @@ mod tests {
     const OKX_POSITIONS: &str = r#"{"code":"0","msg":"","data":[
         {"instId":"BTC-USDT-SWAP","posSide":"net","pos":"0.5","avgPx":"20000","markPx":"20100","lever":"10","upl":"50","mgnMode":"isolated"}
     ]}"#;
+
+    #[test]
+    fn stp_maps_to_stp_mode() {
+        let (okx, mock) = signed_client(1000);
+        mock.push_json(200, r#"{"code":"0","data":[{"ordId":"1","sCode":"0"}]}"#);
+        okx.place_order(
+            &OrderRequest::limit_buy(symbol(), dec!(1), dec!(100))
+                .with_stp(SelfTradePrevention::ExpireTaker),
+        )
+        .unwrap();
+        let reqs = mock.recorded_requests();
+        let body = reqs[0].body.as_ref().unwrap();
+        assert!(body.contains(r#""stpMode":"cancel_taker""#));
+    }
+
+    #[test]
+    fn amend_order_amends_then_reads_back() {
+        let (okx, mock) = signed_client(1000);
+        mock.push_json(200, r#"{"code":"0","data":[{"ordId":"1","sCode":"0"}]}"#);
+        mock.push_json(
+            200,
+            r#"{"code":"0","data":[{"instId":"BTC-USDT","ordId":"1","side":"buy",
+            "ordType":"limit","state":"live","sz":"2","px":"101"}]}"#,
+        );
+        let order = okx
+            .amend_order(&symbol(), "1", Some(dec!(101)), Some(dec!(2)))
+            .unwrap();
+        assert_eq!(order.quantity, dec!(2));
+        let reqs = mock.recorded_requests();
+        assert!(reqs[0].url.contains("/api/v5/trade/amend-order"));
+        let body = reqs[0].body.as_ref().unwrap();
+        assert!(body.contains(r#""newSz":"2""#));
+        assert!(body.contains(r#""newPx":"101""#));
+    }
+
+    #[test]
+    fn place_batch_per_order_results() {
+        let (okx, mock) = signed_client(1000);
+        mock.push_json(
+            200,
+            r#"{"code":"0","data":[
+            {"ordId":"o1","sCode":"0"},
+            {"ordId":"","sCode":"51000","sMsg":"bad symbol"}]}"#,
+        );
+        let results = okx
+            .place_batch(&[
+                OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)),
+                OrderRequest::limit_buy(symbol(), dec!(1), dec!(101)),
+            ])
+            .unwrap();
+        assert_eq!(results[0].as_ref().unwrap().id, "o1");
+        assert!(matches!(
+            results[1].as_ref().unwrap_err(),
+            Error::OrderRejected { .. }
+        ));
+        let reqs = mock.recorded_requests();
+        assert!(reqs[0].url.contains("/api/v5/trade/batch-orders"));
+        // The body is a bare JSON array of order objects.
+        assert!(reqs[0].body.as_ref().unwrap().starts_with('['));
+    }
+
+    #[test]
+    fn cancel_batch_is_one_call() {
+        let (okx, mock) = signed_client(1000);
+        mock.push_json(200, r#"{"code":"0","data":[{}]}"#);
+        okx.cancel_batch(&symbol(), &["1".to_string(), "2".to_string()])
+            .unwrap();
+        let reqs = mock.recorded_requests();
+        assert_eq!(reqs.len(), 1);
+        assert!(reqs[0].url.contains("/api/v5/trade/cancel-batch-orders"));
+    }
+
+    #[test]
+    fn place_oco_is_a_single_algo_order() {
+        let (okx, mock) = signed_client(1000);
+        mock.push_json(
+            200,
+            r#"{"code":"0","data":[{"algoId":"algo1","sCode":"0","sMsg":""}]}"#,
+        );
+        let legs = okx
+            .place_oco(&OcoRequest::new(
+                symbol(),
+                OrderSide::Sell,
+                dec!(1),
+                dec!(110),
+                dec!(95),
+            ))
+            .unwrap();
+        assert_eq!(legs.len(), 1);
+        assert_eq!(legs[0].id, "algo1");
+        let reqs = mock.recorded_requests();
+        assert!(reqs[0].url.contains("/api/v5/trade/order-algo"));
+        let body = reqs[0].body.as_ref().unwrap();
+        assert!(body.contains(r#""ordType":"oco""#));
+        assert!(body.contains(r#""tpTriggerPx":"110""#));
+        assert!(body.contains(r#""slTriggerPx":"95""#));
+    }
 
     #[test]
     fn swap_client_appends_swap_to_inst_id() {
