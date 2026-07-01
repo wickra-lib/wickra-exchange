@@ -69,6 +69,9 @@ pub struct Gate {
     /// [`subscribe_user_data`](Self::subscribe_user_data) and drained by
     /// [`poll_events`](Self::poll_events) alongside the public stream.
     private_connection: Option<Box<dyn WsConnection>>,
+    /// Set once the private stream is subscribed, so [`poll_events`](Self::poll_events)
+    /// re-subscribes it after a drop.
+    user_data_active: bool,
     /// A dedicated logged-in connection to the WebSocket order API, opened lazily
     /// on the first [`place_order_ws`](Self::place_order_ws) /
     /// [`cancel_order_ws`](Self::cancel_order_ws) call.
@@ -93,6 +96,7 @@ impl Gate {
             subscriptions: Vec::new(),
             leverage: 1,
             private_connection: None,
+            user_data_active: false,
             ws_api_connection: None,
         }
     }
@@ -305,12 +309,25 @@ impl Gate {
             }
         }
         // Drain the private user-data stream (spot.orders/spot.balances), if open.
-        // Re-authenticating a dropped private stream is a keepalive follow-up.
         if let Some(connection) = self.private_connection.as_mut() {
             while let Ok(Some(frame)) = connection.recv() {
                 if let Ok(mut parsed) = parse_ws_message(&frame, &resolve) {
                     events.append(&mut parsed);
                 }
+            }
+        }
+        // A dropped private stream is re-subscribed with fresh signed frames (the
+        // per-channel signature is time-bound, so a stale replay would be rejected).
+        if self.user_data_active
+            && self
+                .private_connection
+                .as_ref()
+                .is_some_and(|c| !c.is_connected())
+        {
+            events.push(Event::Disconnected);
+            self.private_connection = None;
+            if self.subscribe_user_data().is_ok() {
+                events.push(Event::Reconnected);
             }
         }
         let url = "wss://api.gateio.ws/ws/v4/";
@@ -331,7 +348,10 @@ impl Gate {
     /// [`poll_events`](Self::poll_events) also surfaces the account's own
     /// [`Event::OrderUpdate`] and [`Event::BalanceUpdate`].
     ///
-    /// Re-authenticating a dropped private stream is a keepalive follow-up.
+    /// A dropped private stream is re-subscribed automatically on the next
+    /// [`poll_events`](Self::poll_events); call
+    /// [`keepalive_user_data`](Self::keepalive_user_data) periodically to keep it
+    /// from being dropped for inactivity.
     ///
     /// # Errors
     /// Returns [`Error::InvalidCredentials`] without credentials,
@@ -355,6 +375,20 @@ impl Gate {
             connection.send(&message)?;
         }
         self.private_connection = Some(connection);
+        self.user_data_active = true;
+        Ok(())
+    }
+
+    /// Send an application-level heartbeat (the `ping` text frame) on the private
+    /// stream so it is not dropped for inactivity. A no-op before
+    /// [`subscribe_user_data`](Self::subscribe_user_data).
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the ping cannot be sent.
+    pub fn keepalive_user_data(&mut self) -> Result<()> {
+        if let Some(connection) = self.private_connection.as_mut() {
+            connection.send("ping")?;
+        }
         Ok(())
     }
 
@@ -1406,6 +1440,9 @@ impl WsUserData for Gate {
     fn subscribe_user_data(&mut self) -> Result<()> {
         Gate::subscribe_user_data(self)
     }
+    fn keepalive_user_data(&mut self) -> Result<()> {
+        Gate::keepalive_user_data(self)
+    }
 }
 
 impl WsExecution for Gate {
@@ -1683,6 +1720,46 @@ mod tests {
             gate.subscribe_user_data().unwrap_err(),
             Error::InvalidCredentials(_)
         ));
+    }
+
+    #[test]
+    fn keepalive_user_data_pings_the_private_stream() {
+        let (mut gate, ws) = signed_ws_client(1_700_000_000_000);
+        ws.push_connection(vec![]);
+        gate.subscribe_user_data().unwrap();
+        gate.keepalive_user_data().unwrap();
+        assert!(ws.sent().iter().any(|f| f == "ping"));
+    }
+
+    #[test]
+    fn keepalive_user_data_is_a_noop_before_subscribe() {
+        let (mut gate, ws) = signed_ws_client(1_700_000_000_000);
+        gate.keepalive_user_data().unwrap();
+        assert!(ws.sent().is_empty());
+    }
+
+    #[test]
+    fn dropped_user_data_stream_reconnects_with_fresh_signed_frames() {
+        let (mut gate, ws) = signed_ws_client(1_700_000_000_000);
+        // The first private connection closes on the first recv; the reconnect
+        // target is a fresh open connection.
+        ws.push_connection(vec![Ok(None)]);
+        ws.push_connection(vec![]);
+        gate.subscribe_user_data().unwrap();
+
+        let events = gate.poll_events();
+        assert!(events.contains(&Event::Disconnected));
+        assert!(events.contains(&Event::Reconnected));
+        // Two private connections (initial + reconnect); each re-signs the
+        // spot.orders subscribe, so four signed subscribe frames total.
+        let signed_subs = ws
+            .sent()
+            .into_iter()
+            .filter(|f| f.contains(r#""SIGN""#))
+            .count();
+        assert_eq!(signed_subs, 4);
+        assert_eq!(ws.connected_urls().len(), 2);
+        assert_eq!(ws.connected_urls()[1], "wss://api.gateio.ws/ws/v4/");
     }
 
     #[test]
