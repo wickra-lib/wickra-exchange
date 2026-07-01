@@ -18,6 +18,11 @@
 //! and cancel (native single-call `/fapi/v1/batchOrders` on futures, sequential
 //! on spot), and OCO brackets (`/api/v3/order/oco`, a spot order-list;
 //! unsupported on USDⓈ-M futures, which has no order-list).
+//!
+//! Binance is also the reference for [`WsExecution`]: `place_order_ws` /
+//! `cancel_order_ws` sign the request exactly like REST, wrap it in a
+//! `{id, method, params}` frame and exchange it on a dedicated `ws-api`
+//! connection (`wss://ws-api.binance.com/ws-api/v3`, or `ws-fapi` on futures).
 
 use crate::credentials::Credentials;
 use crate::error::{Error, Result};
@@ -28,7 +33,7 @@ use crate::options::{ExchangeOptions, MarginMode, MarketType, SelfTradePreventio
 use crate::positions::{Position, PositionSide};
 use crate::signing::hmac_sha256_hex;
 use crate::symbol::Symbol;
-use crate::traits::{AdvancedOrders, Derivatives, Exchange, Execution, MarketData};
+use crate::traits::{AdvancedOrders, Derivatives, Exchange, Execution, MarketData, WsExecution};
 use crate::transport::{
     HttpMethod, HttpRequest, HttpResponse, HttpTransport, WsConnection, WsTransport,
 };
@@ -65,6 +70,9 @@ pub struct Binance {
     sub_id: u64,
     sub_messages: Vec<String>,
     instruments: InstrumentCache,
+    /// A dedicated connection to the WebSocket order API (`ws-api`), opened lazily
+    /// on the first [`place_order_ws`](Self::place_order_ws) call.
+    ws_api_connection: Option<Box<dyn WsConnection>>,
 }
 
 impl Binance {
@@ -87,6 +95,7 @@ impl Binance {
             sub_id: 0,
             sub_messages: Vec::new(),
             instruments: InstrumentCache::new(),
+            ws_api_connection: None,
         }
     }
 
@@ -767,6 +776,138 @@ impl Binance {
             })
             .collect()
     }
+
+    /// Place an order over the Binance WebSocket API (`order.place`). Builds and
+    /// signs the request params exactly like the REST path, wraps them in a
+    /// `{id, method, params}` frame, sends it on the lazily-opened `ws-api`
+    /// connection and parses the response.
+    ///
+    /// # Errors
+    /// Returns [`Error::NotConnected`] if no WebSocket transport is configured, or
+    /// another [`Error`] if the order is invalid or rejected.
+    pub fn place_order_ws(&mut self, request: &OrderRequest) -> Result<Order> {
+        request.validate()?;
+        let type_str = if request.post_only && request.order_type == OrderType::Limit {
+            "LIMIT_MAKER"
+        } else {
+            order_type_str(request.order_type)
+        };
+        let mut params = vec![
+            ("symbol".to_string(), Self::wire_symbol(&request.symbol)),
+            ("side".to_string(), side_str(request.side).to_string()),
+            ("type".to_string(), type_str.to_string()),
+            ("quantity".to_string(), format_decimal(request.quantity)),
+        ];
+        if let Some(price) = request.price {
+            params.push(("price".to_string(), format_decimal(price)));
+        }
+        if matches!(type_str, "LIMIT" | "STOP_LOSS_LIMIT" | "TAKE_PROFIT_LIMIT") {
+            params.push((
+                "timeInForce".to_string(),
+                tif_str(request.time_in_force).to_string(),
+            ));
+        }
+        if let Some(id) = &request.client_order_id {
+            params.push(("newClientOrderId".to_string(), id.clone()));
+        }
+        let result = self.ws_request("order.place", params)?;
+        let raw: RawOrder =
+            serde_json::from_value(result).map_err(|e| Error::Deserialization(e.to_string()))?;
+        order_from_raw(request.symbol.clone(), &raw)
+    }
+
+    /// Cancel an order over the Binance WebSocket API (`order.cancel`).
+    ///
+    /// # Errors
+    /// Returns [`Error::NotConnected`] if no WebSocket transport is configured, or
+    /// another [`Error`] if the order is unknown or the request fails.
+    pub fn cancel_order_ws(&mut self, symbol: &Symbol, order_id: &str) -> Result<()> {
+        let params = vec![
+            ("symbol".to_string(), Self::wire_symbol(symbol)),
+            ("orderId".to_string(), order_id.to_string()),
+        ];
+        self.ws_request("order.cancel", params)?;
+        Ok(())
+    }
+
+    /// Sign `params`, wrap them in a `ws-api` request frame, send it on the
+    /// dedicated connection and return the response `result`.
+    fn ws_request(
+        &mut self,
+        method: &str,
+        mut params: Vec<(String, String)>,
+    ) -> Result<serde_json::Value> {
+        let creds = self.credentials.as_ref().ok_or(Error::InvalidCredentials(
+            "signed endpoint requires credentials",
+        ))?;
+        let id = (self.now_ms)();
+        params.push(("apiKey".to_string(), creds.api_key.clone()));
+        params.push(("timestamp".to_string(), id.to_string()));
+        // Binance signs the request over the alphabetically-sorted params.
+        params.sort_by(|a, b| a.0.cmp(&b.0));
+        let query = params
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        let signature = hmac_sha256_hex(creds.api_secret.as_bytes(), query.as_bytes());
+        params.push(("signature".to_string(), signature));
+        let mut obj = serde_json::Map::new();
+        for (k, v) in params {
+            obj.insert(k, serde_json::Value::String(v));
+        }
+        let frame = serde_json::json!({ "id": id, "method": method, "params": obj }).to_string();
+        // Open the ws-api connection on first use.
+        if self.ws_api_connection.is_none() {
+            let ws = self.ws.as_ref().ok_or(Error::NotConnected)?;
+            let url = ws_api_url(self.market_type, self.testnet);
+            self.ws_api_connection = Some(ws.connect(url)?);
+        }
+        let connection = self
+            .ws_api_connection
+            .as_mut()
+            .expect("ws-api connection just ensured");
+        connection.send(&frame)?;
+        let Some(response) = connection.recv()? else {
+            return Err(Error::NotConnected);
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&response).map_err(|e| Error::Deserialization(e.to_string()))?;
+        let status = value
+            .get("status")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+        if status == 200 {
+            Ok(value
+                .get("result")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null))
+        } else {
+            let error = value.get("error");
+            let code = error
+                .and_then(|e| e.get("code"))
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(status);
+            let message = error
+                .and_then(|e| e.get("msg"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            Err(Error::OrderRejected {
+                code: code.to_string(),
+                message,
+            })
+        }
+    }
+}
+
+impl WsExecution for Binance {
+    fn place_order_ws(&mut self, request: &OrderRequest) -> Result<Order> {
+        Binance::place_order_ws(self, request)
+    }
+    fn cancel_order_ws(&mut self, symbol: &Symbol, order_id: &str) -> Result<()> {
+        Binance::cancel_order_ws(self, symbol, order_id)
+    }
 }
 
 impl Derivatives for Binance {
@@ -1120,6 +1261,16 @@ fn ws_base_url(market_type: MarketType, testnet: bool) -> &'static str {
         (MarketType::UsdMFutures, true) => "wss://stream.binancefuture.com/ws",
         (_, true) => "wss://testnet.binance.vision/ws",
         (_, false) => "wss://stream.binance.com:9443/ws",
+    }
+}
+
+/// The WebSocket order-API (`ws-api`) URL for a market type and network.
+fn ws_api_url(market_type: MarketType, testnet: bool) -> &'static str {
+    match (market_type, testnet) {
+        (MarketType::UsdMFutures, false) => "wss://ws-fapi.binance.com/ws-fapi/v1",
+        (MarketType::UsdMFutures, true) => "wss://testnet.binancefuture.com/ws-fapi/v1",
+        (_, true) => "wss://ws-api.testnet.binance.vision/ws-api/v3",
+        (_, false) => "wss://ws-api.binance.com:443/ws-api/v3",
     }
 }
 
@@ -1726,6 +1877,86 @@ mod tests {
                 ))
                 .unwrap_err(),
             Error::Exchange { .. }
+        ));
+    }
+
+    /// An authenticated client with both a mock HTTP and a mock WS transport.
+    fn ws_signed_client(now_ms: i64) -> (Binance, Arc<MockWsTransport>) {
+        let http = Arc::new(MockHttpTransport::new());
+        let ws = Arc::new(MockWsTransport::new());
+        let opts = ExchangeOptions::mainnet(MarketType::Spot);
+        let binance = Binance::with_credentials(
+            Box::new(ArcTransport(http)),
+            &opts,
+            Credentials::new("APIKEY", "SECRET"),
+        )
+        .with_ws(Box::new(ArcWs(Arc::clone(&ws))))
+        .with_clock(Box::new(move || now_ms));
+        (binance, ws)
+    }
+
+    #[test]
+    fn place_order_ws_signs_and_parses() {
+        let (mut binance, ws) = ws_signed_client(1000);
+        ws.push_connection(vec![Ok(Some(
+            r#"{"id":1000,"status":200,"result":{"symbol":"BTCUSDT","orderId":55,
+            "clientOrderId":"","side":"BUY","type":"LIMIT","status":"NEW","origQty":"1",
+            "executedQty":"0","price":"100"}}"#
+                .to_string(),
+        ))]);
+        let order = WsExecution::place_order_ws(
+            &mut binance,
+            &OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)),
+        )
+        .unwrap();
+        assert_eq!(order.id, "55");
+        assert_eq!(order.status, OrderStatus::New);
+        assert_eq!(
+            ws.connected_urls()[0],
+            "wss://ws-api.binance.com:443/ws-api/v3"
+        );
+        let sent = &ws.sent()[0];
+        assert!(sent.contains(r#""method":"order.place""#));
+        assert!(sent.contains(r#""apiKey":"APIKEY""#));
+        assert!(sent.contains(r#""signature""#));
+        assert!(sent.contains(r#""timestamp":"1000""#));
+    }
+
+    #[test]
+    fn place_order_ws_surfaces_rejection() {
+        let (mut binance, ws) = ws_signed_client(1000);
+        ws.push_connection(vec![Ok(Some(
+            r#"{"id":1000,"status":400,"error":{"code":-2010,"msg":"insufficient balance"}}"#
+                .to_string(),
+        ))]);
+        assert!(matches!(
+            binance
+                .place_order_ws(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)))
+                .unwrap_err(),
+            Error::OrderRejected { .. }
+        ));
+    }
+
+    #[test]
+    fn cancel_order_ws_sends_cancel_method() {
+        let (mut binance, ws) = ws_signed_client(1000);
+        ws.push_connection(vec![Ok(Some(
+            r#"{"id":1000,"status":200,"result":{"symbol":"BTCUSDT","orderId":55}}"#.to_string(),
+        ))]);
+        WsExecution::cancel_order_ws(&mut binance, &symbol(), "55").unwrap();
+        let sent = &ws.sent()[0];
+        assert!(sent.contains(r#""method":"order.cancel""#));
+        assert!(sent.contains(r#""orderId":"55""#));
+    }
+
+    #[test]
+    fn ws_order_requires_a_ws_transport() {
+        let (mut binance, _mock) = signed_client(1000);
+        assert!(matches!(
+            binance
+                .place_order_ws(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)))
+                .unwrap_err(),
+            Error::NotConnected
         ));
     }
 

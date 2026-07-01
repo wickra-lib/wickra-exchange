@@ -179,3 +179,23 @@ pub trait AdvancedOrders {
     /// request fails.
     fn place_oco(&mut self, request: &OcoRequest) -> Result<Vec<Order>>;
 }
+
+/// Order placement and cancellation over a venue's WebSocket API (`ws-api`),
+/// where a signed request frame is sent on a dedicated connection and the
+/// matching response frame is read back. Lower-latency than REST; implemented by
+/// venues that expose a WebSocket order API.
+pub trait WsExecution {
+    /// Place an order over the WebSocket API and return it as the venue reports it.
+    ///
+    /// # Errors
+    /// Returns an [`Error`](crate::Error) if no WebSocket transport is configured,
+    /// the order is invalid, or the venue rejects it.
+    fn place_order_ws(&mut self, request: &OrderRequest) -> Result<Order>;
+
+    /// Cancel an order over the WebSocket API by venue id.
+    ///
+    /// # Errors
+    /// Returns an [`Error`](crate::Error) if no WebSocket transport is configured,
+    /// the order is unknown, or the request fails.
+    fn cancel_order_ws(&mut self, symbol: &Symbol, order_id: &str) -> Result<()>;
+}
