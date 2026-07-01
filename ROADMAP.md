@@ -48,23 +48,29 @@ a deep-dive in [docs/DERIVATIVES.md](docs/DERIVATIVES.md):
   field on `OrderRequest`, on all eight trading venues — native where the API
   supports it, a documented `Error::Exchange` where it does not.
 - **`WsUserData`** (private account/order stream → `poll_events` surfaces the
-  user's own `OrderUpdate` / `BalanceUpdate`) on all eight trading venues.
+  user's own `OrderUpdate` / `BalanceUpdate`) on all eight trading venues,
+  including the Kraken **futures** client over the separate `futures.kraken.com`
+  challenge/response feed. `keepalive_user_data` keeps the session alive, and a
+  dropped stream re-subscribes itself with fresh signed auth on the next
+  `poll_events` (`Event::Disconnected` → `Event::Reconnected`).
 - **`WsExecution`** (order placement over the WebSocket order API) — native on
-  Binance, Bybit, OKX, Gate.io and Kraken; a documented `Error::Exchange` on
-  Bitget, KuCoin and HTX (no WebSocket order-entry API).
+  Binance, Bybit, OKX, Gate.io and Kraken spot; a documented `Error::Exchange` on
+  Bitget, KuCoin and HTX, and REST-only on Kraken Futures (none of which expose a
+  WebSocket order-entry API).
 - All five surfaces are reachable through the facade factory (`connect`,
   `connect_derivatives`, `connect_advanced`, `connect_user_data`,
   `connect_ws_execution`) **and through all nine language bindings** — Python,
   Node.js, the C ABI hub and the Go / C# / Java / R wrappers over it.
 
-### Follow-ups
+### Remaining honest exceptions
 
-- Private-stream keepalive (Binance listen-key `PUT`, KuCoin bullet token,
-  per-venue re-auth on a dropped user-data stream).
-- Native batch where currently sequential (KuCoin/Kraken cancel-by-id, Kraken
-  `AddOrderBatch` indexed form).
-- Kraken Futures WebSocket (separate challenge/response feed on
-  `futures.kraken.com`).
+The follow-ups above are done (private-stream keepalive + auto-reconnect on all
+eight venues, Kraken native `place_batch` / `cancel_batch`, and Kraken Futures
+user-data over its challenge/response feed). Two gaps remain **only** because the
+venue API does not exist — documented, not emulated:
+
+- **KuCoin `cancel_batch`** is sequential (no batch-cancel-by-id endpoint).
+- **Kraken Futures `WsExecution`** is REST-only (no WebSocket order-entry API).
 
 ## Non-goals
 

@@ -112,6 +112,12 @@ export declare class UserData {
    * account's own order/balance events.
    */
   subscribeUserData(): void
+  /**
+   * Keep the private stream alive (refresh the venue session / send a
+   * heartbeat) so it is not dropped for inactivity; call this periodically. A
+   * dropped stream is also recovered automatically on the next `poll`.
+   */
+  keepaliveUserData(): void
   /** Drain all events buffered since the last call. */
   poll(): Array<StreamEvent>
 }

@@ -68,6 +68,9 @@ test("user-data and ws-execution construct and expose their surface", () => {
   // WsUserData: MarketData, so the client can poll (nothing buffered yet).
   assert.deepStrictEqual(userData.poll(), []);
   assert.strictEqual(typeof userData.subscribeUserData, "function");
+  // keepalive is a no-op before subscribe (no stream open yet).
+  assert.strictEqual(typeof userData.keepaliveUserData, "function");
+  userData.keepaliveUserData();
 
   const exec = WsExecution.connect("bybit", creds);
   assert.ok(exec);

@@ -42,6 +42,9 @@ def test_ws_clients_construct_and_expose_the_surface():
     # WsUserData: MarketData, so the client can poll (nothing is buffered yet).
     assert user_data.poll_events() == []
     assert hasattr(user_data, "subscribe_user_data")
+    # keepalive is a no-op before subscribe (no stream open yet).
+    assert hasattr(user_data, "keepalive_user_data")
+    user_data.keepalive_user_data()
 
     execution = wx.WsExecution.connect("bybit", creds)
     assert execution is not None
