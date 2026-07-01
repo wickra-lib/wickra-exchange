@@ -25,6 +25,22 @@ final class Native {
 
     static final int STR_CAP = 64;
 
+    static final int MARGIN_CROSS = 0;
+    static final int MARGIN_ISOLATED = 1;
+    static final int POSITION_LONG = 0;
+    static final int POSITION_SHORT = 1;
+
+    // WickraPosition field offsets (repr(C), 8-aligned; total 120 bytes).
+    static final long POSITION_SIZE = 120;
+    static final long P_SYMBOL = 0;
+    static final long P_SIDE = 64;
+    static final long P_QUANTITY = 72;
+    static final long P_ENTRY = 80;
+    static final long P_MARK = 88;
+    static final long P_LEVERAGE = 96;
+    static final long P_UPNL = 104;
+    static final long P_MARGIN_MODE = 112;
+
     // WickraOrder field offsets (repr(C), 8-aligned; total 104 bytes).
     static final long ORDER_SIZE = 104;
     static final long O_ID = 0;
@@ -78,6 +94,28 @@ final class Native {
             FunctionDescriptor.of(C_INT, C_PTR, C_PTR, C_PTR));
     static final MethodHandle POLL = handle("wickra_exchange_poll",
             FunctionDescriptor.of(C_INT, C_PTR, C_PTR, C_SIZE));
+
+    static final MethodHandle CONNECT_DERIVATIVES = handle("wickra_connect_derivatives",
+            FunctionDescriptor.of(C_PTR, C_PTR, C_PTR, C_PTR, C_PTR, C_PTR, C_BOOL));
+    static final MethodHandle DERIVATIVES_FREE = handle("wickra_derivatives_free",
+            FunctionDescriptor.ofVoid(C_PTR));
+    static final MethodHandle DERIVATIVES_POSITION = handle("wickra_derivatives_position",
+            FunctionDescriptor.of(C_INT, C_PTR, C_PTR, C_PTR));
+    static final MethodHandle DERIVATIVES_SET_LEVERAGE = handle("wickra_derivatives_set_leverage",
+            FunctionDescriptor.of(C_INT, C_PTR, C_PTR, C_INT));
+    static final MethodHandle DERIVATIVES_SET_MARGIN_MODE = handle("wickra_derivatives_set_margin_mode",
+            FunctionDescriptor.of(C_INT, C_PTR, C_PTR, C_INT));
+    static final MethodHandle DERIVATIVES_CLOSE_POSITION = handle("wickra_derivatives_close_position",
+            FunctionDescriptor.of(C_INT, C_PTR, C_PTR, C_PTR));
+
+    static final MethodHandle CONNECT_ADVANCED = handle("wickra_connect_advanced",
+            FunctionDescriptor.of(C_PTR, C_PTR, C_PTR, C_PTR, C_PTR, C_PTR, C_BOOL, C_BOOL));
+    static final MethodHandle ADVANCED_FREE = handle("wickra_advanced_free",
+            FunctionDescriptor.ofVoid(C_PTR));
+    static final MethodHandle ADVANCED_AMEND_ORDER = handle("wickra_advanced_amend_order",
+            FunctionDescriptor.of(C_INT, C_PTR, C_PTR, C_PTR, C_DOUBLE, C_DOUBLE, C_PTR));
+    static final MethodHandle ADVANCED_CANCEL_BATCH = handle("wickra_advanced_cancel_batch",
+            FunctionDescriptor.of(C_INT, C_PTR, C_PTR, C_PTR, C_SIZE));
 
     private static SymbolLookup loadLibrary() {
         String dir = System.getProperty("native.lib.dir");
