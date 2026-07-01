@@ -11,8 +11,9 @@
 //! validation, and the pull-based WebSocket market streams (trade/depth/ticker
 //! subscribe + `poll_events`), and the private user-data stream (listen key ->
 //! `wss://.../ws/<listenKey>`, whose order/balance frames `poll_events` surfaces
-//! as [`Event::OrderUpdate`]/[`Event::BalanceUpdate`]). The listen-key keepalive
-//! `PUT` and the real socket adapter land in a later slice.
+//! as [`Event::OrderUpdate`]/[`Event::BalanceUpdate`]; `keepalive_user_data`
+//! refreshes the listen key with a `PUT`, and a dropped stream re-subscribes on
+//! the next `poll_events`). The real socket adapter lands in a later slice.
 //!
 //! Binance is also the reference for [`AdvancedOrders`]: self-trade-prevention
 //! (the `stp` field maps to `selfTradePreventionMode`), amend (native
@@ -81,6 +82,12 @@ pub struct Binance {
     /// [`subscribe_user_data`](Self::subscribe_user_data) and drained by
     /// [`poll_events`](Self::poll_events) alongside the public stream.
     user_data_connection: Option<Box<dyn WsConnection>>,
+    /// The active listen key for the private stream, used by
+    /// [`keepalive_user_data`](Self::keepalive_user_data) to refresh it.
+    user_data_listen_key: Option<String>,
+    /// Set once the private stream is subscribed, so [`poll_events`](Self::poll_events)
+    /// re-subscribes it after a drop.
+    user_data_active: bool,
 }
 
 impl Binance {
@@ -105,6 +112,8 @@ impl Binance {
             instruments: InstrumentCache::new(),
             ws_api_connection: None,
             user_data_connection: None,
+            user_data_listen_key: None,
+            user_data_active: false,
         }
     }
 
@@ -344,8 +353,6 @@ impl Binance {
             }
         }
         // Drain the private user-data stream (order/balance updates), if open.
-        // Reconnecting it requires a fresh listen-key, tracked as a keepalive
-        // follow-up; here it is best-effort until dropped.
         if let Some(connection) = self.user_data_connection.as_mut() {
             while let Ok(Some(frame)) = connection.recv() {
                 if let Ok(Some(event)) = parse_ws_message(&frame, &resolve) {
@@ -353,6 +360,9 @@ impl Binance {
                 }
             }
         }
+        // A dropped private stream is re-subscribed with a fresh listen key
+        // (a stale replay would fail, since the key is single-use).
+        self.reconnect_user_data_if_dropped(&mut events);
         let url = ws_base_url(self.market_type, self.testnet);
         crate::wsutil::reconnect_if_dropped(
             self.ws.as_deref(),
@@ -362,6 +372,27 @@ impl Binance {
             &mut events,
         );
         events
+    }
+
+    /// Re-subscribe the private user-data stream if it has dropped, emitting
+    /// [`Event::Disconnected`] then [`Event::Reconnected`] around a fresh
+    /// [`subscribe_user_data`](Self::subscribe_user_data).
+    fn reconnect_user_data_if_dropped(&mut self, events: &mut Vec<Event>) {
+        if !self.user_data_active {
+            return;
+        }
+        let dropped = self
+            .user_data_connection
+            .as_ref()
+            .is_some_and(|c| !c.is_connected());
+        if !dropped {
+            return;
+        }
+        events.push(Event::Disconnected);
+        self.user_data_connection = None;
+        if self.subscribe_user_data().is_ok() {
+            events.push(Event::Reconnected);
+        }
     }
 
     /// Place an order. The order is validated locally first, then sent signed.
@@ -855,8 +886,10 @@ impl Binance {
     /// Afterwards [`poll_events`](Self::poll_events) also surfaces the account's
     /// own [`Event::OrderUpdate`] and [`Event::BalanceUpdate`].
     ///
-    /// The listen key expires after 60 minutes without a keepalive `PUT`; issuing
-    /// that keepalive is tracked as a follow-up.
+    /// The listen key expires after 60 minutes without a keepalive `PUT`; call
+    /// [`keepalive_user_data`](Self::keepalive_user_data) periodically to refresh
+    /// it. A dropped stream is re-subscribed automatically on the next
+    /// [`poll_events`](Self::poll_events).
     ///
     /// # Errors
     /// Returns [`Error::InvalidCredentials`] without an API key, [`Error::NotConnected`]
@@ -865,14 +898,11 @@ impl Binance {
         let creds = self.credentials.as_ref().ok_or(Error::InvalidCredentials(
             "user-data stream requires credentials",
         ))?;
-        let path = if self.is_futures() {
-            "/fapi/v1/listenKey"
-        } else {
-            "/api/v3/userDataStream"
-        };
-        let url = format!("{}{path}", self.rest_base);
-        let request = HttpRequest::new(HttpMethod::Post, url)
-            .with_header("X-MBX-APIKEY", creds.api_key.clone());
+        let request = HttpRequest::new(
+            HttpMethod::Post,
+            format!("{}{}", self.rest_base, self.listen_key_path()),
+        )
+        .with_header("X-MBX-APIKEY", creds.api_key.clone());
         let response = self.http.execute(&request)?;
         if !response.is_success() {
             return Err(map_error(&response));
@@ -882,14 +912,61 @@ impl Binance {
         let listen_key = value
             .get("listenKey")
             .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| Error::Deserialization("missing listenKey".to_string()))?;
+            .ok_or_else(|| Error::Deserialization("missing listenKey".to_string()))?
+            .to_string();
         let ws = self.ws.as_ref().ok_or(Error::NotConnected)?;
         let stream_url = format!(
             "{}/{listen_key}",
             ws_base_url(self.market_type, self.testnet)
         );
         self.user_data_connection = Some(ws.connect(&stream_url)?);
+        self.user_data_listen_key = Some(listen_key);
+        self.user_data_active = true;
         Ok(())
+    }
+
+    /// The REST path that mints / refreshes a listen key for this market type.
+    fn listen_key_path(&self) -> &'static str {
+        if self.is_futures() {
+            "/fapi/v1/listenKey"
+        } else {
+            "/api/v3/userDataStream"
+        }
+    }
+
+    /// Refresh the listen key so the private stream is not dropped after 60
+    /// minutes of inactivity (`PUT` the listen-key endpoint). A no-op before
+    /// [`subscribe_user_data`](Self::subscribe_user_data).
+    ///
+    /// # Errors
+    /// Returns [`Error::InvalidCredentials`] without an API key, or another
+    /// [`Error`] if the refresh request fails.
+    pub fn keepalive_user_data(&mut self) -> Result<()> {
+        let Some(listen_key) = self.user_data_listen_key.clone() else {
+            return Ok(());
+        };
+        let creds = self.credentials.as_ref().ok_or(Error::InvalidCredentials(
+            "user-data stream requires credentials",
+        ))?;
+        // Spot refreshes a specific key by query param; futures refreshes the
+        // account's single key with no param.
+        let url = if self.is_futures() {
+            format!("{}{}", self.rest_base, self.listen_key_path())
+        } else {
+            format!(
+                "{}{}?listenKey={listen_key}",
+                self.rest_base,
+                self.listen_key_path()
+            )
+        };
+        let request = HttpRequest::new(HttpMethod::Put, url)
+            .with_header("X-MBX-APIKEY", creds.api_key.clone());
+        let response = self.http.execute(&request)?;
+        if response.is_success() {
+            Ok(())
+        } else {
+            Err(map_error(&response))
+        }
     }
 
     /// Sign `params`, wrap them in a `ws-api` request frame, send it on the
@@ -975,6 +1052,9 @@ impl WsExecution for Binance {
 impl WsUserData for Binance {
     fn subscribe_user_data(&mut self) -> Result<()> {
         Binance::subscribe_user_data(self)
+    }
+    fn keepalive_user_data(&mut self) -> Result<()> {
+        Binance::keepalive_user_data(self)
     }
 }
 
@@ -2243,6 +2323,50 @@ mod tests {
             binance.subscribe_user_data().unwrap_err(),
             Error::InvalidCredentials(_)
         ));
+    }
+
+    #[test]
+    fn keepalive_user_data_refreshes_the_listen_key() {
+        let (mut binance, http, ws) = user_data_client(MarketType::Spot);
+        http.push_json(200, r#"{"listenKey":"listen-abc"}"#);
+        ws.push_connection(vec![]);
+        binance.subscribe_user_data().unwrap();
+        http.push_json(200, "{}"); // the keepalive PUT
+        binance.keepalive_user_data().unwrap();
+        let reqs = http.recorded_requests();
+        let put = &reqs[1];
+        assert_eq!(put.method, HttpMethod::Put);
+        assert!(put
+            .url
+            .contains("/api/v3/userDataStream?listenKey=listen-abc"));
+    }
+
+    #[test]
+    fn keepalive_user_data_is_a_noop_before_subscribe() {
+        let (mut binance, http, _ws) = user_data_client(MarketType::Spot);
+        binance.keepalive_user_data().unwrap();
+        assert!(http.recorded_requests().is_empty());
+    }
+
+    #[test]
+    fn dropped_user_data_stream_reconnects_with_a_fresh_listen_key() {
+        let (mut binance, http, ws) = user_data_client(MarketType::Spot);
+        http.push_json(200, r#"{"listenKey":"key-1"}"#);
+        // First private connection closes on the first recv; the reconnect target
+        // is a fresh open connection.
+        ws.push_connection(vec![Ok(None)]);
+        ws.push_connection(vec![]);
+        binance.subscribe_user_data().unwrap();
+        // The reconnect re-mints a listen key over REST.
+        http.push_json(200, r#"{"listenKey":"key-2"}"#);
+
+        let events = binance.poll_events();
+        assert!(events.contains(&Event::Disconnected));
+        assert!(events.contains(&Event::Reconnected));
+        // Two REST listen-key POSTs (initial + reconnect) and a second WS connection.
+        assert_eq!(http.recorded_requests().len(), 2);
+        assert_eq!(ws.connected_urls().len(), 2);
+        assert!(ws.connected_urls()[1].ends_with("/ws/key-2"));
     }
 
     #[test]

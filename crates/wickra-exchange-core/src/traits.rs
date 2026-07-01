@@ -198,6 +198,23 @@ pub trait WsUserData: MarketData {
     /// Returns an [`Error`](crate::Error) if credentials are missing, no WebSocket
     /// transport is configured, or the stream cannot be opened.
     fn subscribe_user_data(&mut self) -> Result<()>;
+
+    /// Keep the private user-data stream alive: refresh the venue's session so it
+    /// is not dropped for inactivity. The consumer calls this periodically (e.g.
+    /// on a timer). Venues that need a REST keepalive refresh their listen key;
+    /// venues that need an application-level heartbeat send a ping frame. The
+    /// default is a no-op for venues that need neither.
+    ///
+    /// A dropped stream is also recovered automatically on the next
+    /// [`poll_events`](MarketData::poll_events), which re-subscribes with fresh
+    /// credentials and emits [`Event::Disconnected`](crate::Event::Disconnected)
+    /// then [`Event::Reconnected`](crate::Event::Reconnected).
+    ///
+    /// # Errors
+    /// Returns an [`Error`](crate::Error) if the refresh request fails.
+    fn keepalive_user_data(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Order placement and cancellation over a venue's WebSocket API (`ws-api`),
