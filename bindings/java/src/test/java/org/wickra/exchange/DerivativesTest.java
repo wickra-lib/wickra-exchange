@@ -1,8 +1,12 @@
 package org.wickra.exchange;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.util.List;
 import org.junit.jupiter.api.Test;
 
 // Construction is offline (no socket opens until an RPC is issued), so the
@@ -32,5 +36,25 @@ class DerivativesTest {
             assertNotNull(d);
             assertNotNull(a);
         }
+    }
+
+    @Test
+    void placeBatchEmptyIsNoop() {
+        // An empty batch returns without opening a socket.
+        try (AdvancedOrders a = AdvancedOrders.connect("binance", "k", "s", null, null, false, false)) {
+            List<AdvancedOrders.BatchResult> results = a.placeBatch(List.of());
+            assertTrue(results.isEmpty());
+        }
+    }
+
+    @Test
+    void batchRequestShapeRoundTrips() {
+        var requests = List.of(
+                new AdvancedOrders.BatchOrderRequest("BTC/USDT", Exchange.Side.BUY, 0.5, 60000),
+                new AdvancedOrders.BatchOrderRequest("ETH/USDT", Exchange.Side.SELL, 2, Double.NaN));
+        assertEquals(2, requests.size());
+        assertEquals(Exchange.Side.BUY, requests.get(0).side());
+        assertTrue(Double.isNaN(requests.get(1).price()));
+        assertNull(new AdvancedOrders.BatchResult(null, "x").order());
     }
 }

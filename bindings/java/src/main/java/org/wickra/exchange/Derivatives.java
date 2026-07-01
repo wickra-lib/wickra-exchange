@@ -58,6 +58,37 @@ public final class Derivatives implements AutoCloseable {
         }
     }
 
+    /**
+     * Every open position. Pass a {@code market} to scope to one symbol, or
+     * {@code null} for all. Grows its buffer and re-queries if the venue reports
+     * more positions than fit.
+     */
+    public java.util.List<PositionInfo> positions(String market) {
+        int cap = 16;
+        while (true) {
+            try (Arena arena = Arena.ofConfined()) {
+                MemorySegment marketSeg = market == null ? MemorySegment.NULL : arena.allocateFrom(market);
+                MemorySegment out = arena.allocate(Native.POSITION_SIZE * cap, 8);
+                int count = (int) Native.DERIVATIVES_POSITIONS.invokeExact(handle, marketSeg, out, (long) cap);
+                if (count < 0) {
+                    throw new RuntimeException("positions failed with code " + count);
+                }
+                if (count > cap) {
+                    cap = count;
+                    continue;
+                }
+                java.util.List<PositionInfo> result = new java.util.ArrayList<>(count);
+                for (int i = 0; i < count; i++) {
+                    MemorySegment slot = out.asSlice((long) i * Native.POSITION_SIZE, Native.POSITION_SIZE);
+                    result.add(readPosition(slot));
+                }
+                return result;
+            } catch (Throwable t) {
+                throw new RuntimeException(t);
+            }
+        }
+    }
+
     /** Set the leverage for {@code market}. */
     public void setLeverage(String market, int leverage) {
         try (Arena arena = Arena.ofConfined()) {
