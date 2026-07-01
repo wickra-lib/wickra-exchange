@@ -12,7 +12,8 @@
 use crate::{ReqwestHttpTransport, TungsteniteWsTransport};
 use wickra_exchange_core::{
     AdvancedOrders, Binance, Bitget, Bybit, Coinbase, Credentials, Derivatives, Error, Exchange,
-    ExchangeOptions, Gate, HttpTransport, Htx, Kraken, KuCoin, Okx, Result, Upbit, WsTransport,
+    ExchangeOptions, Gate, HttpTransport, Htx, Kraken, KuCoin, Okx, Result, Upbit, WsExecution,
+    WsTransport, WsUserData,
 };
 
 /// Build the real blocking HTTP + pull-based WebSocket transports for a client.
@@ -133,6 +134,84 @@ pub fn connect_advanced(
     Ok(client)
 }
 
+/// Build a real-socket client that streams the account's own order and balance
+/// updates over a private WebSocket. After
+/// [`subscribe_user_data`](WsUserData::subscribe_user_data), the client's
+/// `poll_events` surfaces the user's own `OrderUpdate` / `BalanceUpdate` events.
+///
+/// Available on the eight trading venues; the spot-only venues (`coinbase`,
+/// `upbit`) return [`Error::UnsupportedExchange`].
+///
+/// # Errors
+///
+/// Returns [`Error::UnsupportedExchange`] if `name` is unknown or unsupported, or
+/// [`Error::Network`] if the HTTP client cannot be constructed from `options`.
+pub fn connect_user_data(
+    name: &str,
+    credentials: Credentials,
+    options: &ExchangeOptions,
+) -> Result<Box<dyn WsUserData>> {
+    let (http, ws) = transports(options)?;
+
+    let client: Box<dyn WsUserData> = match name.to_ascii_lowercase().as_str() {
+        "binance" => Box::new(Binance::with_credentials(http, options, credentials).with_ws(ws)),
+        "bybit" => Box::new(Bybit::with_credentials(http, options, credentials).with_ws(ws)),
+        "okx" => Box::new(Okx::with_credentials(http, options, credentials).with_ws(ws)),
+        "bitget" => Box::new(Bitget::with_credentials(http, options, credentials).with_ws(ws)),
+        "kucoin" => Box::new(KuCoin::with_credentials(http, options, credentials).with_ws(ws)),
+        "gateio" => Box::new(Gate::with_credentials(http, options, credentials).with_ws(ws)),
+        "htx" => Box::new(Htx::with_credentials(http, options, credentials).with_ws(ws)),
+        "kraken" => Box::new(Kraken::with_credentials(http, options, credentials).with_ws(ws)),
+        "coinbase" | "upbit" => {
+            return Err(Error::UnsupportedExchange(format!(
+                "{name} has no private user-data stream"
+            )))
+        }
+        other => return Err(Error::UnsupportedExchange(other.to_string())),
+    };
+    Ok(client)
+}
+
+/// Build a real-socket client that places and cancels orders over a venue's
+/// WebSocket order API.
+///
+/// Available on the eight trading venues. Order entry is native on `binance`,
+/// `bybit`, `okx`, `gateio` and `kraken`; on `bitget`, `kucoin` and `htx` the
+/// venue exposes no WebSocket order-entry API, so the methods return a documented
+/// error pointing to REST — see
+/// [docs/CAPABILITIES.md](https://github.com/wickra-lib/wickra-exchange/blob/main/docs/CAPABILITIES.md).
+/// The spot-only venues (`coinbase`, `upbit`) return [`Error::UnsupportedExchange`].
+///
+/// # Errors
+///
+/// Returns [`Error::UnsupportedExchange`] if `name` is unknown or unsupported, or
+/// [`Error::Network`] if the HTTP client cannot be constructed from `options`.
+pub fn connect_ws_execution(
+    name: &str,
+    credentials: Credentials,
+    options: &ExchangeOptions,
+) -> Result<Box<dyn WsExecution>> {
+    let (http, ws) = transports(options)?;
+
+    let client: Box<dyn WsExecution> = match name.to_ascii_lowercase().as_str() {
+        "binance" => Box::new(Binance::with_credentials(http, options, credentials).with_ws(ws)),
+        "bybit" => Box::new(Bybit::with_credentials(http, options, credentials).with_ws(ws)),
+        "okx" => Box::new(Okx::with_credentials(http, options, credentials).with_ws(ws)),
+        "bitget" => Box::new(Bitget::with_credentials(http, options, credentials).with_ws(ws)),
+        "kucoin" => Box::new(KuCoin::with_credentials(http, options, credentials).with_ws(ws)),
+        "gateio" => Box::new(Gate::with_credentials(http, options, credentials).with_ws(ws)),
+        "htx" => Box::new(Htx::with_credentials(http, options, credentials).with_ws(ws)),
+        "kraken" => Box::new(Kraken::with_credentials(http, options, credentials).with_ws(ws)),
+        "coinbase" | "upbit" => {
+            return Err(Error::UnsupportedExchange(format!(
+                "{name} has no WebSocket order API"
+            )))
+        }
+        other => return Err(Error::UnsupportedExchange(other.to_string())),
+    };
+    Ok(client)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,6 +296,50 @@ mod tests {
             match connect_advanced(name, creds(), &opts()) {
                 Err(Error::UnsupportedExchange(_)) => {}
                 _ => panic!("{name} must be rejected for advanced orders"),
+            }
+        }
+    }
+
+    #[test]
+    fn user_data_dispatch_covers_the_eight_trading_venues() {
+        for name in [
+            "binance", "bybit", "okx", "bitget", "kucoin", "gateio", "htx", "kraken",
+        ] {
+            assert!(
+                connect_user_data(name, creds(), &opts()).is_ok(),
+                "{name} should dispatch a user-data client"
+            );
+        }
+    }
+
+    #[test]
+    fn user_data_rejects_spot_only_and_unknown() {
+        for name in ["coinbase", "upbit", "ftx"] {
+            match connect_user_data(name, creds(), &opts()) {
+                Err(Error::UnsupportedExchange(_)) => {}
+                _ => panic!("{name} must be rejected for user-data streaming"),
+            }
+        }
+    }
+
+    #[test]
+    fn ws_execution_dispatch_covers_the_eight_trading_venues() {
+        for name in [
+            "binance", "bybit", "okx", "bitget", "kucoin", "gateio", "htx", "kraken",
+        ] {
+            assert!(
+                connect_ws_execution(name, creds(), &opts()).is_ok(),
+                "{name} should dispatch a ws-execution client"
+            );
+        }
+    }
+
+    #[test]
+    fn ws_execution_rejects_spot_only_and_unknown() {
+        for name in ["coinbase", "upbit", "ftx"] {
+            match connect_ws_execution(name, creds(), &opts()) {
+                Err(Error::UnsupportedExchange(_)) => {}
+                _ => panic!("{name} must be rejected for ws execution"),
             }
         }
     }

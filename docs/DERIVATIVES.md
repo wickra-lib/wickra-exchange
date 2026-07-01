@@ -82,31 +82,51 @@ operation natively, the method returns a documented `Error::Exchange` rather tha
 a fragile emulation — consult the matrix before relying on amend/OCO on a given
 venue.
 
-## `WsExecution` — order placement over the WebSocket API
+## `WsUserData` — private account/order stream
 
-Lower-latency placement over a venue's `ws-api`. Implemented on Binance as the
-reference; the request is signed exactly like REST, wrapped in a
-`{id, method, params}` frame, and exchanged on a dedicated connection opened
-lazily on first use.
+`subscribe_user_data` opens the account's private WebSocket stream so
+`poll_events` also surfaces the user's own `OrderUpdate` / `BalanceUpdate`
+events. Implemented on the eight trading venues (Binance listen key,
+Bybit/OKX/Bitget signed login, KuCoin bullet-private token, Gate signed
+subscribe, HTX v2 auth, Kraken token → `executions`/`balances`); Coinbase and
+Upbit are spot-only and do not implement it.
 
 ```rust
-use wickra_exchange::WsExecution;
+use wickra_exchange::{WsUserData, connect_user_data};
 
-let order = binance.place_order_ws(&req)?;
-binance.cancel_order_ws(&sym, &order.id)?;
+let mut client = connect_user_data("binance", creds, &opts)?;
+client.subscribe_user_data()?;
+for event in client.poll_events() { /* OrderUpdate / BalanceUpdate ... */ }
+```
+
+## `WsExecution` — order placement over the WebSocket API
+
+Lower-latency placement over a venue's WebSocket order API; the request is
+exchanged on a dedicated connection opened (and authenticated) lazily on first
+use. Native on **Binance, Bybit, OKX, Gate.io and Kraken**. Bitget, KuCoin and
+HTX expose no WebSocket order-entry API, so their `place_order_ws` /
+`cancel_order_ws` return a documented `Error::Exchange` pointing to REST.
+
+```rust
+use wickra_exchange::{WsExecution, connect_ws_execution};
+
+let mut client = connect_ws_execution("bybit", creds, &opts)?;
+let order = client.place_order_ws(&req)?;
+client.cancel_order_ws(&sym, &order.id)?;
 ```
 
 `place_order_ws` requires a WebSocket transport (`with_ws`); without one it
-returns `Error::NotConnected`. Other venues' ws-api placement follows the same
-pattern and is a documented follow-up.
+returns `Error::NotConnected`.
 
 ## Honest gaps
 
-- **Futures order shape** on Gate, Bitget, HTX and Kraken: `query_order` /
-  `cancel_order` / `open_orders` still use the spot order shape on a futures
-  client. Market data, `place_order`, `balances`, `positions` and
-  `close_position` are futures-correct.
-- **WS user-data streams** (private pushes) are not yet implemented on any venue.
-- **WS order placement** beyond Binance, and native batch on venues currently
-  falling back to sequential (KuCoin/Kraken cancel, Bitget futures batch,
-  Kraken `AddOrderBatch`), are follow-ups.
+- **Kraken Futures WS**: the `WsUserData` / `WsExecution` methods target the spot
+  v2 endpoints; the futures client returns `Error::Exchange` because Kraken
+  Futures uses a separate WebSocket feed (challenge/response auth on
+  `futures.kraken.com`).
+- **Private-stream keepalive**: re-authenticating / re-negotiating a dropped
+  user-data stream (Binance listen-key `PUT`, KuCoin bullet token, per-venue
+  re-auth) is a documented follow-up.
+- **Native batch** on venues currently falling back to sequential
+  (KuCoin/Kraken cancel-by-id, Kraken `AddOrderBatch` indexed form) is a
+  follow-up.

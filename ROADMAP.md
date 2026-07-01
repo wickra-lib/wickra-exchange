@@ -41,21 +41,31 @@ a deep-dive in [docs/DERIVATIVES.md](docs/DERIVATIVES.md):
 
 - **`Derivatives`** (positions / leverage / margin mode / reduce-only close) on
   all eight futures venues — Binance, Bybit, OKX, Bitget, KuCoin, Gate.io, HTX,
-  Kraken. Coinbase and Upbit stay spot-only.
+  Kraken. Coinbase and Upbit stay spot-only. The futures order lifecycle
+  (`query_order` / `cancel_order` / `open_orders`) now routes to the futures
+  endpoints on every venue (previously spot-shaped on Gate/Bitget/HTX/Kraken).
 - **`AdvancedOrders`** (amend, batch place/cancel, OCO) + a self-trade-prevention
   field on `OrderRequest`, on all eight trading venues — native where the API
   supports it, a documented `Error::Exchange` where it does not.
-- **`WsExecution`** (order placement over the ws-api) on Binance as the reference.
+- **`WsUserData`** (private account/order stream → `poll_events` surfaces the
+  user's own `OrderUpdate` / `BalanceUpdate`) on all eight trading venues.
+- **`WsExecution`** (order placement over the WebSocket order API) — native on
+  Binance, Bybit, OKX, Gate.io and Kraken; a documented `Error::Exchange` on
+  Bitget, KuCoin and HTX (no WebSocket order-entry API).
+- All five surfaces are reachable through the facade factory: `connect`,
+  `connect_derivatives`, `connect_advanced`, `connect_user_data`,
+  `connect_ws_execution`.
 
 ### Follow-ups
 
-- Futures order shape for `query_order`/`cancel_order`/`open_orders` on Gate,
-  Bitget, HTX and Kraken (currently spot-shaped on futures clients).
-- WS order placement beyond Binance; native batch where currently sequential
-  (KuCoin/Kraken cancel, Bitget futures batch, Kraken `AddOrderBatch`).
-- WS user-data (private account/order) streams.
-- Surfacing the derivatives + advanced-order + ws-execution traits through every
-  language binding.
+- Private-stream keepalive (Binance listen-key `PUT`, KuCoin bullet token,
+  per-venue re-auth on a dropped user-data stream).
+- Native batch where currently sequential (KuCoin/Kraken cancel-by-id, Kraken
+  `AddOrderBatch` indexed form).
+- Kraken Futures WebSocket (separate challenge/response feed on
+  `futures.kraken.com`).
+- Surfacing the user-data + ws-execution traits through every language binding
+  (the derivatives + advanced-order traits already are).
 
 ## Non-goals
 
