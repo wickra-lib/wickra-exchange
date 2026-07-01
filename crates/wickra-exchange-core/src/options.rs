@@ -49,6 +49,21 @@ pub enum MarginMode {
     Isolated,
 }
 
+/// Self-trade-prevention (STP) policy: what a venue does when an order would
+/// match against another order from the same account.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SelfTradePrevention {
+    /// No self-trade prevention (the venue default).
+    #[default]
+    None,
+    /// Expire the resting (maker) order in the self-match.
+    ExpireMaker,
+    /// Expire the incoming (taker) order in the self-match.
+    ExpireTaker,
+    /// Expire both orders in the self-match.
+    ExpireBoth,
+}
+
 /// Configuration for one exchange connection.
 #[derive(Debug, Clone)]
 pub struct ExchangeOptions {

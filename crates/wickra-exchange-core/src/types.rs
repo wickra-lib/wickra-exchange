@@ -5,6 +5,7 @@
 //! error) loses money. Indicator inputs stay `f64` — the boundary is the order
 //! layer, which this module defines.
 
+use crate::options::SelfTradePrevention;
 use crate::symbol::Symbol;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -110,6 +111,9 @@ pub struct OrderRequest {
     pub reduce_only: bool,
     /// Only rest as a maker; reject if it would take liquidity.
     pub post_only: bool,
+    /// Self-trade-prevention policy (defaults to [`SelfTradePrevention::None`]).
+    #[serde(default)]
+    pub stp: SelfTradePrevention,
 }
 
 impl OrderRequest {
@@ -125,6 +129,7 @@ impl OrderRequest {
             client_order_id: None,
             reduce_only: false,
             post_only: false,
+            stp: SelfTradePrevention::None,
         }
     }
 
@@ -183,6 +188,13 @@ impl OrderRequest {
     #[must_use]
     pub fn post_only(mut self) -> Self {
         self.post_only = true;
+        self
+    }
+
+    /// Set the self-trade-prevention policy.
+    #[must_use]
+    pub fn with_stp(mut self, stp: SelfTradePrevention) -> Self {
+        self.stp = stp;
         self
     }
 
@@ -288,6 +300,86 @@ pub struct Ticker {
     pub ask: Decimal,
     /// Rolling base-asset volume.
     pub volume: Decimal,
+}
+
+/// A one-cancels-other (OCO) order: a take-profit limit leg paired with a
+/// stop leg, where a fill on one cancels the other. Used to bracket a position
+/// with a profit target and a protective stop in a single request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OcoRequest {
+    /// The market to trade.
+    pub symbol: Symbol,
+    /// Buy or sell (both legs share the side).
+    pub side: OrderSide,
+    /// Order quantity in base units (both legs share the quantity).
+    pub quantity: Decimal,
+    /// The take-profit limit price (the resting maker leg).
+    pub price: Decimal,
+    /// The stop trigger price for the protective leg.
+    pub stop_price: Decimal,
+    /// The stop leg's limit price. When `None` the stop leg is a stop-market.
+    pub stop_limit_price: Option<Decimal>,
+    /// Optional client-supplied id for the order list.
+    pub client_order_id: Option<String>,
+}
+
+impl OcoRequest {
+    /// A new OCO with a take-profit `price` and a `stop_price` trigger (stop-market
+    /// protective leg). Refine with [`with_stop_limit_price`](Self::with_stop_limit_price)
+    /// and [`with_client_order_id`](Self::with_client_order_id).
+    #[must_use]
+    pub fn new(
+        symbol: Symbol,
+        side: OrderSide,
+        quantity: Decimal,
+        price: Decimal,
+        stop_price: Decimal,
+    ) -> Self {
+        Self {
+            symbol,
+            side,
+            quantity,
+            price,
+            stop_price,
+            stop_limit_price: None,
+            client_order_id: None,
+        }
+    }
+
+    /// Make the protective leg a stop-limit at `stop_limit_price` (rather than a stop-market).
+    #[must_use]
+    pub fn with_stop_limit_price(mut self, stop_limit_price: Decimal) -> Self {
+        self.stop_limit_price = Some(stop_limit_price);
+        self
+    }
+
+    /// Attach a client order id for the list.
+    #[must_use]
+    pub fn with_client_order_id(mut self, id: impl Into<String>) -> Self {
+        self.client_order_id = Some(id.into());
+        self
+    }
+
+    /// Validate the OCO: a strictly positive quantity, price and stop price.
+    ///
+    /// # Errors
+    /// Returns [`Error::InvalidOrder`](crate::Error::InvalidOrder) when an
+    /// invariant is violated.
+    pub fn validate(&self) -> crate::Result<()> {
+        use crate::Error;
+        if self.quantity <= Decimal::ZERO {
+            return Err(Error::InvalidOrder("quantity must be positive"));
+        }
+        if self.price <= Decimal::ZERO || self.stop_price <= Decimal::ZERO {
+            return Err(Error::InvalidOrder("OCO prices must be positive"));
+        }
+        if let Some(slp) = self.stop_limit_price {
+            if slp <= Decimal::ZERO {
+                return Err(Error::InvalidOrder("stop limit price must be positive"));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -430,5 +522,45 @@ mod tests {
             OrderRequest::limit_buy(btcusdt(), dec!(0.001), dec!(20000)).with_client_order_id("x");
         let json = serde_json::to_string(&req).unwrap();
         assert_eq!(serde_json::from_str::<OrderRequest>(&json).unwrap(), req);
+    }
+
+    #[test]
+    fn order_request_stp_defaults_and_builder() {
+        use crate::options::SelfTradePrevention;
+        let plain = OrderRequest::market_buy(btcusdt(), dec!(1));
+        assert_eq!(plain.stp, SelfTradePrevention::None);
+        let with = plain.with_stp(SelfTradePrevention::ExpireBoth);
+        assert_eq!(with.stp, SelfTradePrevention::ExpireBoth);
+    }
+
+    #[test]
+    fn oco_request_builders_and_validate() {
+        use crate::Error;
+        let oco = OcoRequest::new(btcusdt(), OrderSide::Sell, dec!(1), dec!(110), dec!(95))
+            .with_stop_limit_price(dec!(94))
+            .with_client_order_id("oco-1");
+        assert_eq!(oco.stop_limit_price, Some(dec!(94)));
+        assert_eq!(oco.client_order_id.as_deref(), Some("oco-1"));
+        assert!(oco.validate().is_ok());
+
+        // Non-positive quantity / prices are rejected.
+        let mut bad = oco.clone();
+        bad.quantity = dec!(0);
+        assert_eq!(
+            bad.validate().unwrap_err(),
+            Error::InvalidOrder("quantity must be positive")
+        );
+        let mut bad_price = oco.clone();
+        bad_price.stop_price = dec!(0);
+        assert_eq!(
+            bad_price.validate().unwrap_err(),
+            Error::InvalidOrder("OCO prices must be positive")
+        );
+        let mut bad_slp = oco;
+        bad_slp.stop_limit_price = Some(dec!(0));
+        assert_eq!(
+            bad_slp.validate().unwrap_err(),
+            Error::InvalidOrder("stop limit price must be positive")
+        );
     }
 }

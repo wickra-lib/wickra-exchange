@@ -11,22 +11,30 @@
 //! validation, and the pull-based WebSocket market streams (trade/depth/ticker
 //! subscribe + `poll_events`). The user-data stream (listenKey) and the real
 //! socket adapter land in a later slice.
+//!
+//! Binance is also the reference for [`AdvancedOrders`]: self-trade-prevention
+//! (the `stp` field maps to `selfTradePreventionMode`), amend (native
+//! `PUT /fapi/v1/order` on futures, atomic `cancelReplace` on spot), batch place
+//! and cancel (native single-call `/fapi/v1/batchOrders` on futures, sequential
+//! on spot), and OCO brackets (`/api/v3/order/oco`, a spot order-list;
+//! unsupported on USDⓈ-M futures, which has no order-list).
 
 use crate::credentials::Credentials;
 use crate::error::{Error, Result};
 use crate::events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
 use crate::instruments::{Instrument, InstrumentCache, InstrumentFilters};
 use crate::normalize::{format_decimal, parse_decimal};
-use crate::options::{ExchangeOptions, MarginMode, MarketType};
+use crate::options::{ExchangeOptions, MarginMode, MarketType, SelfTradePrevention};
 use crate::positions::{Position, PositionSide};
 use crate::signing::hmac_sha256_hex;
 use crate::symbol::Symbol;
-use crate::traits::{Derivatives, Exchange, Execution, MarketData};
+use crate::traits::{AdvancedOrders, Derivatives, Exchange, Execution, MarketData};
 use crate::transport::{
     HttpMethod, HttpRequest, HttpResponse, HttpTransport, WsConnection, WsTransport,
 };
 use crate::types::{
-    Balance, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker, TimeInForce,
+    Balance, OcoRequest, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker,
+    TimeInForce,
 };
 use rust_decimal::Decimal;
 use serde::Deserialize;
@@ -372,6 +380,10 @@ impl Binance {
         if request.reduce_only {
             params.push_str("&reduceOnly=true");
         }
+        if let Some(mode) = stp_str(request.stp) {
+            params.push_str("&selfTradePreventionMode=");
+            params.push_str(mode);
+        }
         let body = self.signed_request(HttpMethod::Post, self.order_path(), &params)?;
         parse_order(&request.symbol, &body)
     }
@@ -603,6 +615,158 @@ impl Binance {
         .reduce_only();
         self.place_order(&request)
     }
+
+    /// Amend a resting order's price and/or quantity. Binance futures amends in
+    /// place (`PUT /fapi/v1/order`); spot has no in-place amend, so it is emulated
+    /// as an atomic cancel-replace (`POST /api/v3/order/cancelReplace`). Either
+    /// path first reads the existing order to preserve its side and type.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the order is unknown or the amend is rejected.
+    pub fn amend_order(
+        &self,
+        symbol: &Symbol,
+        order_id: &str,
+        new_price: Option<Decimal>,
+        new_quantity: Option<Decimal>,
+    ) -> Result<Order> {
+        let existing = self.query_order(symbol, order_id)?;
+        let quantity = new_quantity.unwrap_or(existing.quantity);
+        let price = new_price.or(existing.price);
+        let wire = Self::wire_symbol(symbol);
+        if self.is_futures() {
+            let mut params = format!(
+                "symbol={wire}&orderId={order_id}&side={}&quantity={}",
+                side_str(existing.side),
+                format_decimal(quantity),
+            );
+            if let Some(p) = price {
+                params.push_str("&price=");
+                params.push_str(&format_decimal(p));
+            }
+            let body = self.signed_request(HttpMethod::Put, self.order_path(), &params)?;
+            return parse_order(symbol, &body);
+        }
+        let mut params = format!(
+            "symbol={wire}&cancelReplaceMode=STOP_ON_FAILURE&cancelOrderId={order_id}\
+             &side={}&type={}&quantity={}",
+            side_str(existing.side),
+            order_type_str(existing.order_type),
+            format_decimal(quantity),
+        );
+        if let Some(p) = price {
+            params.push_str("&price=");
+            params.push_str(&format_decimal(p));
+            if existing.order_type.requires_price() {
+                params.push_str("&timeInForce=GTC");
+            }
+        }
+        let body = self.signed_request(HttpMethod::Post, "/api/v3/order/cancelReplace", &params)?;
+        let value: serde_json::Value = deserialize(&body)?;
+        let new_order = value
+            .get("newOrderResult")
+            .ok_or_else(|| Error::Deserialization("missing newOrderResult".to_string()))?;
+        let raw: RawOrder = serde_json::from_value(new_order.clone())
+            .map_err(|e| Error::Deserialization(e.to_string()))?;
+        order_from_raw(symbol.clone(), &raw)
+    }
+
+    /// Place several orders in one round-trip. Binance futures has a native batch
+    /// endpoint (`POST /fapi/v1/batchOrders`); spot has none, so the orders are
+    /// placed sequentially. Each order's own outcome is preserved.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the batch request itself fails.
+    pub fn place_batch(&self, requests: &[OrderRequest]) -> Result<Vec<Result<Order>>> {
+        if self.is_futures() {
+            let items = requests
+                .iter()
+                .map(batch_order_json)
+                .collect::<Vec<_>>()
+                .join(",");
+            let params = format!("batchOrders={}", percent_encode(&format!("[{items}]")));
+            let body = self.signed_request(HttpMethod::Post, "/fapi/v1/batchOrders", &params)?;
+            let arr: Vec<serde_json::Value> = deserialize(&body)?;
+            return Ok(arr.iter().map(batch_element_to_order).collect());
+        }
+        Ok(requests.iter().map(|r| self.place_order(r)).collect())
+    }
+
+    /// Cancel several orders on one `symbol` in a single round-trip. Binance
+    /// futures has a native batch cancel (`DELETE /fapi/v1/batchOrders`); spot has
+    /// none, so the ids are cancelled sequentially.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the request fails.
+    pub fn cancel_batch(&self, symbol: &Symbol, order_ids: &[String]) -> Result<()> {
+        if self.is_futures() {
+            let list = order_ids
+                .iter()
+                .map(|id| format!("\"{id}\""))
+                .collect::<Vec<_>>()
+                .join(",");
+            let params = format!(
+                "symbol={}&orderIdList={}",
+                Self::wire_symbol(symbol),
+                percent_encode(&format!("[{list}]")),
+            );
+            self.signed_request(HttpMethod::Delete, "/fapi/v1/batchOrders", &params)?;
+            return Ok(());
+        }
+        for id in order_ids {
+            self.cancel_order(symbol, id)?;
+        }
+        Ok(())
+    }
+
+    /// Place a one-cancels-other bracket (`POST /api/v3/order/oco`), returning the
+    /// two order legs. OCO is a spot order-list; Binance USDⓈ-M futures has no
+    /// order-list, so this returns an [`Error::Exchange`] on a futures client.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the OCO is invalid, unsupported on this market, or rejected.
+    pub fn place_oco(&self, request: &OcoRequest) -> Result<Vec<Order>> {
+        request.validate()?;
+        if self.is_futures() {
+            return Err(Error::Exchange {
+                code: "unsupported".to_string(),
+                message: "Binance USD-M futures has no OCO order-list; use separate \
+                          take-profit / stop orders"
+                    .to_string(),
+            });
+        }
+        let mut params = format!(
+            "symbol={}&side={}&quantity={}&price={}&stopPrice={}",
+            Self::wire_symbol(&request.symbol),
+            side_str(request.side),
+            format_decimal(request.quantity),
+            format_decimal(request.price),
+            format_decimal(request.stop_price),
+        );
+        if let Some(slp) = request.stop_limit_price {
+            params.push_str("&stopLimitPrice=");
+            params.push_str(&format_decimal(slp));
+            params.push_str("&stopLimitTimeInForce=GTC");
+        }
+        if let Some(id) = &request.client_order_id {
+            params.push_str("&listClientOrderId=");
+            params.push_str(id);
+        }
+        let body = self.signed_request(HttpMethod::Post, "/api/v3/order/oco", &params)?;
+        let value: serde_json::Value = deserialize(&body)?;
+        let reports = value
+            .get("orderReports")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| Error::Deserialization("missing orderReports".to_string()))?;
+        reports
+            .iter()
+            .map(|report| {
+                let raw: RawOrder = serde_json::from_value(report.clone())
+                    .map_err(|e| Error::Deserialization(e.to_string()))?;
+                order_from_raw(request.symbol.clone(), &raw)
+            })
+            .collect()
+    }
 }
 
 impl Derivatives for Binance {
@@ -618,6 +782,90 @@ impl Derivatives for Binance {
     fn close_position(&mut self, symbol: &Symbol) -> Result<Order> {
         Binance::close_position(self, symbol)
     }
+}
+
+impl AdvancedOrders for Binance {
+    fn amend_order(
+        &mut self,
+        symbol: &Symbol,
+        order_id: &str,
+        new_price: Option<Decimal>,
+        new_quantity: Option<Decimal>,
+    ) -> Result<Order> {
+        Binance::amend_order(self, symbol, order_id, new_price, new_quantity)
+    }
+    fn place_batch(&mut self, requests: &[OrderRequest]) -> Result<Vec<Result<Order>>> {
+        Binance::place_batch(self, requests)
+    }
+    fn cancel_batch(&mut self, symbol: &Symbol, order_ids: &[String]) -> Result<()> {
+        Binance::cancel_batch(self, symbol, order_ids)
+    }
+    fn place_oco(&mut self, request: &OcoRequest) -> Result<Vec<Order>> {
+        Binance::place_oco(self, request)
+    }
+}
+
+/// Percent-encode per RFC 3986 (unreserved characters pass through), used for the
+/// JSON `batchOrders`/`orderIdList` values in the futures batch endpoints.
+fn percent_encode(s: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(char::from(b));
+            }
+            _ => {
+                out.push('%');
+                out.push(char::from(HEX[(b >> 4) as usize]));
+                out.push(char::from(HEX[(b & 0x0f) as usize]));
+            }
+        }
+    }
+    out
+}
+
+/// One element of a futures `batchOrders` JSON array.
+fn batch_order_json(request: &OrderRequest) -> String {
+    let mut obj = serde_json::json!({
+        "symbol": Binance::wire_symbol(&request.symbol),
+        "side": side_str(request.side),
+        "type": order_type_str(request.order_type),
+        "quantity": format_decimal(request.quantity),
+    });
+    if let Some(price) = request.price {
+        obj["price"] = serde_json::json!(format_decimal(price));
+    }
+    if request.order_type.requires_price() {
+        obj["timeInForce"] = serde_json::json!(tif_str(request.time_in_force));
+    }
+    if let Some(id) = &request.client_order_id {
+        obj["newClientOrderId"] = serde_json::json!(id);
+    }
+    if request.reduce_only {
+        obj["reduceOnly"] = serde_json::json!("true");
+    }
+    obj.to_string()
+}
+
+/// A batch-order response element is either a placed order or a `{code, msg}`
+/// rejection; map it onto that order's own [`Result`].
+fn batch_element_to_order(value: &serde_json::Value) -> Result<Order> {
+    if let Some(code) = value.get("code").and_then(serde_json::Value::as_i64) {
+        let message = value
+            .get("msg")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        return Err(Error::OrderRejected {
+            code: code.to_string(),
+            message,
+        });
+    }
+    let raw: RawOrder =
+        serde_json::from_value(value.clone()).map_err(|e| Error::Deserialization(e.to_string()))?;
+    let symbol = split_wire_symbol(&raw.symbol);
+    order_from_raw(symbol, &raw)
 }
 
 fn parse_positions(body: &str) -> Result<Vec<Position>> {
@@ -672,6 +920,16 @@ fn tif_str(tif: TimeInForce) -> &'static str {
         TimeInForce::Gtc => "GTC",
         TimeInForce::Ioc => "IOC",
         TimeInForce::Fok => "FOK",
+    }
+}
+
+/// The Binance `selfTradePreventionMode` value, or `None` for no STP.
+fn stp_str(stp: SelfTradePrevention) -> Option<&'static str> {
+    match stp {
+        SelfTradePrevention::None => None,
+        SelfTradePrevention::ExpireMaker => Some("EXPIRE_MAKER"),
+        SelfTradePrevention::ExpireTaker => Some("EXPIRE_TAKER"),
+        SelfTradePrevention::ExpireBoth => Some("EXPIRE_BOTH"),
     }
 }
 
@@ -1286,6 +1544,189 @@ mod tests {
         )
         .with_clock(Box::new(move || now_ms));
         (binance, mock)
+    }
+
+    #[test]
+    fn stp_mode_appends_param() {
+        let (binance, mock) = signed_client(1000);
+        mock.push_json(200, ORDER_JSON);
+        binance
+            .place_order(
+                &OrderRequest::limit_buy(symbol(), dec!(1), dec!(100))
+                    .with_stp(SelfTradePrevention::ExpireMaker),
+            )
+            .unwrap();
+        assert!(mock.recorded_requests()[0]
+            .url
+            .contains("selfTradePreventionMode=EXPIRE_MAKER"));
+    }
+
+    #[test]
+    fn stp_none_omits_param() {
+        let (binance, mock) = signed_client(1000);
+        mock.push_json(200, ORDER_JSON);
+        binance
+            .place_order(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)))
+            .unwrap();
+        assert!(!mock.recorded_requests()[0]
+            .url
+            .contains("selfTradePreventionMode"));
+    }
+
+    #[test]
+    fn amend_spot_uses_cancel_replace() {
+        let (binance, mock) = signed_client(1000);
+        mock.push_json(200, ORDER_JSON); // query_order
+        mock.push_json(
+            200,
+            r#"{"cancelResult":"SUCCESS","newOrderResult":{"symbol":"BTCUSDT","orderId":456,
+            "clientOrderId":"","side":"BUY","type":"LIMIT","status":"NEW","origQty":"2",
+            "executedQty":"0","price":"101"}}"#,
+        );
+        let order = binance
+            .amend_order(&symbol(), "123", Some(dec!(101)), Some(dec!(2)))
+            .unwrap();
+        assert_eq!(order.id, "456");
+        assert_eq!(order.quantity, dec!(2));
+        let reqs = mock.recorded_requests();
+        assert!(reqs[1].url.contains("/api/v3/order/cancelReplace"));
+        assert!(reqs[1].url.contains("cancelOrderId=123"));
+        assert!(reqs[1].url.contains("quantity=2"));
+        assert!(reqs[1].url.contains("price=101"));
+        assert_eq!(reqs[1].method, HttpMethod::Post);
+    }
+
+    #[test]
+    fn amend_futures_puts_in_place() {
+        let (binance, mock) = signed_futures_client(1000);
+        mock.push_json(200, ORDER_JSON); // query_order
+        mock.push_json(
+            200,
+            r#"{"symbol":"BTCUSDT","orderId":123,"clientOrderId":"","side":"BUY","type":"LIMIT",
+            "status":"NEW","origQty":"1","executedQty":"0","price":"105","avgPrice":"0"}"#,
+        );
+        let order = binance
+            .amend_order(&symbol(), "123", Some(dec!(105)), None)
+            .unwrap();
+        assert_eq!(order.price, Some(dec!(105)));
+        let reqs = mock.recorded_requests();
+        assert_eq!(reqs[1].method, HttpMethod::Put);
+        assert!(reqs[1].url.contains("/fapi/v1/order"));
+        assert!(reqs[1].url.contains("price=105"));
+        assert!(reqs[1].url.contains("orderId=123"));
+    }
+
+    #[test]
+    fn place_batch_spot_is_sequential() {
+        let (binance, mock) = signed_client(1000);
+        mock.push_json(200, ORDER_JSON);
+        mock.push_json(200, ORDER_JSON);
+        let results = binance
+            .place_batch(&[
+                OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)),
+                OrderRequest::limit_buy(symbol(), dec!(1), dec!(101)),
+            ])
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(std::result::Result::is_ok));
+        assert_eq!(mock.recorded_requests().len(), 2);
+    }
+
+    #[test]
+    fn place_batch_futures_is_one_call_with_per_order_results() {
+        let (binance, mock) = signed_futures_client(1000);
+        mock.push_json(
+            200,
+            r#"[{"symbol":"BTCUSDT","orderId":1,"clientOrderId":"","side":"BUY","type":"LIMIT",
+            "status":"NEW","origQty":"1","executedQty":"0","price":"100","avgPrice":"0"},
+            {"code":-2019,"msg":"Margin is insufficient."}]"#,
+        );
+        let results = binance
+            .place_batch(&[
+                OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)),
+                OrderRequest::limit_buy(symbol(), dec!(1), dec!(101)),
+            ])
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results[0].is_ok());
+        assert!(matches!(
+            results[1].as_ref().unwrap_err(),
+            Error::OrderRejected { .. }
+        ));
+        let reqs = mock.recorded_requests();
+        assert_eq!(reqs.len(), 1);
+        assert!(reqs[0].url.contains("/fapi/v1/batchOrders"));
+        assert!(reqs[0].url.contains("batchOrders=%5B")); // url-encoded '['
+    }
+
+    #[test]
+    fn cancel_batch_spot_is_sequential() {
+        let (binance, mock) = signed_client(1000);
+        mock.push_json(200, "{}");
+        mock.push_json(200, "{}");
+        binance
+            .cancel_batch(&symbol(), &["1".to_string(), "2".to_string()])
+            .unwrap();
+        assert_eq!(mock.recorded_requests().len(), 2);
+    }
+
+    #[test]
+    fn cancel_batch_futures_is_one_call() {
+        let (binance, mock) = signed_futures_client(1000);
+        mock.push_json(200, "[{}]");
+        binance
+            .cancel_batch(&symbol(), &["1".to_string(), "2".to_string()])
+            .unwrap();
+        let reqs = mock.recorded_requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].method, HttpMethod::Delete);
+        assert!(reqs[0].url.contains("/fapi/v1/batchOrders"));
+        assert!(reqs[0].url.contains("orderIdList=%5B")); // url-encoded '['
+    }
+
+    #[test]
+    fn place_oco_spot_returns_both_legs() {
+        let (binance, mock) = signed_client(1000);
+        mock.push_json(
+            200,
+            r#"{"orderListId":99,"orderReports":[
+            {"symbol":"BTCUSDT","orderId":1,"clientOrderId":"","side":"SELL","type":"LIMIT_MAKER",
+            "status":"NEW","origQty":"1","executedQty":"0","price":"110"},
+            {"symbol":"BTCUSDT","orderId":2,"clientOrderId":"","side":"SELL","type":"STOP_LOSS_LIMIT",
+            "status":"NEW","origQty":"1","executedQty":"0","price":"90"}]}"#,
+        );
+        let legs = binance
+            .place_oco(&OcoRequest::new(
+                symbol(),
+                OrderSide::Sell,
+                dec!(1),
+                dec!(110),
+                dec!(95),
+            ))
+            .unwrap();
+        assert_eq!(legs.len(), 2);
+        assert_eq!(legs[0].id, "1");
+        assert_eq!(legs[1].id, "2");
+        let req = &mock.recorded_requests()[0];
+        assert!(req.url.contains("/api/v3/order/oco"));
+        assert!(req.url.contains("stopPrice=95"));
+    }
+
+    #[test]
+    fn place_oco_futures_is_unsupported() {
+        let (binance, _mock) = signed_futures_client(1000);
+        assert!(matches!(
+            binance
+                .place_oco(&OcoRequest::new(
+                    symbol(),
+                    OrderSide::Sell,
+                    dec!(1),
+                    dec!(110),
+                    dec!(95)
+                ))
+                .unwrap_err(),
+            Error::Exchange { .. }
+        ));
     }
 
     #[test]
