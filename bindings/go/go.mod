@@ -1,3 +1,3 @@
-module github.com/wickra-lib/wickra-exchange/bindings/go
+module github.com/wickra-lib/wickra-exchange-go
 
 go 1.23

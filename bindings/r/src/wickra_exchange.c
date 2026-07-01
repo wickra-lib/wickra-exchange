@@ -179,7 +179,7 @@ static const R_CallMethodDef CallEntries[] = {
     {"wkex_poll", (DL_FUNC)&wkex_poll, 2},
     {NULL, NULL, 0}};
 
-void R_init_wickra_exchange(DllInfo *dll) {
+void R_init_wickraexchange(DllInfo *dll) {
     R_registerRoutines(dll, NULL, CallEntries, NULL, NULL);
     R_useDynamicSymbols(dll, FALSE);
 }

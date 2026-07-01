@@ -1,7 +1,7 @@
 ## Plain-R tests for the wickra-exchange R binding (no testthat dependency).
 ## Mirrors the Rust/Python/Node/Go/C#/Java replay-parity tests.
 
-library(wickra.exchange)
+library(wickraexchange)
 
 stopifnot(nzchar(wkex_version()))
 

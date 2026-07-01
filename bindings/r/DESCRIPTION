@@ -1,4 +1,4 @@
-Package: wickra.exchange
+Package: wickraexchange
 Type: Package
 Title: Streaming-Native Crypto Exchange Connectivity
 Version: 0.1.0
