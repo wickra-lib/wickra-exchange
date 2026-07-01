@@ -1,0 +1,21 @@
+[package]
+name = "wickra-exchange-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Internal throughput benchmarks for wickra-exchange (not published)."
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+wickra-exchange-core = { workspace = true }
+rust_decimal = { workspace = true }
+rust_decimal_macros = { workspace = true }
+serde_json = { workspace = true }
+criterion = "0.5"
+
+[[bench]]
+name = "throughput"
+harness = false

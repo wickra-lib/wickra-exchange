@@ -1,0 +1,22 @@
+[package]
+name = "wickra-exchange-examples"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "Runnable examples for wickra-exchange (not published)."
+
+[lints]
+workspace = true
+
+[dependencies]
+wickra-exchange = { workspace = true }
+rust_decimal = { workspace = true }
+rust_decimal_macros = { workspace = true }
+
+[[bin]]
+name = "paper_trade"
+path = "src/paper_trade.rs"
+
+[[bin]]
+name = "ticker"
+path = "src/ticker.rs"
