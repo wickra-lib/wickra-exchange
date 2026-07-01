@@ -587,7 +587,9 @@ if (!nativeBinding) {
 }
 
 module.exports = nativeBinding
+module.exports.AdvancedOrders = nativeBinding.AdvancedOrders
 module.exports.Credentials = nativeBinding.Credentials
+module.exports.Derivatives = nativeBinding.Derivatives
 module.exports.Exchange = nativeBinding.Exchange
 module.exports.OrderRequest = nativeBinding.OrderRequest
 module.exports.version = nativeBinding.version
