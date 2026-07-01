@@ -9,23 +9,38 @@
 //! (not strings); orders require a spot `account-id` (fetched and cached). The
 //! response envelope carries `status: "ok"` with the payload under `tick` or
 //! `data`.
+//!
+//! When built with a futures [`MarketType`](crate::MarketType), the client
+//! targets the USDT-margined swap host (`api.hbdm.com`): market data via
+//! `/linear-swap-ex/market/*` (same tick/data shapes as spot, so the parsers are
+//! reused), and the [`Derivatives`] trait plus `place_order`/`balances` via the
+//! **cross-margin** `/linear-swap-api/v1/swap_cross_*` family, where orders carry
+//! an integer contract `volume`, a `direction`, an `offset` (open/close) and a
+//! `lever_rate`. `query_order`/`cancel_order`/`open_orders` keep the spot order
+//! shape on futures, and `set_margin_mode(Isolated)` is unsupported within the
+//! cross family — both documented gaps.
 
 use crate::credentials::Credentials;
 use crate::error::{Error, Result};
 use crate::events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
 use crate::normalize::{format_decimal, parse_decimal};
-use crate::options::ExchangeOptions;
+use crate::options::{ExchangeOptions, MarginMode, MarketType};
+use crate::positions::{Position, PositionSide};
 use crate::signing::hmac_sha256_base64;
 use crate::symbol::Symbol;
-use crate::traits::{Exchange, Execution, MarketData};
+use crate::traits::{Derivatives, Exchange, Execution, MarketData};
 use crate::transport::{HttpMethod, HttpRequest, HttpTransport, WsConnection, WsTransport};
 use crate::types::{Balance, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker};
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use wickra_core::Candle;
 
+/// Spot API host.
 const HOST: &str = "api.huobi.pro";
+/// USDT-margined swap (futures) API host.
+const FUTURES_HOST: &str = "api.hbdm.com";
 
 fn system_now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -85,31 +100,59 @@ pub struct Htx {
     http: Box<dyn HttpTransport>,
     ws: Option<Box<dyn WsTransport>>,
     rest_base: String,
+    host: &'static str,
+    market_type: MarketType,
     credentials: Option<Credentials>,
     now_ms: Box<dyn Fn() -> i64 + Send + Sync>,
     connection: Option<Box<dyn WsConnection>>,
     sub_messages: Vec<String>,
     subscriptions: Vec<(String, Symbol)>,
     account_id: RefCell<Option<String>>,
+    /// Leverage applied to futures orders (HTX sets `lever_rate` per order).
+    leverage: Cell<u32>,
 }
 
 impl Htx {
     fn build(
         http: Box<dyn HttpTransport>,
-        _options: &ExchangeOptions,
+        options: &ExchangeOptions,
         credentials: Option<Credentials>,
     ) -> Self {
+        let host = if options.market_type.is_derivatives() {
+            FUTURES_HOST
+        } else {
+            HOST
+        };
         Self {
             http,
             ws: None,
-            rest_base: format!("https://{HOST}"),
+            rest_base: format!("https://{host}"),
+            host,
+            market_type: options.market_type,
             credentials,
             now_ms: Box::new(system_now_ms),
             connection: None,
             sub_messages: Vec::new(),
             subscriptions: Vec::new(),
             account_id: RefCell::new(None),
+            leverage: Cell::new(1),
         }
+    }
+
+    /// Whether this client targets HTX USDT-margined swaps (`api.hbdm.com`,
+    /// `/linear-swap-*`) rather than spot.
+    fn is_futures(&self) -> bool {
+        self.market_type.is_derivatives()
+    }
+
+    /// The HTX **swap** contract code for a canonical [`Symbol`]
+    /// (`BTC/USDT` -> `BTC-USDT`, uppercase dash form).
+    fn contract_code(symbol: &Symbol) -> String {
+        format!(
+            "{}-{}",
+            symbol.base().to_uppercase(),
+            symbol.quote().to_uppercase()
+        )
     }
 
     /// Build a public HTX client.
@@ -153,8 +196,18 @@ impl Htx {
     /// # Errors
     /// Returns an [`Error`] if the request fails or the symbol is unknown.
     pub fn ticker(&self, symbol: &Symbol) -> Result<Ticker> {
-        let query = format!("symbol={}", Self::wire_symbol(symbol));
-        let value = self.get("/market/detail/merged", &query)?;
+        let (path, query) = if self.is_futures() {
+            (
+                "/linear-swap-ex/market/detail/merged",
+                format!("contract_code={}", Self::contract_code(symbol)),
+            )
+        } else {
+            (
+                "/market/detail/merged",
+                format!("symbol={}", Self::wire_symbol(symbol)),
+            )
+        };
+        let value = self.get(path, &query)?;
         let tick = value
             .get("tick")
             .ok_or_else(|| Error::Deserialization("missing tick".to_string()))?;
@@ -173,12 +226,26 @@ impl Htx {
     /// # Errors
     /// Returns an [`Error`] if the request fails or a row cannot be parsed.
     pub fn klines(&self, symbol: &Symbol, interval: &str, limit: u32) -> Result<Vec<Candle>> {
-        let query = format!(
-            "symbol={}&period={}&size={limit}",
-            Self::wire_symbol(symbol),
-            map_period(interval),
-        );
-        let value = self.get("/market/history/kline", &query)?;
+        let (path, query) = if self.is_futures() {
+            (
+                "/linear-swap-ex/market/history/kline",
+                format!(
+                    "contract_code={}&period={}&size={limit}",
+                    Self::contract_code(symbol),
+                    map_period(interval),
+                ),
+            )
+        } else {
+            (
+                "/market/history/kline",
+                format!(
+                    "symbol={}&period={}&size={limit}",
+                    Self::wire_symbol(symbol),
+                    map_period(interval),
+                ),
+            )
+        };
+        let value = self.get(path, &query)?;
         let data = value
             .get("data")
             .and_then(serde_json::Value::as_array)
@@ -196,8 +263,18 @@ impl Htx {
     /// # Errors
     /// Returns an [`Error`] if the request fails or the response cannot be parsed.
     pub fn order_book(&self, symbol: &Symbol, _depth: u32) -> Result<OrderBookSnapshot> {
-        let query = format!("symbol={}&type=step0", Self::wire_symbol(symbol));
-        let value = self.get("/market/depth", &query)?;
+        let (path, query) = if self.is_futures() {
+            (
+                "/linear-swap-ex/market/depth",
+                format!("contract_code={}&type=step0", Self::contract_code(symbol)),
+            )
+        } else {
+            (
+                "/market/depth",
+                format!("symbol={}&type=step0", Self::wire_symbol(symbol)),
+            )
+        };
+        let value = self.get(path, &query)?;
         let tick = value
             .get("tick")
             .ok_or_else(|| Error::Deserialization("missing tick".to_string()))?;
@@ -319,6 +396,9 @@ impl Htx {
     /// the venue rejects it.
     pub fn place_order(&self, request: &OrderRequest) -> Result<Order> {
         request.validate()?;
+        if self.is_futures() {
+            return self.place_futures_order(request);
+        }
         let account_id = self.account_id()?;
         let order_kind = format!(
             "{}-{}",
@@ -419,6 +499,9 @@ impl Htx {
     /// # Errors
     /// Returns an [`Error`] if credentials are missing or the request fails.
     pub fn balances(&self) -> Result<Vec<Balance>> {
+        if self.is_futures() {
+            return self.futures_balances();
+        }
         let account_id = self.account_id()?;
         let path = format!("/v1/account/accounts/{account_id}/balance");
         let value = self.signed_request(HttpMethod::Get, &path, &[], "")?;
@@ -457,6 +540,184 @@ impl Htx {
         Ok(balances)
     }
 
+    /// Place a USDT-margined swap order via the cross-margin family
+    /// (`/linear-swap-api/v1/swap_cross_order`). Orders carry an integer contract
+    /// `volume`, a `direction` (buy/sell), an `offset` (open/close; reduce-only
+    /// closes), the stored `lever_rate`, and an `order_price_type`
+    /// (`optimal_5` for market, `limit` otherwise).
+    fn place_futures_order(&self, request: &OrderRequest) -> Result<Order> {
+        let volume = decimal_to_contracts(request.quantity)?;
+        let mut body = serde_json::json!({
+            "contract_code": Self::contract_code(&request.symbol),
+            "direction": side_str(request.side),
+            "offset": if request.reduce_only { "close" } else { "open" },
+            "lever_rate": self.leverage.get(),
+            "volume": volume,
+        });
+        match request.order_type {
+            OrderType::Market | OrderType::StopMarket => {
+                body["order_price_type"] = serde_json::json!("optimal_5");
+            }
+            OrderType::Limit | OrderType::StopLimit => {
+                let price = request
+                    .price
+                    .ok_or(Error::InvalidOrder("limit order requires a price"))?;
+                body["order_price_type"] = serde_json::json!("limit");
+                body["price"] = serde_json::json!(format_decimal(price));
+            }
+        }
+        if let Some(id) = &request.client_order_id {
+            if let Ok(numeric) = id.parse::<u64>() {
+                body["client_order_id"] = serde_json::json!(numeric);
+            }
+        }
+        let value = self.signed_request(
+            HttpMethod::Post,
+            "/linear-swap-api/v1/swap_cross_order",
+            &[],
+            &body.to_string(),
+        )?;
+        let data = value
+            .get("data")
+            .ok_or_else(|| Error::Deserialization("missing order data".to_string()))?;
+        let order_id = data
+            .get("order_id_str")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                data.get("order_id")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|n| n.to_string())
+            })
+            .ok_or_else(|| Error::Deserialization("missing order id".to_string()))?;
+        Ok(Order {
+            id: order_id,
+            client_order_id: request.client_order_id.clone(),
+            symbol: request.symbol.clone(),
+            side: request.side,
+            order_type: request.order_type,
+            status: OrderStatus::New,
+            quantity: request.quantity,
+            filled_quantity: Decimal::ZERO,
+            price: request.price,
+            average_price: None,
+        })
+    }
+
+    /// USDT-margined cross account balance
+    /// (`/linear-swap-api/v1/swap_cross_account_info`).
+    fn futures_balances(&self) -> Result<Vec<Balance>> {
+        let value = self.signed_request(
+            HttpMethod::Post,
+            "/linear-swap-api/v1/swap_cross_account_info",
+            &[],
+            "{}",
+        )?;
+        let list = value
+            .get("data")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| Error::Deserialization("missing account data".to_string()))?;
+        Ok(list
+            .iter()
+            .map(|acct| {
+                let asset = acct
+                    .get("margin_asset")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("USDT")
+                    .to_string();
+                Balance {
+                    asset,
+                    free: decimal_field(acct, "margin_available").unwrap_or(Decimal::ZERO),
+                    locked: decimal_field(acct, "margin_frozen").unwrap_or(Decimal::ZERO),
+                }
+            })
+            .collect())
+    }
+
+    /// Open positions on the USDT-margined cross account
+    /// (`/linear-swap-api/v1/swap_cross_position_info`).
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if credentials are missing or the request fails.
+    pub fn positions(&self, symbol: Option<&Symbol>) -> Result<Vec<Position>> {
+        let body = symbol.map_or_else(
+            || "{}".to_string(),
+            |s| format!(r#"{{"contract_code":"{}"}}"#, Self::contract_code(s)),
+        );
+        let value = self.signed_request(
+            HttpMethod::Post,
+            "/linear-swap-api/v1/swap_cross_position_info",
+            &[],
+            &body,
+        )?;
+        let list = value
+            .get("data")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| Error::Deserialization("missing position data".to_string()))?;
+        list.iter().map(parse_futures_position).collect()
+    }
+
+    /// Set the leverage for `symbol`
+    /// (`/linear-swap-api/v1/swap_cross_switch_lever_rate`).
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the leverage is rejected or the request fails.
+    pub fn set_leverage(&self, symbol: &Symbol, leverage: u32) -> Result<()> {
+        let lever = leverage.max(1);
+        self.leverage.set(lever);
+        let body = format!(
+            r#"{{"contract_code":"{}","lever_rate":{lever}}}"#,
+            Self::contract_code(symbol)
+        );
+        self.signed_request(
+            HttpMethod::Post,
+            "/linear-swap-api/v1/swap_cross_switch_lever_rate",
+            &[],
+            &body,
+        )?;
+        Ok(())
+    }
+
+    /// Set the margin mode for `symbol`.
+    ///
+    /// This binding drives HTX's **cross-margin** swap family, so `Cross` is a
+    /// no-op success. HTX does not expose a per-symbol switch to isolated within
+    /// this family (it is an account/order-family choice), so `Isolated` returns
+    /// an [`Error::Exchange`] documenting the limitation.
+    ///
+    /// # Errors
+    /// Returns [`Error::Exchange`] when `Isolated` is requested.
+    pub fn set_margin_mode(&self, _symbol: &Symbol, mode: MarginMode) -> Result<()> {
+        match mode {
+            MarginMode::Cross => Ok(()),
+            MarginMode::Isolated => Err(Error::Exchange {
+                code: "unsupported".to_string(),
+                message: "HTX linear-swap binding uses the cross-margin family; \
+                          isolated is not switchable per-symbol"
+                    .to_string(),
+            }),
+        }
+    }
+
+    /// Flatten the open position in `symbol` with a reduce-only market order.
+    ///
+    /// # Errors
+    /// Returns [`Error::NotFound`] if there is no open position, or another
+    /// [`Error`] if the request fails.
+    pub fn close_position(&self, symbol: &Symbol) -> Result<Order> {
+        let position = self
+            .positions(Some(symbol))?
+            .into_iter()
+            .find(|p| &p.symbol == symbol)
+            .ok_or_else(|| Error::NotFound(format!("no open position for {symbol}")))?;
+        let request = match position.side {
+            PositionSide::Long => OrderRequest::market_sell(symbol.clone(), position.quantity),
+            PositionSide::Short => OrderRequest::market_buy(symbol.clone(), position.quantity),
+        }
+        .reduce_only();
+        self.place_order(&request)
+    }
+
     fn get(&self, path: &str, query: &str) -> Result<serde_json::Value> {
         let url = format!("{}{path}?{query}", self.rest_base);
         let response = self.http.execute(&HttpRequest::get(url))?;
@@ -490,7 +751,7 @@ impl Htx {
             .map(|(key, val)| format!("{}={}", encode(key), encode(val)))
             .collect::<Vec<_>>()
             .join("&");
-        let canonical = format!("{}\n{HOST}\n{path}\n{encoded}", method.as_str());
+        let canonical = format!("{}\n{}\n{path}\n{encoded}", method.as_str(), self.host);
         let signature = hmac_sha256_base64(creds.api_secret.as_bytes(), canonical.as_bytes());
         let url = format!(
             "{}{path}?{encoded}&Signature={}",
@@ -849,6 +1110,72 @@ impl Exchange for Htx {
     }
 }
 
+impl Derivatives for Htx {
+    fn positions(&mut self, symbol: Option<&Symbol>) -> Result<Vec<Position>> {
+        Htx::positions(self, symbol)
+    }
+    fn set_leverage(&mut self, symbol: &Symbol, leverage: u32) -> Result<()> {
+        Htx::set_leverage(self, symbol, leverage)
+    }
+    fn set_margin_mode(&mut self, symbol: &Symbol, mode: MarginMode) -> Result<()> {
+        Htx::set_margin_mode(self, symbol, mode)
+    }
+    fn close_position(&mut self, symbol: &Symbol) -> Result<Order> {
+        Htx::close_position(self, symbol)
+    }
+}
+
+/// Round a base quantity to a whole number of HTX contracts.
+fn decimal_to_contracts(quantity: Decimal) -> Result<i64> {
+    quantity
+        .round()
+        .to_i64()
+        .filter(|c| *c > 0)
+        .ok_or(Error::InvalidOrder(
+            "futures volume rounds to zero contracts",
+        ))
+}
+
+fn parse_futures_position(data: &serde_json::Value) -> Result<Position> {
+    let direction = data
+        .get("direction")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let side = match direction {
+        "buy" => PositionSide::Long,
+        "sell" => PositionSide::Short,
+        other => {
+            return Err(Error::Deserialization(format!(
+                "unknown position direction {other:?}"
+            )))
+        }
+    };
+    let contract = data
+        .get("contract_code")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    Ok(Position {
+        symbol: symbol_from_contract(contract),
+        side,
+        quantity: decimal_field(data, "volume").unwrap_or(Decimal::ZERO),
+        entry_price: decimal_field(data, "cost_open").unwrap_or(Decimal::ZERO),
+        mark_price: decimal_field(data, "last_price").unwrap_or(Decimal::ZERO),
+        leverage: decimal_field(data, "lever_rate").unwrap_or(Decimal::ZERO),
+        unrealized_pnl: decimal_field(data, "profit_unreal").unwrap_or(Decimal::ZERO),
+        // The cross-margin family always reports cross positions.
+        margin_mode: MarginMode::Cross,
+    })
+}
+
+/// Reconstruct a canonical [`Symbol`] from an HTX swap contract code
+/// (`BTC-USDT` -> `BTC/USDT`).
+fn symbol_from_contract(contract: &str) -> Symbol {
+    match contract.split_once('-') {
+        Some((base, quote)) => Symbol::new(base, quote),
+        None => Symbol::new(contract, ""),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -892,6 +1219,155 @@ mod tests {
         )
         .with_clock(Box::new(move || now_ms));
         (htx, mock)
+    }
+
+    fn futures_client() -> (Htx, Arc<MockHttpTransport>) {
+        let mock = Arc::new(MockHttpTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::UsdMFutures);
+        (
+            Htx::with_http(Box::new(ArcTransport(Arc::clone(&mock))), &opts),
+            mock,
+        )
+    }
+
+    fn signed_futures_client(now_ms: i64) -> (Htx, Arc<MockHttpTransport>) {
+        let mock = Arc::new(MockHttpTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::UsdMFutures);
+        let htx = Htx::with_credentials(
+            Box::new(ArcTransport(Arc::clone(&mock))),
+            &opts,
+            Credentials::new("APIKEY", "SECRET"),
+        )
+        .with_clock(Box::new(move || now_ms));
+        (htx, mock)
+    }
+
+    #[test]
+    fn futures_ticker_targets_swap_host_and_contract_code() {
+        let (htx, mock) = futures_client();
+        mock.push_json(
+            200,
+            r#"{"status":"ok","tick":{"close":20000.5,"bid":[19999.0,1.0],"ask":[20001.0,2.0],"vol":1234.0}}"#,
+        );
+        let ticker = htx.ticker(&symbol()).unwrap();
+        assert_eq!(ticker.last, dec!(20000.5));
+        assert_eq!(ticker.bid, dec!(19999));
+        assert_eq!(
+            mock.recorded_requests()[0].url,
+            "https://api.hbdm.com/linear-swap-ex/market/detail/merged?contract_code=BTC-USDT"
+        );
+    }
+
+    #[test]
+    fn futures_market_order_uses_cross_swap_family() {
+        let (htx, mock) = signed_futures_client(0);
+        mock.push_json(
+            200,
+            r#"{"status":"ok","data":{"order_id":123,"order_id_str":"123"}}"#,
+        );
+        let order = htx
+            .place_order(&OrderRequest::market_buy(symbol(), dec!(2)))
+            .unwrap();
+        assert_eq!(order.id, "123");
+        assert_eq!(order.status, OrderStatus::New);
+        let req = &mock.recorded_requests()[0];
+        assert!(req
+            .url
+            .contains("api.hbdm.com/linear-swap-api/v1/swap_cross_order"));
+        let body = req.body.as_ref().unwrap();
+        assert!(body.contains(r#""contract_code":"BTC-USDT""#));
+        assert!(body.contains(r#""direction":"buy""#));
+        assert!(body.contains(r#""offset":"open""#));
+        assert!(body.contains(r#""order_price_type":"optimal_5""#));
+        assert!(body.contains(r#""volume":2"#));
+        assert!(body.contains(r#""lever_rate":1"#));
+    }
+
+    #[test]
+    fn derivatives_positions_parse_cross() {
+        let (mut htx, mock) = signed_futures_client(0);
+        mock.push_json(
+            200,
+            r#"{"status":"ok","data":[{"contract_code":"BTC-USDT","direction":"buy","volume":3,
+            "cost_open":20000,"last_price":20100,"lever_rate":10,"profit_unreal":30}]}"#,
+        );
+        let positions = Derivatives::positions(&mut htx, Some(&symbol())).unwrap();
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].symbol, Symbol::new("BTC", "USDT"));
+        assert_eq!(positions[0].side, PositionSide::Long);
+        assert_eq!(positions[0].quantity, dec!(3));
+        assert_eq!(positions[0].entry_price, dec!(20000));
+        assert_eq!(positions[0].mark_price, dec!(20100));
+        assert_eq!(positions[0].leverage, dec!(10));
+        assert_eq!(positions[0].margin_mode, MarginMode::Cross);
+        assert!(mock.recorded_requests()[0]
+            .url
+            .contains("/linear-swap-api/v1/swap_cross_position_info"));
+    }
+
+    #[test]
+    fn set_leverage_persists_and_flows_into_orders() {
+        let (htx, mock) = signed_futures_client(0);
+        mock.push_json(200, r#"{"status":"ok"}"#);
+        htx.set_leverage(&symbol(), 5).unwrap();
+        assert!(mock.recorded_requests()[0]
+            .url
+            .contains("/linear-swap-api/v1/swap_cross_switch_lever_rate"));
+
+        mock.push_json(
+            200,
+            r#"{"status":"ok","data":{"order_id":1,"order_id_str":"1"}}"#,
+        );
+        htx.place_order(&OrderRequest::market_buy(symbol(), dec!(1)))
+            .unwrap();
+        let reqs = mock.recorded_requests();
+        assert!(reqs[1].body.as_ref().unwrap().contains(r#""lever_rate":5"#));
+    }
+
+    #[test]
+    fn set_margin_mode_isolated_is_unsupported() {
+        let (htx, _mock) = signed_futures_client(0);
+        assert!(htx.set_margin_mode(&symbol(), MarginMode::Cross).is_ok());
+        assert!(matches!(
+            htx.set_margin_mode(&symbol(), MarginMode::Isolated)
+                .unwrap_err(),
+            Error::Exchange { .. }
+        ));
+    }
+
+    #[test]
+    fn close_position_is_reduce_only_opposite() {
+        let (mut htx, mock) = signed_futures_client(0);
+        mock.push_json(
+            200,
+            r#"{"status":"ok","data":[{"contract_code":"BTC-USDT","direction":"buy","volume":3,
+            "cost_open":20000,"last_price":20100,"lever_rate":10,"profit_unreal":30}]}"#,
+        );
+        mock.push_json(
+            200,
+            r#"{"status":"ok","data":{"order_id":9,"order_id_str":"9"}}"#,
+        );
+        Derivatives::close_position(&mut htx, &symbol()).unwrap();
+        let reqs = mock.recorded_requests();
+        let body = reqs[1].body.as_ref().unwrap();
+        assert!(body.contains(r#""direction":"sell""#));
+        assert!(body.contains(r#""offset":"close""#));
+    }
+
+    #[test]
+    fn futures_balances_split_available_and_frozen() {
+        let (htx, mock) = signed_futures_client(0);
+        mock.push_json(
+            200,
+            r#"{"status":"ok","data":[{"margin_asset":"USDT","margin_available":800,"margin_frozen":200}]}"#,
+        );
+        let bals = htx.balances().unwrap();
+        assert_eq!(bals[0].asset, "USDT");
+        assert_eq!(bals[0].free, dec!(800));
+        assert_eq!(bals[0].locked, dec!(200));
+        assert!(mock.recorded_requests()[0]
+            .url
+            .contains("/linear-swap-api/v1/swap_cross_account_info"));
     }
 
     #[test]
