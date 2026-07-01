@@ -66,4 +66,20 @@ stopifnot(inherits(deriv, "wickra_derivatives"))
 adv <- wkex_advanced("binance", "k", "s", futures = TRUE)
 stopifnot(inherits(adv, "wickra_advanced"))
 
+## Array-out extended-ops surface is present (loading the package already
+## validated that every .Call entry resolves to a registered C symbol).
+stopifnot(is.function(wkex_positions))
+stopifnot(is.function(wkex_place_oco))
+stopifnot(is.function(wkex_place_batch))
+## place_batch marshals parallel vectors: a NA price means a market order.
+reqs <- data.frame(
+  market = c("BTC/USDT", "ETH/USDT"),
+  side = c("buy", "sell"),
+  quantity = c(0.5, 2),
+  price = c(60000, NA_real_),
+  stringsAsFactors = FALSE
+)
+stopifnot(nrow(reqs) == 2L)
+stopifnot(is.na(reqs$price[2]))
+
 cat("wickra.exchange R tests passed\n")

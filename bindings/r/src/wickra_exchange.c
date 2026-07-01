@@ -231,6 +231,28 @@ SEXP wkex_derivatives_position(SEXP ext, SEXP market) {
     return position_to_list(&pos);
 }
 
+SEXP wkex_derivatives_positions(SEXP ext, SEXP market) {
+    const char *m = opt_cstr(market);
+    int cap = 16;
+    for (;;) {
+        WickraPosition *buf = (WickraPosition *)R_alloc(cap, sizeof(WickraPosition));
+        int count = wickra_derivatives_positions(deriv_of(ext), m, buf, (size_t)cap);
+        if (count < 0) {
+            Rf_error("wickra: positions failed with code %d", count);
+        }
+        if (count > cap) {
+            cap = count;
+            continue;
+        }
+        SEXP out = PROTECT(Rf_allocVector(VECSXP, count));
+        for (int i = 0; i < count; i++) {
+            SET_VECTOR_ELT(out, i, position_to_list(&buf[i]));
+        }
+        UNPROTECT(1);
+        return out;
+    }
+}
+
 SEXP wkex_derivatives_set_leverage(SEXP ext, SEXP market, SEXP leverage) {
     int rc = wickra_derivatives_set_leverage(deriv_of(ext), CHAR(STRING_ELT(market, 0)),
                                              (uint32_t)Rf_asInteger(leverage));
@@ -305,6 +327,67 @@ SEXP wkex_advanced_cancel_batch(SEXP ext, SEXP market, SEXP order_ids) {
     return Rf_ScalarInteger(rc);
 }
 
+SEXP wkex_advanced_place_oco(SEXP ext, SEXP market, SEXP side, SEXP quantity,
+                             SEXP price, SEXP stop_price, SEXP stop_limit_price) {
+    const char *m = CHAR(STRING_ELT(market, 0));
+    int s = Rf_asInteger(side);
+    double qty = Rf_asReal(quantity);
+    double p = Rf_asReal(price);
+    double sp = Rf_asReal(stop_price);
+    /* NA_real_ is a NaN, so it reaches the C ABI as "no stop-limit" (stop-market). */
+    double slp = Rf_asReal(stop_limit_price);
+    int cap = 4;
+    for (;;) {
+        WickraOrder *buf = (WickraOrder *)R_alloc(cap, sizeof(WickraOrder));
+        int count = wickra_advanced_place_oco(adv_of(ext), m, s, qty, p, sp, slp, buf, (size_t)cap);
+        if (count < 0) {
+            Rf_error("wickra: place_oco failed with code %d", count);
+        }
+        if (count > cap) {
+            cap = count;
+            continue;
+        }
+        SEXP out = PROTECT(Rf_allocVector(VECSXP, count));
+        for (int i = 0; i < count; i++) {
+            SET_VECTOR_ELT(out, i, order_to_list(&buf[i]));
+        }
+        UNPROTECT(1);
+        return out;
+    }
+}
+
+SEXP wkex_advanced_place_batch(SEXP ext, SEXP markets, SEXP sides,
+                               SEXP quantities, SEXP prices) {
+    R_xlen_t n = Rf_xlength(markets);
+    const char **c_markets = string_vec(markets, n);
+    int *c_sides = INTEGER(sides);
+    double *c_qty = REAL(quantities);
+    double *c_prices = REAL(prices);
+    WickraOrder *out = (WickraOrder *)R_alloc(n, sizeof(WickraOrder));
+    int *codes = (int *)R_alloc(n, sizeof(int));
+    int count = wickra_advanced_place_batch(adv_of(ext), c_markets, c_sides, c_qty, c_prices,
+                                            (size_t)n, out, codes, (size_t)n);
+    if (count < 0) {
+        Rf_error("wickra: place_batch failed with code %d", count);
+    }
+    const char *rnames[] = {"order", "error", ""};
+    SEXP result = PROTECT(Rf_allocVector(VECSXP, count));
+    for (int i = 0; i < count; i++) {
+        SEXP entry = PROTECT(Rf_mkNamed(VECSXP, rnames));
+        if (codes[i] == WICKRA_OK) {
+            SET_VECTOR_ELT(entry, 0, order_to_list(&out[i]));
+            SET_VECTOR_ELT(entry, 1, R_NilValue);
+        } else {
+            SET_VECTOR_ELT(entry, 0, R_NilValue);
+            SET_VECTOR_ELT(entry, 1, Rf_ScalarInteger(codes[i]));
+        }
+        SET_VECTOR_ELT(result, i, entry);
+        UNPROTECT(1);
+    }
+    UNPROTECT(1);
+    return result;
+}
+
 /* --- registration -------------------------------------------------------- */
 
 static const R_CallMethodDef CallEntries[] = {
@@ -319,12 +402,15 @@ static const R_CallMethodDef CallEntries[] = {
     {"wkex_poll", (DL_FUNC)&wkex_poll, 2},
     {"wkex_connect_derivatives", (DL_FUNC)&wkex_connect_derivatives, 6},
     {"wkex_derivatives_position", (DL_FUNC)&wkex_derivatives_position, 2},
+    {"wkex_derivatives_positions", (DL_FUNC)&wkex_derivatives_positions, 2},
     {"wkex_derivatives_set_leverage", (DL_FUNC)&wkex_derivatives_set_leverage, 3},
     {"wkex_derivatives_set_margin_mode", (DL_FUNC)&wkex_derivatives_set_margin_mode, 3},
     {"wkex_derivatives_close_position", (DL_FUNC)&wkex_derivatives_close_position, 2},
     {"wkex_connect_advanced", (DL_FUNC)&wkex_connect_advanced, 7},
     {"wkex_advanced_amend_order", (DL_FUNC)&wkex_advanced_amend_order, 5},
     {"wkex_advanced_cancel_batch", (DL_FUNC)&wkex_advanced_cancel_batch, 3},
+    {"wkex_advanced_place_oco", (DL_FUNC)&wkex_advanced_place_oco, 7},
+    {"wkex_advanced_place_batch", (DL_FUNC)&wkex_advanced_place_batch, 5},
     {NULL, NULL, 0}};
 
 void R_init_wickraexchange(DllInfo *dll) {
