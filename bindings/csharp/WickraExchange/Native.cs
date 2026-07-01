@@ -1,0 +1,96 @@
+using System.Runtime.InteropServices;
+
+namespace WickraExchange;
+
+/// <summary>Raw P/Invoke surface for the wickra-exchange C ABI.</summary>
+internal static unsafe class Native
+{
+    private const string Lib = "wickra_exchange";
+
+    public const int Ok = 0;
+    public const int SideBuy = 0;
+    public const int SideSell = 1;
+
+    public const int StatusNew = 0;
+    public const int StatusPartiallyFilled = 1;
+    public const int StatusFilled = 2;
+    public const int StatusCanceled = 3;
+    public const int StatusRejected = 4;
+    public const int StatusExpired = 5;
+
+    public const int EventTrade = 0;
+    public const int EventTicker = 1;
+    public const int EventOrderUpdate = 2;
+    public const int EventBalanceUpdate = 3;
+    public const int EventSubscribed = 4;
+    public const int EventOther = 5;
+
+    public const int StrCap = 64;
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct Order
+    {
+        public fixed byte Id[StrCap];
+        public int Side;
+        public int Status;
+        public double Quantity;
+        public double FilledQuantity;
+        public double Price;
+        public double AveragePrice;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct Event
+    {
+        public int Kind;
+        public fixed byte Symbol[StrCap];
+        public double Price;
+        public double Quantity;
+        public int Side;
+        public Order Order;
+    }
+
+    [DllImport(Lib)]
+    public static extern nint wickra_version();
+
+    [DllImport(Lib)]
+    public static extern nint wickra_paper_new(
+        nint* assets, double* amounts, nuint nBalances, double makerBps, double takerBps, double slippageBps);
+
+    [DllImport(Lib)]
+    public static extern nint wickra_replay_new(
+        byte* market, double* tape, nuint nTape,
+        nint* assets, double* amounts, nuint nBalances,
+        double makerBps, double takerBps, double slippageBps);
+
+    [DllImport(Lib)]
+    public static extern nint wickra_connect(
+        byte* name, byte* apiKey, byte* apiSecret, byte* passphrase, byte* privateKey,
+        [MarshalAs(UnmanagedType.U1)] bool testnet);
+
+    [DllImport(Lib)]
+    public static extern void wickra_exchange_free(nint handle);
+
+    [DllImport(Lib)]
+    public static extern int wickra_exchange_name(nint handle, byte* outBuf, nuint cap);
+
+    [DllImport(Lib)]
+    public static extern int wickra_exchange_set_price(nint handle, byte* market, double price);
+
+    [DllImport(Lib)]
+    public static extern int wickra_exchange_place_market(
+        nint handle, byte* market, int side, double quantity, Order* outOrder);
+
+    [DllImport(Lib)]
+    public static extern int wickra_exchange_place_limit(
+        nint handle, byte* market, int side, double quantity, double price, Order* outOrder);
+
+    [DllImport(Lib)]
+    public static extern int wickra_exchange_cancel(nint handle, byte* market, byte* orderId);
+
+    [DllImport(Lib)]
+    public static extern int wickra_exchange_balance(nint handle, byte* asset, double* outFree);
+
+    [DllImport(Lib)]
+    public static extern int wickra_exchange_poll(nint handle, Event* outBuf, nuint cap);
+}

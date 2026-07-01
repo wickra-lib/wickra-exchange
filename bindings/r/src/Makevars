@@ -1,0 +1,6 @@
+# The wickra-exchange C ABI header and library are provided out-of-tree via the
+# WKEX_INC (include dir) and WKEX_LIB (library dir) environment variables, set by
+# CI / the installer. The Makevars do not bake an rpath; the loader must find the
+# shared library via LD_LIBRARY_PATH / DYLD_LIBRARY_PATH at run time.
+PKG_CPPFLAGS = -I$(WKEX_INC)
+PKG_LIBS = -L$(WKEX_LIB) -lwickra_exchange

@@ -21,6 +21,9 @@ build/
 node_modules/
 *.node
 
+# Go: the C ABI library is staged per-platform by CI, never committed here.
+bindings/go/lib/*/
+
 # .NET build artifacts
 bin/
 obj/

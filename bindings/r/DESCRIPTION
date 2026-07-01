@@ -1,0 +1,17 @@
+Package: wickra.exchange
+Type: Package
+Title: Streaming-Native Crypto Exchange Connectivity
+Version: 0.1.0
+Authors@R: person("kingchenc", role = c("aut", "cre"), email = "support@wickra.org")
+Description: R bindings for wickra-exchange over its C ABI hub: one synchronous,
+    pull-based API over the ten largest crypto exchanges, plus offline paper and
+    replay simulators that share the exact same API. The same strategy runs
+    paper, replay and live by swapping the constructor.
+License: MIT + file LICENSE | Apache License 2.0
+URL: https://github.com/wickra-lib/wickra-exchange
+BugReports: https://github.com/wickra-lib/wickra-exchange/issues
+Encoding: UTF-8
+NeedsCompilation: yes
+SystemRequirements: the wickra-exchange C ABI shared library (WKEX_LIB) and its
+    header (WKEX_INC).
+RoxygenNote: 7.3.2

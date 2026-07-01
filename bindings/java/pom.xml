@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>org.wickra</groupId>
+  <artifactId>wickra-exchange</artifactId>
+  <version>0.1.0</version>
+  <packaging>jar</packaging>
+
+  <name>wickra-exchange</name>
+  <description>Streaming-native, unified connectivity for the ten largest crypto exchanges, with paper and replay simulators — for the JVM over the Wickra C ABI (FFM/Panama).</description>
+  <url>https://github.com/wickra-lib/wickra-exchange</url>
+
+  <licenses>
+    <license>
+      <name>MIT OR Apache-2.0</name>
+    </license>
+  </licenses>
+
+  <properties>
+    <maven.compiler.release>25</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <!-- The native C ABI library is built by `cargo build -p wickra-exchange-c`
+         (debug profile) into the workspace target/debug directory. -->
+    <native.lib.dir>${project.basedir}/../../target/debug</native.lib.dir>
+    <junit.version>5.11.3</junit.version>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>${junit.version}</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.13.0</version>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>3.5.2</version>
+        <configuration>
+          <!-- FFM needs native access enabled. native.lib.dir goes through
+               systemPropertyVariables (not argLine) so a path with spaces is not
+               split into separate JVM arguments. -->
+          <argLine>--enable-native-access=ALL-UNNAMED</argLine>
+          <systemPropertyVariables>
+            <native.lib.dir>${native.lib.dir}</native.lib.dir>
+          </systemPropertyVariables>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>
