@@ -1,10 +1,14 @@
 # Derivatives & advanced orders
 
 Beyond the uniform `Exchange` surface (market data + spot execution +
-streaming), wickra-exchange exposes three optional trait surfaces for
+streaming), wickra-exchange exposes four optional trait surfaces —
+`Derivatives`, `AdvancedOrders`, `WsUserData` and `WsExecution` — for
 derivatives trading and richer order control. Each is object-safe and
 implemented per venue where the underlying API supports it; per-venue gaps are
-documented honestly (see [CAPABILITIES.md](CAPABILITIES.md) for the matrix).
+documented honestly (see [CAPABILITIES.md](CAPABILITIES.md) for the matrix). All
+four are reachable through the facade factory and surfaced through every
+language binding (Python, Node.js, the C ABI hub, and the Go / C# / Java / R
+wrappers over it).
 
 ## Market type selects the futures API
 
