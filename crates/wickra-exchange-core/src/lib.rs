@@ -36,6 +36,7 @@ mod symbol;
 mod traits;
 mod transport;
 mod types;
+mod wsutil;
 
 pub use clock::{NonceGenerator, ServerClock, TokenTtl};
 pub use credentials::Credentials;

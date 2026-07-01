@@ -175,6 +175,7 @@ impl WsTransport for TungsteniteWsTransport {
             inbound: inbound_rx,
             outbound: outbound_tx,
             closed,
+            peer_closed: false,
         }))
     }
 }
@@ -183,6 +184,9 @@ struct RealWsConnection {
     inbound: Receiver<Result<Option<String>>>,
     outbound: UnboundedSender<String>,
     closed: Arc<AtomicBool>,
+    /// Set once the peer closes the stream (a `None`/`Err` item, or the reader
+    /// thread ending), so `is_connected` can report it for reconnect.
+    peer_closed: bool,
 }
 
 impl WsConnection for RealWsConnection {
@@ -194,9 +198,21 @@ impl WsConnection for RealWsConnection {
 
     fn recv(&mut self) -> Result<Option<String>> {
         match self.inbound.try_recv() {
-            Ok(item) => item,
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => Ok(None),
+            Ok(Ok(Some(text))) => Ok(Some(text)),
+            Ok(Err(e)) => {
+                self.peer_closed = true;
+                Err(e)
+            }
+            Ok(Ok(None)) | Err(TryRecvError::Disconnected) => {
+                self.peer_closed = true;
+                Ok(None)
+            }
+            Err(TryRecvError::Empty) => Ok(None),
         }
+    }
+
+    fn is_connected(&self) -> bool {
+        !self.peer_closed && !self.closed.load(Ordering::Relaxed)
     }
 
     fn close(&mut self) -> Result<()> {

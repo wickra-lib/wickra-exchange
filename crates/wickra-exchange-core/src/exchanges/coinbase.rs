@@ -48,6 +48,7 @@ pub struct Coinbase {
     credentials: Option<Credentials>,
     now_ms: Box<dyn Fn() -> i64 + Send + Sync>,
     connection: Option<Box<dyn WsConnection>>,
+    sub_messages: Vec<String>,
 }
 
 impl Coinbase {
@@ -63,6 +64,7 @@ impl Coinbase {
             credentials,
             now_ms: Box::new(system_now_ms),
             connection: None,
+            sub_messages: Vec::new(),
         }
     }
 
@@ -215,20 +217,30 @@ impl Coinbase {
             .as_mut()
             .expect("connection just ensured")
             .send(&message)?;
+        if !self.sub_messages.contains(&message) {
+            self.sub_messages.push(message.clone());
+        }
         Ok(())
     }
 
     /// Drain all stream events available since the last call. Non-blocking.
     pub fn poll_events(&mut self) -> Vec<Event> {
         let mut events = Vec::new();
-        let Some(connection) = self.connection.as_mut() else {
-            return events;
-        };
-        while let Ok(Some(frame)) = connection.recv() {
-            if let Ok(mut parsed) = parse_ws_message(&frame) {
-                events.append(&mut parsed);
+        if let Some(connection) = self.connection.as_mut() {
+            while let Ok(Some(frame)) = connection.recv() {
+                if let Ok(mut parsed) = parse_ws_message(&frame) {
+                    events.append(&mut parsed);
+                }
             }
         }
+        let url = "wss://advanced-trade-ws.coinbase.com";
+        crate::wsutil::reconnect_if_dropped(
+            self.ws.as_deref(),
+            url,
+            &mut self.connection,
+            &self.sub_messages,
+            &mut events,
+        );
         events
     }
 

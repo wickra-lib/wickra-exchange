@@ -156,12 +156,18 @@ pub trait WsConnection: Send {
     /// transport error on failure.
     fn send(&mut self, text: &str) -> Result<()>;
 
-    /// Receive the next text frame, or `Ok(None)` if the connection closed.
+    /// Receive the next text frame, or `Ok(None)` if nothing is pending or the
+    /// peer closed the connection. Use [`is_connected`](Self::is_connected) to
+    /// distinguish a live-but-idle stream from a closed one.
     ///
     /// # Errors
     ///
     /// Returns a transport-level [`Error`] on a read failure.
     fn recv(&mut self) -> Result<Option<String>>;
+
+    /// Whether the connection is still open. Returns `false` once the peer has
+    /// closed it cleanly, so a caller can reconnect and resubscribe.
+    fn is_connected(&self) -> bool;
 
     /// Close the connection.
     ///
@@ -294,8 +300,20 @@ impl WsConnection for MockWsConnection {
     }
 
     fn recv(&mut self) -> Result<Option<String>> {
-        // An exhausted script is a clean close.
-        self.incoming.pop_front().unwrap_or(Ok(None))
+        // An explicit `Ok(None)` frame in the script is a peer close; running out
+        // of scripted frames just means nothing more is pending (still open).
+        match self.incoming.pop_front() {
+            Some(Ok(None)) => {
+                self.closed = true;
+                Ok(None)
+            }
+            Some(other) => other,
+            None => Ok(None),
+        }
+    }
+
+    fn is_connected(&self) -> bool {
+        !self.closed
     }
 
     fn close(&mut self) -> Result<()> {

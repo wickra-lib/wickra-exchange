@@ -54,6 +54,7 @@ pub struct Binance {
     connection: Option<Box<dyn WsConnection>>,
     subscriptions: Vec<(String, Symbol)>,
     sub_id: u64,
+    sub_messages: Vec<String>,
     instruments: InstrumentCache,
 }
 
@@ -75,6 +76,7 @@ impl Binance {
             connection: None,
             subscriptions: Vec::new(),
             sub_id: 0,
+            sub_messages: Vec::new(),
             instruments: InstrumentCache::new(),
         }
     }
@@ -237,6 +239,9 @@ impl Binance {
         if !self.subscriptions.iter().any(|(w, _)| w == &wire) {
             self.subscriptions.push((wire, symbol.clone()));
         }
+        if !self.sub_messages.contains(&message) {
+            self.sub_messages.push(message);
+        }
         Ok(())
     }
 
@@ -252,14 +257,21 @@ impl Binance {
                 .unwrap_or_else(|| Symbol::new(wire, ""))
         };
         let mut events = Vec::new();
-        let Some(connection) = self.connection.as_mut() else {
-            return events;
-        };
-        while let Ok(Some(frame)) = connection.recv() {
-            if let Ok(Some(event)) = parse_ws_message(&frame, &resolve) {
-                events.push(event);
+        if let Some(connection) = self.connection.as_mut() {
+            while let Ok(Some(frame)) = connection.recv() {
+                if let Ok(Some(event)) = parse_ws_message(&frame, &resolve) {
+                    events.push(event);
+                }
             }
         }
+        let url = ws_base_url(self.market_type, self.testnet);
+        crate::wsutil::reconnect_if_dropped(
+            self.ws.as_deref(),
+            url,
+            &mut self.connection,
+            &self.sub_messages,
+            &mut events,
+        );
         events
     }
 
@@ -1309,6 +1321,41 @@ mod tests {
         let sent = ws.sent();
         assert!(sent[0].contains("btcusdt@depth"));
         assert!(sent[1].contains("btcusdt@ticker"));
+    }
+
+    #[test]
+    fn peer_close_triggers_reconnect_and_resubscribe() {
+        let ws = Arc::new(MockWsTransport::new());
+        // First stream: one trade, then a clean peer close.
+        ws.push_connection(vec![
+            Ok(Some(
+                r#"{"e":"trade","s":"BTCUSDT","p":"100","q":"1","m":false,"T":1}"#.to_string(),
+            )),
+            Ok(None),
+        ]);
+        // Reconnect target: another trade.
+        ws.push_connection(vec![Ok(Some(
+            r#"{"e":"trade","s":"BTCUSDT","p":"101","q":"2","m":true,"T":2}"#.to_string(),
+        ))]);
+
+        let mut binance = streaming_client(&ws);
+        binance.subscribe_trades(&symbol()).unwrap();
+
+        // First poll drains the trade, sees the close, reconnects and resubscribes.
+        let first = binance.poll_events();
+        assert!(matches!(first[0], Event::Trade(_)));
+        assert!(first.contains(&Event::Disconnected));
+        assert!(first.contains(&Event::Reconnected));
+
+        // The reconnect opened a second connection and replayed the SUBSCRIBE.
+        assert_eq!(ws.connected_urls().len(), 2);
+        let sent = ws.sent();
+        assert_eq!(sent.len(), 2);
+        assert!(sent[1].contains("btcusdt@trade"));
+
+        // The fresh connection delivers its trade on the next poll.
+        let second = binance.poll_events();
+        assert!(matches!(second[0], Event::Trade(_)));
     }
 
     #[test]

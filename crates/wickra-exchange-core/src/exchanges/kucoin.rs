@@ -38,6 +38,7 @@ pub struct KuCoin {
     credentials: Option<Credentials>,
     now_ms: Box<dyn Fn() -> i64 + Send + Sync>,
     connection: Option<Box<dyn WsConnection>>,
+    sub_messages: Vec<String>,
     subscriptions: Vec<(String, Symbol)>,
 }
 
@@ -54,6 +55,7 @@ impl KuCoin {
             credentials,
             now_ms: Box::new(system_now_ms),
             connection: None,
+            sub_messages: Vec::new(),
             subscriptions: Vec::new(),
         }
     }
@@ -189,6 +191,9 @@ impl KuCoin {
             .as_mut()
             .expect("connection just ensured")
             .send(&message)?;
+        if !self.sub_messages.contains(&message) {
+            self.sub_messages.push(message.clone());
+        }
         if !self.subscriptions.iter().any(|(w, _)| w == &wire) {
             self.subscriptions.push((wire, symbol.clone()));
         }
@@ -205,14 +210,21 @@ impl KuCoin {
                 .unwrap_or_else(|| wire.parse().unwrap_or_else(|_| Symbol::new(wire, "")))
         };
         let mut events = Vec::new();
-        let Some(connection) = self.connection.as_mut() else {
-            return events;
-        };
-        while let Ok(Some(frame)) = connection.recv() {
-            if let Ok(Some(event)) = parse_ws_message(&frame, &resolve) {
-                events.push(event);
+        if let Some(connection) = self.connection.as_mut() {
+            while let Ok(Some(frame)) = connection.recv() {
+                if let Ok(Some(event)) = parse_ws_message(&frame, &resolve) {
+                    events.push(event);
+                }
             }
         }
+        let url = "wss://ws-api-spot.kucoin.com/";
+        crate::wsutil::reconnect_if_dropped(
+            self.ws.as_deref(),
+            url,
+            &mut self.connection,
+            &self.sub_messages,
+            &mut events,
+        );
         events
     }
 
