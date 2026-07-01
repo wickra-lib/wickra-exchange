@@ -49,6 +49,7 @@ fn reqwest_method(method: HttpMethod) -> reqwest::Method {
         HttpMethod::Get => reqwest::Method::GET,
         HttpMethod::Post => reqwest::Method::POST,
         HttpMethod::Put => reqwest::Method::PUT,
+        HttpMethod::Patch => reqwest::Method::PATCH,
         HttpMethod::Delete => reqwest::Method::DELETE,
     }
 }

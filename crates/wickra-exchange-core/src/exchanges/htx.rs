@@ -19,6 +19,11 @@
 //! `lever_rate`. `query_order`/`cancel_order`/`open_orders` keep the spot order
 //! shape on futures, and `set_margin_mode(Isolated)` is unsupported within the
 //! cross family — both documented gaps.
+//!
+//! [`AdvancedOrders`]: native spot batch place/cancel (`/v1/order/batch-orders`,
+//! `/v1/order/orders/batchcancel`, per-order `err-code`). HTX has no STP field,
+//! no in-place amend and no OCO order-list, so `amend_order`/`place_oco` and STP
+//! are documented gaps.
 
 use crate::credentials::Credentials;
 use crate::error::{Error, Result};
@@ -28,9 +33,11 @@ use crate::options::{ExchangeOptions, MarginMode, MarketType};
 use crate::positions::{Position, PositionSide};
 use crate::signing::hmac_sha256_base64;
 use crate::symbol::Symbol;
-use crate::traits::{Derivatives, Exchange, Execution, MarketData};
+use crate::traits::{AdvancedOrders, Derivatives, Exchange, Execution, MarketData};
 use crate::transport::{HttpMethod, HttpRequest, HttpTransport, WsConnection, WsTransport};
-use crate::types::{Balance, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker};
+use crate::types::{
+    Balance, OcoRequest, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker,
+};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use std::cell::{Cell, RefCell};
@@ -1125,6 +1132,132 @@ impl Derivatives for Htx {
     }
 }
 
+impl Htx {
+    /// Place several spot orders in one request (`/v1/order/batch-orders`). Each
+    /// element carries an `err-code`, so each request's own [`Result`] is kept.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the batch request itself fails, or if called on a
+    /// futures client (spot batch endpoint).
+    pub fn place_batch(&self, requests: &[OrderRequest]) -> Result<Vec<Result<Order>>> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        if self.is_futures() {
+            return Err(Error::Exchange {
+                code: "unsupported".to_string(),
+                message: "HTX batch-orders is a spot endpoint".to_string(),
+            });
+        }
+        let account_id = self.account_id()?;
+        let items: Vec<serde_json::Value> = requests
+            .iter()
+            .map(|r| {
+                let order_kind = format!("{}-{}", side_str(r.side), order_type_str(r.order_type));
+                let mut o = serde_json::json!({
+                    "account-id": account_id,
+                    "symbol": Self::wire_symbol(&r.symbol),
+                    "type": order_kind,
+                    "amount": format_decimal(r.quantity),
+                });
+                if let Some(price) = r.price {
+                    o["price"] = serde_json::json!(format_decimal(price));
+                }
+                if let Some(id) = &r.client_order_id {
+                    o["client-order-id"] = serde_json::json!(id.clone());
+                }
+                o
+            })
+            .collect();
+        let body = serde_json::Value::Array(items).to_string();
+        let value = self.signed_request(HttpMethod::Post, "/v1/order/batch-orders", &[], &body)?;
+        let data = value
+            .get("data")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| Error::Deserialization("missing batch data".to_string()))?;
+        Ok(requests
+            .iter()
+            .zip(data)
+            .map(|(req, elem)| {
+                let err_code = elem
+                    .get("err-code")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                if !err_code.is_empty() {
+                    return Err(Error::OrderRejected {
+                        code: err_code.to_string(),
+                        message: elem
+                            .get("err-msg")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                    });
+                }
+                let id = elem
+                    .get("order-id")
+                    .map(|v| {
+                        v.as_u64()
+                            .map_or_else(|| v.as_str().unwrap_or("").to_string(), |n| n.to_string())
+                    })
+                    .unwrap_or_default();
+                Ok(Order {
+                    id,
+                    client_order_id: req.client_order_id.clone(),
+                    symbol: req.symbol.clone(),
+                    side: req.side,
+                    order_type: req.order_type,
+                    status: OrderStatus::New,
+                    quantity: req.quantity,
+                    filled_quantity: Decimal::ZERO,
+                    price: req.price,
+                    average_price: None,
+                })
+            })
+            .collect())
+    }
+
+    /// Cancel several orders by id in one request (`/v1/order/orders/batchcancel`).
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the request fails.
+    pub fn cancel_batch(&self, _symbol: &Symbol, order_ids: &[String]) -> Result<()> {
+        let ids: Vec<&str> = order_ids.iter().map(String::as_str).collect();
+        let body = serde_json::json!({ "order-ids": ids }).to_string();
+        self.signed_request(HttpMethod::Post, "/v1/order/orders/batchcancel", &[], &body)?;
+        Ok(())
+    }
+}
+
+impl AdvancedOrders for Htx {
+    /// HTX has no in-place amend (orders are cancelled and re-placed), so this
+    /// returns an [`Error::Exchange`].
+    fn amend_order(
+        &mut self,
+        _symbol: &Symbol,
+        _order_id: &str,
+        _new_price: Option<Decimal>,
+        _new_quantity: Option<Decimal>,
+    ) -> Result<Order> {
+        Err(Error::Exchange {
+            code: "unsupported".to_string(),
+            message: "HTX has no in-place amend; cancel and re-place the order".to_string(),
+        })
+    }
+    fn place_batch(&mut self, requests: &[OrderRequest]) -> Result<Vec<Result<Order>>> {
+        Htx::place_batch(self, requests)
+    }
+    fn cancel_batch(&mut self, symbol: &Symbol, order_ids: &[String]) -> Result<()> {
+        Htx::cancel_batch(self, symbol, order_ids)
+    }
+    /// HTX has no OCO order-list, so this returns an [`Error::Exchange`].
+    fn place_oco(&mut self, _request: &OcoRequest) -> Result<Vec<Order>> {
+        Err(Error::Exchange {
+            code: "unsupported".to_string(),
+            message: "HTX has no OCO order-list".to_string(),
+        })
+    }
+}
+
 /// Round a base quantity to a whole number of HTX contracts.
 fn decimal_to_contracts(quantity: Decimal) -> Result<i64> {
     quantity
@@ -1240,6 +1373,70 @@ mod tests {
         )
         .with_clock(Box::new(move || now_ms));
         (htx, mock)
+    }
+
+    #[test]
+    fn place_batch_reads_per_order_err_code() {
+        let (htx, mock) = signed_client(0);
+        mock.push_json(
+            200,
+            r#"{"status":"ok","data":[{"id":42,"type":"spot","state":"working"}]}"#,
+        );
+        mock.push_json(
+            200,
+            r#"{"status":"ok","data":[
+            {"order-id":1,"client-order-id":"","err-code":"","err-msg":""},
+            {"order-id":0,"client-order-id":"","err-code":"account-frozen-balance-insufficient-error","err-msg":"no"}]}"#,
+        );
+        let results = htx
+            .place_batch(&[
+                OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)),
+                OrderRequest::limit_buy(symbol(), dec!(1), dec!(101)),
+            ])
+            .unwrap();
+        assert_eq!(results[0].as_ref().unwrap().id, "1");
+        assert!(matches!(
+            results[1].as_ref().unwrap_err(),
+            Error::OrderRejected { .. }
+        ));
+        let reqs = mock.recorded_requests();
+        assert!(reqs[1].url.contains("/v1/order/batch-orders"));
+    }
+
+    #[test]
+    fn cancel_batch_is_one_call() {
+        let (htx, mock) = signed_client(0);
+        mock.push_json(
+            200,
+            r#"{"status":"ok","data":{"success":["1"],"failed":[]}}"#,
+        );
+        htx.cancel_batch(&symbol(), &["1".to_string(), "2".to_string()])
+            .unwrap();
+        let reqs = mock.recorded_requests();
+        assert_eq!(reqs.len(), 1);
+        assert!(reqs[0].url.contains("/v1/order/orders/batchcancel"));
+        assert!(reqs[0]
+            .body
+            .as_ref()
+            .unwrap()
+            .contains(r#""order-ids":["1","2"]"#));
+    }
+
+    #[test]
+    fn amend_and_oco_are_unsupported() {
+        let (mut htx, _mock) = signed_client(0);
+        assert!(matches!(
+            AdvancedOrders::amend_order(&mut htx, &symbol(), "1", Some(dec!(1)), None).unwrap_err(),
+            Error::Exchange { .. }
+        ));
+        assert!(matches!(
+            AdvancedOrders::place_oco(
+                &mut htx,
+                &OcoRequest::new(symbol(), OrderSide::Sell, dec!(1), dec!(110), dec!(95))
+            )
+            .unwrap_err(),
+            Error::Exchange { .. }
+        ));
     }
 
     #[test]
