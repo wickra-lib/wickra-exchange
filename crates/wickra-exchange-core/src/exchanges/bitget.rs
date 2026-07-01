@@ -5,10 +5,16 @@
 //! headers, concatenated symbols (`BTCUSDT`) and a `{code, msg, data}` envelope
 //! whose success code is the string `"00000"`.
 //!
-//! [`AdvancedOrders`]: STP via `stpMode` on order create and native spot batch
-//! place/cancel (`/api/v2/spot/trade/batch-orders`, `.../batch-cancel-order`,
-//! per-order results). Bitget has no in-place amend and no OCO order-list, and
-//! the mix (futures) batch endpoints are not yet wired — all documented gaps.
+//! On a futures [`MarketType`](crate::MarketType), `query_order`/`cancel_order`/
+//! `open_orders` route to the mix order endpoints (`/api/v2/mix/order/detail`,
+//! `/cancel-order`, `/orders-pending`) with `productType=USDT-FUTURES` and the
+//! mix order object (`state` instead of `status`, `entrustedList` wrapper).
+//!
+//! [`AdvancedOrders`]: STP via `stpMode` on order create and native batch
+//! place/cancel — spot (`/api/v2/spot/trade/batch-orders`, `.../batch-cancel-order`)
+//! or mix (`/api/v2/mix/order/batch-place-order`, `.../batch-cancel-orders`),
+//! per-order results. Bitget has no in-place amend and no OCO order-list — both
+//! documented gaps.
 
 use crate::credentials::Credentials;
 use crate::error::{Error, Result};
@@ -331,6 +337,21 @@ impl Bitget {
     /// # Errors
     /// Returns an [`Error`] if credentials are missing or the venue rejects it.
     pub fn cancel_order(&self, symbol: &Symbol, order_id: &str) -> Result<()> {
+        if self.is_futures() {
+            let body = serde_json::json!({
+                "symbol": Self::wire_symbol(symbol),
+                "productType": "USDT-FUTURES",
+                "marginCoin": "USDT",
+                "orderId": order_id,
+            });
+            self.signed_request(
+                HttpMethod::Post,
+                "/api/v2/mix/order/cancel-order",
+                "",
+                &body.to_string(),
+            )?;
+            return Ok(());
+        }
         let body = serde_json::json!({
             "symbol": Self::wire_symbol(symbol),
             "orderId": order_id,
@@ -349,6 +370,17 @@ impl Bitget {
     /// # Errors
     /// Returns an [`Error`] if credentials are missing or the order is unknown.
     pub fn query_order(&self, symbol: &Symbol, order_id: &str) -> Result<Order> {
+        if self.is_futures() {
+            let query = format!(
+                "symbol={}&productType=USDT-FUTURES&orderId={order_id}",
+                Self::wire_symbol(symbol)
+            );
+            // The mix order-detail endpoint returns a single order object.
+            let data =
+                self.signed_request(HttpMethod::Get, "/api/v2/mix/order/detail", &query, "")?;
+            let raw: RawOrder = parse_json(data)?;
+            return order_from_raw(symbol.clone(), &raw);
+        }
         let query = format!("orderId={order_id}");
         let data =
             self.signed_request(HttpMethod::Get, "/api/v2/spot/trade/orderInfo", &query, "")?;
@@ -365,6 +397,31 @@ impl Bitget {
     /// # Errors
     /// Returns an [`Error`] if credentials are missing or the request fails.
     pub fn open_orders(&self, symbol: Option<&Symbol>) -> Result<Vec<Order>> {
+        if self.is_futures() {
+            let mut query = "productType=USDT-FUTURES".to_string();
+            if let Some(s) = symbol {
+                query.push_str("&symbol=");
+                query.push_str(&Self::wire_symbol(s));
+            }
+            let data = self.signed_request(
+                HttpMethod::Get,
+                "/api/v2/mix/order/orders-pending",
+                &query,
+                "",
+            )?;
+            // The mix pending endpoint wraps the orders in an `entrustedList`.
+            let pending: RawMixPending = parse_json(data)?;
+            return pending
+                .entrusted_list
+                .iter()
+                .map(|raw| {
+                    let sym = symbol
+                        .cloned()
+                        .unwrap_or_else(|| split_wire_symbol(&raw.symbol));
+                    order_from_raw(sym, raw)
+                })
+                .collect();
+        }
         let query = match symbol {
             Some(s) => format!("symbol={}", Self::wire_symbol(s)),
             None => String::new(),
@@ -560,7 +617,7 @@ fn parse_order_type(raw: &str) -> Result<OrderType> {
 
 fn parse_status(raw: &str) -> Result<OrderStatus> {
     match raw {
-        "live" | "new" => Ok(OrderStatus::New),
+        "live" | "new" | "init" => Ok(OrderStatus::New),
         "partially_filled" => Ok(OrderStatus::PartiallyFilled),
         "filled" | "full_fill" => Ok(OrderStatus::Filled),
         "cancelled" | "canceled" => Ok(OrderStatus::Canceled),
@@ -800,6 +857,8 @@ struct RawOrder {
     side: String,
     #[serde(rename = "orderType")]
     order_type: String,
+    // Spot reports `status`; the mix (futures) order object reports `state`.
+    #[serde(alias = "state")]
     status: String,
     size: String,
     #[serde(rename = "baseVolume", default)]
@@ -817,6 +876,13 @@ struct RawAsset {
     available: String,
     #[serde(default)]
     frozen: String,
+}
+
+/// The mix (futures) pending-orders response wraps the orders in `entrustedList`.
+#[derive(Deserialize)]
+struct RawMixPending {
+    #[serde(rename = "entrustedList", default)]
+    entrusted_list: Vec<RawOrder>,
 }
 
 impl MarketData for Bitget {
@@ -956,13 +1022,6 @@ impl Bitget {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
-        if self.is_futures() {
-            return Err(Error::Exchange {
-                code: "unsupported".to_string(),
-                message: "Bitget mix batch (/api/v2/mix/order/batch-place-order) is not yet wired"
-                    .to_string(),
-            });
-        }
         let wire = Self::wire_symbol(&requests[0].symbol);
         let order_list: Vec<serde_json::Value> = requests
             .iter()
@@ -982,13 +1041,24 @@ impl Bitget {
                 o
             })
             .collect();
-        let body = serde_json::json!({ "symbol": wire, "orderList": order_list });
-        let data = self.signed_request(
-            HttpMethod::Post,
-            "/api/v2/spot/trade/batch-orders",
-            "",
-            &body.to_string(),
-        )?;
+        let (path, body) = if self.is_futures() {
+            (
+                "/api/v2/mix/order/batch-place-order",
+                serde_json::json!({
+                    "symbol": wire,
+                    "productType": "USDT-FUTURES",
+                    "marginMode": "crossed",
+                    "marginCoin": "USDT",
+                    "orderList": order_list,
+                }),
+            )
+        } else {
+            (
+                "/api/v2/spot/trade/batch-orders",
+                serde_json::json!({ "symbol": wire, "orderList": order_list }),
+            )
+        };
+        let data = self.signed_request(HttpMethod::Post, path, "", &body.to_string())?;
         let result: BatchOrdersResult = parse_json(data)?;
         let ok_map: HashMap<String, String> = result
             .success_list
@@ -1037,26 +1107,28 @@ impl Bitget {
     /// # Errors
     /// Returns an [`Error`] if the request fails, or if called on a futures client.
     pub fn cancel_batch(&self, symbol: &Symbol, order_ids: &[String]) -> Result<()> {
-        if self.is_futures() {
-            return Err(Error::Exchange {
-                code: "unsupported".to_string(),
-                message: "Bitget mix batch-cancel is not yet wired".to_string(),
-            });
-        }
-        let order_list: Vec<serde_json::Value> = order_ids
+        let wire = Self::wire_symbol(symbol);
+        let id_list: Vec<serde_json::Value> = order_ids
             .iter()
             .map(|id| serde_json::json!({ "orderId": id }))
             .collect();
-        let body = serde_json::json!({
-            "symbol": Self::wire_symbol(symbol),
-            "orderList": order_list,
-        });
-        self.signed_request(
-            HttpMethod::Post,
-            "/api/v2/spot/trade/batch-cancel-order",
-            "",
-            &body.to_string(),
-        )?;
+        let (path, body) = if self.is_futures() {
+            (
+                "/api/v2/mix/order/batch-cancel-orders",
+                serde_json::json!({
+                    "symbol": wire,
+                    "productType": "USDT-FUTURES",
+                    "marginCoin": "USDT",
+                    "orderIdList": id_list,
+                }),
+            )
+        } else {
+            (
+                "/api/v2/spot/trade/batch-cancel-order",
+                serde_json::json!({ "symbol": wire, "orderList": id_list }),
+            )
+        };
+        self.signed_request(HttpMethod::Post, path, "", &body.to_string())?;
         Ok(())
     }
 }
@@ -1347,14 +1419,61 @@ mod tests {
     }
 
     #[test]
-    fn futures_batch_is_a_documented_gap() {
-        let (bitget, _mock) = signed_futures_client(1000);
-        assert!(matches!(
-            bitget
-                .place_batch(&[OrderRequest::limit_buy(symbol(), dec!(1), dec!(100))])
-                .unwrap_err(),
-            Error::Exchange { .. }
-        ));
+    fn futures_query_order_uses_mix_detail_and_state() {
+        let (bitget, mock) = signed_futures_client(1000);
+        mock.push_json(
+            200,
+            r#"{"code":"00000","data":{"symbol":"BTCUSDT","orderId":"88","clientOid":"",
+            "side":"buy","orderType":"limit","state":"filled","size":"2","baseVolume":"2",
+            "price":"100","priceAvg":"100"}}"#,
+        );
+        let order = bitget.query_order(&symbol(), "88").unwrap();
+        assert_eq!(order.id, "88");
+        assert_eq!(order.status, OrderStatus::Filled);
+        let url = &mock.recorded_requests()[0].url;
+        assert!(url.contains("/api/v2/mix/order/detail"));
+        assert!(url.contains("productType=USDT-FUTURES"));
+    }
+
+    #[test]
+    fn futures_cancel_and_open_orders_use_mix_endpoints() {
+        let (bitget, mock) = signed_futures_client(1000);
+        mock.push_json(200, r#"{"code":"00000","data":{"orderId":"88"}}"#);
+        bitget.cancel_order(&symbol(), "88").unwrap();
+        mock.push_json(
+            200,
+            r#"{"code":"00000","data":{"entrustedList":[{"symbol":"BTCUSDT","orderId":"90",
+            "clientOid":"","side":"sell","orderType":"limit","state":"live","size":"3",
+            "baseVolume":"0","price":"21000","priceAvg":"0"}]}}"#,
+        );
+        let orders = bitget.open_orders(Some(&symbol())).unwrap();
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].side, OrderSide::Sell);
+        let reqs = mock.recorded_requests();
+        assert!(reqs[0].url.contains("/api/v2/mix/order/cancel-order"));
+        assert!(reqs[1].url.contains("/api/v2/mix/order/orders-pending"));
+    }
+
+    #[test]
+    fn futures_place_batch_uses_mix_endpoint() {
+        let (bitget, mock) = signed_futures_client(1000);
+        mock.push_json(
+            200,
+            r#"{"code":"00000","data":{
+            "successList":[{"orderId":"o1","clientOid":"wbatch-0"}],
+            "failureList":[]}}"#,
+        );
+        let results = bitget
+            .place_batch(&[OrderRequest::limit_buy(symbol(), dec!(1), dec!(100))])
+            .unwrap();
+        assert_eq!(results[0].as_ref().unwrap().id, "o1");
+        let req = &mock.recorded_requests()[0];
+        assert!(req.url.contains("/api/v2/mix/order/batch-place-order"));
+        assert!(req
+            .body
+            .as_ref()
+            .unwrap()
+            .contains(r#""productType":"USDT-FUTURES""#));
     }
 
     #[test]
