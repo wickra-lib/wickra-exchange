@@ -2064,6 +2064,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "wickra-exchange-c"
+version = "0.1.0"
+dependencies = [
+ "rust_decimal",
+ "wickra-exchange",
+]
+
+[[package]]
 name = "wickra-exchange-core"
 version = "0.1.0"
 dependencies = [

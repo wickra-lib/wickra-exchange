@@ -12,6 +12,7 @@ members = [
     "crates/wickra-exchange",
     "bindings/python",
     "bindings/node",
+    "bindings/c",
 ]
 # The fuzz crate is its own (detached) workspace — cargo-fuzz builds it on its
 # own with sanitizer flags on a nightly toolchain.
@@ -72,3 +73,9 @@ must_use_candidate = "allow"
 too_many_lines = "allow"
 similar_names = "allow"
 many_single_char_names = "allow"
+
+[profile.release]
+# Panics must never unwind across the C ABI boundary (undefined behaviour):
+# abort instead. Applies to the distributed cdylib/staticlib release builds;
+# `cargo test` uses the dev/test profile, which keeps unwinding.
+panic = "abort"
