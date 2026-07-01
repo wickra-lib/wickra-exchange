@@ -78,7 +78,8 @@ Track progress in [ROADMAP.md](ROADMAP.md). Not released to any registry.
 - **[Streaming](docs/STREAMING.md)** — the pull-based event model, the local
   order-book builder and reconnect/resubscribe semantics.
 - **[Derivatives & advanced orders](docs/DERIVATIVES.md)** — the `Derivatives`,
-  `AdvancedOrders` and `WsExecution` traits, futures routing, and per-venue gaps.
+  `AdvancedOrders`, `WsUserData` and `WsExecution` traits, futures routing, and
+  per-venue gaps.
 - **[Capability matrix](docs/CAPABILITIES.md)** — real per-venue support for
   spot/futures, positions/leverage/margin, and STP/amend/batch/OCO/WS-order.
 - **[Architecture](ARCHITECTURE.md)** — crates, traits, the transport abstraction
