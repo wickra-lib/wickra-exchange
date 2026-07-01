@@ -48,6 +48,31 @@ class DerivativesTest {
     }
 
     @Test
+    void userDataAndWsExecutionRejectSpotOnly() {
+        for (String name : new String[] {"coinbase", "upbit", "ftx"}) {
+            assertThrows(RuntimeException.class,
+                    () -> UserData.connect(name, "k", "s", null, null, false, false));
+            assertThrows(RuntimeException.class,
+                    () -> WsExecution.connect(name, "k", "s", null, null, false, false));
+        }
+    }
+
+    @Test
+    void userDataConstructsAndPolls() {
+        try (UserData userData = UserData.connect("binance", "k", "s", null, null, false, false)) {
+            // WsUserData: MarketData, so the client can poll (nothing buffered offline).
+            assertTrue(userData.poll(4).isEmpty());
+        }
+    }
+
+    @Test
+    void wsExecutionConstructsForATradingVenue() {
+        try (WsExecution exec = WsExecution.connect("bybit", "k", "s", null, null, false, false)) {
+            assertNotNull(exec);
+        }
+    }
+
+    @Test
     void batchRequestShapeRoundTrips() {
         var requests = List.of(
                 new AdvancedOrders.BatchOrderRequest("BTC/USDT", Exchange.Side.BUY, 0.5, 60000),
