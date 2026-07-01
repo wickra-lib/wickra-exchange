@@ -1,0 +1,46 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "wickra-exchange"
+version = "0.1.0"
+description = "Streaming-native, unified connectivity for the ten largest crypto exchanges (market data + signed order execution), with paper and replay simulators."
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+authors = [{ name = "kingchenc", email = "support@wickra.org" }]
+requires-python = ">=3.9"
+keywords = ["crypto", "exchange", "trading", "connectivity", "streaming"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Rust",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.urls]
+Homepage = "https://github.com/wickra-lib/wickra-exchange"
+Repository = "https://github.com/wickra-lib/wickra-exchange"
+Issues = "https://github.com/wickra-lib/wickra-exchange/issues"
+
+[tool.maturin]
+manifest-path = "Cargo.toml"
+python-source = "python"
+module-name = "wickra_exchange._wickra_exchange"
+features = ["pyo3/extension-module"]
+strip = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -q"
