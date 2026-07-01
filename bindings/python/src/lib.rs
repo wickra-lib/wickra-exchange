@@ -668,6 +668,15 @@ impl PyUserData {
             .map_err(|e| PyValueError::new_err(e.to_string()))
     }
 
+    /// Keep the private stream alive (refresh the venue session / send a
+    /// heartbeat) so it is not dropped for inactivity; call this periodically. A
+    /// dropped stream is also recovered automatically on the next `poll_events`.
+    fn keepalive_user_data(&mut self) -> PyResult<()> {
+        self.inner
+            .keepalive_user_data()
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
     /// Drain all events buffered since the last call, each as a dict.
     fn poll_events<'py>(&mut self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyDict>>> {
         self.inner

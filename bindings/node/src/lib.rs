@@ -746,6 +746,14 @@ impl UserData {
         self.inner.subscribe_user_data().map_err(map_err)
     }
 
+    /// Keep the private stream alive (refresh the venue session / send a
+    /// heartbeat) so it is not dropped for inactivity; call this periodically. A
+    /// dropped stream is also recovered automatically on the next `poll`.
+    #[napi]
+    pub fn keepalive_user_data(&mut self) -> napi::Result<()> {
+        self.inner.keepalive_user_data().map_err(map_err)
+    }
+
     /// Drain all events buffered since the last call.
     #[napi]
     pub fn poll(&mut self) -> Vec<StreamEvent> {

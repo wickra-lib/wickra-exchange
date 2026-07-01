@@ -93,15 +93,28 @@ venue.
 events. Implemented on the eight trading venues (Binance listen key,
 Bybit/OKX/Bitget signed login, KuCoin bullet-private token, Gate signed
 subscribe, HTX v2 auth, Kraken token → `executions`/`balances`); Coinbase and
-Upbit are spot-only and do not implement it.
+Upbit are spot-only and do not implement it. The Kraken **futures** client uses
+the separate Kraken Futures feed (`wss://futures.kraken.com/ws/v1`) with
+challenge/response auth → `open_orders`/`balances`.
 
 ```rust
 use wickra_exchange::{WsUserData, connect_user_data};
 
 let mut client = connect_user_data("binance", creds, &opts)?;
 client.subscribe_user_data()?;
-for event in client.poll_events() { /* OrderUpdate / BalanceUpdate ... */ }
+loop {
+    client.keepalive_user_data()?;                 // periodic: keep the session alive
+    for event in client.poll_events() { /* OrderUpdate / BalanceUpdate ... */ }
+}
 ```
+
+**Keepalive & auto-reconnect.** `keepalive_user_data` keeps the private stream
+alive — Binance refreshes its listen key (`PUT`), the others send the venue's
+private ping frame — so it is not dropped for inactivity; call it periodically.
+If the stream is dropped anyway, the next `poll_events` re-subscribes it with
+**fresh** signed auth (re-signed login / re-fetched token, never a stale replay)
+and emits `Event::Disconnected` then `Event::Reconnected`, so a consumer that
+only polls still recovers transparently.
 
 ## `WsExecution` — order placement over the WebSocket API
 
@@ -124,13 +137,15 @@ returns `Error::NotConnected`.
 
 ## Honest gaps
 
-- **Kraken Futures WS**: the `WsUserData` / `WsExecution` methods target the spot
-  v2 endpoints; the futures client returns `Error::Exchange` because Kraken
-  Futures uses a separate WebSocket feed (challenge/response auth on
-  `futures.kraken.com`).
-- **Private-stream keepalive**: re-authenticating / re-negotiating a dropped
-  user-data stream (Binance listen-key `PUT`, KuCoin bullet token, per-venue
-  re-auth) is a documented follow-up.
-- **Native batch** on venues currently falling back to sequential
-  (KuCoin/Kraken cancel-by-id, Kraken `AddOrderBatch` indexed form) is a
-  follow-up.
+These two remain because the venue API does not exist — they are documented, not
+faked:
+
+- **KuCoin `cancel_batch`** cancels sequentially: KuCoin has no
+  batch-cancel-by-id endpoint (order-list cancel is by list id only).
+- **Kraken Futures `WsExecution`** stays REST-only: Kraken Futures has no
+  WebSocket order-entry API. (Its `WsUserData` **is** wired, over the separate
+  `futures.kraken.com` challenge/response feed.)
+
+Everything else in this document is implemented: private-stream keepalive +
+automatic reconnect on all eight venues, Kraken native `place_batch` /
+`cancel_batch`, and Kraken Futures user-data.

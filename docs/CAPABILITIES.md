@@ -32,10 +32,14 @@ Per-symbol filters (lot step, price tick, min-notional) are enforced through
 > **WS user-data streams** ([`WsUserData`]) push the account's own order and
 > balance updates: `subscribe_user_data` opens a private stream (Binance listen
 > key, Bybit/OKX/Bitget signed login, KuCoin bullet-private token, Gate signed
-> subscribe, HTX v2 auth, Kraken token) so `poll_events` surfaces the user's own
-> `OrderUpdate` / `BalanceUpdate` events. Available on the eight trading venues;
-> Coinbase and Upbit are spot-only and do not implement it. Re-authenticating a
-> dropped private stream (keepalive) is a documented follow-up.
+> subscribe, HTX v2 auth, Kraken token; the Kraken **futures** client uses the
+> separate `futures.kraken.com` challenge/response feed) so `poll_events` surfaces
+> the user's own `OrderUpdate` / `BalanceUpdate` events. Available on the eight
+> trading venues; Coinbase and Upbit are spot-only and do not implement it.
+> `keepalive_user_data` keeps the stream alive (Binance listen-key `PUT`, KuCoin
+> bullet-token refresh via re-subscribe, per-venue ping frame); a dropped stream
+> is also recovered automatically on the next `poll_events`, which re-subscribes
+> with fresh signed auth and emits `Event::Disconnected` then `Event::Reconnected`.
 >
 > **WS order placement** ([`WsExecution`]: `place_order_ws` / `cancel_order_ws`)
 > is native on Binance, Bybit, OKX, Gate.io and Kraken over each venue's
@@ -97,7 +101,7 @@ used where the venue supports it natively, and returns a documented
 | KuCoin  |  ✅  | —                |     ✅      |     ✅³      | ✅ order-list |
 | Gate.io |  ✅  | ✅ PATCH         |     ✅      |     ✅       | —             |
 | HTX     |  —   | —                |     ✅      |     ✅       | —             |
-| Kraken  |  —   | ✅ EditOrder     |     —⁴      |     ✅³      | —             |
+| Kraken  |  —   | ✅ EditOrder     |     ✅⁴     |     ✅⁴      | —             |
 
 1. Self-trade-prevention: the `stp` field on `OrderRequest` maps to the venue's
    native mode (`selfTradePreventionMode` / `smpType` / `stpMode` / `stp` /
@@ -105,10 +109,12 @@ used where the venue supports it natively, and returns a documented
 2. Bitget batch routes to the mix (futures) batch endpoints
    (`/api/v2/mix/order/batch-place-order` / `batch-cancel-orders`) on a futures
    client and to the spot endpoints otherwise.
-3. KuCoin and Kraken have no batch-cancel-by-id, so `cancel_batch` cancels
+3. KuCoin has no batch-cancel-by-id endpoint, so `cancel_batch` cancels
    sequentially.
-4. Kraken's `AddOrderBatch` encodes its order array as indexed form fields, which
-   does not fit this binding's form helper — place orders individually.
+4. Kraken spot batches natively: `place_batch` → `AddOrderBatch` (indexed
+   `orders[i][…]` form array), `cancel_batch` → `CancelOrderBatch`. The Kraken
+   **futures** client has no batch-cancel endpoint, so its `cancel_batch` is
+   sequential.
 
 `place_batch` returns `Vec<Result<Order>>` so a partially-accepted batch keeps
 each order's own outcome.
