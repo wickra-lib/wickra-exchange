@@ -1,0 +1,975 @@
+//! KuCoin (v1/v2 API) — the fifth exchange.
+//!
+//! KuCoin signs with base64(HMAC-SHA256) over `msTimestamp + METHOD + endpoint +
+//! body` under `KC-API-*` headers, and — unlike OKX/Bitget — the passphrase
+//! itself is HMAC-signed (`KC-API-PASSPHRASE = base64(HMAC-SHA256(secret,
+//! passphrase))`, key version 2). Symbols are dash-form (`BTC-USDT`); the
+//! envelope success code is the string `"200000"`. KuCoin candles are
+//! newest-first and ordered `[time, open, close, high, low, volume, turnover]`.
+
+use crate::credentials::Credentials;
+use crate::error::{Error, Result};
+use crate::events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
+use crate::normalize::{format_decimal, parse_decimal};
+use crate::options::ExchangeOptions;
+use crate::signing::hmac_sha256_base64;
+use crate::symbol::Symbol;
+use crate::traits::{Exchange, Execution, MarketData};
+use crate::transport::{HttpMethod, HttpRequest, HttpTransport, WsConnection, WsTransport};
+use crate::types::{Balance, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker};
+use rust_decimal::Decimal;
+use serde::Deserialize;
+use std::collections::HashMap;
+use wickra_core::Candle;
+
+fn system_now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is before the Unix epoch")
+        .as_millis() as i64
+}
+
+/// A KuCoin client over injected transports.
+pub struct KuCoin {
+    http: Box<dyn HttpTransport>,
+    ws: Option<Box<dyn WsTransport>>,
+    rest_base: String,
+    credentials: Option<Credentials>,
+    now_ms: Box<dyn Fn() -> i64 + Send + Sync>,
+    connection: Option<Box<dyn WsConnection>>,
+    subscriptions: Vec<(String, Symbol)>,
+}
+
+impl KuCoin {
+    fn build(
+        http: Box<dyn HttpTransport>,
+        _options: &ExchangeOptions,
+        credentials: Option<Credentials>,
+    ) -> Self {
+        Self {
+            http,
+            ws: None,
+            rest_base: "https://api.kucoin.com".to_string(),
+            credentials,
+            now_ms: Box::new(system_now_ms),
+            connection: None,
+            subscriptions: Vec::new(),
+        }
+    }
+
+    /// Build a public KuCoin client.
+    #[must_use]
+    pub fn with_http(http: Box<dyn HttpTransport>, options: &ExchangeOptions) -> Self {
+        Self::build(http, options, None)
+    }
+
+    /// Build an authenticated KuCoin client (credentials must carry a passphrase).
+    #[must_use]
+    pub fn with_credentials(
+        http: Box<dyn HttpTransport>,
+        options: &ExchangeOptions,
+        credentials: Credentials,
+    ) -> Self {
+        Self::build(http, options, Some(credentials))
+    }
+
+    /// Override the timestamp source (deterministic signing in tests).
+    #[must_use]
+    pub fn with_clock(mut self, now_ms: Box<dyn Fn() -> i64 + Send + Sync>) -> Self {
+        self.now_ms = now_ms;
+        self
+    }
+
+    /// Attach a WebSocket transport.
+    #[must_use]
+    pub fn with_ws(mut self, ws: Box<dyn WsTransport>) -> Self {
+        self.ws = Some(ws);
+        self
+    }
+
+    /// The KuCoin wire symbol for a canonical [`Symbol`] (`BTC/USDT` -> `BTC-USDT`).
+    #[must_use]
+    pub fn wire_symbol(symbol: &Symbol) -> String {
+        format!("{}-{}", symbol.base(), symbol.quote())
+    }
+
+    /// A ticker for `symbol` (from the 24-hour stats endpoint).
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the request fails or the symbol is unknown.
+    pub fn ticker(&self, symbol: &Symbol) -> Result<Ticker> {
+        let query = format!("symbol={}", Self::wire_symbol(symbol));
+        let data = self.get("/api/v1/market/stats", &query)?;
+        let raw: RawStats = parse_json(data)?;
+        Ok(Ticker {
+            symbol: symbol.clone(),
+            last: parse_decimal(&raw.last)?,
+            bid: parse_decimal(&raw.buy)?,
+            ask: parse_decimal(&raw.sell)?,
+            volume: parse_decimal(&raw.vol)?,
+        })
+    }
+
+    /// Up to `limit` candles for `symbol` at `interval` (unified). KuCoin returns
+    /// newest-first; the result is chronological.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the request fails or a row cannot be parsed.
+    pub fn klines(&self, symbol: &Symbol, interval: &str, _limit: u32) -> Result<Vec<Candle>> {
+        let query = format!(
+            "symbol={}&type={}",
+            Self::wire_symbol(symbol),
+            map_type(interval),
+        );
+        let data = self.get("/api/v1/market/candles", &query)?;
+        let rows: Vec<Vec<String>> = parse_json(data)?;
+        let mut candles = rows
+            .iter()
+            .map(|row| parse_kline_row(row))
+            .collect::<Result<Vec<_>>>()?;
+        candles.reverse();
+        Ok(candles)
+    }
+
+    /// A depth snapshot of `symbol` (top 20 levels per side).
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the request fails or the response cannot be parsed.
+    pub fn order_book(&self, symbol: &Symbol, _depth: u32) -> Result<OrderBookSnapshot> {
+        let query = format!("symbol={}", Self::wire_symbol(symbol));
+        let data = self.get("/api/v1/market/orderbook/level2_20", &query)?;
+        let raw: RawDepth = parse_json(data)?;
+        Ok(OrderBookSnapshot {
+            symbol: symbol.clone(),
+            last_update_id: raw.sequence.parse().unwrap_or(0),
+            bids: parse_levels(&raw.bids)?,
+            asks: parse_levels(&raw.asks)?,
+        })
+    }
+
+    /// Subscribe to the public trade stream for `symbol`.
+    ///
+    /// # Errors
+    /// Returns [`Error::NotConnected`] if no WebSocket transport is configured.
+    pub fn subscribe_trades(&mut self, symbol: &Symbol) -> Result<()> {
+        self.subscribe(symbol, "/market/match")
+    }
+
+    /// Subscribe to the order-book stream for `symbol`.
+    ///
+    /// # Errors
+    /// See [`subscribe_trades`](Self::subscribe_trades).
+    pub fn subscribe_book(&mut self, symbol: &Symbol) -> Result<()> {
+        self.subscribe(symbol, "/market/level2")
+    }
+
+    /// Subscribe to the ticker stream for `symbol`.
+    ///
+    /// # Errors
+    /// See [`subscribe_trades`](Self::subscribe_trades).
+    pub fn subscribe_ticker(&mut self, symbol: &Symbol) -> Result<()> {
+        self.subscribe(symbol, "/market/ticker")
+    }
+
+    fn subscribe(&mut self, symbol: &Symbol, topic_prefix: &str) -> Result<()> {
+        let wire = Self::wire_symbol(symbol);
+        if self.connection.is_none() {
+            // The bullet-token negotiation and instance endpoint are handled by
+            // the real transport adapter; the module only produces the topics.
+            let ws = self.ws.as_ref().ok_or(Error::NotConnected)?;
+            let connection = ws.connect("wss://ws-api-spot.kucoin.com/")?;
+            self.connection = Some(connection);
+        }
+        let id = (self.now_ms)();
+        let message = format!(
+            r#"{{"id":"{id}","type":"subscribe","topic":"{topic_prefix}:{wire}","response":true}}"#
+        );
+        self.connection
+            .as_mut()
+            .expect("connection just ensured")
+            .send(&message)?;
+        if !self.subscriptions.iter().any(|(w, _)| w == &wire) {
+            self.subscriptions.push((wire, symbol.clone()));
+        }
+        Ok(())
+    }
+
+    /// Drain all stream events available since the last call. Non-blocking.
+    pub fn poll_events(&mut self) -> Vec<Event> {
+        let subscriptions: HashMap<String, Symbol> = self.subscriptions.iter().cloned().collect();
+        let resolve = |wire: &str| {
+            subscriptions
+                .get(wire)
+                .cloned()
+                .unwrap_or_else(|| wire.parse().unwrap_or_else(|_| Symbol::new(wire, "")))
+        };
+        let mut events = Vec::new();
+        let Some(connection) = self.connection.as_mut() else {
+            return events;
+        };
+        while let Ok(Some(frame)) = connection.recv() {
+            if let Ok(Some(event)) = parse_ws_message(&frame, &resolve) {
+                events.push(event);
+            }
+        }
+        events
+    }
+
+    /// Place an order. KuCoin requires a client order id; one is generated from
+    /// the clock when the request does not supply it.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the order is invalid, credentials are missing, or
+    /// the venue rejects it.
+    pub fn place_order(&self, request: &OrderRequest) -> Result<Order> {
+        request.validate()?;
+        let client_oid = request
+            .client_order_id
+            .clone()
+            .unwrap_or_else(|| format!("wkex-{}", (self.now_ms)()));
+        let mut body = serde_json::json!({
+            "clientOid": client_oid,
+            "side": side_str(request.side),
+            "symbol": Self::wire_symbol(&request.symbol),
+            "type": order_type_str(request.order_type),
+            "size": format_decimal(request.quantity),
+        });
+        if let Some(price) = request.price {
+            body["price"] = serde_json::json!(format_decimal(price));
+        }
+        if request.post_only {
+            body["postOnly"] = serde_json::json!(true);
+        }
+        let data =
+            self.signed_request(HttpMethod::Post, "/api/v1/orders", "", &body.to_string())?;
+        let placed: PlaceResult = parse_json(data)?;
+        Ok(Order {
+            id: placed.order_id,
+            client_order_id: Some(client_oid),
+            symbol: request.symbol.clone(),
+            side: request.side,
+            order_type: request.order_type,
+            status: OrderStatus::New,
+            quantity: request.quantity,
+            filled_quantity: Decimal::ZERO,
+            price: request.price,
+            average_price: None,
+        })
+    }
+
+    /// Cancel an open order by venue id.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if credentials are missing or the venue rejects it.
+    pub fn cancel_order(&self, _symbol: &Symbol, order_id: &str) -> Result<()> {
+        let path = format!("/api/v1/orders/{order_id}");
+        self.signed_request(HttpMethod::Delete, &path, "", "")?;
+        Ok(())
+    }
+
+    /// Query a single order by venue id.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if credentials are missing or the order is unknown.
+    pub fn query_order(&self, symbol: &Symbol, order_id: &str) -> Result<Order> {
+        let path = format!("/api/v1/orders/{order_id}");
+        let data = self.signed_request(HttpMethod::Get, &path, "", "")?;
+        let raw: RawOrder = parse_json(data)?;
+        order_from_raw(symbol.clone(), &raw)
+    }
+
+    /// All open orders, optionally filtered to one `symbol`.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if credentials are missing or the request fails.
+    pub fn open_orders(&self, symbol: Option<&Symbol>) -> Result<Vec<Order>> {
+        let mut query = "status=active".to_string();
+        if let Some(s) = symbol {
+            query.push_str("&symbol=");
+            query.push_str(&Self::wire_symbol(s));
+        }
+        let data = self.signed_request(HttpMethod::Get, "/api/v1/orders", &query, "")?;
+        let page: OrderPage = parse_json(data)?;
+        page.items
+            .iter()
+            .map(|raw| {
+                let sym = symbol.cloned().unwrap_or_else(|| {
+                    raw.symbol
+                        .parse()
+                        .unwrap_or_else(|_| Symbol::new(&raw.symbol, ""))
+                });
+                order_from_raw(sym, raw)
+            })
+            .collect()
+    }
+
+    /// Trade-account balances.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if credentials are missing or the request fails.
+    pub fn balances(&self) -> Result<Vec<Balance>> {
+        let data = self.signed_request(HttpMethod::Get, "/api/v1/accounts", "type=trade", "")?;
+        let list: Vec<RawAccount> = parse_json(data)?;
+        Ok(list
+            .iter()
+            .map(|a| Balance {
+                asset: a.currency.clone(),
+                free: dec_or_zero(&a.available),
+                locked: dec_or_zero(&a.holds),
+            })
+            .collect())
+    }
+
+    fn get(&self, path: &str, query: &str) -> Result<serde_json::Value> {
+        let url = format!("{}{path}?{query}", self.rest_base);
+        let response = self.http.execute(&HttpRequest::get(url))?;
+        unwrap_envelope(&response.body)
+    }
+
+    /// Sign with the `KC-API-*` headers (key version 2, HMAC-signed passphrase).
+    fn signed_request(
+        &self,
+        method: HttpMethod,
+        path: &str,
+        query: &str,
+        body: &str,
+    ) -> Result<serde_json::Value> {
+        let creds = self.credentials.as_ref().ok_or(Error::InvalidCredentials(
+            "signed endpoint requires credentials",
+        ))?;
+        let passphrase = creds
+            .passphrase
+            .as_deref()
+            .ok_or(Error::InvalidCredentials("KuCoin requires a passphrase"))?;
+        let timestamp = (self.now_ms)().to_string();
+        let endpoint = if query.is_empty() {
+            path.to_string()
+        } else {
+            format!("{path}?{query}")
+        };
+        let prehash = format!("{timestamp}{}{endpoint}{body}", method.as_str());
+        let signature = hmac_sha256_base64(creds.api_secret.as_bytes(), prehash.as_bytes());
+        let signed_passphrase =
+            hmac_sha256_base64(creds.api_secret.as_bytes(), passphrase.as_bytes());
+        let url = format!("{}{endpoint}", self.rest_base);
+        let mut request = HttpRequest::new(method, url)
+            .with_header("KC-API-KEY", creds.api_key.clone())
+            .with_header("KC-API-SIGN", signature)
+            .with_header("KC-API-TIMESTAMP", timestamp)
+            .with_header("KC-API-PASSPHRASE", signed_passphrase)
+            .with_header("KC-API-KEY-VERSION", "2");
+        if !body.is_empty() {
+            request = request
+                .with_header("Content-Type", "application/json")
+                .with_body(body.to_string());
+        }
+        let response = self.http.execute(&request)?;
+        unwrap_envelope(&response.body)
+    }
+}
+
+fn map_type(interval: &str) -> String {
+    match interval {
+        "1m" => "1min",
+        "3m" => "3min",
+        "5m" => "5min",
+        "15m" => "15min",
+        "30m" => "30min",
+        "1h" => "1hour",
+        "2h" => "2hour",
+        "4h" => "4hour",
+        "6h" => "6hour",
+        "12h" => "12hour",
+        "1d" => "1day",
+        "1w" => "1week",
+        other => other,
+    }
+    .to_string()
+}
+
+fn unwrap_envelope(body: &str) -> Result<serde_json::Value> {
+    let envelope: Envelope =
+        serde_json::from_str(body).map_err(|e| Error::Deserialization(e.to_string()))?;
+    if envelope.code != "200000" {
+        return Err(map_error(&envelope.code, &envelope.msg));
+    }
+    Ok(envelope.data)
+}
+
+fn parse_json<T: for<'de> Deserialize<'de>>(value: serde_json::Value) -> Result<T> {
+    serde_json::from_value(value).map_err(|e| Error::Deserialization(e.to_string()))
+}
+
+fn map_error(code: &str, msg: &str) -> Error {
+    match code {
+        "429000" => Error::RateLimited { retry_after: None },
+        "400003" | "400004" | "400005" | "400006" | "400007" => Error::Auth(msg.to_string()),
+        "200004" | "400100" => Error::InsufficientBalance,
+        "400600" | "404000" => Error::NotFound(msg.to_string()),
+        other => Error::Exchange {
+            code: other.to_string(),
+            message: msg.to_string(),
+        },
+    }
+}
+
+fn side_str(side: OrderSide) -> &'static str {
+    match side {
+        OrderSide::Buy => "buy",
+        OrderSide::Sell => "sell",
+    }
+}
+
+fn order_type_str(order_type: OrderType) -> &'static str {
+    match order_type {
+        OrderType::Market | OrderType::StopMarket => "market",
+        OrderType::Limit | OrderType::StopLimit => "limit",
+    }
+}
+
+fn parse_side(raw: &str) -> Result<OrderSide> {
+    match raw {
+        "buy" => Ok(OrderSide::Buy),
+        "sell" => Ok(OrderSide::Sell),
+        other => Err(Error::Deserialization(format!("unknown side {other:?}"))),
+    }
+}
+
+fn parse_order_type(raw: &str) -> Result<OrderType> {
+    match raw {
+        "market" => Ok(OrderType::Market),
+        "limit" => Ok(OrderType::Limit),
+        other => Err(Error::Deserialization(format!(
+            "unknown order type {other:?}"
+        ))),
+    }
+}
+
+fn dec_or_zero(raw: &str) -> Decimal {
+    crate::normalize::parse_opt_decimal(Some(raw))
+        .ok()
+        .flatten()
+        .unwrap_or(Decimal::ZERO)
+}
+
+fn nonzero_decimal(raw: &str) -> Option<Decimal> {
+    crate::normalize::parse_opt_decimal(Some(raw))
+        .ok()
+        .flatten()
+        .filter(|d| *d > Decimal::ZERO)
+}
+
+fn parse_levels(levels: &[[String; 2]]) -> Result<Vec<BookLevel>> {
+    levels
+        .iter()
+        .map(|[price, qty]| {
+            Ok(BookLevel {
+                price: parse_decimal(price)?,
+                quantity: parse_decimal(qty)?,
+            })
+        })
+        .collect()
+}
+
+fn parse_kline_row(row: &[String]) -> Result<Candle> {
+    // KuCoin candle: [time, open, close, high, low, volume, turnover].
+    if row.len() < 6 {
+        return Err(Error::Deserialization("kline row too short".to_string()));
+    }
+    let ts = row[0]
+        .parse::<i64>()
+        .map_err(|e| Error::Deserialization(format!("kline time not an integer: {e}")))?;
+    let f = |i: usize| -> Result<f64> {
+        row[i]
+            .parse::<f64>()
+            .map_err(|e| Error::Deserialization(format!("kline field not a number: {e}")))
+    };
+    // Note the KuCoin field order: open, close, high, low.
+    Candle::new(f(1)?, f(3)?, f(4)?, f(2)?, f(5)?, ts)
+        .map_err(|e| Error::Deserialization(e.to_string()))
+}
+
+fn order_from_raw(symbol: Symbol, raw: &RawOrder) -> Result<Order> {
+    let status = if raw.is_active {
+        if dec_or_zero(&raw.deal_size) > Decimal::ZERO {
+            OrderStatus::PartiallyFilled
+        } else {
+            OrderStatus::New
+        }
+    } else if raw.cancel_exist {
+        OrderStatus::Canceled
+    } else {
+        OrderStatus::Filled
+    };
+    Ok(Order {
+        id: raw.id.clone(),
+        client_order_id: (!raw.client_oid.is_empty()).then(|| raw.client_oid.clone()),
+        symbol,
+        side: parse_side(&raw.side)?,
+        order_type: parse_order_type(&raw.order_type)?,
+        status,
+        quantity: parse_decimal(&raw.size)?,
+        filled_quantity: dec_or_zero(&raw.deal_size),
+        price: nonzero_decimal(&raw.price),
+        average_price: None,
+    })
+}
+
+fn field_str<'a>(value: &'a serde_json::Value, key: &str) -> Result<&'a str> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| Error::Deserialization(format!("missing string field {key:?}")))
+}
+
+fn opt_str<'a>(value: &'a serde_json::Value, key: &str) -> &'a str {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+}
+
+/// Read a `u64` that a venue may encode as either a JSON number or a string.
+fn opt_u64(value: &serde_json::Value, key: &str) -> u64 {
+    value
+        .get(key)
+        .and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        })
+        .unwrap_or(0)
+}
+
+fn parse_ws_levels(value: Option<&serde_json::Value>) -> Result<Vec<BookLevel>> {
+    let array = value
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| Error::Deserialization("missing depth levels".to_string()))?;
+    array
+        .iter()
+        .map(|level| {
+            let pair = level
+                .as_array()
+                .ok_or_else(|| Error::Deserialization("depth level not an array".to_string()))?;
+            let price = parse_decimal(
+                pair.first()
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| Error::Deserialization("depth price missing".to_string()))?,
+            )?;
+            let quantity =
+                parse_decimal(pair.get(1).and_then(serde_json::Value::as_str).ok_or_else(
+                    || Error::Deserialization("depth quantity missing".to_string()),
+                )?)?;
+            Ok(BookLevel { price, quantity })
+        })
+        .collect()
+}
+
+fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Option<Event>> {
+    let value: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| Error::Deserialization(e.to_string()))?;
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("message") {
+        return Ok(None); // ack/welcome/pong
+    }
+    let Some(topic) = value.get("topic").and_then(serde_json::Value::as_str) else {
+        return Ok(None);
+    };
+    let wire = topic.rsplit(':').next().unwrap_or("");
+    let symbol = resolve(wire);
+    let null = serde_json::Value::Null;
+    let data = value.get("data").unwrap_or(&null);
+
+    if topic.starts_with("/market/match:") {
+        Ok(Some(Event::Trade(TradePrint {
+            symbol,
+            price: parse_decimal(field_str(data, "price")?)?,
+            quantity: parse_decimal(field_str(data, "size")?)?,
+            aggressor: parse_side(field_str(data, "side")?)?,
+            timestamp: opt_str(data, "time").parse().unwrap_or(0),
+        })))
+    } else if topic.starts_with("/market/ticker:") {
+        Ok(Some(Event::Ticker(Ticker {
+            symbol,
+            last: parse_decimal(field_str(data, "price")?)?,
+            bid: dec_or_zero(opt_str(data, "bestBid")),
+            ask: dec_or_zero(opt_str(data, "bestAsk")),
+            volume: dec_or_zero(opt_str(data, "size")),
+        })))
+    } else if topic.starts_with("/market/level2:") {
+        let changes = data.get("changes");
+        let bids = parse_ws_levels(changes.and_then(|c| c.get("bids")))?;
+        let asks = parse_ws_levels(changes.and_then(|c| c.get("asks")))?;
+        let update_id = opt_u64(data, "sequenceEnd");
+        Ok(Some(Event::BookDelta(BookDelta {
+            symbol,
+            first_update_id: update_id,
+            final_update_id: update_id,
+            bids,
+            asks,
+        })))
+    } else {
+        Ok(None)
+    }
+}
+
+#[derive(Deserialize)]
+struct Envelope {
+    code: String,
+    #[serde(default)]
+    msg: String,
+    #[serde(default)]
+    data: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+struct RawStats {
+    last: String,
+    buy: String,
+    sell: String,
+    vol: String,
+}
+
+#[derive(Deserialize)]
+struct RawDepth {
+    #[serde(default)]
+    sequence: String,
+    bids: Vec<[String; 2]>,
+    asks: Vec<[String; 2]>,
+}
+
+#[derive(Deserialize)]
+struct PlaceResult {
+    #[serde(rename = "orderId", default)]
+    order_id: String,
+}
+
+#[derive(Deserialize)]
+struct OrderPage {
+    items: Vec<RawOrder>,
+}
+
+#[derive(Deserialize)]
+struct RawOrder {
+    id: String,
+    #[serde(rename = "clientOid", default)]
+    client_oid: String,
+    #[serde(default)]
+    symbol: String,
+    side: String,
+    #[serde(rename = "type")]
+    order_type: String,
+    size: String,
+    #[serde(rename = "dealSize", default)]
+    deal_size: String,
+    #[serde(default)]
+    price: String,
+    #[serde(rename = "isActive", default)]
+    is_active: bool,
+    #[serde(rename = "cancelExist", default)]
+    cancel_exist: bool,
+}
+
+#[derive(Deserialize)]
+struct RawAccount {
+    currency: String,
+    #[serde(default)]
+    available: String,
+    #[serde(default)]
+    holds: String,
+}
+
+impl MarketData for KuCoin {
+    fn ticker(&mut self, symbol: &Symbol) -> Result<Ticker> {
+        KuCoin::ticker(self, symbol)
+    }
+    fn klines(&mut self, symbol: &Symbol, interval: &str, limit: u32) -> Result<Vec<Candle>> {
+        KuCoin::klines(self, symbol, interval, limit)
+    }
+    fn order_book(&mut self, symbol: &Symbol, depth: u32) -> Result<OrderBookSnapshot> {
+        KuCoin::order_book(self, symbol, depth)
+    }
+    fn subscribe_trades(&mut self, symbol: &Symbol) -> Result<()> {
+        KuCoin::subscribe_trades(self, symbol)
+    }
+    fn subscribe_book(&mut self, symbol: &Symbol) -> Result<()> {
+        KuCoin::subscribe_book(self, symbol)
+    }
+    fn subscribe_ticker(&mut self, symbol: &Symbol) -> Result<()> {
+        KuCoin::subscribe_ticker(self, symbol)
+    }
+    fn poll_events(&mut self) -> Vec<Event> {
+        KuCoin::poll_events(self)
+    }
+}
+
+impl Execution for KuCoin {
+    fn place_order(&mut self, request: &OrderRequest) -> Result<Order> {
+        KuCoin::place_order(self, request)
+    }
+    fn cancel_order(&mut self, symbol: &Symbol, order_id: &str) -> Result<()> {
+        KuCoin::cancel_order(self, symbol, order_id)
+    }
+    fn query_order(&mut self, symbol: &Symbol, order_id: &str) -> Result<Order> {
+        KuCoin::query_order(self, symbol, order_id)
+    }
+    fn open_orders(&mut self, symbol: Option<&Symbol>) -> Result<Vec<Order>> {
+        KuCoin::open_orders(self, symbol)
+    }
+    fn balances(&mut self) -> Result<Vec<Balance>> {
+        KuCoin::balances(self)
+    }
+}
+
+impl Exchange for KuCoin {
+    fn name(&self) -> &'static str {
+        "kucoin"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::{HttpResponse, MockHttpTransport, MockWsTransport};
+    use rust_decimal_macros::dec;
+    use std::sync::Arc;
+
+    struct ArcTransport(Arc<MockHttpTransport>);
+    impl HttpTransport for ArcTransport {
+        fn execute(&self, request: &HttpRequest) -> Result<HttpResponse> {
+            self.0.execute(request)
+        }
+    }
+    struct ArcWs(Arc<MockWsTransport>);
+    impl WsTransport for ArcWs {
+        fn connect(&self, url: &str) -> Result<Box<dyn WsConnection>> {
+            self.0.connect(url)
+        }
+    }
+
+    fn symbol() -> Symbol {
+        Symbol::new("BTC", "USDT")
+    }
+
+    fn client() -> (KuCoin, Arc<MockHttpTransport>) {
+        let mock = Arc::new(MockHttpTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::Spot);
+        (
+            KuCoin::with_http(Box::new(ArcTransport(Arc::clone(&mock))), &opts),
+            mock,
+        )
+    }
+
+    fn signed_client(now_ms: i64) -> (KuCoin, Arc<MockHttpTransport>) {
+        let mock = Arc::new(MockHttpTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::Spot);
+        let kucoin = KuCoin::with_credentials(
+            Box::new(ArcTransport(Arc::clone(&mock))),
+            &opts,
+            Credentials::new("APIKEY", "SECRET").with_passphrase("PASS"),
+        )
+        .with_clock(Box::new(move || now_ms));
+        (kucoin, mock)
+    }
+
+    #[test]
+    fn ticker_from_stats() {
+        let (kucoin, mock) = client();
+        mock.push_json(
+            200,
+            r#"{"code":"200000","data":{"last":"20000","buy":"19999","sell":"20001","vol":"1234"}}"#,
+        );
+        let ticker = kucoin.ticker(&symbol()).unwrap();
+        assert_eq!(ticker.last, dec!(20000));
+        assert_eq!(ticker.bid, dec!(19999));
+        assert_eq!(ticker.ask, dec!(20001));
+    }
+
+    #[test]
+    fn klines_field_order_and_reverse() {
+        let (kucoin, mock) = client();
+        // [time, open, close, high, low, volume, turnover], newest-first.
+        mock.push_json(
+            200,
+            r#"{"code":"200000","data":[
+            ["1700000060","105","105.5","106","104","2","0"],
+            ["1700000000","100","105","110","95","12","0"]]}"#,
+        );
+        let candles = kucoin.klines(&symbol(), "1h", 2).unwrap();
+        assert_eq!(candles[0].timestamp, 1_700_000_000);
+        // open=100, high=110, low=95, close=105.
+        assert!((candles[0].high - 110.0).abs() < 1e-9);
+        assert!((candles[0].low - 95.0).abs() < 1e-9);
+        assert!((candles[0].close - 105.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn order_book_parses() {
+        let (kucoin, mock) = client();
+        mock.push_json(
+            200,
+            r#"{"code":"200000","data":{"sequence":"55","bids":[["100","1"]],"asks":[["101","2"]]}}"#,
+        );
+        let book = kucoin.order_book(&symbol(), 20).unwrap();
+        assert_eq!(book.last_update_id, 55);
+        assert_eq!(book.bids[0], BookLevel::new(dec!(100), dec!(1)));
+    }
+
+    #[test]
+    fn error_mapping() {
+        let (kucoin, mock) = client();
+        mock.push_json(200, r#"{"code":"200004","msg":"balance","data":null}"#);
+        assert!(matches!(
+            kucoin.ticker(&symbol()).unwrap_err(),
+            Error::InsufficientBalance
+        ));
+    }
+
+    #[test]
+    fn place_order_signs_with_kc_headers_and_signed_passphrase() {
+        let (kucoin, mock) = signed_client(1000);
+        mock.push_json(200, r#"{"code":"200000","data":{"orderId":"99"}}"#);
+        let order = kucoin
+            .place_order(
+                &OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)).with_client_order_id("abc"),
+            )
+            .unwrap();
+        assert_eq!(order.id, "99");
+        assert_eq!(order.client_order_id.as_deref(), Some("abc"));
+
+        let req = &mock.recorded_requests()[0];
+        let header = |name: &str| {
+            req.headers
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.as_str())
+                .unwrap()
+        };
+        let ts = header("KC-API-TIMESTAMP");
+        assert_eq!(ts, "1000");
+        let body = req.body.as_ref().unwrap();
+        let prehash = format!("{ts}POST/api/v1/orders{body}");
+        assert_eq!(
+            header("KC-API-SIGN"),
+            hmac_sha256_base64(b"SECRET", prehash.as_bytes())
+        );
+        // The passphrase header is itself HMAC-signed.
+        assert_eq!(
+            header("KC-API-PASSPHRASE"),
+            hmac_sha256_base64(b"SECRET", b"PASS")
+        );
+        assert_eq!(header("KC-API-KEY-VERSION"), "2");
+    }
+
+    #[test]
+    fn place_order_generates_client_oid_when_absent() {
+        let (kucoin, mock) = signed_client(1000);
+        mock.push_json(200, r#"{"code":"200000","data":{"orderId":"1"}}"#);
+        let order = kucoin
+            .place_order(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)))
+            .unwrap();
+        assert_eq!(order.client_order_id.as_deref(), Some("wkex-1000"));
+    }
+
+    #[test]
+    fn query_order_status_from_flags() {
+        let (kucoin, mock) = signed_client(1000);
+        mock.push_json(
+            200,
+            r#"{"code":"200000","data":{"id":"99","clientOid":"","symbol":"BTC-USDT",
+            "side":"sell","type":"limit","size":"2","dealSize":"0","price":"100",
+            "isActive":false,"cancelExist":false}}"#,
+        );
+        let order = kucoin.query_order(&symbol(), "99").unwrap();
+        // Inactive, not cancelled -> filled.
+        assert_eq!(order.status, OrderStatus::Filled);
+        assert_eq!(order.side, OrderSide::Sell);
+    }
+
+    #[test]
+    fn balances_and_open_orders() {
+        let (kucoin, mock) = signed_client(1000);
+        mock.push_json(
+            200,
+            r#"{"code":"200000","data":[{"currency":"USDT","available":"100.5","holds":"25.5"}]}"#,
+        );
+        let bals = kucoin.balances().unwrap();
+        assert_eq!(bals[0].total(), dec!(126));
+
+        mock.push_json(
+            200,
+            r#"{"code":"200000","data":{"items":[{"id":"7","clientOid":"","symbol":"ETH-USDT",
+            "side":"buy","type":"limit","size":"1","dealSize":"0","price":"50",
+            "isActive":true,"cancelExist":false}]}}"#,
+        );
+        let open = kucoin.open_orders(None).unwrap();
+        assert_eq!(open[0].symbol, Symbol::new("ETH", "USDT"));
+        assert_eq!(open[0].status, OrderStatus::New);
+    }
+
+    #[test]
+    fn signed_requires_passphrase() {
+        let mock = Arc::new(MockHttpTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::Spot);
+        let kucoin = KuCoin::with_credentials(
+            Box::new(ArcTransport(mock)),
+            &opts,
+            Credentials::new("k", "s"),
+        );
+        assert!(matches!(
+            kucoin.balances().unwrap_err(),
+            Error::InvalidCredentials(_)
+        ));
+    }
+
+    #[test]
+    fn ws_parses_trade_ticker_book() {
+        let ws = Arc::new(MockWsTransport::new());
+        ws.push_connection(vec![
+            Ok(Some(
+                r#"{"type":"message","topic":"/market/match:BTC-USDT","subject":"trade.l3match",
+                "data":{"symbol":"BTC-USDT","side":"buy","price":"100","size":"0.5","time":"1"}}"#
+                    .to_string(),
+            )),
+            Ok(Some(
+                r#"{"type":"message","topic":"/market/level2:BTC-USDT","subject":"trade.l2update",
+                "data":{"sequenceEnd":9,"changes":{"bids":[["100","1","9"]],"asks":[]}}}"#
+                    .to_string(),
+            )),
+            Ok(Some(r#"{"type":"welcome"}"#.to_string())),
+        ]);
+        let http = Arc::new(MockHttpTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::Spot);
+        let mut kucoin = KuCoin::with_http(Box::new(ArcTransport(http)), &opts)
+            .with_ws(Box::new(ArcWs(Arc::clone(&ws))));
+        kucoin.subscribe_trades(&symbol()).unwrap();
+        assert!(ws.sent()[0].contains(r#""topic":"/market/match:BTC-USDT""#));
+
+        let events = kucoin.poll_events();
+        assert_eq!(events.len(), 2);
+        let Event::Trade(t) = &events[0] else {
+            panic!("expected trade")
+        };
+        assert_eq!(t.aggressor, OrderSide::Buy);
+        let Event::BookDelta(d) = &events[1] else {
+            panic!("expected book delta")
+        };
+        assert_eq!(d.final_update_id, 9);
+    }
+
+    #[test]
+    fn works_as_a_boxed_exchange() {
+        let (kucoin, mock) = signed_client(1000);
+        mock.push_json(200, r#"{"code":"200000","data":{"orderId":"1"}}"#);
+        let mut exchange: Box<dyn Exchange> = Box::new(kucoin);
+        assert_eq!(exchange.name(), "kucoin");
+        let order = exchange
+            .place_order(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)))
+            .unwrap();
+        assert_eq!(order.id, "1");
+    }
+
+    #[test]
+    fn system_clock_is_sane() {
+        assert!(system_now_ms() > 1_600_000_000_000);
+    }
+}
