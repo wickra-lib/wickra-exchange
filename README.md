@@ -77,6 +77,10 @@ Track progress in [ROADMAP.md](ROADMAP.md). Not released to any registry.
   JWT ES256/HS512, passphrase) and how `Credentials` map onto each.
 - **[Streaming](docs/STREAMING.md)** — the pull-based event model, the local
   order-book builder and reconnect/resubscribe semantics.
+- **[Derivatives & advanced orders](docs/DERIVATIVES.md)** — the `Derivatives`,
+  `AdvancedOrders` and `WsExecution` traits, futures routing, and per-venue gaps.
+- **[Capability matrix](docs/CAPABILITIES.md)** — real per-venue support for
+  spot/futures, positions/leverage/margin, and STP/amend/batch/OCO/WS-order.
 - **[Architecture](ARCHITECTURE.md)** — crates, traits, the transport abstraction
   and design decisions.
 - **[Benchmarks](BENCHMARKS.md)** — signing / parse / filter-rounding throughput.
