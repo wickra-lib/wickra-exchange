@@ -388,6 +388,108 @@ SEXP wkex_advanced_place_batch(SEXP ext, SEXP markets, SEXP sides,
     return result;
 }
 
+/* --- user data ----------------------------------------------------------- */
+
+static void wkex_user_data_finalize(SEXP ext) {
+    WickraUserData *h = (WickraUserData *)R_ExternalPtrAddr(ext);
+    if (h) {
+        wickra_user_data_free(h);
+    }
+    R_ClearExternalPtr(ext);
+}
+
+static WickraUserData *user_data_of(SEXP ext) {
+    WickraUserData *h = (WickraUserData *)R_ExternalPtrAddr(ext);
+    if (!h) {
+        Rf_error("wickra: user-data handle is closed");
+    }
+    return h;
+}
+
+SEXP wkex_connect_user_data(SEXP name, SEXP api_key, SEXP api_secret,
+                            SEXP passphrase, SEXP private_key, SEXP testnet, SEXP futures) {
+    WickraUserData *h = wickra_connect_user_data(
+        CHAR(STRING_ELT(name, 0)), CHAR(STRING_ELT(api_key, 0)), CHAR(STRING_ELT(api_secret, 0)),
+        opt_cstr(passphrase), opt_cstr(private_key),
+        (bool)Rf_asLogical(testnet), (bool)Rf_asLogical(futures));
+    if (!h) {
+        Rf_error("wickra: failed to connect user-data client (spot-only or unknown venue?)");
+    }
+    SEXP ext = PROTECT(R_MakeExternalPtr(h, R_NilValue, R_NilValue));
+    R_RegisterCFinalizerEx(ext, wkex_user_data_finalize, TRUE);
+    UNPROTECT(1);
+    return ext;
+}
+
+SEXP wkex_user_data_subscribe(SEXP ext) {
+    return Rf_ScalarInteger(wickra_user_data_subscribe(user_data_of(ext)));
+}
+
+SEXP wkex_user_data_poll(SEXP ext, SEXP capacity) {
+    int cap = Rf_asInteger(capacity);
+    WickraEvent *buf = (WickraEvent *)R_alloc(cap, sizeof(WickraEvent));
+    int count = wickra_user_data_poll(user_data_of(ext), buf, (size_t)cap);
+    if (count < 0) {
+        Rf_error("wickra: user-data poll failed with code %d", count);
+    }
+    SEXP out = PROTECT(Rf_allocVector(VECSXP, count));
+    for (int i = 0; i < count; i++) {
+        SET_VECTOR_ELT(out, i, event_to_list(&buf[i]));
+    }
+    UNPROTECT(1);
+    return out;
+}
+
+/* --- ws execution -------------------------------------------------------- */
+
+static void wkex_ws_execution_finalize(SEXP ext) {
+    WickraWsExecution *h = (WickraWsExecution *)R_ExternalPtrAddr(ext);
+    if (h) {
+        wickra_ws_execution_free(h);
+    }
+    R_ClearExternalPtr(ext);
+}
+
+static WickraWsExecution *ws_execution_of(SEXP ext) {
+    WickraWsExecution *h = (WickraWsExecution *)R_ExternalPtrAddr(ext);
+    if (!h) {
+        Rf_error("wickra: ws-execution handle is closed");
+    }
+    return h;
+}
+
+SEXP wkex_connect_ws_execution(SEXP name, SEXP api_key, SEXP api_secret,
+                               SEXP passphrase, SEXP private_key, SEXP testnet, SEXP futures) {
+    WickraWsExecution *h = wickra_connect_ws_execution(
+        CHAR(STRING_ELT(name, 0)), CHAR(STRING_ELT(api_key, 0)), CHAR(STRING_ELT(api_secret, 0)),
+        opt_cstr(passphrase), opt_cstr(private_key),
+        (bool)Rf_asLogical(testnet), (bool)Rf_asLogical(futures));
+    if (!h) {
+        Rf_error("wickra: failed to connect ws-execution client (spot-only or unknown venue?)");
+    }
+    SEXP ext = PROTECT(R_MakeExternalPtr(h, R_NilValue, R_NilValue));
+    R_RegisterCFinalizerEx(ext, wkex_ws_execution_finalize, TRUE);
+    UNPROTECT(1);
+    return ext;
+}
+
+SEXP wkex_ws_place_order(SEXP ext, SEXP market, SEXP side, SEXP quantity, SEXP price) {
+    WickraOrder order;
+    int rc = wickra_ws_place_order(ws_execution_of(ext), CHAR(STRING_ELT(market, 0)),
+                                   Rf_asInteger(side), Rf_asReal(quantity), Rf_asReal(price),
+                                   &order);
+    if (rc != WICKRA_OK) {
+        Rf_error("wickra: ws place_order failed with code %d", rc);
+    }
+    return order_to_list(&order);
+}
+
+SEXP wkex_ws_cancel_order(SEXP ext, SEXP market, SEXP order_id) {
+    int rc = wickra_ws_cancel_order(ws_execution_of(ext), CHAR(STRING_ELT(market, 0)),
+                                    CHAR(STRING_ELT(order_id, 0)));
+    return Rf_ScalarInteger(rc);
+}
+
 /* --- registration -------------------------------------------------------- */
 
 static const R_CallMethodDef CallEntries[] = {
@@ -411,6 +513,12 @@ static const R_CallMethodDef CallEntries[] = {
     {"wkex_advanced_cancel_batch", (DL_FUNC)&wkex_advanced_cancel_batch, 3},
     {"wkex_advanced_place_oco", (DL_FUNC)&wkex_advanced_place_oco, 7},
     {"wkex_advanced_place_batch", (DL_FUNC)&wkex_advanced_place_batch, 5},
+    {"wkex_connect_user_data", (DL_FUNC)&wkex_connect_user_data, 7},
+    {"wkex_user_data_subscribe", (DL_FUNC)&wkex_user_data_subscribe, 1},
+    {"wkex_user_data_poll", (DL_FUNC)&wkex_user_data_poll, 2},
+    {"wkex_connect_ws_execution", (DL_FUNC)&wkex_connect_ws_execution, 7},
+    {"wkex_ws_place_order", (DL_FUNC)&wkex_ws_place_order, 5},
+    {"wkex_ws_cancel_order", (DL_FUNC)&wkex_ws_cancel_order, 3},
     {NULL, NULL, 0}};
 
 void R_init_wickraexchange(DllInfo *dll) {

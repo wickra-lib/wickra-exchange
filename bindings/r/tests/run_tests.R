@@ -82,4 +82,18 @@ reqs <- data.frame(
 stopifnot(nrow(reqs) == 2L)
 stopifnot(is.na(reqs$price[2]))
 
+## User-data + ws-execution: construction is offline; spot-only venues error.
+for (venue in c("coinbase", "upbit", "ftx")) {
+  stopifnot(inherits(try(wkex_user_data(venue, "k", "s"), silent = TRUE), "try-error"))
+  stopifnot(inherits(try(wkex_ws_execution(venue, "k", "s"), silent = TRUE), "try-error"))
+}
+ud <- wkex_user_data("binance", "k", "s")
+stopifnot(inherits(ud, "wickra_user_data"))
+## WsUserData: MarketData, so the client can poll (nothing buffered offline).
+stopifnot(length(wkex_user_data_poll(ud)) == 0)
+wse <- wkex_ws_execution("bybit", "k", "s")
+stopifnot(inherits(wse, "wickra_ws_execution"))
+stopifnot(is.function(wkex_ws_place_order))
+stopifnot(is.function(wkex_ws_cancel_order))
+
 cat("wickra.exchange R tests passed\n")

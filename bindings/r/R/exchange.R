@@ -303,3 +303,78 @@ wkex_place_batch <- function(adv, markets, sides, quantities, prices) {
     r
   })
 }
+
+#' Connect a live private user-data client.
+#'
+#' After [wkex_subscribe_user_data()], [wkex_user_data_poll()] surfaces the
+#' account's own order and balance updates. Fails for a spot-only venue.
+#' @param name,api_key,api_secret Venue and API credentials.
+#' @param passphrase,private_key Optional extra credentials (NULL if unused).
+#' @param testnet Use the venue testnet.
+#' @param futures Select the USD-M futures market.
+#' @return A `wickra_user_data` object.
+#' @export
+wkex_user_data <- function(name, api_key, api_secret,
+                           passphrase = NULL, private_key = NULL, testnet = FALSE, futures = FALSE) {
+  handle <- .Call(C_wkex_connect_user_data, name, api_key, api_secret,
+                  passphrase, private_key, as.logical(testnet), as.logical(futures))
+  structure(list(handle = handle), class = "wickra_user_data")
+}
+
+#' Open the private user-data stream.
+#' @param ud A `wickra_user_data` object.
+#' @return Invisibly, `ud`.
+#' @export
+wkex_subscribe_user_data <- function(ud) {
+  invisible(.Call(C_wkex_user_data_subscribe, ud$handle))
+}
+
+#' Drain buffered user-data events.
+#' @param ud A `wickra_user_data` object.
+#' @param capacity Maximum events to return per call.
+#' @return A list of event lists.
+#' @export
+wkex_user_data_poll <- function(ud, capacity = 16L) {
+  lapply(.Call(C_wkex_user_data_poll, ud$handle, as.integer(capacity)), .wkex_event)
+}
+
+#' Connect a live WebSocket order-API client (place/cancel over the ws-api).
+#'
+#' Native on binance/bybit/okx/gateio/kraken; on bitget/kucoin/htx the methods
+#' error (no WebSocket order-entry API). Fails for a spot-only venue.
+#' @param name,api_key,api_secret Venue and API credentials.
+#' @param passphrase,private_key Optional extra credentials (NULL if unused).
+#' @param testnet Use the venue testnet.
+#' @param futures Select the USD-M futures market.
+#' @return A `wickra_ws_execution` object.
+#' @export
+wkex_ws_execution <- function(name, api_key, api_secret,
+                              passphrase = NULL, private_key = NULL, testnet = FALSE, futures = FALSE) {
+  handle <- .Call(C_wkex_connect_ws_execution, name, api_key, api_secret,
+                  passphrase, private_key, as.logical(testnet), as.logical(futures))
+  structure(list(handle = handle), class = "wickra_ws_execution")
+}
+
+#' Place an order over the WebSocket order API.
+#' @param wse A `wickra_ws_execution` object.
+#' @param market Market string.
+#' @param side "buy" or "sell".
+#' @param quantity Order quantity.
+#' @param price Limit price, or NA for a market order.
+#' @return The resulting order as a list.
+#' @export
+wkex_ws_place_order <- function(wse, market, side, quantity, price = NA_real_) {
+  .wkex_order(.Call(C_wkex_ws_place_order, wse$handle, market, .wkex_side(side),
+                    as.numeric(quantity), as.numeric(price)))
+}
+
+#' Cancel an order over the WebSocket order API by venue id.
+#' @param wse A `wickra_ws_execution` object.
+#' @param market Market string.
+#' @param order_id The venue order id.
+#' @return Invisibly, `wse`.
+#' @export
+wkex_ws_cancel_order <- function(wse, market, order_id) {
+  .Call(C_wkex_ws_cancel_order, wse$handle, market, order_id)
+  invisible(wse)
+}
