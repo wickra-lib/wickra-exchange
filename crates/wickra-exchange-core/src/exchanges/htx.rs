@@ -35,7 +35,7 @@ use crate::options::{ExchangeOptions, MarginMode, MarketType};
 use crate::positions::{Position, PositionSide};
 use crate::signing::hmac_sha256_base64;
 use crate::symbol::Symbol;
-use crate::traits::{AdvancedOrders, Derivatives, Exchange, Execution, MarketData};
+use crate::traits::{AdvancedOrders, Derivatives, Exchange, Execution, MarketData, WsUserData};
 use crate::transport::{HttpMethod, HttpRequest, HttpTransport, WsConnection, WsTransport};
 use crate::types::{
     Balance, OcoRequest, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker,
@@ -119,6 +119,10 @@ pub struct Htx {
     account_id: RefCell<Option<String>>,
     /// Leverage applied to futures orders (HTX sets `lever_rate` per order).
     leverage: Cell<u32>,
+    /// The private user-data connection, opened by
+    /// [`subscribe_user_data`](Self::subscribe_user_data) and drained by
+    /// [`poll_events`](Self::poll_events) alongside the public stream.
+    private_connection: Option<Box<dyn WsConnection>>,
 }
 
 impl Htx {
@@ -145,6 +149,7 @@ impl Htx {
             subscriptions: Vec::new(),
             account_id: RefCell::new(None),
             leverage: Cell::new(1),
+            private_connection: None,
         }
     }
 
@@ -364,6 +369,15 @@ impl Htx {
                 }
             }
         }
+        // Drain the private user-data (v2 `orders`/`accounts.update`) stream, if
+        // open. Re-authenticating a dropped private stream is a keepalive follow-up.
+        if let Some(connection) = self.private_connection.as_mut() {
+            while let Ok(Some(frame)) = connection.recv() {
+                if let Ok(mut parsed) = parse_ws_message(&frame, &resolve) {
+                    events.append(&mut parsed);
+                }
+            }
+        }
         let url = "wss://api.huobi.pro/ws";
         crate::wsutil::reconnect_if_dropped(
             self.ws.as_deref(),
@@ -373,6 +387,52 @@ impl Htx {
             &mut events,
         );
         events
+    }
+
+    /// Open the private user-data stream (`wss://api.huobi.pro/ws/v2`).
+    /// Authenticates with the v2 `req/auth` handshake (signature = base64(HMAC-SHA256)
+    /// over `GET\napi.huobi.pro\n/ws/v2\n<sorted query>`), then subscribes to the
+    /// `orders#*` and `accounts.update#2` channels. Afterwards
+    /// [`poll_events`](Self::poll_events) also surfaces the account's own
+    /// [`Event::OrderUpdate`] and [`Event::BalanceUpdate`].
+    ///
+    /// Re-authenticating a dropped private stream is a keepalive follow-up.
+    ///
+    /// # Errors
+    /// Returns [`Error::InvalidCredentials`] without credentials,
+    /// [`Error::NotConnected`] without a WebSocket transport, or another
+    /// [`Error`] if the request fails.
+    pub fn subscribe_user_data(&mut self) -> Result<()> {
+        let creds = self.credentials.as_ref().ok_or(Error::InvalidCredentials(
+            "user-data stream requires credentials",
+        ))?;
+        let timestamp = iso8601_no_millis((self.now_ms)());
+        // The v2 WS auth signs the same canonical form as REST, over `/ws/v2`.
+        let mut params = [
+            ("accessKey", creds.api_key.as_str()),
+            ("signatureMethod", "HmacSHA256"),
+            ("signatureVersion", "2.1"),
+            ("timestamp", timestamp.as_str()),
+        ];
+        params.sort_by(|a, b| a.0.cmp(b.0));
+        let encoded = params
+            .iter()
+            .map(|(key, val)| format!("{}={}", encode(key), encode(val)))
+            .collect::<Vec<_>>()
+            .join("&");
+        let canonical = format!("GET\n{HOST}\n/ws/v2\n{encoded}");
+        let signature = hmac_sha256_base64(creds.api_secret.as_bytes(), canonical.as_bytes());
+        let auth = format!(
+            r#"{{"action":"req","ch":"auth","params":{{"authType":"api","accessKey":"{}","signatureMethod":"HmacSHA256","signatureVersion":"2.1","timestamp":"{timestamp}","signature":"{signature}"}}}}"#,
+            creds.api_key
+        );
+        let ws = self.ws.as_ref().ok_or(Error::NotConnected)?;
+        let mut connection = ws.connect("wss://api.huobi.pro/ws/v2")?;
+        connection.send(&auth)?;
+        connection.send(r#"{"action":"sub","ch":"orders#*"}"#)?;
+        connection.send(r#"{"action":"sub","ch":"accounts.update#2"}"#)?;
+        self.private_connection = Some(connection);
+        Ok(())
     }
 
     /// The spot `account-id`, fetched once and cached.
@@ -1124,9 +1184,95 @@ fn split_wire_symbol(wire: &str) -> Symbol {
     Symbol::new(wire, "")
 }
 
+/// Build an [`Order`] from an HTX v2 `orders#*` push payload.
+fn ws_order_from_data(data: &serde_json::Value) -> Result<Order> {
+    let wire = data
+        .get("symbol")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| Error::Deserialization("missing order symbol".to_string()))?;
+    let order_type = data
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| Error::Deserialization("missing order type".to_string()))?;
+    let state = data
+        .get("orderStatus")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| Error::Deserialization("missing orderStatus".to_string()))?;
+    // HTX encodes the order id as a JSON number.
+    let id = match data.get("orderId") {
+        Some(serde_json::Value::Number(n)) => n.to_string(),
+        Some(serde_json::Value::String(s)) => s.clone(),
+        _ => return Err(Error::Deserialization("missing orderId".to_string())),
+    };
+    let client_id = data
+        .get("clientOrderId")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let opt_dec = |key: &str| {
+        data.get(key)
+            .and_then(|f| decimal_value(f).ok())
+            .filter(|d| *d > Decimal::ZERO)
+    };
+    Ok(Order {
+        id,
+        client_order_id: (!client_id.is_empty()).then(|| client_id.to_string()),
+        symbol: split_wire_symbol(wire),
+        side: parse_side(order_type)?,
+        order_type: parse_order_type(order_type)?,
+        status: parse_state(state)?,
+        quantity: decimal_field(data, "orderSize").unwrap_or(Decimal::ZERO),
+        filled_quantity: data
+            .get("execAmt")
+            .and_then(|f| decimal_value(f).ok())
+            .unwrap_or(Decimal::ZERO),
+        price: opt_dec("orderPrice"),
+        average_price: opt_dec("tradePrice"),
+    })
+}
+
+/// Build a [`Balance`] from an HTX v2 `accounts.update` push payload. `available`
+/// is the free balance; `balance` (when present) is the total, so the locked
+/// amount is `balance - available`.
+fn ws_balance_from_data(data: &serde_json::Value) -> Result<Balance> {
+    let currency = data
+        .get("currency")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| Error::Deserialization("missing balance currency".to_string()))?;
+    let available = data.get("available").and_then(|f| decimal_value(f).ok());
+    let total = data.get("balance").and_then(|f| decimal_value(f).ok());
+    let (free, locked) = match (available, total) {
+        (Some(free), Some(total)) => (free, (total - free).max(Decimal::ZERO)),
+        (Some(free), None) => (free, Decimal::ZERO),
+        (None, Some(total)) => (total, Decimal::ZERO),
+        (None, None) => (Decimal::ZERO, Decimal::ZERO),
+    };
+    Ok(Balance {
+        asset: currency.to_string(),
+        free,
+        locked,
+    })
+}
+
 fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Vec<Event>> {
     let value: serde_json::Value =
         serde_json::from_str(text).map_err(|e| Error::Deserialization(e.to_string()))?;
+    // HTX v2 private stream frames are `{"action":"push","ch":"orders#..."|"accounts.update#...","data":{...}}`.
+    if value.get("action").and_then(serde_json::Value::as_str) == Some("push") {
+        let ch = value
+            .get("ch")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let null = serde_json::Value::Null;
+        let data = value.get("data").unwrap_or(&null);
+        if ch.starts_with("orders#") {
+            return Ok(vec![Event::OrderUpdate(ws_order_from_data(data)?)]);
+        } else if ch.starts_with("accounts.update") {
+            return Ok(vec![Event::BalanceUpdate(vec![ws_balance_from_data(
+                data,
+            )?])]);
+        }
+        return Ok(Vec::new());
+    }
     let Some(channel) = value.get("ch").and_then(serde_json::Value::as_str) else {
         return Ok(Vec::new()); // ping / sub-ack
     };
@@ -1229,6 +1375,12 @@ impl Execution for Htx {
 impl Exchange for Htx {
     fn name(&self) -> &'static str {
         "htx"
+    }
+}
+
+impl WsUserData for Htx {
+    fn subscribe_user_data(&mut self) -> Result<()> {
+        Htx::subscribe_user_data(self)
     }
 }
 
@@ -1488,6 +1640,84 @@ mod tests {
         )
         .with_clock(Box::new(move || now_ms));
         (htx, mock)
+    }
+
+    fn signed_ws_client(now_ms: i64) -> (Htx, Arc<MockWsTransport>) {
+        let http = Arc::new(MockHttpTransport::new());
+        let ws = Arc::new(MockWsTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::Spot);
+        let htx = Htx::with_credentials(
+            Box::new(ArcTransport(http)),
+            &opts,
+            Credentials::new("APIKEY", "SECRET"),
+        )
+        .with_ws(Box::new(ArcWs(Arc::clone(&ws))))
+        .with_clock(Box::new(move || now_ms));
+        (htx, ws)
+    }
+
+    #[test]
+    fn subscribe_user_data_authenticates_and_streams_orders_and_accounts() {
+        let (mut htx, ws) = signed_ws_client(1_700_000_000_000);
+        ws.push_connection(vec![
+            Ok(Some(
+                r#"{"action":"req","code":200,"ch":"auth","data":{}}"#.to_string(),
+            )),
+            Ok(Some(
+                r#"{"action":"sub","code":200,"ch":"orders#*"}"#.to_string(),
+            )),
+            Ok(Some(
+                r#"{"action":"push","ch":"orders#btcusdt","data":{"orderId":55,"symbol":"btcusdt",
+                "clientOrderId":"my","type":"buy-limit","orderStatus":"filled","orderSize":"1",
+                "execAmt":"1","orderPrice":"100","tradePrice":"100"}}"#
+                    .to_string(),
+            )),
+            Ok(Some(
+                r#"{"action":"push","ch":"accounts.update#2","data":{"currency":"usdt",
+                "balance":"950","available":"900"}}"#
+                    .to_string(),
+            )),
+        ]);
+        htx.subscribe_user_data().unwrap();
+        assert_eq!(ws.connected_urls()[0], "wss://api.huobi.pro/ws/v2");
+        assert!(ws.sent()[0].contains(r#""ch":"auth""#));
+        assert!(ws.sent()[0].contains(r#""accessKey":"APIKEY""#));
+        assert!(ws.sent()[0].contains(r#""signature""#));
+        assert!(ws.sent()[1].contains(r#""ch":"orders#*""#));
+        assert!(ws.sent()[2].contains(r#""ch":"accounts.update#2""#));
+
+        let events = htx.poll_events();
+        assert_eq!(events.len(), 2);
+        let Event::OrderUpdate(order) = &events[0] else {
+            panic!("first event must be an order update");
+        };
+        assert_eq!(order.id, "55");
+        assert_eq!(order.client_order_id.as_deref(), Some("my"));
+        assert_eq!(order.symbol, symbol());
+        assert_eq!(order.side, OrderSide::Buy);
+        assert_eq!(order.status, OrderStatus::Filled);
+        assert_eq!(order.filled_quantity, dec!(1));
+        assert_eq!(order.average_price, Some(dec!(100)));
+        let Event::BalanceUpdate(balances) = &events[1] else {
+            panic!("second event must be a balance update");
+        };
+        assert_eq!(balances.len(), 1);
+        assert_eq!(balances[0].asset, "usdt");
+        assert_eq!(balances[0].free, dec!(900));
+        assert_eq!(balances[0].locked, dec!(50));
+    }
+
+    #[test]
+    fn subscribe_user_data_requires_credentials() {
+        let http = Arc::new(MockHttpTransport::new());
+        let ws = Arc::new(MockWsTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::Spot);
+        let mut htx = Htx::with_http(Box::new(ArcTransport(http)), &opts)
+            .with_ws(Box::new(ArcWs(Arc::clone(&ws))));
+        assert!(matches!(
+            htx.subscribe_user_data().unwrap_err(),
+            Error::InvalidCredentials(_)
+        ));
     }
 
     #[test]
