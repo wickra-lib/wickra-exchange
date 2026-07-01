@@ -35,7 +35,9 @@ use crate::options::{ExchangeOptions, MarginMode, MarketType};
 use crate::positions::{Position, PositionSide};
 use crate::signing::hmac_sha256_base64;
 use crate::symbol::Symbol;
-use crate::traits::{AdvancedOrders, Derivatives, Exchange, Execution, MarketData, WsUserData};
+use crate::traits::{
+    AdvancedOrders, Derivatives, Exchange, Execution, MarketData, WsExecution, WsUserData,
+};
 use crate::transport::{HttpMethod, HttpRequest, HttpTransport, WsConnection, WsTransport};
 use crate::types::{
     Balance, OcoRequest, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker,
@@ -1384,6 +1386,30 @@ impl WsUserData for Htx {
     }
 }
 
+impl WsExecution for Htx {
+    /// HTX exposes no WebSocket order-entry API for spot — its WebSocket surface
+    /// is subscription-only (market data plus the private v2 order/account push
+    /// channels). Orders are placed over REST, so this returns a documented
+    /// [`Error::Exchange`].
+    fn place_order_ws(&mut self, _request: &OrderRequest) -> Result<Order> {
+        Err(Error::Exchange {
+            code: "unsupported".to_string(),
+            message: "HTX has no WebSocket order-entry API; place orders over REST \
+                      (POST /v1/order/orders/place)"
+                .to_string(),
+        })
+    }
+
+    fn cancel_order_ws(&mut self, _symbol: &Symbol, _order_id: &str) -> Result<()> {
+        Err(Error::Exchange {
+            code: "unsupported".to_string(),
+            message: "HTX has no WebSocket order-entry API; cancel orders over REST \
+                      (POST /v1/order/orders/{id}/submitcancel)"
+                .to_string(),
+        })
+    }
+}
+
 impl Derivatives for Htx {
     fn positions(&mut self, symbol: Option<&Symbol>) -> Result<Vec<Position>> {
         Htx::positions(self, symbol)
@@ -1717,6 +1743,22 @@ mod tests {
         assert!(matches!(
             htx.subscribe_user_data().unwrap_err(),
             Error::InvalidCredentials(_)
+        ));
+    }
+
+    #[test]
+    fn ws_execution_is_a_documented_gap() {
+        // HTX has no WebSocket order-entry API; the trait methods return a
+        // documented error rather than faking a round trip.
+        let (mut htx, _mock) = client();
+        assert!(matches!(
+            htx.place_order_ws(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)))
+                .unwrap_err(),
+            Error::Exchange { .. }
+        ));
+        assert!(matches!(
+            htx.cancel_order_ws(&symbol(), "1").unwrap_err(),
+            Error::Exchange { .. }
         ));
     }
 
