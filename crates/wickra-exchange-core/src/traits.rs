@@ -180,6 +180,22 @@ pub trait AdvancedOrders {
     fn place_oco(&mut self, request: &OcoRequest) -> Result<Vec<Order>>;
 }
 
+/// Private user-data streaming: subscribe to the account's own order and balance
+/// updates so [`poll_events`](MarketData::poll_events) surfaces
+/// [`Event::OrderUpdate`](crate::Event::OrderUpdate) and
+/// [`Event::BalanceUpdate`](crate::Event::BalanceUpdate). Implemented by venues
+/// that expose a private WebSocket stream (a listen-key / login handshake).
+pub trait WsUserData {
+    /// Open the private user-data stream. After it returns,
+    /// [`poll_events`](MarketData::poll_events) on the same client also drains the
+    /// user's order and balance events alongside the public market-data stream.
+    ///
+    /// # Errors
+    /// Returns an [`Error`](crate::Error) if credentials are missing, no WebSocket
+    /// transport is configured, or the stream cannot be opened.
+    fn subscribe_user_data(&mut self) -> Result<()>;
+}
+
 /// Order placement and cancellation over a venue's WebSocket API (`ws-api`),
 /// where a signed request frame is sent on a dedicated connection and the
 /// matching response frame is read back. Lower-latency than REST; implemented by
