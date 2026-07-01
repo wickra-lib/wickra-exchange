@@ -356,3 +356,158 @@ public sealed unsafe class AdvancedOrders : IDisposable
         }
     }
 }
+
+/// <summary>
+/// A live private user-data client. After <see cref="Subscribe"/>, <see cref="Poll"/>
+/// surfaces the account's own order and balance updates alongside the public
+/// market-data stream. Available on the eight trading venues.
+/// </summary>
+public sealed unsafe class UserData : IDisposable
+{
+    private nint _handle;
+
+    private UserData(nint handle) => _handle = handle;
+
+    /// <summary>Connect a user-data client; <paramref name="futures"/> selects USDⓈ-M futures.</summary>
+    public static UserData Connect(
+        string name, string apiKey, string apiSecret,
+        string? passphrase = null, string? privateKey = null, bool testnet = false, bool futures = false)
+    {
+        nint pass = passphrase is null ? 0 : Marshal.StringToCoTaskMemUTF8(passphrase);
+        nint priv = privateKey is null ? 0 : Marshal.StringToCoTaskMemUTF8(privateKey);
+        var nameBytes = Exchange.Utf8(name);
+        var keyBytes = Exchange.Utf8(apiKey);
+        var secretBytes = Exchange.Utf8(apiSecret);
+        try
+        {
+            fixed (byte* np = nameBytes)
+            fixed (byte* kp = keyBytes)
+            fixed (byte* sp = secretBytes)
+            {
+                nint handle = Native.wickra_connect_user_data(np, kp, sp, (byte*)pass, (byte*)priv, testnet, futures);
+                if (handle == 0)
+                {
+                    throw new WickraException($"failed to connect user-data client for {name}");
+                }
+                return new UserData(handle);
+            }
+        }
+        finally
+        {
+            if (pass != 0) { Marshal.FreeCoTaskMem(pass); }
+            if (priv != 0) { Marshal.FreeCoTaskMem(priv); }
+        }
+    }
+
+    /// <summary>Open the private user-data stream; afterwards <see cref="Poll"/> drains the account's events too.</summary>
+    public void Subscribe()
+    {
+        Exchange.Check(Native.wickra_user_data_subscribe(_handle));
+    }
+
+    /// <summary>Drain buffered events (up to <paramref name="capacity"/> per call).</summary>
+    public IReadOnlyList<EventInfo> Poll(int capacity = 16)
+    {
+        var buffer = new Native.Event[capacity];
+        int count;
+        fixed (Native.Event* bp = buffer)
+        {
+            count = Native.wickra_user_data_poll(_handle, bp, (nuint)capacity);
+        }
+        if (count < 0)
+        {
+            throw new WickraException($"user-data poll failed with code {count}");
+        }
+        var events = new List<EventInfo>(count);
+        for (int i = 0; i < count; i++)
+        {
+            events.Add(Exchange.ReadEvent(buffer[i]));
+        }
+        return events;
+    }
+
+    public void Dispose()
+    {
+        if (_handle != 0)
+        {
+            Native.wickra_user_data_free(_handle);
+            _handle = 0;
+        }
+    }
+}
+
+/// <summary>
+/// A live WebSocket order-API client: place and cancel orders over the venue's
+/// WebSocket order API. Native on Binance/Bybit/OKX/Gate/Kraken; on Bitget,
+/// KuCoin and HTX the methods throw (no WebSocket order-entry API — use REST).
+/// </summary>
+public sealed unsafe class WsExecution : IDisposable
+{
+    private nint _handle;
+
+    private WsExecution(nint handle) => _handle = handle;
+
+    /// <summary>Connect a WebSocket order-API client; <paramref name="futures"/> selects USDⓈ-M futures.</summary>
+    public static WsExecution Connect(
+        string name, string apiKey, string apiSecret,
+        string? passphrase = null, string? privateKey = null, bool testnet = false, bool futures = false)
+    {
+        nint pass = passphrase is null ? 0 : Marshal.StringToCoTaskMemUTF8(passphrase);
+        nint priv = privateKey is null ? 0 : Marshal.StringToCoTaskMemUTF8(privateKey);
+        var nameBytes = Exchange.Utf8(name);
+        var keyBytes = Exchange.Utf8(apiKey);
+        var secretBytes = Exchange.Utf8(apiSecret);
+        try
+        {
+            fixed (byte* np = nameBytes)
+            fixed (byte* kp = keyBytes)
+            fixed (byte* sp = secretBytes)
+            {
+                nint handle = Native.wickra_connect_ws_execution(np, kp, sp, (byte*)pass, (byte*)priv, testnet, futures);
+                if (handle == 0)
+                {
+                    throw new WickraException($"failed to connect ws-execution client for {name}");
+                }
+                return new WsExecution(handle);
+            }
+        }
+        finally
+        {
+            if (pass != 0) { Marshal.FreeCoTaskMem(pass); }
+            if (priv != 0) { Marshal.FreeCoTaskMem(priv); }
+        }
+    }
+
+    /// <summary>Place an order over the WebSocket order API. <c>double.NaN</c> price = market order.</summary>
+    public OrderInfo PlaceOrderWs(string market, Side side, double quantity, double price)
+    {
+        var m = Exchange.Utf8(market);
+        Native.Order order;
+        fixed (byte* mp = m)
+        {
+            Exchange.Check(Native.wickra_ws_place_order(_handle, mp, (int)side, quantity, price, &order));
+        }
+        return Exchange.ReadOrder(order);
+    }
+
+    /// <summary>Cancel an order over the WebSocket order API by venue id.</summary>
+    public void CancelOrderWs(string market, string orderId)
+    {
+        var m = Exchange.Utf8(market);
+        var o = Exchange.Utf8(orderId);
+        fixed (byte* mp = m)
+        fixed (byte* op = o)
+        {
+            Exchange.Check(Native.wickra_ws_cancel_order(_handle, mp, op));
+        }
+    }
+
+    public void Dispose()
+    {
+        if (_handle != 0)
+        {
+            Native.wickra_ws_execution_free(_handle);
+            _handle = 0;
+        }
+    }
+}

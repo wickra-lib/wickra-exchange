@@ -55,4 +55,30 @@ public class DerivativesTests
         Assert.Equal(Side.Buy, requests[0].Side);
         Assert.Null(requests[1].Price);
     }
+
+    [Theory]
+    [InlineData("coinbase")]
+    [InlineData("upbit")]
+    [InlineData("ftx")]
+    public void UserDataAndWsExecutionRejectSpotOnlyAndUnknown(string name)
+    {
+        Assert.Throws<WickraException>(() => UserData.Connect(name, "k", "s"));
+        Assert.Throws<WickraException>(() => WsExecution.Connect(name, "k", "s"));
+    }
+
+    [Fact]
+    public void UserDataConstructsAndPolls()
+    {
+        using var userData = UserData.Connect("binance", "k", "s");
+        Assert.NotNull(userData);
+        // WsUserData: MarketData, so the client can poll (nothing buffered offline).
+        Assert.Empty(userData.Poll());
+    }
+
+    [Fact]
+    public void WsExecutionConstructsForATradingVenue()
+    {
+        using var exec = WsExecution.Connect("bybit", "k", "s");
+        Assert.NotNull(exec);
+    }
 }
