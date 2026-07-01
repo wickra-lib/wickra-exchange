@@ -125,6 +125,9 @@ internal static unsafe class Native
     public static extern int wickra_derivatives_position(nint handle, byte* market, Position* outPos);
 
     [DllImport(Lib)]
+    public static extern int wickra_derivatives_positions(nint handle, byte* market, Position* outBuf, nuint cap);
+
+    [DllImport(Lib)]
     public static extern int wickra_derivatives_set_leverage(nint handle, byte* market, uint leverage);
 
     [DllImport(Lib)]
@@ -147,4 +150,14 @@ internal static unsafe class Native
 
     [DllImport(Lib)]
     public static extern int wickra_advanced_cancel_batch(nint handle, byte* market, nint* orderIds, nuint n);
+
+    [DllImport(Lib)]
+    public static extern int wickra_advanced_place_oco(
+        nint handle, byte* market, int side, double quantity, double price, double stopPrice,
+        double stopLimitPrice, Order* outBuf, nuint cap);
+
+    [DllImport(Lib)]
+    public static extern int wickra_advanced_place_batch(
+        nint handle, nint* markets, int* sides, double* quantities, double* prices, nuint n,
+        Order* outBuf, int* outCodes, nuint cap);
 }
