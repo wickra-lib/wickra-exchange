@@ -1,0 +1,39 @@
+name: Testnet integration
+
+# The gated integration tests hit live exchange endpoints (public market data,
+# no keys), so they are not part of the per-push ci.yml. They run on a schedule
+# and on demand instead, surfacing upstream/API drift without flaking every PR.
+on:
+  schedule:
+    - cron: "0 4 * * *" # nightly at 04:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+
+concurrency:
+  group: testnet-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  integration:
+    name: Live integration (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      # The real-socket adapters' #[ignore] tests open live HTTP + WebSocket
+      # connections to public endpoints; run them here, not on every push.
+      - name: Run gated integration tests
+        run: cargo test -p wickra-exchange --all-features -- --ignored --nocapture

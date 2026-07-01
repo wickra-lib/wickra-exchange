@@ -29,6 +29,7 @@ p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
 
 [dev-dependencies]
 rust_decimal_macros = { workspace = true }
+proptest = { workspace = true }
 
 [lints]
 workspace = true
