@@ -185,7 +185,11 @@ pub trait AdvancedOrders {
 /// [`Event::OrderUpdate`](crate::Event::OrderUpdate) and
 /// [`Event::BalanceUpdate`](crate::Event::BalanceUpdate). Implemented by venues
 /// that expose a private WebSocket stream (a listen-key / login handshake).
-pub trait WsUserData {
+///
+/// [`MarketData`] is a supertrait, so a `WsUserData` client (including the
+/// `Box<dyn WsUserData>` returned by the facade's `connect_user_data`) can
+/// [`poll_events`](MarketData::poll_events) directly after subscribing.
+pub trait WsUserData: MarketData {
     /// Open the private user-data stream. After it returns,
     /// [`poll_events`](MarketData::poll_events) on the same client also drains the
     /// user's order and balance events alongside the public market-data stream.

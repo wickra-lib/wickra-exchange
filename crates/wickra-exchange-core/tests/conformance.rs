@@ -11,7 +11,7 @@ use rust_decimal_macros::dec;
 use wickra_exchange_core::{
     Binance, Bitget, Bybit, Coinbase, Event, Exchange, ExchangeOptions, Gate, Htx, Kraken, KuCoin,
     MarketData, MarketType, MockHttpTransport, Okx, OrderRequest, OrderStatus, PaperExchange,
-    ReplayExchange, Symbol, TradePrint, Upbit,
+    ReplayExchange, Symbol, TradePrint, Upbit, WsExecution, WsUserData,
 };
 
 /// The order lifecycle every execution backend must honour: a resting limit
@@ -110,5 +110,43 @@ fn every_venue_client_is_object_safe_and_named() {
     assert_eq!(clients.len(), 10);
     for client in &clients {
         assert!(!client.name().is_empty());
+    }
+}
+
+/// The eight trading venues: each is object-safe as both `WsUserData` (private
+/// account/order stream) and `WsExecution` (WebSocket order placement). Building
+/// these `Box<dyn _>` vectors is itself the object-safety assertion.
+#[test]
+fn every_trading_venue_is_object_safe_as_ws_user_data_and_ws_execution() {
+    let options = ExchangeOptions::mainnet(MarketType::Spot);
+    let mock = || Box::new(MockHttpTransport::new());
+
+    let user_data: Vec<Box<dyn WsUserData>> = vec![
+        Box::new(Binance::with_http(mock(), &options)),
+        Box::new(Bybit::with_http(mock(), &options)),
+        Box::new(Okx::with_http(mock(), &options)),
+        Box::new(Bitget::with_http(mock(), &options)),
+        Box::new(KuCoin::with_http(mock(), &options)),
+        Box::new(Gate::with_http(mock(), &options)),
+        Box::new(Htx::with_http(mock(), &options)),
+        Box::new(Kraken::with_http(mock(), &options)),
+    ];
+    let execution: Vec<Box<dyn WsExecution>> = vec![
+        Box::new(Binance::with_http(mock(), &options)),
+        Box::new(Bybit::with_http(mock(), &options)),
+        Box::new(Okx::with_http(mock(), &options)),
+        Box::new(Bitget::with_http(mock(), &options)),
+        Box::new(KuCoin::with_http(mock(), &options)),
+        Box::new(Gate::with_http(mock(), &options)),
+        Box::new(Htx::with_http(mock(), &options)),
+        Box::new(Kraken::with_http(mock(), &options)),
+    ];
+    assert_eq!(user_data.len(), 8);
+    assert_eq!(execution.len(), 8);
+
+    // `WsUserData: MarketData`, so a boxed user-data client can poll directly.
+    let mut user_data = user_data;
+    for client in &mut user_data {
+        assert!(client.poll_events().is_empty());
     }
 }
