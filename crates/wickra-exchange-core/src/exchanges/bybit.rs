@@ -30,7 +30,7 @@ use crate::options::{ExchangeOptions, MarginMode, MarketType, SelfTradePreventio
 use crate::positions::{Position, PositionSide};
 use crate::signing::hmac_sha256_hex;
 use crate::symbol::Symbol;
-use crate::traits::{AdvancedOrders, Derivatives, Exchange, Execution, MarketData};
+use crate::traits::{AdvancedOrders, Derivatives, Exchange, Execution, MarketData, WsUserData};
 use crate::transport::{HttpMethod, HttpRequest, HttpTransport, WsConnection, WsTransport};
 use crate::types::{
     Balance, OcoRequest, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker,
@@ -63,6 +63,10 @@ pub struct Bybit {
     connection: Option<Box<dyn WsConnection>>,
     sub_messages: Vec<String>,
     subscriptions: Vec<(String, Symbol)>,
+    /// The private user-data connection, opened by
+    /// [`subscribe_user_data`](Self::subscribe_user_data) and drained by
+    /// [`poll_events`](Self::poll_events) alongside the public stream.
+    private_connection: Option<Box<dyn WsConnection>>,
 }
 
 impl Bybit {
@@ -87,6 +91,7 @@ impl Bybit {
             connection: None,
             sub_messages: Vec::new(),
             subscriptions: Vec::new(),
+            private_connection: None,
         }
     }
 
@@ -273,6 +278,16 @@ impl Bybit {
                 }
             }
         }
+        // Drain the private user-data stream (order/wallet topics), if open.
+        // Re-authenticating a dropped private stream is a keepalive follow-up;
+        // this is best-effort until the connection drops.
+        if let Some(connection) = self.private_connection.as_mut() {
+            while let Ok(Some(frame)) = connection.recv() {
+                if let Ok(mut parsed) = parse_ws_message(&frame, &resolve) {
+                    events.append(&mut parsed);
+                }
+            }
+        }
         let url = ws_base_url(self.category, self.testnet);
         crate::wsutil::reconnect_if_dropped(
             self.ws.as_deref(),
@@ -282,6 +297,40 @@ impl Bybit {
             &mut events,
         );
         events
+    }
+
+    /// Open the private user-data stream (`wss://.../v5/private`). Authenticates
+    /// with an `op:auth` frame (signature = HMAC-SHA256 over `GET/realtime<expires>`),
+    /// then subscribes to the `order` and `wallet` topics. Afterwards
+    /// [`poll_events`](Self::poll_events) also surfaces the account's own
+    /// [`Event::OrderUpdate`] and [`Event::BalanceUpdate`].
+    ///
+    /// Re-authenticating a dropped private stream is a keepalive follow-up.
+    ///
+    /// # Errors
+    /// Returns [`Error::InvalidCredentials`] without credentials, [`Error::NotConnected`]
+    /// without a WebSocket transport, or another [`Error`] if the request fails.
+    pub fn subscribe_user_data(&mut self) -> Result<()> {
+        let creds = self.credentials.as_ref().ok_or(Error::InvalidCredentials(
+            "user-data stream requires credentials",
+        ))?;
+        // Bybit signs `GET/realtime<expires>`; the auth is valid until `expires`.
+        let expires = (self.now_ms)() + i64::try_from(self.recv_window_ms).unwrap_or(5000);
+        let signature = hmac_sha256_hex(
+            creds.api_secret.as_bytes(),
+            format!("GET/realtime{expires}").as_bytes(),
+        );
+        let auth = format!(
+            r#"{{"op":"auth","args":["{}",{expires},"{signature}"]}}"#,
+            creds.api_key
+        );
+        let subscribe = r#"{"op":"subscribe","args":["order","wallet"]}"#.to_string();
+        let ws = self.ws.as_ref().ok_or(Error::NotConnected)?;
+        let mut connection = ws.connect(&ws_private_url(self.testnet))?;
+        connection.send(&auth)?;
+        connection.send(&subscribe)?;
+        self.private_connection = Some(connection);
+        Ok(())
     }
 
     /// Place an order. Validated locally, then sent signed. Bybit's create
@@ -765,6 +814,16 @@ fn ws_base_url(category: &str, testnet: bool) -> String {
     format!("{host}/v5/public/{category}")
 }
 
+/// The private (user-data) WebSocket URL for a network.
+fn ws_private_url(testnet: bool) -> String {
+    let host = if testnet {
+        "wss://stream-testnet.bybit.com"
+    } else {
+        "wss://stream.bybit.com"
+    };
+    format!("{host}/v5/private")
+}
+
 fn field_str<'a>(value: &'a serde_json::Value, key: &str) -> Result<&'a str> {
     value
         .get(key)
@@ -862,6 +921,45 @@ fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Vec
                 asks,
             })])
         }
+    } else if topic == "order" {
+        // Private order stream: `data` is an array of order objects sharing the
+        // REST order shape, so each deserializes into `RawOrder`.
+        let orders = data
+            .as_array()
+            .ok_or_else(|| Error::Deserialization("order data not an array".to_string()))?;
+        orders
+            .iter()
+            .map(|raw| {
+                let order: RawOrder = serde_json::from_value(raw.clone())
+                    .map_err(|e| Error::Deserialization(e.to_string()))?;
+                let symbol = split_wire_symbol(&order.symbol);
+                Ok(Event::OrderUpdate(order_from_raw(symbol, &order)?))
+            })
+            .collect()
+    } else if topic == "wallet" {
+        // Private wallet stream: `data` is an array of accounts, each with a
+        // `coin` array; every account emits a balance-update snapshot.
+        let accounts = data
+            .as_array()
+            .ok_or_else(|| Error::Deserialization("wallet data not an array".to_string()))?;
+        accounts
+            .iter()
+            .map(|raw| {
+                let account: WalletAccount = serde_json::from_value(raw.clone())
+                    .map_err(|e| Error::Deserialization(e.to_string()))?;
+                Ok(Event::BalanceUpdate(
+                    account
+                        .coin
+                        .iter()
+                        .map(|c| Balance {
+                            asset: c.coin.clone(),
+                            free: dec_or_zero(&c.available_to_withdraw),
+                            locked: dec_or_zero(&c.locked),
+                        })
+                        .collect(),
+                ))
+            })
+            .collect()
     } else {
         Ok(Vec::new())
     }
@@ -1138,6 +1236,12 @@ impl AdvancedOrders for Bybit {
 impl Exchange for Bybit {
     fn name(&self) -> &'static str {
         "bybit"
+    }
+}
+
+impl WsUserData for Bybit {
+    fn subscribe_user_data(&mut self) -> Result<()> {
+        Bybit::subscribe_user_data(self)
     }
 }
 
@@ -1696,6 +1800,77 @@ mod tests {
         let opts = ExchangeOptions::mainnet(MarketType::Spot);
         Bybit::with_http(Box::new(ArcTransport(http)), &opts)
             .with_ws(Box::new(ArcWs(Arc::clone(ws))))
+    }
+
+    fn signed_ws_client(now_ms: i64) -> (Bybit, Arc<MockWsTransport>) {
+        let http = Arc::new(MockHttpTransport::new());
+        let ws = Arc::new(MockWsTransport::new());
+        let opts = ExchangeOptions::mainnet(MarketType::Spot);
+        let bybit = Bybit::with_credentials(
+            Box::new(ArcTransport(http)),
+            &opts,
+            Credentials::new("APIKEY", "SECRET"),
+        )
+        .with_ws(Box::new(ArcWs(Arc::clone(&ws))))
+        .with_clock(Box::new(move || now_ms));
+        (bybit, ws)
+    }
+
+    #[test]
+    fn subscribe_user_data_authenticates_and_streams_orders_and_wallet() {
+        let (mut bybit, ws) = signed_ws_client(1000);
+        ws.push_connection(vec![
+            Ok(Some(r#"{"success":true,"op":"auth"}"#.to_string())),
+            Ok(Some(r#"{"success":true,"op":"subscribe"}"#.to_string())),
+            Ok(Some(
+                r#"{"topic":"order","data":[{"symbol":"BTCUSDT","orderId":"55","orderLinkId":"my",
+                "side":"Buy","orderType":"Limit","orderStatus":"Filled","qty":"1","cumExecQty":"1",
+                "price":"100","avgPrice":"100"}]}"#
+                    .to_string(),
+            )),
+            Ok(Some(
+                r#"{"topic":"wallet","data":[{"coin":[{"coin":"USDT",
+                "availableToWithdraw":"900","locked":"50"}]}]}"#
+                    .to_string(),
+            )),
+        ]);
+        bybit.subscribe_user_data().unwrap();
+        assert_eq!(ws.connected_urls()[0], "wss://stream.bybit.com/v5/private");
+        assert!(ws.sent()[0].contains(r#""op":"auth""#));
+        assert!(ws.sent()[0].contains(r#""APIKEY""#));
+        assert!(ws.sent()[1].contains(r#""op":"subscribe""#));
+        assert!(ws.sent()[1].contains("order"));
+        assert!(ws.sent()[1].contains("wallet"));
+
+        let events = bybit.poll_events();
+        assert_eq!(events.len(), 2);
+        let Event::OrderUpdate(order) = &events[0] else {
+            panic!("first event must be an order update");
+        };
+        assert_eq!(order.id, "55");
+        assert_eq!(order.client_order_id.as_deref(), Some("my"));
+        assert_eq!(order.symbol, symbol());
+        assert_eq!(order.side, OrderSide::Buy);
+        assert_eq!(order.status, OrderStatus::Filled);
+        assert_eq!(order.filled_quantity, dec!(1));
+        assert_eq!(order.average_price, Some(dec!(100)));
+        let Event::BalanceUpdate(balances) = &events[1] else {
+            panic!("second event must be a balance update");
+        };
+        assert_eq!(balances.len(), 1);
+        assert_eq!(balances[0].asset, "USDT");
+        assert_eq!(balances[0].free, dec!(900));
+        assert_eq!(balances[0].locked, dec!(50));
+    }
+
+    #[test]
+    fn subscribe_user_data_requires_credentials() {
+        let ws = Arc::new(MockWsTransport::new());
+        let mut bybit = streaming_client(&ws);
+        assert!(matches!(
+            bybit.subscribe_user_data().unwrap_err(),
+            Error::InvalidCredentials(_)
+        ));
     }
 
     #[test]

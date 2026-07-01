@@ -21,7 +21,7 @@ use crate::options::{ExchangeOptions, MarginMode, MarketType, SelfTradePreventio
 use crate::positions::{Position, PositionSide};
 use crate::signing::hmac_sha256_base64;
 use crate::symbol::Symbol;
-use crate::traits::{AdvancedOrders, Derivatives, Exchange, Execution, MarketData};
+use crate::traits::{AdvancedOrders, Derivatives, Exchange, Execution, MarketData, WsUserData};
 use crate::transport::{HttpMethod, HttpRequest, HttpTransport, WsConnection, WsTransport};
 use crate::types::{
     Balance, OcoRequest, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker,
@@ -82,6 +82,10 @@ pub struct Okx {
     connection: Option<Box<dyn WsConnection>>,
     sub_messages: Vec<String>,
     subscriptions: Vec<(String, Symbol)>,
+    /// The private user-data connection, opened by
+    /// [`subscribe_user_data`](Self::subscribe_user_data) and drained by
+    /// [`poll_events`](Self::poll_events) alongside the public stream.
+    private_connection: Option<Box<dyn WsConnection>>,
 }
 
 impl Okx {
@@ -102,6 +106,7 @@ impl Okx {
             connection: None,
             sub_messages: Vec::new(),
             subscriptions: Vec::new(),
+            private_connection: None,
         }
     }
 
@@ -283,6 +288,15 @@ impl Okx {
                 }
             }
         }
+        // Drain the private user-data stream (orders/account channels), if open.
+        // Re-authenticating a dropped private stream is a keepalive follow-up.
+        if let Some(connection) = self.private_connection.as_mut() {
+            while let Ok(Some(frame)) = connection.recv() {
+                if let Ok(mut parsed) = parse_ws_message(&frame, &resolve) {
+                    events.append(&mut parsed);
+                }
+            }
+        }
         let url = ws_url(self.testnet);
         crate::wsutil::reconnect_if_dropped(
             self.ws.as_deref(),
@@ -292,6 +306,49 @@ impl Okx {
             &mut events,
         );
         events
+    }
+
+    /// Open the private user-data stream (`wss://.../ws/v5/private`). Logs in with
+    /// an `op:login` frame (sign = base64(HMAC-SHA256) over
+    /// `<epochSeconds>GET/users/self/verify`), then subscribes to the `orders`
+    /// and `account` channels. Afterwards [`poll_events`](Self::poll_events) also
+    /// surfaces the account's own [`Event::OrderUpdate`] and [`Event::BalanceUpdate`].
+    ///
+    /// Re-authenticating a dropped private stream is a keepalive follow-up.
+    ///
+    /// # Errors
+    /// Returns [`Error::InvalidCredentials`] without credentials or a passphrase,
+    /// [`Error::NotConnected`] without a WebSocket transport, or another
+    /// [`Error`] if the request fails.
+    pub fn subscribe_user_data(&mut self) -> Result<()> {
+        let creds = self.credentials.as_ref().ok_or(Error::InvalidCredentials(
+            "user-data stream requires credentials",
+        ))?;
+        let passphrase = creds
+            .passphrase
+            .as_deref()
+            .ok_or(Error::InvalidCredentials("OKX requires a passphrase"))?;
+        // OKX WS login signs `<timestamp>GET/users/self/verify`, where the
+        // timestamp is Unix epoch seconds.
+        let timestamp = (self.now_ms)() / 1000;
+        let sign = hmac_sha256_base64(
+            creds.api_secret.as_bytes(),
+            format!("{timestamp}GET/users/self/verify").as_bytes(),
+        );
+        let login = format!(
+            r#"{{"op":"login","args":[{{"apiKey":"{}","passphrase":"{passphrase}","timestamp":"{timestamp}","sign":"{sign}"}}]}}"#,
+            creds.api_key
+        );
+        let subscribe = format!(
+            r#"{{"op":"subscribe","args":[{{"channel":"orders","instType":"{}"}},{{"channel":"account"}}]}}"#,
+            self.inst_type
+        );
+        let ws = self.ws.as_ref().ok_or(Error::NotConnected)?;
+        let mut connection = ws.connect(ws_private_url(self.testnet))?;
+        connection.send(&login)?;
+        connection.send(&subscribe)?;
+        self.private_connection = Some(connection);
+        Ok(())
     }
 
     /// Place an order.
@@ -517,6 +574,15 @@ fn ws_url(testnet: bool) -> &'static str {
         "wss://wspap.okx.com:8443/ws/v5/public"
     } else {
         "wss://ws.okx.com:8443/ws/v5/public"
+    }
+}
+
+/// The private (user-data) WebSocket URL for a network.
+fn ws_private_url(testnet: bool) -> &'static str {
+    if testnet {
+        "wss://wspap.okx.com:8443/ws/v5/private"
+    } else {
+        "wss://ws.okx.com:8443/ws/v5/private"
     }
 }
 
@@ -767,6 +833,36 @@ fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Vec
                 }
             })
             .collect()
+    } else if channel == "orders" {
+        // Private order channel: each element shares the REST order shape.
+        data.iter()
+            .map(|raw| {
+                let order: RawOrder = serde_json::from_value(raw.clone())
+                    .map_err(|e| Error::Deserialization(e.to_string()))?;
+                let symbol = symbol_from_inst_id(&order.inst_id);
+                Ok(Event::OrderUpdate(order_from_raw(symbol, &order)?))
+            })
+            .collect()
+    } else if channel == "account" {
+        // Private account channel: each element carries a `details` array of
+        // per-currency balances.
+        data.iter()
+            .map(|raw| {
+                let balance: RawBalance = serde_json::from_value(raw.clone())
+                    .map_err(|e| Error::Deserialization(e.to_string()))?;
+                Ok(Event::BalanceUpdate(
+                    balance
+                        .details
+                        .iter()
+                        .map(|c| Balance {
+                            asset: c.ccy.clone(),
+                            free: dec_or_zero(&c.avail_bal),
+                            locked: dec_or_zero(&c.frozen_bal),
+                        })
+                        .collect(),
+                ))
+            })
+            .collect()
     } else {
         Ok(Vec::new())
     }
@@ -900,6 +996,12 @@ impl Execution for Okx {
 impl Exchange for Okx {
     fn name(&self) -> &'static str {
         "okx"
+    }
+}
+
+impl WsUserData for Okx {
+    fn subscribe_user_data(&mut self) -> Result<()> {
+        Okx::subscribe_user_data(self)
     }
 }
 
@@ -1659,6 +1761,86 @@ mod tests {
         );
         assert!(matches!(
             okx.balances().unwrap_err(),
+            Error::InvalidCredentials(_)
+        ));
+    }
+
+    fn signed_ws_client(now_ms: i64) -> (Okx, Arc<MockWsTransport>) {
+        let http = Arc::new(MockHttpTransport::new());
+        let ws = Arc::new(MockWsTransport::new());
+        let opts = ExchangeOptions::mainnet(MarketType::Spot);
+        let okx = Okx::with_credentials(
+            Box::new(ArcTransport(http)),
+            &opts,
+            Credentials::new("APIKEY", "SECRET").with_passphrase("PASS"),
+        )
+        .with_ws(Box::new(ArcWs(Arc::clone(&ws))))
+        .with_clock(Box::new(move || now_ms));
+        (okx, ws)
+    }
+
+    #[test]
+    fn subscribe_user_data_logs_in_and_streams_orders_and_account() {
+        let (mut okx, ws) = signed_ws_client(1_700_000_000_000);
+        ws.push_connection(vec![
+            Ok(Some(r#"{"event":"login","code":"0"}"#.to_string())),
+            Ok(Some(r#"{"event":"subscribe"}"#.to_string())),
+            Ok(Some(
+                r#"{"arg":{"channel":"orders","instType":"SPOT"},"data":[{"instId":"BTC-USDT",
+                "ordId":"55","clOrdId":"my","side":"buy","ordType":"limit","state":"filled",
+                "sz":"1","accFillSz":"1","px":"100","avgPx":"100"}]}"#
+                    .to_string(),
+            )),
+            Ok(Some(
+                r#"{"arg":{"channel":"account"},"data":[{"details":[{"ccy":"USDT",
+                "availBal":"900","frozenBal":"50"}]}]}"#
+                    .to_string(),
+            )),
+        ]);
+        okx.subscribe_user_data().unwrap();
+        assert_eq!(
+            ws.connected_urls()[0],
+            "wss://ws.okx.com:8443/ws/v5/private"
+        );
+        assert!(ws.sent()[0].contains(r#""op":"login""#));
+        assert!(ws.sent()[0].contains(r#""apiKey":"APIKEY""#));
+        assert!(ws.sent()[0].contains(r#""sign""#));
+        assert!(ws.sent()[1].contains(r#""channel":"orders""#));
+        assert!(ws.sent()[1].contains(r#""channel":"account""#));
+
+        let events = okx.poll_events();
+        assert_eq!(events.len(), 2);
+        let Event::OrderUpdate(order) = &events[0] else {
+            panic!("first event must be an order update");
+        };
+        assert_eq!(order.id, "55");
+        assert_eq!(order.client_order_id.as_deref(), Some("my"));
+        assert_eq!(order.symbol, symbol());
+        assert_eq!(order.side, OrderSide::Buy);
+        assert_eq!(order.status, OrderStatus::Filled);
+        assert_eq!(order.average_price, Some(dec!(100)));
+        let Event::BalanceUpdate(balances) = &events[1] else {
+            panic!("second event must be a balance update");
+        };
+        assert_eq!(balances.len(), 1);
+        assert_eq!(balances[0].asset, "USDT");
+        assert_eq!(balances[0].free, dec!(900));
+        assert_eq!(balances[0].locked, dec!(50));
+    }
+
+    #[test]
+    fn subscribe_user_data_requires_a_passphrase() {
+        let http = Arc::new(MockHttpTransport::new());
+        let ws = Arc::new(MockWsTransport::new());
+        let opts = ExchangeOptions::mainnet(MarketType::Spot);
+        let mut okx = Okx::with_credentials(
+            Box::new(ArcTransport(http)),
+            &opts,
+            Credentials::new("APIKEY", "SECRET"),
+        )
+        .with_ws(Box::new(ArcWs(Arc::clone(&ws))));
+        assert!(matches!(
+            okx.subscribe_user_data().unwrap_err(),
             Error::InvalidCredentials(_)
         ));
     }
