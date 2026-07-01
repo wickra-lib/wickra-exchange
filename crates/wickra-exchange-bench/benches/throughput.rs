@@ -6,7 +6,7 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use wickra_exchange_core::{
     format_decimal, hmac_sha256_hex, hmac_sha512_hex, parse_decimal, sha256, BookDelta, BookLevel,
-    Event, InstrumentFilters, OrderBookBuilder, OrderBookSnapshot, Symbol,
+    Event, InstrumentFilters, OrderBookBuilder, OrderBookSnapshot, OrderSide, Symbol, TradePrint,
 };
 
 fn bench_signing(c: &mut Criterion) {
@@ -27,7 +27,16 @@ fn bench_signing(c: &mut Criterion) {
 }
 
 fn bench_parse(c: &mut Criterion) {
-    let trade = r#"{"type":"trade","symbol":"BTC/USDT","price":"20123.45","quantity":"0.5","aggressor":"Buy","timestamp":1700000000000}"#;
+    // Build a real trade event and serialize it, so the parse bench round-trips
+    // the exact wire form the type produces.
+    let trade = serde_json::to_string(&Event::Trade(TradePrint {
+        symbol: Symbol::new("BTC", "USDT"),
+        price: dec!(20123.45),
+        quantity: dec!(0.5),
+        aggressor: OrderSide::Buy,
+        timestamp: 1_700_000_000_000,
+    }))
+    .unwrap();
     let mut group = c.benchmark_group("parse");
     group.bench_function("parse_decimal", |b| {
         b.iter(|| parse_decimal(black_box("20123.456789")));
@@ -36,7 +45,7 @@ fn bench_parse(c: &mut Criterion) {
         b.iter(|| format_decimal(black_box(dec!(20123.456789))));
     });
     group.bench_function("event_from_json", |b| {
-        b.iter(|| serde_json::from_str::<Event>(black_box(trade)).unwrap());
+        b.iter(|| serde_json::from_str::<Event>(black_box(trade.as_str())).unwrap());
     });
     group.finish();
 }
