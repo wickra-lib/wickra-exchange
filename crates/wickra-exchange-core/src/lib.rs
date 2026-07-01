@@ -40,7 +40,7 @@ pub use clock::{NonceGenerator, ServerClock, TokenTtl};
 pub use credentials::Credentials;
 pub use error::{Error, Result};
 pub use events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
-pub use exchanges::{Binance, Bitget, Bybit, Coinbase, Gate, Htx, Kraken, KuCoin, Okx};
+pub use exchanges::{Binance, Bitget, Bybit, Coinbase, Gate, Htx, Kraken, KuCoin, Okx, Upbit};
 pub use idempotency::ClientIdGenerator;
 pub use instruments::{Instrument, InstrumentCache, InstrumentFilters};
 pub use normalize::{format_decimal, parse_decimal, parse_opt_decimal};
@@ -53,7 +53,7 @@ pub use reconcile::{reconcile_orders, Reconciliation};
 pub use retry::Backoff;
 pub use signing::{
     hmac_sha256_base64, hmac_sha256_hex, hmac_sha512_base64, hmac_sha512_base64_with_b64_secret,
-    hmac_sha512_hex, sha256, sha512_hex,
+    hmac_sha512_bytes, hmac_sha512_hex, sha256, sha512_hex,
 };
 pub use symbol::Symbol;
 pub use traits::{Exchange, Execution, MarketData};
