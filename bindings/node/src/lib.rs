@@ -18,7 +18,7 @@
 
 use std::collections::HashMap;
 
-use napi::bindgen_prelude::{Error as NapiError, Status};
+use napi::bindgen_prelude::{ClassInstance, Error as NapiError, Status};
 use napi_derive::napi;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
@@ -110,6 +110,14 @@ impl From<&Order> for OrderInfo {
             average_price: order.average_price.map(to_float),
         }
     }
+}
+
+/// One order's outcome in a batch placement. Exactly one of `order` / `error`
+/// is set: `order` on success, `error` with the venue's message on rejection.
+#[napi(object)]
+pub struct BatchOrderResult {
+    pub order: Option<OrderInfo>,
+    pub error: Option<String>,
 }
 
 fn position_side_str(side: PositionSide) -> String {
@@ -664,6 +672,34 @@ impl AdvancedOrders {
             .map_err(map_err)?
             .iter()
             .map(OrderInfo::from)
+            .collect())
+    }
+
+    /// Place several orders in one request. Takes an array of `OrderRequest`
+    /// instances and returns one `BatchOrderResult` per order, in the same order:
+    /// `{ order }` on success, `{ error }` on a per-order rejection. Throws only
+    /// on a whole-request failure (auth, transport).
+    #[napi]
+    pub fn place_batch(
+        &mut self,
+        requests: Vec<ClassInstance<OrderRequest>>,
+    ) -> napi::Result<Vec<BatchOrderResult>> {
+        let requests: Vec<CoreOrderRequest> = requests.iter().map(|r| r.inner.clone()).collect();
+        Ok(self
+            .inner
+            .place_batch(&requests)
+            .map_err(map_err)?
+            .iter()
+            .map(|result| match result {
+                Ok(order) => BatchOrderResult {
+                    order: Some(OrderInfo::from(order)),
+                    error: None,
+                },
+                Err(e) => BatchOrderResult {
+                    order: None,
+                    error: Some(e.to_string()),
+                },
+            })
             .collect())
     }
 }

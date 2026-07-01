@@ -22,6 +22,13 @@ export declare class AdvancedOrders {
    * trigger, optional `stopLimitPrice`); returns the resulting order legs.
    */
   placeOco(market: string, side: string, quantity: number, price: number, stopPrice: number, stopLimitPrice?: number | undefined | null): Array<OrderInfo>
+  /**
+   * Place several orders in one request. Takes an array of `OrderRequest`
+   * instances and returns one `BatchOrderResult` per order, in the same order:
+   * `{ order }` on success, `{ error }` on a per-order rejection. Throws only
+   * on a whole-request failure (auth, transport).
+   */
+  placeBatch(requests: Array<OrderRequest>): Array<BatchOrderResult>
 }
 
 /** API credentials for a venue. */
@@ -87,6 +94,15 @@ export declare class OrderRequest {
   static marketSell(market: string, quantity: number): OrderRequest
   static limitBuy(market: string, quantity: number, price: number): OrderRequest
   static limitSell(market: string, quantity: number, price: number): OrderRequest
+}
+
+/**
+ * One order's outcome in a batch placement. Exactly one of `order` / `error`
+ * is set: `order` on success, `error` with the venue's message on rejection.
+ */
+export interface BatchOrderResult {
+  order?: OrderInfo
+  error?: string
 }
 
 /** An order as reported by the exchange. */
