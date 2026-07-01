@@ -40,7 +40,7 @@ pub use clock::{NonceGenerator, ServerClock, TokenTtl};
 pub use credentials::Credentials;
 pub use error::{Error, Result};
 pub use events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
-pub use exchanges::{Binance, Bybit};
+pub use exchanges::{Binance, Bybit, Okx};
 pub use idempotency::ClientIdGenerator;
 pub use instruments::{Instrument, InstrumentCache, InstrumentFilters};
 pub use normalize::{format_decimal, parse_decimal, parse_opt_decimal};

@@ -8,6 +8,8 @@
 
 mod binance;
 mod bybit;
+mod okx;
 
 pub use binance::Binance;
 pub use bybit::Bybit;
+pub use okx::Okx;
