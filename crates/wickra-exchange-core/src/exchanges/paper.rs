@@ -139,6 +139,25 @@ impl PaperExchange {
         self.marks.insert(symbol.clone(), price);
     }
 
+    /// Cancel every open order, releasing the funds they locked, and return the
+    /// number cancelled. This is the actuator a
+    /// [`DeadMansSwitch`](crate::DeadMansSwitch) fires on disconnect.
+    pub fn cancel_all(&mut self) -> u32 {
+        let open: Vec<(Symbol, String)> = self
+            .orders
+            .values()
+            .filter(|order| order.is_open())
+            .map(|order| (order.symbol.clone(), order.id.clone()))
+            .collect();
+        let mut cancelled = 0;
+        for (symbol, id) in open {
+            if self.cancel_order(&symbol, &id).is_ok() {
+                cancelled += 1;
+            }
+        }
+        cancelled
+    }
+
     /// The configured maker fee, in basis points.
     #[must_use]
     pub fn maker_bps(&self) -> Decimal {
@@ -525,6 +544,33 @@ mod tests {
             ex.query_order(&sym(), &order.id).unwrap().status,
             OrderStatus::Canceled
         );
+    }
+
+    #[test]
+    fn dead_mans_switch_fires_cancel_all_on_lost_heartbeat() {
+        use crate::DeadMansSwitch;
+        use std::time::Duration;
+
+        let mut ex = seeded();
+        // Two resting orders on opposite sides of the mark (20000).
+        ex.place_order(&OrderRequest::limit_buy(sym(), dec!(1), dec!(19000)))
+            .unwrap();
+        ex.place_order(&OrderRequest::limit_sell(sym(), dec!(1), dec!(21000)))
+            .unwrap();
+        assert_eq!(ex.open_orders(None).unwrap().len(), 2);
+
+        let mut switch = DeadMansSwitch::new(Duration::from_secs(5));
+        switch.heartbeat(1_000);
+        assert!(!switch.is_expired(3_000)); // still in contact
+
+        // The heartbeat is lost: the switch trips and the actuator cancels all.
+        assert!(switch.is_expired(6_000));
+        let cancelled = ex.cancel_all();
+        assert_eq!(cancelled, 2);
+        assert!(ex.open_orders(None).unwrap().is_empty());
+        // Locked funds are released back to free on both sides.
+        assert_eq!(ex.free_of("USDT"), dec!(100000));
+        assert_eq!(ex.free_of("BTC"), dec!(2));
     }
 
     #[test]
