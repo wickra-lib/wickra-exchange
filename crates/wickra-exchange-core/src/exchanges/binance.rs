@@ -18,6 +18,7 @@ use crate::normalize::{format_decimal, parse_decimal};
 use crate::options::{ExchangeOptions, MarketType};
 use crate::signing::hmac_sha256_hex;
 use crate::symbol::Symbol;
+use crate::traits::{Exchange, Execution, MarketData};
 use crate::transport::{
     HttpMethod, HttpRequest, HttpResponse, HttpTransport, WsConnection, WsTransport,
 };
@@ -317,6 +318,29 @@ impl Binance {
             .collect()
     }
 
+    /// All open orders, optionally filtered to one `symbol`. When unfiltered, the
+    /// venue reports each order's wire symbol, which is mapped back to a canonical
+    /// [`Symbol`] via the known quote-asset suffixes.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if credentials are missing or the request fails.
+    pub fn open_orders(&self, symbol: Option<&Symbol>) -> Result<Vec<Order>> {
+        let params = match symbol {
+            Some(s) => format!("symbol={}", Self::wire_symbol(s)),
+            None => String::new(),
+        };
+        let body = self.signed_request(HttpMethod::Get, "/api/v3/openOrders", &params)?;
+        let raws: Vec<RawOrder> = deserialize(&body)?;
+        raws.iter()
+            .map(|raw| {
+                let sym = symbol
+                    .cloned()
+                    .unwrap_or_else(|| split_wire_symbol(&raw.symbol));
+                order_from_raw(sym, raw)
+            })
+            .collect()
+    }
+
     /// Issue a GET and return the body, mapping non-2xx responses onto the error
     /// taxonomy.
     fn get(&self, path: &str, query: &str) -> Result<String> {
@@ -354,6 +378,56 @@ impl Binance {
         } else {
             Err(map_error(&response))
         }
+    }
+}
+
+// The trait surface delegates to the inherent methods (fully qualified to avoid
+// resolving back to the trait method), giving a `Box<dyn Exchange>` for the factory.
+impl MarketData for Binance {
+    fn ticker(&mut self, symbol: &Symbol) -> Result<Ticker> {
+        Binance::ticker(self, symbol)
+    }
+    fn klines(&mut self, symbol: &Symbol, interval: &str, limit: u32) -> Result<Vec<Candle>> {
+        Binance::klines(self, symbol, interval, limit)
+    }
+    fn order_book(&mut self, symbol: &Symbol, depth: u32) -> Result<OrderBookSnapshot> {
+        Binance::order_book(self, symbol, depth)
+    }
+    fn subscribe_trades(&mut self, symbol: &Symbol) -> Result<()> {
+        Binance::subscribe_trades(self, symbol)
+    }
+    fn subscribe_book(&mut self, symbol: &Symbol) -> Result<()> {
+        Binance::subscribe_book(self, symbol)
+    }
+    fn subscribe_ticker(&mut self, symbol: &Symbol) -> Result<()> {
+        Binance::subscribe_ticker(self, symbol)
+    }
+    fn poll_events(&mut self) -> Vec<Event> {
+        Binance::poll_events(self)
+    }
+}
+
+impl Execution for Binance {
+    fn place_order(&mut self, request: &OrderRequest) -> Result<Order> {
+        Binance::place_order(self, request)
+    }
+    fn cancel_order(&mut self, symbol: &Symbol, order_id: &str) -> Result<()> {
+        Binance::cancel_order(self, symbol, order_id)
+    }
+    fn query_order(&mut self, symbol: &Symbol, order_id: &str) -> Result<Order> {
+        Binance::query_order(self, symbol, order_id)
+    }
+    fn open_orders(&mut self, symbol: Option<&Symbol>) -> Result<Vec<Order>> {
+        Binance::open_orders(self, symbol)
+    }
+    fn balances(&mut self) -> Result<Vec<Balance>> {
+        Binance::balances(self)
+    }
+}
+
+impl Exchange for Binance {
+    fn name(&self) -> &'static str {
+        "binance"
     }
 }
 
@@ -415,6 +489,10 @@ fn parse_status(raw: &str) -> Result<OrderStatus> {
 
 fn parse_order(symbol: &Symbol, body: &str) -> Result<Order> {
     let raw: RawOrder = deserialize(body)?;
+    order_from_raw(symbol.clone(), &raw)
+}
+
+fn order_from_raw(symbol: Symbol, raw: &RawOrder) -> Result<Order> {
     let executed = parse_decimal(&raw.executed_qty)?;
     let average_price = if executed > Decimal::ZERO {
         Some(parse_decimal(&raw.cummulative_quote_qty)? / executed)
@@ -425,8 +503,8 @@ fn parse_order(symbol: &Symbol, body: &str) -> Result<Order> {
     let price = (parsed_price > Decimal::ZERO).then_some(parsed_price);
     Ok(Order {
         id: raw.order_id.to_string(),
-        client_order_id: (!raw.client_order_id.is_empty()).then_some(raw.client_order_id),
-        symbol: symbol.clone(),
+        client_order_id: (!raw.client_order_id.is_empty()).then(|| raw.client_order_id.clone()),
+        symbol,
         side: parse_side(&raw.side)?,
         order_type: parse_order_type(&raw.order_type)?,
         status: parse_status(&raw.status)?,
@@ -435,6 +513,25 @@ fn parse_order(symbol: &Symbol, body: &str) -> Result<Order> {
         price,
         average_price,
     })
+}
+
+/// Quote assets used to split a concatenated wire symbol (`BTCUSDT` -> `BTC/USDT`)
+/// when the venue reports only the wire form. Longer quotes are tried first.
+const KNOWN_QUOTES: &[&str] = &[
+    "FDUSD", "USDT", "USDC", "TUSD", "BUSD", "DAI", "EUR", "TRY", "BTC", "ETH", "BNB", "USD",
+];
+
+/// Map a concatenated Binance wire symbol back to a canonical [`Symbol`] using
+/// the known quote-asset suffixes. Falls back to the whole string as the base.
+fn split_wire_symbol(wire: &str) -> Symbol {
+    for quote in KNOWN_QUOTES {
+        if let Some(base) = wire.strip_suffix(quote) {
+            if !base.is_empty() {
+                return Symbol::new(base, *quote);
+            }
+        }
+    }
+    Symbol::new(wire, "")
 }
 
 fn field_str<'a>(value: &'a serde_json::Value, key: &str) -> Result<&'a str> {
@@ -570,6 +667,8 @@ struct BinanceError {
 
 #[derive(Deserialize)]
 struct RawOrder {
+    #[serde(default)]
+    symbol: String,
     #[serde(rename = "orderId")]
     order_id: u64,
     #[serde(rename = "clientOrderId", default)]
@@ -1138,5 +1237,53 @@ mod tests {
         let opts = ExchangeOptions::mainnet(MarketType::Spot);
         let mut binance = Binance::with_http(Box::new(ArcTransport(http)), &opts);
         assert!(binance.poll_events().is_empty());
+    }
+
+    #[test]
+    fn split_wire_symbol_uses_known_quotes() {
+        assert_eq!(split_wire_symbol("BTCUSDT"), Symbol::new("BTC", "USDT"));
+        assert_eq!(split_wire_symbol("ETHFDUSD"), Symbol::new("ETH", "FDUSD"));
+        assert_eq!(split_wire_symbol("ETHBTC"), Symbol::new("ETH", "BTC"));
+        // Unknown quote -> whole string as the base.
+        assert_eq!(split_wire_symbol("WEIRD"), Symbol::new("WEIRD", ""));
+    }
+
+    #[test]
+    fn open_orders_filtered_and_unfiltered() {
+        let (binance, mock) = signed_client(1000);
+        // Filtered: the symbol is known from the caller.
+        mock.push_json(
+            200,
+            r#"[{"symbol":"BTCUSDT","orderId":1,"clientOrderId":"a","price":"100.0",
+            "origQty":"1.0","executedQty":"0.0","cummulativeQuoteQty":"0.0",
+            "status":"NEW","type":"LIMIT","side":"BUY"}]"#,
+        );
+        let orders = binance.open_orders(Some(&symbol())).unwrap();
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].symbol, symbol());
+
+        // Unfiltered: the symbol is resolved from the wire form.
+        mock.push_json(
+            200,
+            r#"[{"symbol":"ETHUSDT","orderId":2,"clientOrderId":"","price":"0.0",
+            "origQty":"2.0","executedQty":"0.0","cummulativeQuoteQty":"0.0",
+            "status":"NEW","type":"MARKET","side":"SELL"}]"#,
+        );
+        let orders = binance.open_orders(None).unwrap();
+        assert_eq!(orders[0].symbol, Symbol::new("ETH", "USDT"));
+        let req = &mock.recorded_requests()[1];
+        assert!(!req.url.contains("symbol="));
+    }
+
+    #[test]
+    fn works_as_a_boxed_exchange() {
+        let (binance, mock) = signed_client(1000);
+        mock.push_json(200, ORDER_JSON);
+        let mut exchange: Box<dyn Exchange> = Box::new(binance);
+        assert_eq!(exchange.name(), "binance");
+        let order = exchange
+            .place_order(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)))
+            .unwrap();
+        assert_eq!(order.id, "28");
     }
 }
