@@ -22,10 +22,10 @@ use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 
 use wickra_exchange::{
-    connect, connect_advanced, connect_derivatives, AdvancedOrders, Credentials, Derivatives,
-    Event, Exchange, ExchangeOptions, MarginMode, MarketType, OcoRequest, Order, OrderRequest,
-    OrderSide, OrderStatus, PaperExchange, Position, PositionSide, ReplayExchange, Symbol, Ticker,
-    TradePrint,
+    connect, connect_advanced, connect_derivatives, connect_user_data, connect_ws_execution,
+    AdvancedOrders, Credentials, Derivatives, Event, Exchange, ExchangeOptions, MarginMode,
+    MarketType, OcoRequest, Order, OrderRequest, OrderSide, OrderStatus, PaperExchange, Position,
+    PositionSide, ReplayExchange, Symbol, Ticker, TradePrint, WsExecution, WsUserData,
 };
 
 /// Parse a `"BASE/QUOTE"` market string into a [`Symbol`].
@@ -625,6 +625,115 @@ impl PyAdvancedOrders {
     }
 }
 
+/// A live private user-data client. After `subscribe_user_data`, `poll_events`
+/// surfaces the account's own order and balance updates alongside the public
+/// market-data stream. Available on the eight trading venues.
+#[pyclass(name = "UserData", unsendable)]
+pub struct PyUserData {
+    inner: Box<dyn WsUserData>,
+}
+
+#[pymethods]
+impl PyUserData {
+    /// Connect a user-data client for `name`. `futures` selects the USDⓈ-M
+    /// futures market. Raises for a venue without a private user-data stream.
+    #[staticmethod]
+    #[pyo3(signature = (name, credentials, testnet=false, futures=false))]
+    fn connect(
+        name: &str,
+        credentials: &PyCredentials,
+        testnet: bool,
+        futures: bool,
+    ) -> PyResult<Self> {
+        let market_type = if futures {
+            MarketType::UsdMFutures
+        } else {
+            MarketType::Spot
+        };
+        let options = if testnet {
+            ExchangeOptions::testnet(market_type)
+        } else {
+            ExchangeOptions::mainnet(market_type)
+        };
+        let inner = connect_user_data(name, credentials.inner.clone(), &options)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(Self { inner })
+    }
+
+    /// Open the private user-data stream. Afterwards `poll_events` also drains the
+    /// account's own order/balance events.
+    fn subscribe_user_data(&mut self) -> PyResult<()> {
+        self.inner
+            .subscribe_user_data()
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
+    /// Drain all events buffered since the last call, each as a dict.
+    fn poll_events<'py>(&mut self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyDict>>> {
+        self.inner
+            .poll_events()
+            .iter()
+            .map(|event| event_dict(py, event))
+            .collect()
+    }
+}
+
+/// A live WebSocket order-API client: place and cancel orders over the venue's
+/// WebSocket order API. Native on Binance/Bybit/OKX/Gate/Kraken; on Bitget,
+/// KuCoin and HTX the methods raise (no WebSocket order-entry API — use REST).
+#[pyclass(name = "WsExecution", unsendable)]
+pub struct PyWsExecution {
+    inner: Box<dyn WsExecution>,
+}
+
+#[pymethods]
+impl PyWsExecution {
+    /// Connect a WebSocket order-API client for `name`. `futures` selects the
+    /// USDⓈ-M futures market. Raises for a venue without a WebSocket order API.
+    #[staticmethod]
+    #[pyo3(signature = (name, credentials, testnet=false, futures=false))]
+    fn connect(
+        name: &str,
+        credentials: &PyCredentials,
+        testnet: bool,
+        futures: bool,
+    ) -> PyResult<Self> {
+        let market_type = if futures {
+            MarketType::UsdMFutures
+        } else {
+            MarketType::Spot
+        };
+        let options = if testnet {
+            ExchangeOptions::testnet(market_type)
+        } else {
+            ExchangeOptions::mainnet(market_type)
+        };
+        let inner = connect_ws_execution(name, credentials.inner.clone(), &options)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(Self { inner })
+    }
+
+    /// Place an order over the WebSocket order API; returns the order as a dict.
+    fn place_order_ws<'py>(
+        &mut self,
+        py: Python<'py>,
+        request: PyRef<'py, PyOrderRequest>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let order = self
+            .inner
+            .place_order_ws(&request.inner)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        order_dict(py, &order)
+    }
+
+    /// Cancel an order over the WebSocket order API by venue id.
+    fn cancel_order_ws(&mut self, market: &str, order_id: &str) -> PyResult<()> {
+        self.inner
+            .cancel_order_ws(&parse_symbol(market)?, order_id)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+}
+
 /// The `_wickra_exchange` extension module.
 #[pymodule]
 fn _wickra_exchange(module: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -634,5 +743,7 @@ fn _wickra_exchange(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyExchange>()?;
     module.add_class::<PyDerivatives>()?;
     module.add_class::<PyAdvancedOrders>()?;
+    module.add_class::<PyUserData>()?;
+    module.add_class::<PyWsExecution>()?;
     Ok(())
 }
