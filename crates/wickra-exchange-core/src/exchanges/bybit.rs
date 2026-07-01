@@ -12,6 +12,11 @@
 //! `X-BAPI-*`-header signed execution (place/cancel/query/open orders, balances),
 //! the pull-based WebSocket market streams (`op:subscribe`, topic-routed frames),
 //! and the [`Exchange`] trait — so Bybit is usable as `Box<dyn Exchange>`.
+//!
+//! [`AdvancedOrders`] is native: STP via `smpType` on order create, amend via
+//! `/v5/order/amend`, and batch place/cancel via `/v5/order/create-batch` and
+//! `/v5/order/cancel-batch`. Bybit has no standalone OCO order-list (take-profit
+//! / stop-loss attach to a position/order), so `place_oco` is a documented gap.
 
 // Bybit `retCode`s are externally-defined numeric codes; grouping their digits
 // with underscores would obscure them rather than aid reading.
@@ -21,14 +26,15 @@ use crate::credentials::Credentials;
 use crate::error::{Error, Result};
 use crate::events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
 use crate::normalize::{format_decimal, parse_decimal};
-use crate::options::{ExchangeOptions, MarginMode, MarketType};
+use crate::options::{ExchangeOptions, MarginMode, MarketType, SelfTradePrevention};
 use crate::positions::{Position, PositionSide};
 use crate::signing::hmac_sha256_hex;
 use crate::symbol::Symbol;
-use crate::traits::{Derivatives, Exchange, Execution, MarketData};
+use crate::traits::{AdvancedOrders, Derivatives, Exchange, Execution, MarketData};
 use crate::transport::{HttpMethod, HttpRequest, HttpTransport, WsConnection, WsTransport};
 use crate::types::{
-    Balance, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker, TimeInForce,
+    Balance, OcoRequest, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker,
+    TimeInForce,
 };
 use rust_decimal::Decimal;
 use serde::Deserialize;
@@ -308,6 +314,9 @@ impl Bybit {
         }
         if request.reduce_only {
             body["reduceOnly"] = serde_json::json!(true);
+        }
+        if let Some(smp) = smp_str(request.stp) {
+            body["smpType"] = serde_json::json!(smp);
         }
         let result =
             self.signed_request(HttpMethod::Post, "/v5/order/create", "", &body.to_string())?;
@@ -605,6 +614,17 @@ fn tif_str(tif: TimeInForce) -> &'static str {
         TimeInForce::Gtc => "GTC",
         TimeInForce::Ioc => "IOC",
         TimeInForce::Fok => "FOK",
+    }
+}
+
+/// The Bybit `smpType` value for a self-trade-prevention policy, or `None` to
+/// omit it. Bybit expresses the maker/taker/both choice as `Cancel*`.
+fn smp_str(stp: SelfTradePrevention) -> Option<&'static str> {
+    match stp {
+        SelfTradePrevention::None => None,
+        SelfTradePrevention::ExpireMaker => Some("CancelMaker"),
+        SelfTradePrevention::ExpireTaker => Some("CancelTaker"),
+        SelfTradePrevention::ExpireBoth => Some("CancelBoth"),
     }
 }
 
@@ -974,12 +994,156 @@ impl Bybit {
         .reduce_only();
         self.place_order(&request)
     }
+
+    /// Amend a resting order's price and/or quantity in place
+    /// (`/v5/order/amend`), then return the refreshed order.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the order is unknown or the amend is rejected.
+    pub fn amend_order(
+        &self,
+        symbol: &Symbol,
+        order_id: &str,
+        new_price: Option<Decimal>,
+        new_quantity: Option<Decimal>,
+    ) -> Result<Order> {
+        let mut body = serde_json::json!({
+            "category": self.category,
+            "symbol": Self::wire_symbol(symbol),
+            "orderId": order_id,
+        });
+        if let Some(q) = new_quantity {
+            body["qty"] = serde_json::json!(format_decimal(q));
+        }
+        if let Some(p) = new_price {
+            body["price"] = serde_json::json!(format_decimal(p));
+        }
+        self.signed_request(HttpMethod::Post, "/v5/order/amend", "", &body.to_string())?;
+        self.query_order(symbol, order_id)
+    }
+
+    /// Place several orders in one request (`/v5/order/create-batch`). Each
+    /// element's outcome is preserved: an empty returned `orderId` marks a
+    /// rejected leg.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the batch request itself fails.
+    pub fn place_batch(&self, requests: &[OrderRequest]) -> Result<Vec<Result<Order>>> {
+        let items: Vec<serde_json::Value> = requests
+            .iter()
+            .map(|r| {
+                let mut o = serde_json::json!({
+                    "symbol": Self::wire_symbol(&r.symbol),
+                    "side": side_str(r.side),
+                    "orderType": order_type_str(r.order_type),
+                    "qty": format_decimal(r.quantity),
+                    "timeInForce": tif_str(r.time_in_force),
+                });
+                if let Some(price) = r.price {
+                    o["price"] = serde_json::json!(format_decimal(price));
+                }
+                if let Some(id) = &r.client_order_id {
+                    o["orderLinkId"] = serde_json::json!(id.clone());
+                }
+                if r.reduce_only {
+                    o["reduceOnly"] = serde_json::json!(true);
+                }
+                o
+            })
+            .collect();
+        let body = serde_json::json!({ "category": self.category, "request": items });
+        let result = self.signed_request(
+            HttpMethod::Post,
+            "/v5/order/create-batch",
+            "",
+            &body.to_string(),
+        )?;
+        let created: BatchCreateResult = parse_result(result)?;
+        Ok(requests
+            .iter()
+            .zip(created.list)
+            .map(|(req, out)| {
+                if out.order_id.is_empty() {
+                    return Err(Error::OrderRejected {
+                        code: "batch".to_string(),
+                        message: "order rejected in batch".to_string(),
+                    });
+                }
+                Ok(Order {
+                    id: out.order_id,
+                    client_order_id: (!out.order_link_id.is_empty()).then_some(out.order_link_id),
+                    symbol: req.symbol.clone(),
+                    side: req.side,
+                    order_type: req.order_type,
+                    status: OrderStatus::New,
+                    quantity: req.quantity,
+                    filled_quantity: Decimal::ZERO,
+                    price: req.price,
+                    average_price: None,
+                })
+            })
+            .collect())
+    }
+
+    /// Cancel several orders on one `symbol` in a single request
+    /// (`/v5/order/cancel-batch`).
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the request fails.
+    pub fn cancel_batch(&self, symbol: &Symbol, order_ids: &[String]) -> Result<()> {
+        let wire = Self::wire_symbol(symbol);
+        let items: Vec<serde_json::Value> = order_ids
+            .iter()
+            .map(|id| serde_json::json!({ "symbol": wire, "orderId": id }))
+            .collect();
+        let body = serde_json::json!({ "category": self.category, "request": items });
+        self.signed_request(
+            HttpMethod::Post,
+            "/v5/order/cancel-batch",
+            "",
+            &body.to_string(),
+        )?;
+        Ok(())
+    }
+}
+
+impl AdvancedOrders for Bybit {
+    fn amend_order(
+        &mut self,
+        symbol: &Symbol,
+        order_id: &str,
+        new_price: Option<Decimal>,
+        new_quantity: Option<Decimal>,
+    ) -> Result<Order> {
+        Bybit::amend_order(self, symbol, order_id, new_price, new_quantity)
+    }
+    fn place_batch(&mut self, requests: &[OrderRequest]) -> Result<Vec<Result<Order>>> {
+        Bybit::place_batch(self, requests)
+    }
+    fn cancel_batch(&mut self, symbol: &Symbol, order_ids: &[String]) -> Result<()> {
+        Bybit::cancel_batch(self, symbol, order_ids)
+    }
+    /// Bybit has no standalone one-cancels-other order-list (take-profit/stop are
+    /// attached to a position/order via `takeProfit`/`stopLoss`), so this returns
+    /// an [`Error::Exchange`].
+    fn place_oco(&mut self, _request: &OcoRequest) -> Result<Vec<Order>> {
+        Err(Error::Exchange {
+            code: "unsupported".to_string(),
+            message: "Bybit has no OCO order-list; attach takeProfit/stopLoss to the order"
+                .to_string(),
+        })
+    }
 }
 
 impl Exchange for Bybit {
     fn name(&self) -> &'static str {
         "bybit"
     }
+}
+
+#[derive(Deserialize)]
+struct BatchCreateResult {
+    list: Vec<CreateResult>,
 }
 
 impl Derivatives for Bybit {
@@ -1213,6 +1377,103 @@ mod tests {
         )
         .with_clock(Box::new(move || now_ms));
         (bybit, mock)
+    }
+
+    #[test]
+    fn stp_maps_to_smp_type() {
+        let (bybit, mock) = signed_client(1000);
+        mock.push_json(
+            200,
+            r#"{"retCode":0,"result":{"orderId":"a","orderLinkId":""}}"#,
+        );
+        bybit
+            .place_order(
+                &OrderRequest::limit_buy(symbol(), dec!(1), dec!(100))
+                    .with_stp(SelfTradePrevention::ExpireBoth),
+            )
+            .unwrap();
+        let reqs = mock.recorded_requests();
+        let body = reqs[0].body.as_ref().unwrap();
+        assert!(body.contains(r#""smpType":"CancelBoth""#));
+    }
+
+    #[test]
+    fn amend_order_amends_then_reads_back() {
+        let (bybit, mock) = signed_client(1000);
+        mock.push_json(
+            200,
+            r#"{"retCode":0,"result":{"orderId":"a","orderLinkId":""}}"#,
+        );
+        mock.push_json(
+            200,
+            r#"{"retCode":0,"result":{"list":[{"symbol":"BTCUSDT","orderId":"a","side":"Buy",
+            "orderType":"Limit","orderStatus":"New","qty":"2","price":"101"}]}}"#,
+        );
+        let order = bybit
+            .amend_order(&symbol(), "a", Some(dec!(101)), Some(dec!(2)))
+            .unwrap();
+        assert_eq!(order.quantity, dec!(2));
+        assert_eq!(order.price, Some(dec!(101)));
+        let reqs = mock.recorded_requests();
+        assert!(reqs[0].url.contains("/v5/order/amend"));
+        let body = reqs[0].body.as_ref().unwrap();
+        assert!(body.contains(r#""qty":"2""#));
+        assert!(body.contains(r#""price":"101""#));
+        assert!(reqs[1].url.contains("/v5/order/realtime"));
+    }
+
+    #[test]
+    fn place_batch_returns_per_order_results() {
+        let (bybit, mock) = signed_client(1000);
+        mock.push_json(
+            200,
+            r#"{"retCode":0,"result":{"list":[
+            {"orderId":"o1","orderLinkId":""},
+            {"orderId":"","orderLinkId":""}]}}"#,
+        );
+        let results = bybit
+            .place_batch(&[
+                OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)),
+                OrderRequest::limit_buy(symbol(), dec!(1), dec!(101)),
+            ])
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].as_ref().unwrap().id, "o1");
+        assert!(matches!(
+            results[1].as_ref().unwrap_err(),
+            Error::OrderRejected { .. }
+        ));
+        assert!(mock.recorded_requests()[0]
+            .url
+            .contains("/v5/order/create-batch"));
+    }
+
+    #[test]
+    fn cancel_batch_is_one_call() {
+        let (bybit, mock) = signed_client(1000);
+        mock.push_json(200, r#"{"retCode":0,"result":{"list":[]}}"#);
+        bybit
+            .cancel_batch(&symbol(), &["1".to_string(), "2".to_string()])
+            .unwrap();
+        let reqs = mock.recorded_requests();
+        assert_eq!(reqs.len(), 1);
+        assert!(reqs[0].url.contains("/v5/order/cancel-batch"));
+        let body = reqs[0].body.as_ref().unwrap();
+        assert!(body.contains(r#""orderId":"1""#));
+        assert!(body.contains(r#""orderId":"2""#));
+    }
+
+    #[test]
+    fn place_oco_is_unsupported() {
+        let (mut bybit, _mock) = signed_client(1000);
+        assert!(matches!(
+            AdvancedOrders::place_oco(
+                &mut bybit,
+                &OcoRequest::new(symbol(), OrderSide::Sell, dec!(1), dec!(110), dec!(95))
+            )
+            .unwrap_err(),
+            Error::Exchange { .. }
+        ));
     }
 
     const POSITION_ENVELOPE: &str = r#"{"retCode":0,"retMsg":"OK","result":{"list":[
