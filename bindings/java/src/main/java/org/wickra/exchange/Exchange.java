@@ -226,7 +226,7 @@ public final class Exchange implements AutoCloseable {
         return side == Side.BUY ? Native.SIDE_BUY : Native.SIDE_SELL;
     }
 
-    private static OrderInfo readOrder(MemorySegment order) {
+    static OrderInfo readOrder(MemorySegment order) {
         String id = Native.readCString(order, Native.O_ID, Native.STR_CAP);
         Side side = order.get(ValueLayout.JAVA_INT, Native.O_SIDE) == Native.SIDE_SELL ? Side.SELL : Side.BUY;
         Status status = Status.values()[order.get(ValueLayout.JAVA_INT, Native.O_STATUS)];
@@ -257,7 +257,7 @@ public final class Exchange implements AutoCloseable {
         return Double.isNaN(value) ? null : value;
     }
 
-    private static void check(int code) {
+    static void check(int code) {
         if (code != Native.OK) {
             throw new RuntimeException("exchange call failed with code " + code);
         }
