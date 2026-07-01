@@ -25,6 +25,8 @@ from ._wickra_exchange import (
     Derivatives,
     Exchange,
     OrderRequest,
+    UserData,
+    WsExecution,
     __version__,
 )
 
@@ -34,5 +36,7 @@ __all__ = [
     "Derivatives",
     "Exchange",
     "OrderRequest",
+    "UserData",
+    "WsExecution",
     "__version__",
 ]
