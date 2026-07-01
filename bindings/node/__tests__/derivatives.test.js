@@ -2,7 +2,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert");
-const { Derivatives, AdvancedOrders, Credentials, OrderRequest } = require("../index.js");
+const { Derivatives, AdvancedOrders, Credentials, OrderRequest, UserData, WsExecution } = require("../index.js");
 
 // Construction is offline (no socket opens until an RPC is issued), so the class
 // surface and the spot-only rejection are checked without a network.
@@ -50,5 +50,28 @@ test("placeBatch accepts an array of OrderRequest instances", () => {
   assert.strictEqual(requests.length, 2);
   for (const request of requests) {
     assert.ok(request instanceof OrderRequest);
+  }
+});
+
+test("user-data and ws-execution reject spot-only and unknown venues", () => {
+  const creds = new Credentials("key", "secret");
+  for (const name of ["coinbase", "upbit", "ftx"]) {
+    assert.throws(() => UserData.connect(name, creds), `${name} must be rejected for user-data`);
+    assert.throws(() => WsExecution.connect(name, creds), `${name} must be rejected for ws-execution`);
+  }
+});
+
+test("user-data and ws-execution construct and expose their surface", () => {
+  const creds = new Credentials("key", "secret");
+  const userData = UserData.connect("binance", creds);
+  assert.ok(userData);
+  // WsUserData: MarketData, so the client can poll (nothing buffered yet).
+  assert.deepStrictEqual(userData.poll(), []);
+  assert.strictEqual(typeof userData.subscribeUserData, "function");
+
+  const exec = WsExecution.connect("bybit", creds);
+  assert.ok(exec);
+  for (const method of ["placeOrderWs", "cancelOrderWs"]) {
+    assert.strictEqual(typeof exec[method], "function", `${method} must be a method`);
   }
 });

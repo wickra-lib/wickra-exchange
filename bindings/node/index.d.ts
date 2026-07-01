@@ -97,6 +97,43 @@ export declare class OrderRequest {
 }
 
 /**
+ * A live private user-data client. After `subscribeUserData`, `poll` surfaces
+ * the account's own order and balance updates alongside the public market-data
+ * stream. Available on the eight trading venues.
+ */
+export declare class UserData {
+  /**
+   * Connect a user-data client for `name`. `futures` selects the USDⓈ-M
+   * futures market. Throws for a venue without a private user-data stream.
+   */
+  static connect(name: string, credentials: Credentials, testnet?: boolean | undefined | null, futures?: boolean | undefined | null): UserData
+  /**
+   * Open the private user-data stream. Afterwards `poll` also drains the
+   * account's own order/balance events.
+   */
+  subscribeUserData(): void
+  /** Drain all events buffered since the last call. */
+  poll(): Array<StreamEvent>
+}
+
+/**
+ * A live WebSocket order-API client: place and cancel orders over the venue's
+ * WebSocket order API. Native on Binance/Bybit/OKX/Gate/Kraken; on Bitget,
+ * KuCoin and HTX the methods throw (no WebSocket order-entry API — use REST).
+ */
+export declare class WsExecution {
+  /**
+   * Connect a WebSocket order-API client for `name`. `futures` selects the
+   * USDⓈ-M futures market. Throws for a venue without a WebSocket order API.
+   */
+  static connect(name: string, credentials: Credentials, testnet?: boolean | undefined | null, futures?: boolean | undefined | null): WsExecution
+  /** Place an order over the WebSocket order API; returns the resulting order. */
+  placeOrderWs(request: OrderRequest): OrderInfo
+  /** Cancel an order over the WebSocket order API by venue id. */
+  cancelOrderWs(market: string, orderId: string): void
+}
+
+/**
  * One order's outcome in a batch placement. Exactly one of `order` / `error`
  * is set: `order` on success, `error` with the venue's message on rejection.
  */

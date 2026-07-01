@@ -592,4 +592,6 @@ module.exports.Credentials = nativeBinding.Credentials
 module.exports.Derivatives = nativeBinding.Derivatives
 module.exports.Exchange = nativeBinding.Exchange
 module.exports.OrderRequest = nativeBinding.OrderRequest
+module.exports.UserData = nativeBinding.UserData
+module.exports.WsExecution = nativeBinding.WsExecution
 module.exports.version = nativeBinding.version

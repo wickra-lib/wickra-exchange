@@ -24,11 +24,12 @@ use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 
 use wickra_exchange::{
-    connect, connect_advanced, connect_derivatives, AdvancedOrders as CoreAdvancedOrders,
-    Credentials as CoreCredentials, Derivatives as CoreDerivatives, Event,
-    Exchange as CoreExchange, ExchangeOptions, MarginMode, MarketType, OcoRequest, Order,
-    OrderRequest as CoreOrderRequest, OrderSide, OrderStatus, PaperExchange, Position,
-    PositionSide, ReplayExchange, Symbol, TradePrint,
+    connect, connect_advanced, connect_derivatives, connect_user_data, connect_ws_execution,
+    AdvancedOrders as CoreAdvancedOrders, Credentials as CoreCredentials,
+    Derivatives as CoreDerivatives, Event, Exchange as CoreExchange, ExchangeOptions, MarginMode,
+    MarketType, OcoRequest, Order, OrderRequest as CoreOrderRequest, OrderSide, OrderStatus,
+    PaperExchange, Position, PositionSide, ReplayExchange, Symbol, TradePrint,
+    WsExecution as CoreWsExecution, WsUserData as CoreWsUserData,
 };
 
 fn err(message: impl Into<String>) -> NapiError {
@@ -701,5 +702,107 @@ impl AdvancedOrders {
                 },
             })
             .collect())
+    }
+}
+
+/// A live private user-data client. After `subscribeUserData`, `poll` surfaces
+/// the account's own order and balance updates alongside the public market-data
+/// stream. Available on the eight trading venues.
+#[napi]
+pub struct UserData {
+    inner: Box<dyn CoreWsUserData>,
+}
+
+#[napi]
+impl UserData {
+    /// Connect a user-data client for `name`. `futures` selects the USDⓈ-M
+    /// futures market. Throws for a venue without a private user-data stream.
+    #[napi(factory)]
+    pub fn connect(
+        name: String,
+        credentials: &Credentials,
+        testnet: Option<bool>,
+        futures: Option<bool>,
+    ) -> napi::Result<Self> {
+        let market_type = if futures.unwrap_or(false) {
+            MarketType::UsdMFutures
+        } else {
+            MarketType::Spot
+        };
+        let options = if testnet.unwrap_or(false) {
+            ExchangeOptions::testnet(market_type)
+        } else {
+            ExchangeOptions::mainnet(market_type)
+        };
+        let inner =
+            connect_user_data(&name, credentials.inner.clone(), &options).map_err(map_err)?;
+        Ok(Self { inner })
+    }
+
+    /// Open the private user-data stream. Afterwards `poll` also drains the
+    /// account's own order/balance events.
+    #[napi]
+    pub fn subscribe_user_data(&mut self) -> napi::Result<()> {
+        self.inner.subscribe_user_data().map_err(map_err)
+    }
+
+    /// Drain all events buffered since the last call.
+    #[napi]
+    pub fn poll(&mut self) -> Vec<StreamEvent> {
+        self.inner
+            .poll_events()
+            .iter()
+            .map(StreamEvent::from_event)
+            .collect()
+    }
+}
+
+/// A live WebSocket order-API client: place and cancel orders over the venue's
+/// WebSocket order API. Native on Binance/Bybit/OKX/Gate/Kraken; on Bitget,
+/// KuCoin and HTX the methods throw (no WebSocket order-entry API — use REST).
+#[napi]
+pub struct WsExecution {
+    inner: Box<dyn CoreWsExecution>,
+}
+
+#[napi]
+impl WsExecution {
+    /// Connect a WebSocket order-API client for `name`. `futures` selects the
+    /// USDⓈ-M futures market. Throws for a venue without a WebSocket order API.
+    #[napi(factory)]
+    pub fn connect(
+        name: String,
+        credentials: &Credentials,
+        testnet: Option<bool>,
+        futures: Option<bool>,
+    ) -> napi::Result<Self> {
+        let market_type = if futures.unwrap_or(false) {
+            MarketType::UsdMFutures
+        } else {
+            MarketType::Spot
+        };
+        let options = if testnet.unwrap_or(false) {
+            ExchangeOptions::testnet(market_type)
+        } else {
+            ExchangeOptions::mainnet(market_type)
+        };
+        let inner =
+            connect_ws_execution(&name, credentials.inner.clone(), &options).map_err(map_err)?;
+        Ok(Self { inner })
+    }
+
+    /// Place an order over the WebSocket order API; returns the resulting order.
+    #[napi]
+    pub fn place_order_ws(&mut self, request: &OrderRequest) -> napi::Result<OrderInfo> {
+        let order = self.inner.place_order_ws(&request.inner).map_err(map_err)?;
+        Ok(OrderInfo::from(&order))
+    }
+
+    /// Cancel an order over the WebSocket order API by venue id.
+    #[napi]
+    pub fn cancel_order_ws(&mut self, market: String, order_id: String) -> napi::Result<()> {
+        self.inner
+            .cancel_order_ws(&parse_symbol(&market)?, &order_id)
+            .map_err(map_err)
     }
 }
