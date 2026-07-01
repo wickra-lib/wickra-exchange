@@ -20,14 +20,18 @@ same strategy runs paper, replay and live by swapping the constructor::
 from __future__ import annotations
 
 from ._wickra_exchange import (
+    AdvancedOrders,
     Credentials,
+    Derivatives,
     Exchange,
     OrderRequest,
     __version__,
 )
 
 __all__ = [
+    "AdvancedOrders",
     "Credentials",
+    "Derivatives",
     "Exchange",
     "OrderRequest",
     "__version__",
