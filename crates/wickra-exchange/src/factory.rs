@@ -305,10 +305,11 @@ mod tests {
         for name in [
             "binance", "bybit", "okx", "bitget", "kucoin", "gateio", "htx", "kraken",
         ] {
-            assert!(
-                connect_user_data(name, creds(), &opts()).is_ok(),
-                "{name} should dispatch a user-data client"
-            );
+            let mut client = connect_user_data(name, creds(), &opts())
+                .unwrap_or_else(|_| panic!("{name} should dispatch a user-data client"));
+            // `WsUserData: MarketData`, so the boxed facade handle can poll without
+            // opening a socket (nothing is buffered yet).
+            assert!(client.poll_events().is_empty());
         }
     }
 
