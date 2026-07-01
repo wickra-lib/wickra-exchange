@@ -24,7 +24,7 @@ use crate::options::{ExchangeOptions, MarginMode, MarketType, SelfTradePreventio
 use crate::positions::{Position, PositionSide};
 use crate::signing::hmac_sha256_base64;
 use crate::symbol::Symbol;
-use crate::traits::{AdvancedOrders, Derivatives, Exchange, Execution, MarketData};
+use crate::traits::{AdvancedOrders, Derivatives, Exchange, Execution, MarketData, WsUserData};
 use crate::transport::{HttpMethod, HttpRequest, HttpTransport, WsConnection, WsTransport};
 use crate::types::{
     Balance, OcoRequest, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker,
@@ -55,6 +55,10 @@ pub struct Bitget {
     connection: Option<Box<dyn WsConnection>>,
     sub_messages: Vec<String>,
     subscriptions: Vec<(String, Symbol)>,
+    /// The private user-data connection, opened by
+    /// [`subscribe_user_data`](Self::subscribe_user_data) and drained by
+    /// [`poll_events`](Self::poll_events) alongside the public stream.
+    private_connection: Option<Box<dyn WsConnection>>,
 }
 
 impl Bitget {
@@ -73,6 +77,7 @@ impl Bitget {
             connection: None,
             sub_messages: Vec::new(),
             subscriptions: Vec::new(),
+            private_connection: None,
         }
     }
 
@@ -266,6 +271,15 @@ impl Bitget {
                 }
             }
         }
+        // Drain the private user-data stream (orders/account channels), if open.
+        // Re-authenticating a dropped private stream is a keepalive follow-up.
+        if let Some(connection) = self.private_connection.as_mut() {
+            while let Ok(Some(frame)) = connection.recv() {
+                if let Ok(mut parsed) = parse_ws_message(&frame, &resolve) {
+                    events.append(&mut parsed);
+                }
+            }
+        }
         let url = "wss://ws.bitget.com/v2/ws/public";
         crate::wsutil::reconnect_if_dropped(
             self.ws.as_deref(),
@@ -275,6 +289,45 @@ impl Bitget {
             &mut events,
         );
         events
+    }
+
+    /// Open the private user-data stream (`wss://ws.bitget.com/v2/ws/private`).
+    /// Logs in with an `op:login` frame (sign = base64(HMAC-SHA256) over
+    /// `<epochSeconds>GET/user/verify`), then subscribes to the `orders` and
+    /// `account` channels. Afterwards [`poll_events`](Self::poll_events) also
+    /// surfaces the account's own [`Event::OrderUpdate`] and [`Event::BalanceUpdate`].
+    ///
+    /// Re-authenticating a dropped private stream is a keepalive follow-up.
+    ///
+    /// # Errors
+    /// Returns [`Error::InvalidCredentials`] without credentials or a passphrase,
+    /// [`Error::NotConnected`] without a WebSocket transport, or another
+    /// [`Error`] if the request fails.
+    pub fn subscribe_user_data(&mut self) -> Result<()> {
+        let creds = self.credentials.as_ref().ok_or(Error::InvalidCredentials(
+            "user-data stream requires credentials",
+        ))?;
+        let passphrase = creds
+            .passphrase
+            .as_deref()
+            .ok_or(Error::InvalidCredentials("Bitget requires a passphrase"))?;
+        // Bitget WS login signs `<timestamp>GET/user/verify`, timestamp in seconds.
+        let timestamp = (self.now_ms)() / 1000;
+        let sign = hmac_sha256_base64(
+            creds.api_secret.as_bytes(),
+            format!("{timestamp}GET/user/verify").as_bytes(),
+        );
+        let login = format!(
+            r#"{{"op":"login","args":[{{"apiKey":"{}","passphrase":"{passphrase}","timestamp":"{timestamp}","sign":"{sign}"}}]}}"#,
+            creds.api_key
+        );
+        let subscribe = r#"{"op":"subscribe","args":[{"instType":"SPOT","channel":"orders","instId":"default"},{"instType":"SPOT","channel":"account","coin":"default"}]}"#.to_string();
+        let ws = self.ws.as_ref().ok_or(Error::NotConnected)?;
+        let mut connection = ws.connect("wss://ws.bitget.com/v2/ws/private")?;
+        connection.send(&login)?;
+        connection.send(&subscribe)?;
+        self.private_connection = Some(connection);
+        Ok(())
     }
 
     /// Place an order.
@@ -804,6 +857,33 @@ fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Vec
                 }
             })
             .collect()
+    } else if channel == "orders" {
+        // Private order channel: each element carries its own `instId`, which
+        // `RawOrder` picks up as the wire symbol via the `instId` alias.
+        data.iter()
+            .map(|raw| {
+                let order: RawOrder = serde_json::from_value(raw.clone())
+                    .map_err(|e| Error::Deserialization(e.to_string()))?;
+                let order_symbol = split_wire_symbol(&order.symbol);
+                Ok(Event::OrderUpdate(order_from_raw(order_symbol, &order)?))
+            })
+            .collect()
+    } else if channel == "account" {
+        // Private account channel: `data` is an array of per-coin balances,
+        // emitted together as one balance-update snapshot.
+        let balances = data
+            .iter()
+            .map(|raw| {
+                let asset: RawAsset = serde_json::from_value(raw.clone())
+                    .map_err(|e| Error::Deserialization(e.to_string()))?;
+                Ok(Balance {
+                    asset: asset.coin,
+                    free: dec_or_zero(&asset.available),
+                    locked: dec_or_zero(&asset.frozen),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(vec![Event::BalanceUpdate(balances)])
     } else {
         Ok(Vec::new())
     }
@@ -848,7 +928,8 @@ struct PlaceResult {
 
 #[derive(Deserialize)]
 struct RawOrder {
-    #[serde(default)]
+    // REST reports `symbol`; the private `orders` stream reports `instId`.
+    #[serde(default, alias = "instId")]
     symbol: String,
     #[serde(rename = "orderId")]
     order_id: String,
@@ -1203,6 +1284,12 @@ impl Exchange for Bitget {
     }
 }
 
+impl WsUserData for Bitget {
+    fn subscribe_user_data(&mut self) -> Result<()> {
+        Bitget::subscribe_user_data(self)
+    }
+}
+
 impl Derivatives for Bitget {
     fn positions(&mut self, symbol: Option<&Symbol>) -> Result<Vec<Position>> {
         Bitget::positions(self, symbol)
@@ -1318,6 +1405,81 @@ mod tests {
         )
         .with_clock(Box::new(move || now_ms));
         (bitget, mock)
+    }
+
+    fn signed_ws_client(now_ms: i64) -> (Bitget, Arc<MockWsTransport>) {
+        let http = Arc::new(MockHttpTransport::new());
+        let ws = Arc::new(MockWsTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::Spot);
+        let bitget = Bitget::with_credentials(
+            Box::new(ArcTransport(http)),
+            &opts,
+            Credentials::new("APIKEY", "SECRET").with_passphrase("PASS"),
+        )
+        .with_ws(Box::new(ArcWs(Arc::clone(&ws))))
+        .with_clock(Box::new(move || now_ms));
+        (bitget, ws)
+    }
+
+    #[test]
+    fn subscribe_user_data_logs_in_and_streams_orders_and_account() {
+        let (mut bitget, ws) = signed_ws_client(1_700_000_000_000);
+        ws.push_connection(vec![
+            Ok(Some(r#"{"event":"login","code":"0"}"#.to_string())),
+            Ok(Some(r#"{"event":"subscribe"}"#.to_string())),
+            Ok(Some(
+                r#"{"arg":{"instType":"SPOT","channel":"orders","instId":"default"},"data":[
+                {"instId":"BTCUSDT","orderId":"55","clientOid":"my","side":"buy","orderType":"limit",
+                "status":"filled","size":"1","baseVolume":"1","price":"100","priceAvg":"100"}]}"#
+                    .to_string(),
+            )),
+            Ok(Some(
+                r#"{"arg":{"instType":"SPOT","channel":"account","coin":"default"},"data":[
+                {"coin":"USDT","available":"900","frozen":"50"}]}"#
+                    .to_string(),
+            )),
+        ]);
+        bitget.subscribe_user_data().unwrap();
+        assert_eq!(ws.connected_urls()[0], "wss://ws.bitget.com/v2/ws/private");
+        assert!(ws.sent()[0].contains(r#""op":"login""#));
+        assert!(ws.sent()[0].contains(r#""apiKey":"APIKEY""#));
+        assert!(ws.sent()[1].contains(r#""channel":"orders""#));
+        assert!(ws.sent()[1].contains(r#""channel":"account""#));
+
+        let events = bitget.poll_events();
+        assert_eq!(events.len(), 2);
+        let Event::OrderUpdate(order) = &events[0] else {
+            panic!("first event must be an order update");
+        };
+        assert_eq!(order.id, "55");
+        assert_eq!(order.symbol, symbol());
+        assert_eq!(order.side, OrderSide::Buy);
+        assert_eq!(order.status, OrderStatus::Filled);
+        assert_eq!(order.average_price, Some(dec!(100)));
+        let Event::BalanceUpdate(balances) = &events[1] else {
+            panic!("second event must be a balance update");
+        };
+        assert_eq!(balances.len(), 1);
+        assert_eq!(balances[0].asset, "USDT");
+        assert_eq!(balances[0].free, dec!(900));
+        assert_eq!(balances[0].locked, dec!(50));
+    }
+
+    #[test]
+    fn subscribe_user_data_requires_a_passphrase() {
+        let http = Arc::new(MockHttpTransport::new());
+        let ws = Arc::new(MockWsTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::Spot);
+        let mut bitget = Bitget::with_credentials(
+            Box::new(ArcTransport(http)),
+            &opts,
+            Credentials::new("APIKEY", "SECRET"),
+        )
+        .with_ws(Box::new(ArcWs(Arc::clone(&ws))));
+        assert!(matches!(
+            bitget.subscribe_user_data().unwrap_err(),
+            Error::InvalidCredentials(_)
+        ));
     }
 
     fn signed_futures_client(now_ms: i64) -> (Bitget, Arc<MockHttpTransport>) {

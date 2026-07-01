@@ -21,7 +21,7 @@ use crate::options::{ExchangeOptions, MarginMode, MarketType, SelfTradePreventio
 use crate::positions::{Position, PositionSide};
 use crate::signing::hmac_sha256_base64;
 use crate::symbol::Symbol;
-use crate::traits::{AdvancedOrders, Derivatives, Exchange, Execution, MarketData};
+use crate::traits::{AdvancedOrders, Derivatives, Exchange, Execution, MarketData, WsUserData};
 use crate::transport::{HttpMethod, HttpRequest, HttpTransport, WsConnection, WsTransport};
 use crate::types::{
     Balance, OcoRequest, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker,
@@ -53,6 +53,10 @@ pub struct KuCoin {
     /// Leverage applied to futures orders. KuCoin sets leverage per order rather
     /// than per account, so [`set_leverage`](Self::set_leverage) records it here.
     leverage: u32,
+    /// The private user-data connection, opened by
+    /// [`subscribe_user_data`](Self::subscribe_user_data) and drained by
+    /// [`poll_events`](Self::poll_events) alongside the public stream.
+    private_connection: Option<Box<dyn WsConnection>>,
 }
 
 impl KuCoin {
@@ -77,6 +81,7 @@ impl KuCoin {
             sub_messages: Vec::new(),
             subscriptions: Vec::new(),
             leverage: 1,
+            private_connection: None,
         }
     }
 
@@ -255,6 +260,15 @@ impl KuCoin {
                 }
             }
         }
+        // Drain the private user-data stream (tradeOrders/account.balance), if open.
+        // Re-negotiating a fresh bullet token on reconnect is a keepalive follow-up.
+        if let Some(connection) = self.private_connection.as_mut() {
+            while let Ok(Some(frame)) = connection.recv() {
+                if let Ok(Some(event)) = parse_ws_message(&frame, &resolve) {
+                    events.push(event);
+                }
+            }
+        }
         let url = "wss://ws-api-spot.kucoin.com/";
         crate::wsutil::reconnect_if_dropped(
             self.ws.as_deref(),
@@ -264,6 +278,46 @@ impl KuCoin {
             &mut events,
         );
         events
+    }
+
+    /// Open the private user-data stream. Negotiates a bullet-private token over
+    /// REST (`POST /api/v1/bullet-private`, signed), connects the returned
+    /// instance endpoint (`<endpoint>?token=<token>&connectId=<id>`), then
+    /// subscribes to the `/spotMarket/tradeOrders` and `/account/balance` private
+    /// channels. Afterwards [`poll_events`](Self::poll_events) also surfaces the
+    /// account's own [`Event::OrderUpdate`] and [`Event::BalanceUpdate`].
+    ///
+    /// The bullet token expires (KuCoin pings keep it alive); re-negotiating it on
+    /// reconnect is a keepalive follow-up.
+    ///
+    /// # Errors
+    /// Returns [`Error::InvalidCredentials`] without credentials or a passphrase,
+    /// [`Error::NotConnected`] without a WebSocket transport, or another
+    /// [`Error`] if the token negotiation or subscription fails.
+    pub fn subscribe_user_data(&mut self) -> Result<()> {
+        let data = self.signed_request(HttpMethod::Post, "/api/v1/bullet-private", "", "")?;
+        let bullet: BulletToken = parse_json(data)?;
+        let server = bullet.instance_servers.into_iter().next().ok_or_else(|| {
+            Error::NotFound("bullet-private returned no instance server".to_string())
+        })?;
+        let connect_id = (self.now_ms)();
+        let url = format!(
+            "{}?token={}&connectId={connect_id}",
+            server.endpoint, bullet.token
+        );
+        let orders = format!(
+            r#"{{"id":"{connect_id}","type":"subscribe","topic":"/spotMarket/tradeOrders","privateChannel":true,"response":true}}"#
+        );
+        let account = format!(
+            r#"{{"id":"{}","type":"subscribe","topic":"/account/balance","privateChannel":true,"response":true}}"#,
+            connect_id + 1
+        );
+        let ws = self.ws.as_ref().ok_or(Error::NotConnected)?;
+        let mut connection = ws.connect(&url)?;
+        connection.send(&orders)?;
+        connection.send(&account)?;
+        self.private_connection = Some(connection);
+        Ok(())
     }
 
     /// Place an order. KuCoin requires a client order id; one is generated from
@@ -683,9 +737,60 @@ fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Opt
             bids,
             asks,
         })))
+    } else if topic == "/spotMarket/tradeOrders" {
+        Ok(Some(Event::OrderUpdate(ws_order_from_data(data)?)))
+    } else if topic == "/account/balance" {
+        Ok(Some(Event::BalanceUpdate(vec![Balance {
+            asset: field_str(data, "currency")?.to_string(),
+            free: dec_or_zero(opt_str(data, "available")),
+            locked: dec_or_zero(opt_str(data, "hold")),
+        }])))
     } else {
         Ok(None)
     }
+}
+
+/// Map a `/spotMarket/tradeOrders` status (with the event `type` disambiguating a
+/// finished order) to an [`OrderStatus`].
+fn ws_order_status(status: &str, event_type: &str) -> OrderStatus {
+    match status {
+        "match" => OrderStatus::PartiallyFilled,
+        "done" if event_type == "canceled" => OrderStatus::Canceled,
+        "done" => OrderStatus::Filled,
+        _ => OrderStatus::New,
+    }
+}
+
+/// Build an [`Order`] from a `/spotMarket/tradeOrders` message payload.
+fn ws_order_from_data(data: &serde_json::Value) -> Result<Order> {
+    let wire = field_str(data, "symbol")?;
+    let symbol = wire.parse().unwrap_or_else(|_| Symbol::new(wire, ""));
+    let client_oid = opt_str(data, "clientOid");
+    Ok(Order {
+        id: field_str(data, "orderId")?.to_string(),
+        client_order_id: (!client_oid.is_empty()).then(|| client_oid.to_string()),
+        symbol,
+        side: parse_side(field_str(data, "side")?)?,
+        order_type: parse_order_type(field_str(data, "orderType")?)?,
+        status: ws_order_status(opt_str(data, "status"), opt_str(data, "type")),
+        quantity: parse_decimal(field_str(data, "size")?)?,
+        filled_quantity: dec_or_zero(opt_str(data, "filledSize")),
+        price: nonzero_decimal(opt_str(data, "price")),
+        average_price: None,
+    })
+}
+
+/// The bullet-private token negotiation response.
+#[derive(Deserialize)]
+struct BulletToken {
+    token: String,
+    #[serde(rename = "instanceServers", default)]
+    instance_servers: Vec<BulletServer>,
+}
+
+#[derive(Deserialize)]
+struct BulletServer {
+    endpoint: String,
 }
 
 #[derive(Deserialize)]
@@ -1041,6 +1146,12 @@ impl Exchange for KuCoin {
     }
 }
 
+impl WsUserData for KuCoin {
+    fn subscribe_user_data(&mut self) -> Result<()> {
+        KuCoin::subscribe_user_data(self)
+    }
+}
+
 impl Derivatives for KuCoin {
     fn positions(&mut self, symbol: Option<&Symbol>) -> Result<Vec<Position>> {
         KuCoin::positions(self, symbol)
@@ -1159,6 +1270,92 @@ mod tests {
         )
         .with_clock(Box::new(move || now_ms));
         (kucoin, mock)
+    }
+
+    fn signed_ws_client(now_ms: i64) -> (KuCoin, Arc<MockHttpTransport>, Arc<MockWsTransport>) {
+        let http = Arc::new(MockHttpTransport::new());
+        let ws = Arc::new(MockWsTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::Spot);
+        let kucoin = KuCoin::with_credentials(
+            Box::new(ArcTransport(Arc::clone(&http))),
+            &opts,
+            Credentials::new("APIKEY", "SECRET").with_passphrase("PASS"),
+        )
+        .with_ws(Box::new(ArcWs(Arc::clone(&ws))))
+        .with_clock(Box::new(move || now_ms));
+        (kucoin, http, ws)
+    }
+
+    #[test]
+    fn subscribe_user_data_negotiates_token_and_streams_orders_and_balance() {
+        let (mut kucoin, http, ws) = signed_ws_client(1000);
+        http.push_json(
+            200,
+            r#"{"code":"200000","data":{"token":"tok","instanceServers":[
+            {"endpoint":"wss://push.kucoin.com/endpoint"}]}}"#,
+        );
+        ws.push_connection(vec![
+            Ok(Some(r#"{"type":"ack","id":"1000"}"#.to_string())),
+            Ok(Some(
+                r#"{"type":"message","topic":"/spotMarket/tradeOrders","subject":"orderChange",
+                "data":{"symbol":"BTC-USDT","orderId":"55","clientOid":"my","side":"buy",
+                "orderType":"limit","type":"filled","status":"done","size":"1","filledSize":"1",
+                "price":"100"}}"#
+                    .to_string(),
+            )),
+            Ok(Some(
+                r#"{"type":"message","topic":"/account/balance","subject":"account.balance",
+                "data":{"currency":"USDT","available":"900","hold":"50","total":"950"}}"#
+                    .to_string(),
+            )),
+        ]);
+        kucoin.subscribe_user_data().unwrap();
+
+        let reqs = http.recorded_requests();
+        assert!(reqs[0].url.contains("/api/v1/bullet-private"));
+        assert_eq!(reqs[0].method, HttpMethod::Post);
+        assert_eq!(
+            ws.connected_urls()[0],
+            "wss://push.kucoin.com/endpoint?token=tok&connectId=1000"
+        );
+        assert!(ws.sent()[0].contains("/spotMarket/tradeOrders"));
+        assert!(ws.sent()[1].contains("/account/balance"));
+
+        let events = kucoin.poll_events();
+        assert_eq!(events.len(), 2);
+        let Event::OrderUpdate(order) = &events[0] else {
+            panic!("first event must be an order update");
+        };
+        assert_eq!(order.id, "55");
+        assert_eq!(order.client_order_id.as_deref(), Some("my"));
+        assert_eq!(order.symbol, symbol());
+        assert_eq!(order.side, OrderSide::Buy);
+        assert_eq!(order.status, OrderStatus::Filled);
+        assert_eq!(order.filled_quantity, dec!(1));
+        let Event::BalanceUpdate(balances) = &events[1] else {
+            panic!("second event must be a balance update");
+        };
+        assert_eq!(balances.len(), 1);
+        assert_eq!(balances[0].asset, "USDT");
+        assert_eq!(balances[0].free, dec!(900));
+        assert_eq!(balances[0].locked, dec!(50));
+    }
+
+    #[test]
+    fn subscribe_user_data_requires_a_passphrase() {
+        let http = Arc::new(MockHttpTransport::new());
+        let ws = Arc::new(MockWsTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::Spot);
+        let mut kucoin = KuCoin::with_credentials(
+            Box::new(ArcTransport(http)),
+            &opts,
+            Credentials::new("APIKEY", "SECRET"),
+        )
+        .with_ws(Box::new(ArcWs(Arc::clone(&ws))));
+        assert!(matches!(
+            kucoin.subscribe_user_data().unwrap_err(),
+            Error::InvalidCredentials(_)
+        ));
     }
 
     fn signed_futures_client(now_ms: i64) -> (KuCoin, Arc<MockHttpTransport>) {
