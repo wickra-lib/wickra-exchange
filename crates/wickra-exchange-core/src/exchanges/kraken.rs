@@ -35,7 +35,9 @@ use crate::options::{ExchangeOptions, MarginMode, MarketType};
 use crate::positions::{Position, PositionSide};
 use crate::signing::{hmac_sha512_base64_with_b64_secret, sha256};
 use crate::symbol::Symbol;
-use crate::traits::{AdvancedOrders, Derivatives, Exchange, Execution, MarketData, WsUserData};
+use crate::traits::{
+    AdvancedOrders, Derivatives, Exchange, Execution, MarketData, WsExecution, WsUserData,
+};
 use crate::transport::{HttpMethod, HttpRequest, HttpTransport, WsConnection, WsTransport};
 use crate::types::{
     Balance, OcoRequest, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker,
@@ -75,6 +77,11 @@ pub struct Kraken {
     /// [`subscribe_user_data`](Self::subscribe_user_data) and drained by
     /// [`poll_events`](Self::poll_events) alongside the public stream.
     private_connection: Option<Box<dyn WsConnection>>,
+    /// A dedicated connection to the v2 authenticated order API, opened lazily on
+    /// the first [`place_order_ws`](Self::place_order_ws) / [`cancel_order_ws`](Self::cancel_order_ws)
+    /// call, together with the WebSocket token each request carries.
+    ws_api_connection: Option<Box<dyn WsConnection>>,
+    ws_api_token: Option<String>,
 }
 
 impl Kraken {
@@ -95,6 +102,8 @@ impl Kraken {
             sub_messages: Vec::new(),
             leverage: Cell::new(1),
             private_connection: None,
+            ws_api_connection: None,
+            ws_api_token: None,
         }
     }
 
@@ -368,6 +377,146 @@ impl Kraken {
         connection.send(&balances)?;
         self.private_connection = Some(connection);
         Ok(())
+    }
+
+    /// Place an order over the Kraken v2 authenticated WebSocket order API
+    /// (`add_order`). Fetches a `GetWebSocketsToken` token over REST on first use, connects
+    /// `wss://ws-auth.kraken.com/v2`, and sends the order with the token.
+    ///
+    /// # Errors
+    /// Returns [`Error::Exchange`] on the **futures** client (Kraken Futures uses a
+    /// separate feed), [`Error::NotConnected`] without a WebSocket transport, or
+    /// another [`Error`] if the order is invalid or rejected.
+    pub fn place_order_ws(&mut self, request: &OrderRequest) -> Result<Order> {
+        request.validate()?;
+        let mut params = serde_json::Map::new();
+        params.insert(
+            "order_type".to_string(),
+            serde_json::json!(order_type_str(request.order_type)),
+        );
+        params.insert(
+            "side".to_string(),
+            serde_json::json!(side_str(request.side)),
+        );
+        params.insert("order_qty".to_string(), json_number(request.quantity));
+        params.insert(
+            "symbol".to_string(),
+            serde_json::json!(request.symbol.to_string()),
+        );
+        if let Some(price) = request.price {
+            params.insert("limit_price".to_string(), json_number(price));
+        }
+        if let Some(id) = &request.client_order_id {
+            params.insert("cl_ord_id".to_string(), serde_json::json!(id.clone()));
+        }
+        let result = self.ws_order_request("add_order", params)?;
+        let id = result
+            .get("order_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        Ok(Order {
+            id,
+            client_order_id: request.client_order_id.clone(),
+            symbol: request.symbol.clone(),
+            side: request.side,
+            order_type: request.order_type,
+            status: OrderStatus::New,
+            quantity: request.quantity,
+            filled_quantity: Decimal::ZERO,
+            price: request.price,
+            average_price: None,
+        })
+    }
+
+    /// Cancel an order over the Kraken v2 authenticated WebSocket order API
+    /// (`cancel_order`).
+    ///
+    /// # Errors
+    /// Returns [`Error::Exchange`] on the futures client, [`Error::NotConnected`]
+    /// without a WebSocket transport, or another [`Error`] if the request fails.
+    pub fn cancel_order_ws(&mut self, _symbol: &Symbol, order_id: &str) -> Result<()> {
+        let mut params = serde_json::Map::new();
+        params.insert("order_id".to_string(), serde_json::json!([order_id]));
+        self.ws_order_request("cancel_order", params)?;
+        Ok(())
+    }
+
+    /// Open the authenticated order connection if needed: fetch a
+    /// `GetWebSocketsToken` token over REST, connect `wss://ws-auth.kraken.com/v2`,
+    /// and cache both.
+    fn ensure_ws_api(&mut self) -> Result<()> {
+        if self.ws_api_connection.is_some() {
+            return Ok(());
+        }
+        if self.is_futures() {
+            return Err(Error::Exchange {
+                code: "unsupported".to_string(),
+                message: "Kraken Futures exposes a separate WebSocket order feed \
+                          (challenge/response auth on futures.kraken.com); the spot \
+                          v2 order API is not available for the futures client"
+                    .to_string(),
+            });
+        }
+        let result = self.signed_post("/0/private/GetWebSocketsToken", &[])?;
+        let token = result
+            .get("token")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| Error::Deserialization("missing WebSockets token".to_string()))?
+            .to_string();
+        let ws = self.ws.as_ref().ok_or(Error::NotConnected)?;
+        let connection = ws.connect("wss://ws-auth.kraken.com/v2")?;
+        self.ws_api_connection = Some(connection);
+        self.ws_api_token = Some(token);
+        Ok(())
+    }
+
+    /// Send a token-authenticated order request frame and return its `result`,
+    /// mapping `success == false` onto the error taxonomy.
+    fn ws_order_request(
+        &mut self,
+        method: &str,
+        mut params: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<serde_json::Value> {
+        self.ensure_ws_api()?;
+        let token = self
+            .ws_api_token
+            .clone()
+            .expect("token set alongside the connection");
+        params.insert("token".to_string(), serde_json::json!(token));
+        let req_id = (self.now_ms)();
+        let frame = serde_json::json!({
+            "method": method,
+            "params": serde_json::Value::Object(params),
+            "req_id": req_id,
+        })
+        .to_string();
+        let connection = self
+            .ws_api_connection
+            .as_mut()
+            .expect("ws order connection just ensured");
+        connection.send(&frame)?;
+        let Some(response) = connection.recv()? else {
+            return Err(Error::NotConnected);
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&response).map_err(|e| Error::Deserialization(e.to_string()))?;
+        if value.get("success").and_then(serde_json::Value::as_bool) == Some(true) {
+            Ok(value
+                .get("result")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null))
+        } else {
+            let message = value
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("order rejected")
+                .to_string();
+            Err(Error::OrderRejected {
+                code: "ws".to_string(),
+                message,
+            })
+        }
     }
 
     /// Place an order.
@@ -1154,6 +1303,13 @@ fn nonzero(value: Decimal) -> Option<Decimal> {
     (value > Decimal::ZERO).then_some(value)
 }
 
+/// Render a [`Decimal`] as a JSON number, preserving its exact digits. Kraken's
+/// v2 order API expects `order_qty` / `limit_price` as numbers.
+fn json_number(value: Decimal) -> serde_json::Value {
+    serde_json::from_str(&value.to_string())
+        .unwrap_or_else(|_| serde_json::json!(value.to_string()))
+}
+
 fn decimal_value(field: &serde_json::Value) -> Result<Decimal> {
     match field {
         serde_json::Value::String(s) => parse_decimal(s),
@@ -1500,6 +1656,15 @@ impl WsUserData for Kraken {
     }
 }
 
+impl WsExecution for Kraken {
+    fn place_order_ws(&mut self, request: &OrderRequest) -> Result<Order> {
+        Kraken::place_order_ws(self, request)
+    }
+    fn cancel_order_ws(&mut self, symbol: &Symbol, order_id: &str) -> Result<()> {
+        Kraken::cancel_order_ws(self, symbol, order_id)
+    }
+}
+
 impl Derivatives for Kraken {
     fn positions(&mut self, symbol: Option<&Symbol>) -> Result<Vec<Position>> {
         Kraken::positions(self, symbol)
@@ -1740,6 +1905,73 @@ mod tests {
         let (mut kraken, _mock) = futures_client();
         assert!(matches!(
             kraken.subscribe_user_data().unwrap_err(),
+            Error::Exchange { .. }
+        ));
+    }
+
+    #[test]
+    fn place_and_cancel_order_over_ws() {
+        let (mut kraken, http, ws) = signed_ws_client(1000);
+        http.push_json(
+            200,
+            r#"{"error":[],"result":{"token":"tok","expires":900}}"#,
+        );
+        ws.push_connection(vec![
+            Ok(Some(
+                r#"{"method":"add_order","req_id":1000,"success":true,
+                "result":{"order_id":"O123","order_userref":0}}"#
+                    .to_string(),
+            )),
+            Ok(Some(
+                r#"{"method":"cancel_order","req_id":1000,"success":true,
+                "result":{"order_id":"O123"}}"#
+                    .to_string(),
+            )),
+        ]);
+        let order = kraken
+            .place_order_ws(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)))
+            .unwrap();
+        assert_eq!(order.id, "O123");
+        assert_eq!(order.status, OrderStatus::New);
+        let reqs = http.recorded_requests();
+        assert!(reqs[0].url.contains("/0/private/GetWebSocketsToken"));
+        assert_eq!(ws.connected_urls()[0], "wss://ws-auth.kraken.com/v2");
+        assert!(ws.sent()[0].contains(r#""method":"add_order""#));
+        assert!(ws.sent()[0].contains(r#""token":"tok""#));
+        assert!(ws.sent()[0].contains(r#""symbol":"BTC/USDT""#));
+
+        kraken.cancel_order_ws(&symbol(), "O123").unwrap();
+        assert!(ws.sent()[1].contains(r#""method":"cancel_order""#));
+        assert!(ws.sent()[1].contains(r#""order_id":["O123"]"#));
+    }
+
+    #[test]
+    fn ws_order_surfaces_rejection() {
+        let (mut kraken, http, ws) = signed_ws_client(1000);
+        http.push_json(
+            200,
+            r#"{"error":[],"result":{"token":"tok","expires":900}}"#,
+        );
+        ws.push_connection(vec![Ok(Some(
+            r#"{"method":"add_order","req_id":1000,"success":false,
+            "error":"EOrder:Insufficient funds"}"#
+                .to_string(),
+        ))]);
+        assert!(matches!(
+            kraken
+                .place_order_ws(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)))
+                .unwrap_err(),
+            Error::OrderRejected { .. }
+        ));
+    }
+
+    #[test]
+    fn ws_order_rejects_the_futures_client() {
+        let (mut kraken, _mock) = futures_client();
+        assert!(matches!(
+            kraken
+                .place_order_ws(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)))
+                .unwrap_err(),
             Error::Exchange { .. }
         ));
     }
