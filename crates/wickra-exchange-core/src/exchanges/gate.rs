@@ -27,7 +27,9 @@ use crate::options::{ExchangeOptions, MarginMode, MarketType, SelfTradePreventio
 use crate::positions::{Position, PositionSide};
 use crate::signing::{hmac_sha512_hex, sha512_hex};
 use crate::symbol::Symbol;
-use crate::traits::{AdvancedOrders, Derivatives, Exchange, Execution, MarketData, WsUserData};
+use crate::traits::{
+    AdvancedOrders, Derivatives, Exchange, Execution, MarketData, WsExecution, WsUserData,
+};
 use crate::transport::{
     HttpMethod, HttpRequest, HttpResponse, HttpTransport, WsConnection, WsTransport,
 };
@@ -67,6 +69,10 @@ pub struct Gate {
     /// [`subscribe_user_data`](Self::subscribe_user_data) and drained by
     /// [`poll_events`](Self::poll_events) alongside the public stream.
     private_connection: Option<Box<dyn WsConnection>>,
+    /// A dedicated logged-in connection to the WebSocket order API, opened lazily
+    /// on the first [`place_order_ws`](Self::place_order_ws) /
+    /// [`cancel_order_ws`](Self::cancel_order_ws) call.
+    ws_api_connection: Option<Box<dyn WsConnection>>,
 }
 
 impl Gate {
@@ -87,6 +93,7 @@ impl Gate {
             subscriptions: Vec::new(),
             leverage: 1,
             private_connection: None,
+            ws_api_connection: None,
         }
     }
 
@@ -349,6 +356,158 @@ impl Gate {
         }
         self.private_connection = Some(connection);
         Ok(())
+    }
+
+    /// Place a spot order over the Gate WebSocket order API (`spot.order_place`).
+    /// Logs into a dedicated connection on first use (`spot.login`, signature =
+    /// HMAC-SHA512 over `api\nspot.login\n\n<timestamp>`), then exchanges the same
+    /// order args as the REST path.
+    ///
+    /// # Errors
+    /// Returns [`Error::Exchange`] on the **futures** client (this binding's WS
+    /// order API covers spot), [`Error::NotConnected`] without a WebSocket
+    /// transport, or another [`Error`] if the order is invalid or rejected.
+    pub fn place_order_ws(&mut self, request: &OrderRequest) -> Result<Order> {
+        request.validate()?;
+        if self.is_futures() {
+            return Err(Error::Exchange {
+                code: "unsupported".to_string(),
+                message: "Gate's WebSocket order API is wired for spot here; place \
+                          futures orders over REST (/api/v4/futures/usdt/orders)"
+                    .to_string(),
+            });
+        }
+        let mut req_param = serde_json::json!({
+            "currency_pair": Self::wire_symbol(&request.symbol),
+            "type": order_type_str(request.order_type),
+            "account": "spot",
+            "side": side_str(request.side),
+            "amount": format_decimal(request.quantity),
+        });
+        if let Some(price) = request.price {
+            req_param["price"] = serde_json::json!(format_decimal(price));
+        }
+        if request.post_only {
+            req_param["time_in_force"] = serde_json::json!("poc");
+        }
+        if let Some(id) = &request.client_order_id {
+            let text = if id.starts_with("t-") {
+                id.clone()
+            } else {
+                format!("t-{id}")
+            };
+            req_param["text"] = serde_json::json!(text);
+        }
+        let result = self.ws_api_request("spot.order_place", &req_param)?;
+        let raw: RawOrder =
+            serde_json::from_value(result).map_err(|e| Error::Deserialization(e.to_string()))?;
+        order_from_raw(request.symbol.clone(), &raw)
+    }
+
+    /// Cancel a spot order over the Gate WebSocket order API (`spot.order_cancel`).
+    ///
+    /// # Errors
+    /// Returns [`Error::Exchange`] on the futures client, [`Error::NotConnected`]
+    /// without a WebSocket transport, or another [`Error`] if the request fails.
+    pub fn cancel_order_ws(&mut self, symbol: &Symbol, order_id: &str) -> Result<()> {
+        if self.is_futures() {
+            return Err(Error::Exchange {
+                code: "unsupported".to_string(),
+                message: "Gate's WebSocket order API is wired for spot here; cancel \
+                          futures orders over REST"
+                    .to_string(),
+            });
+        }
+        let req_param = serde_json::json!({
+            "order_id": order_id,
+            "currency_pair": Self::wire_symbol(symbol),
+        });
+        self.ws_api_request("spot.order_cancel", &req_param)?;
+        Ok(())
+    }
+
+    /// Open and log into the WebSocket order connection if needed. The `spot.login`
+    /// request signs `api\nspot.login\n\n<timestamp>`; later requests on the same
+    /// connection inherit the session, so they are unsigned.
+    fn ensure_ws_api(&mut self) -> Result<()> {
+        if self.ws_api_connection.is_some() {
+            return Ok(());
+        }
+        let creds = self.credentials.as_ref().ok_or(Error::InvalidCredentials(
+            "WebSocket order API requires credentials",
+        ))?;
+        let timestamp = (self.now_ms)() / 1000;
+        let signature = hmac_sha512_hex(
+            creds.api_secret.as_bytes(),
+            format!("api\nspot.login\n\n{timestamp}").as_bytes(),
+        );
+        let req_id = format!("wkex-login-{}", (self.now_ms)());
+        let login = format!(
+            r#"{{"time":{timestamp},"channel":"spot.login","event":"api","payload":{{"req_id":"{req_id}","api_key":"{}","signature":"{signature}","timestamp":"{timestamp}"}}}}"#,
+            creds.api_key
+        );
+        let ws = self.ws.as_ref().ok_or(Error::NotConnected)?;
+        let mut connection = ws.connect("wss://api.gateio.ws/ws/v4/")?;
+        connection.send(&login)?;
+        connection.recv()?; // consume the login acknowledgement
+        self.ws_api_connection = Some(connection);
+        Ok(())
+    }
+
+    /// Send an order-API request frame and return its `data.result`, mapping a
+    /// non-`"200"` header status onto the error taxonomy.
+    fn ws_api_request(
+        &mut self,
+        channel: &str,
+        req_param: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        self.ensure_ws_api()?;
+        let time = (self.now_ms)() / 1000;
+        let req_id = format!("wkex-{}", (self.now_ms)());
+        let frame = serde_json::json!({
+            "time": time,
+            "channel": channel,
+            "event": "api",
+            "payload": { "req_id": req_id, "req_param": req_param },
+        })
+        .to_string();
+        let connection = self
+            .ws_api_connection
+            .as_mut()
+            .expect("ws order connection just ensured");
+        connection.send(&frame)?;
+        let Some(response) = connection.recv()? else {
+            return Err(Error::NotConnected);
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&response).map_err(|e| Error::Deserialization(e.to_string()))?;
+        let status = value
+            .get("header")
+            .and_then(|header| header.get("status"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if status == "200" {
+            Ok(value
+                .get("data")
+                .and_then(|data| data.get("result"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null))
+        } else {
+            let errs = value.get("data").and_then(|data| data.get("errs"));
+            let label = errs
+                .and_then(|e| e.get("label"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("ws");
+            let message = errs
+                .and_then(|e| e.get("message"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("order rejected")
+                .to_string();
+            Err(Error::OrderRejected {
+                code: label.to_string(),
+                message,
+            })
+        }
     }
 
     /// Place an order.
@@ -1249,6 +1408,15 @@ impl WsUserData for Gate {
     }
 }
 
+impl WsExecution for Gate {
+    fn place_order_ws(&mut self, request: &OrderRequest) -> Result<Order> {
+        Gate::place_order_ws(self, request)
+    }
+    fn cancel_order_ws(&mut self, symbol: &Symbol, order_id: &str) -> Result<()> {
+        Gate::cancel_order_ws(self, symbol, order_id)
+    }
+}
+
 impl Derivatives for Gate {
     fn positions(&mut self, symbol: Option<&Symbol>) -> Result<Vec<Position>> {
         Gate::positions(self, symbol)
@@ -1513,6 +1681,81 @@ mod tests {
             .with_ws(Box::new(ArcWs(Arc::clone(&ws))));
         assert!(matches!(
             gate.subscribe_user_data().unwrap_err(),
+            Error::InvalidCredentials(_)
+        ));
+    }
+
+    #[test]
+    fn place_and_cancel_order_over_ws() {
+        let (mut gate, ws) = signed_ws_client(1_700_000_000_000);
+        ws.push_connection(vec![
+            Ok(Some(
+                r#"{"request_id":"login","header":{"status":"200","channel":"spot.login",
+                "event":"api"},"data":{"result":{"api_key":"APIKEY"}}}"#
+                    .to_string(),
+            )),
+            Ok(Some(
+                r#"{"request_id":"o","header":{"status":"200","channel":"spot.order_place",
+                "event":"api"},"data":{"result":{"id":"55","text":"t-my","currency_pair":"BTC_USDT",
+                "side":"buy","type":"limit","status":"closed","amount":"1","left":"0","price":"100",
+                "avg_deal_price":"100"}}}"#
+                    .to_string(),
+            )),
+            Ok(Some(
+                r#"{"request_id":"c","header":{"status":"200","channel":"spot.order_cancel",
+                "event":"api"},"data":{"result":{"id":"55"}}}"#
+                    .to_string(),
+            )),
+        ]);
+        let order = gate
+            .place_order_ws(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)))
+            .unwrap();
+        assert_eq!(order.id, "55");
+        assert_eq!(order.symbol, symbol());
+        assert_eq!(order.status, OrderStatus::Filled);
+        assert_eq!(order.filled_quantity, dec!(1));
+        assert_eq!(ws.connected_urls()[0], "wss://api.gateio.ws/ws/v4/");
+        // The login frame is sent first, then the order request.
+        assert!(ws.sent()[0].contains(r#""channel":"spot.login""#));
+        assert!(ws.sent()[0].contains(r#""signature""#));
+        assert!(ws.sent()[1].contains(r#""channel":"spot.order_place""#));
+        assert!(ws.sent()[1].contains(r#""currency_pair":"BTC_USDT""#));
+
+        gate.cancel_order_ws(&symbol(), "55").unwrap();
+        assert!(ws.sent()[2].contains(r#""channel":"spot.order_cancel""#));
+        assert!(ws.sent()[2].contains(r#""order_id":"55""#));
+    }
+
+    #[test]
+    fn ws_order_surfaces_rejection() {
+        let (mut gate, ws) = signed_ws_client(1000);
+        ws.push_connection(vec![
+            Ok(Some(
+                r#"{"header":{"status":"200","channel":"spot.login","event":"api"}}"#.to_string(),
+            )),
+            Ok(Some(
+                r#"{"header":{"status":"400","channel":"spot.order_place","event":"api"},
+                "data":{"errs":{"label":"BALANCE_NOT_ENOUGH","message":"not enough balance"}}}"#
+                    .to_string(),
+            )),
+        ]);
+        assert!(matches!(
+            gate.place_order_ws(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)))
+                .unwrap_err(),
+            Error::OrderRejected { .. }
+        ));
+    }
+
+    #[test]
+    fn ws_order_requires_credentials() {
+        let http = Arc::new(MockHttpTransport::new());
+        let ws = Arc::new(MockWsTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::Spot);
+        let mut gate = Gate::with_http(Box::new(ArcTransport(http)), &opts)
+            .with_ws(Box::new(ArcWs(Arc::clone(&ws))));
+        assert!(matches!(
+            gate.place_order_ws(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)))
+                .unwrap_err(),
             Error::InvalidCredentials(_)
         ));
     }
