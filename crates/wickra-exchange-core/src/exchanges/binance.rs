@@ -6,23 +6,27 @@
 //! wiring of a real socket lives elsewhere.
 //!
 //! Covered here: the public REST market data (ticker, klines, depth), the
-//! URL/symbol mapping, the Binance error taxonomy, and HMAC-SHA256 signed
-//! execution (place/cancel/query order, account balances). The WebSocket market
-//! and user-data streams land in a later slice.
+//! URL/symbol mapping, the Binance error taxonomy, HMAC-SHA256 signed execution
+//! (place/cancel/query order, account balances), and the pull-based WebSocket
+//! market streams (trade/depth/ticker subscribe + `poll_events`). The user-data
+//! stream (listenKey) and the exchangeInfo/filter wiring land in a later slice.
 
 use crate::credentials::Credentials;
 use crate::error::{Error, Result};
-use crate::events::{BookLevel, OrderBookSnapshot};
+use crate::events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
 use crate::normalize::{format_decimal, parse_decimal};
 use crate::options::{ExchangeOptions, MarketType};
 use crate::signing::hmac_sha256_hex;
 use crate::symbol::Symbol;
-use crate::transport::{HttpMethod, HttpRequest, HttpResponse, HttpTransport};
+use crate::transport::{
+    HttpMethod, HttpRequest, HttpResponse, HttpTransport, WsConnection, WsTransport,
+};
 use crate::types::{
     Balance, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker, TimeInForce,
 };
 use rust_decimal::Decimal;
 use serde::Deserialize;
+use std::collections::HashMap;
 use wickra_core::Candle;
 
 /// The current Unix time in milliseconds, from the system clock.
@@ -37,11 +41,16 @@ fn system_now_ms() -> i64 {
 /// A Binance client over an injected HTTP transport.
 pub struct Binance {
     http: Box<dyn HttpTransport>,
+    ws: Option<Box<dyn WsTransport>>,
     rest_base: String,
     market_type: MarketType,
+    testnet: bool,
     credentials: Option<Credentials>,
     recv_window_ms: u64,
     now_ms: Box<dyn Fn() -> i64 + Send + Sync>,
+    connection: Option<Box<dyn WsConnection>>,
+    subscriptions: Vec<(String, Symbol)>,
+    sub_id: u64,
 }
 
 impl Binance {
@@ -52,11 +61,16 @@ impl Binance {
     ) -> Self {
         Self {
             http,
+            ws: None,
             rest_base: rest_base_url(options.market_type, options.testnet).to_string(),
             market_type: options.market_type,
+            testnet: options.testnet,
             credentials,
             recv_window_ms: options.recv_window_ms,
             now_ms: Box::new(system_now_ms),
+            connection: None,
+            subscriptions: Vec::new(),
+            sub_id: 0,
         }
     }
 
@@ -80,6 +94,13 @@ impl Binance {
     #[must_use]
     pub fn with_clock(mut self, now_ms: Box<dyn Fn() -> i64 + Send + Sync>) -> Self {
         self.now_ms = now_ms;
+        self
+    }
+
+    /// Attach a WebSocket transport, enabling the streaming subscriptions.
+    #[must_use]
+    pub fn with_ws(mut self, ws: Box<dyn WsTransport>) -> Self {
+        self.ws = Some(ws);
         self
     }
 
@@ -140,6 +161,79 @@ impl Binance {
             bids: parse_levels(&raw.bids)?,
             asks: parse_levels(&raw.asks)?,
         })
+    }
+
+    /// Subscribe to the public trade stream for `symbol`.
+    ///
+    /// # Errors
+    /// Returns [`Error::NotConnected`] if no WebSocket transport is configured,
+    /// or a transport error if the connection or subscription fails.
+    pub fn subscribe_trades(&mut self, symbol: &Symbol) -> Result<()> {
+        self.subscribe(symbol, "trade")
+    }
+
+    /// Subscribe to the order-book (diff-depth) stream for `symbol`.
+    ///
+    /// # Errors
+    /// See [`subscribe_trades`](Self::subscribe_trades).
+    pub fn subscribe_book(&mut self, symbol: &Symbol) -> Result<()> {
+        self.subscribe(symbol, "depth")
+    }
+
+    /// Subscribe to the 24-hour ticker stream for `symbol`.
+    ///
+    /// # Errors
+    /// See [`subscribe_trades`](Self::subscribe_trades).
+    pub fn subscribe_ticker(&mut self, symbol: &Symbol) -> Result<()> {
+        self.subscribe(symbol, "ticker")
+    }
+
+    /// Open the connection if needed, send a SUBSCRIBE for `<symbol>@<channel>`,
+    /// and register the symbol for wire-name resolution.
+    fn subscribe(&mut self, symbol: &Symbol, channel: &str) -> Result<()> {
+        let wire = Self::wire_symbol(symbol);
+        if self.connection.is_none() {
+            let ws = self.ws.as_ref().ok_or(Error::NotConnected)?;
+            let connection = ws.connect(ws_base_url(self.market_type, self.testnet))?;
+            self.connection = Some(connection);
+        }
+        self.sub_id += 1;
+        let stream = format!("{}@{channel}", wire.to_lowercase());
+        let message = format!(
+            r#"{{"method":"SUBSCRIBE","params":["{stream}"],"id":{}}}"#,
+            self.sub_id
+        );
+        self.connection
+            .as_mut()
+            .expect("connection just ensured")
+            .send(&message)?;
+        if !self.subscriptions.iter().any(|(w, _)| w == &wire) {
+            self.subscriptions.push((wire, symbol.clone()));
+        }
+        Ok(())
+    }
+
+    /// Drain all stream events available since the last call. Non-blocking:
+    /// returns an empty vector when nothing is pending or no stream is open.
+    /// Frames that fail to parse are skipped.
+    pub fn poll_events(&mut self) -> Vec<Event> {
+        let subscriptions: HashMap<String, Symbol> = self.subscriptions.iter().cloned().collect();
+        let resolve = |wire: &str| {
+            subscriptions
+                .get(wire)
+                .cloned()
+                .unwrap_or_else(|| Symbol::new(wire, ""))
+        };
+        let mut events = Vec::new();
+        let Some(connection) = self.connection.as_mut() else {
+            return events;
+        };
+        while let Ok(Some(frame)) = connection.recv() {
+            if let Ok(Some(event)) = parse_ws_message(&frame, &resolve) {
+                events.push(event);
+            }
+        }
+        events
     }
 
     /// Place an order. The order is validated locally first, then sent signed.
@@ -343,6 +437,92 @@ fn parse_order(symbol: &Symbol, body: &str) -> Result<Order> {
     })
 }
 
+fn field_str<'a>(value: &'a serde_json::Value, key: &str) -> Result<&'a str> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| Error::Deserialization(format!("missing string field {key:?}")))
+}
+
+fn parse_ws_levels(value: Option<&serde_json::Value>) -> Result<Vec<BookLevel>> {
+    let array = value
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| Error::Deserialization("missing depth levels".to_string()))?;
+    array
+        .iter()
+        .map(|level| {
+            let pair = level
+                .as_array()
+                .ok_or_else(|| Error::Deserialization("depth level not an array".to_string()))?;
+            let price = parse_decimal(
+                pair.first()
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| Error::Deserialization("depth price missing".to_string()))?,
+            )?;
+            let quantity =
+                parse_decimal(pair.get(1).and_then(serde_json::Value::as_str).ok_or_else(
+                    || Error::Deserialization("depth quantity missing".to_string()),
+                )?)?;
+            Ok(BookLevel { price, quantity })
+        })
+        .collect()
+}
+
+/// Parse one Binance WebSocket frame into an [`Event`], resolving the wire
+/// symbol with `resolve`. Non-data frames (subscription acks) and unhandled
+/// event types return `Ok(None)`.
+fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Option<Event>> {
+    let value: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| Error::Deserialization(e.to_string()))?;
+    // A combined stream wraps the payload as {"stream":..,"data":..}.
+    let data = value.get("data").unwrap_or(&value);
+    let Some(event_type) = data.get("e").and_then(serde_json::Value::as_str) else {
+        return Ok(None);
+    };
+    match event_type {
+        "trade" => {
+            // `m` = "is the buyer the market maker?"; if so the taker (aggressor)
+            // is the seller.
+            let is_maker_buyer = data.get("m").and_then(serde_json::Value::as_bool) == Some(true);
+            Ok(Some(Event::Trade(TradePrint {
+                symbol: resolve(field_str(data, "s")?),
+                price: parse_decimal(field_str(data, "p")?)?,
+                quantity: parse_decimal(field_str(data, "q")?)?,
+                aggressor: if is_maker_buyer {
+                    OrderSide::Sell
+                } else {
+                    OrderSide::Buy
+                },
+                timestamp: data
+                    .get("T")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0),
+            })))
+        }
+        "depthUpdate" => Ok(Some(Event::BookDelta(BookDelta {
+            symbol: resolve(field_str(data, "s")?),
+            first_update_id: data
+                .get("U")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            final_update_id: data
+                .get("u")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            bids: parse_ws_levels(data.get("b"))?,
+            asks: parse_ws_levels(data.get("a"))?,
+        }))),
+        "24hrTicker" => Ok(Some(Event::Ticker(Ticker {
+            symbol: resolve(field_str(data, "s")?),
+            last: parse_decimal(field_str(data, "c")?)?,
+            bid: parse_decimal(field_str(data, "b")?)?,
+            ask: parse_decimal(field_str(data, "a")?)?,
+            volume: parse_decimal(field_str(data, "v")?)?,
+        }))),
+        _ => Ok(None),
+    }
+}
+
 /// The REST base URL for a market type and network.
 fn rest_base_url(market_type: MarketType, testnet: bool) -> &'static str {
     match (market_type, testnet) {
@@ -350,6 +530,16 @@ fn rest_base_url(market_type: MarketType, testnet: bool) -> &'static str {
         (MarketType::UsdMFutures, true) => "https://testnet.binancefuture.com",
         (_, true) => "https://testnet.binance.vision",
         (_, false) => "https://api.binance.com",
+    }
+}
+
+/// The WebSocket base URL for a market type and network.
+fn ws_base_url(market_type: MarketType, testnet: bool) -> &'static str {
+    match (market_type, testnet) {
+        (MarketType::UsdMFutures, false) => "wss://fstream.binance.com/ws",
+        (MarketType::UsdMFutures, true) => "wss://stream.binancefuture.com/ws",
+        (_, true) => "wss://testnet.binance.vision/ws",
+        (_, false) => "wss://stream.binance.com:9443/ws",
     }
 }
 
@@ -473,9 +663,18 @@ fn map_error(response: &HttpResponse) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::MockHttpTransport;
+    use crate::transport::{MockHttpTransport, MockWsTransport};
     use rust_decimal_macros::dec;
     use std::sync::Arc;
+
+    /// A `WsTransport` that forwards to a shared `MockWsTransport`, so a test
+    /// keeps a handle after the client takes ownership.
+    struct ArcWs(Arc<MockWsTransport>);
+    impl WsTransport for ArcWs {
+        fn connect(&self, url: &str) -> Result<Box<dyn WsConnection>> {
+            self.0.connect(url)
+        }
+    }
 
     fn symbol() -> Symbol {
         Symbol::new("BTC", "USDT")
@@ -757,5 +956,187 @@ mod tests {
     fn system_clock_is_sane() {
         // Covers the production timestamp source: a plausible 2023+ epoch ms.
         assert!(system_now_ms() > 1_600_000_000_000);
+    }
+
+    fn resolve(_wire: &str) -> Symbol {
+        symbol()
+    }
+
+    #[test]
+    fn ws_trade_frame_maps_aggressor() {
+        // m=false -> buyer is taker -> Buy aggressor.
+        let buy = parse_ws_message(
+            r#"{"e":"trade","s":"BTCUSDT","p":"100.5","q":"0.25","m":false,"T":1700000000000}"#,
+            &resolve,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            buy,
+            Event::Trade(TradePrint {
+                symbol: symbol(),
+                price: dec!(100.5),
+                quantity: dec!(0.25),
+                aggressor: OrderSide::Buy,
+                timestamp: 1_700_000_000_000,
+            })
+        );
+        // m=true -> seller is taker -> Sell aggressor.
+        let sell = parse_ws_message(
+            r#"{"e":"trade","s":"BTCUSDT","p":"100","q":"1","m":true,"T":1}"#,
+            &resolve,
+        )
+        .unwrap()
+        .unwrap();
+        let Event::Trade(print) = sell else {
+            panic!("expected trade")
+        };
+        assert_eq!(print.aggressor, OrderSide::Sell);
+    }
+
+    #[test]
+    fn ws_combined_stream_wrapper_is_unwrapped() {
+        let event = parse_ws_message(
+            r#"{"stream":"btcusdt@trade","data":{"e":"trade","s":"BTCUSDT","p":"1","q":"1","m":false,"T":1}}"#,
+            &resolve,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(event, Event::Trade(_)));
+    }
+
+    #[test]
+    fn ws_depth_update_maps_to_book_delta() {
+        let event = parse_ws_message(
+            r#"{"e":"depthUpdate","s":"BTCUSDT","U":10,"u":12,"b":[["100","1"],["99","0"]],"a":[["101","2"]]}"#,
+            &resolve,
+        )
+        .unwrap()
+        .unwrap();
+        let Event::BookDelta(delta) = event else {
+            panic!("expected book delta")
+        };
+        assert_eq!(delta.first_update_id, 10);
+        assert_eq!(delta.final_update_id, 12);
+        assert_eq!(
+            delta.bids,
+            vec![
+                BookLevel::new(dec!(100), dec!(1)),
+                BookLevel::new(dec!(99), dec!(0))
+            ]
+        );
+        assert_eq!(delta.asks, vec![BookLevel::new(dec!(101), dec!(2))]);
+    }
+
+    #[test]
+    fn ws_ticker_frame_maps_to_ticker() {
+        let event = parse_ws_message(
+            r#"{"e":"24hrTicker","s":"BTCUSDT","c":"100","b":"99","a":"101","v":"1234"}"#,
+            &resolve,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            event,
+            Event::Ticker(Ticker {
+                symbol: symbol(),
+                last: dec!(100),
+                bid: dec!(99),
+                ask: dec!(101),
+                volume: dec!(1234),
+            })
+        );
+    }
+
+    #[test]
+    fn ws_non_event_frames_are_ignored() {
+        // Subscription ack.
+        assert!(parse_ws_message(r#"{"result":null,"id":1}"#, &resolve)
+            .unwrap()
+            .is_none());
+        // Unhandled event type.
+        assert!(parse_ws_message(r#"{"e":"kline","s":"BTCUSDT"}"#, &resolve)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn ws_malformed_frame_errors() {
+        assert!(matches!(
+            parse_ws_message("not json", &resolve).unwrap_err(),
+            Error::Deserialization(_)
+        ));
+        // A trade frame missing a required field.
+        assert!(parse_ws_message(r#"{"e":"trade","s":"BTCUSDT"}"#, &resolve).is_err());
+    }
+
+    fn streaming_client(ws: &Arc<MockWsTransport>) -> Binance {
+        let http = Arc::new(MockHttpTransport::new());
+        let opts = ExchangeOptions::mainnet(MarketType::Spot);
+        Binance::with_http(Box::new(ArcTransport(http)), &opts)
+            .with_ws(Box::new(ArcWs(Arc::clone(ws))))
+    }
+
+    #[test]
+    fn subscribe_sends_frame_and_poll_returns_events() {
+        let ws = Arc::new(MockWsTransport::new());
+        ws.push_connection(vec![
+            Ok(Some(
+                r#"{"e":"trade","s":"BTCUSDT","p":"100","q":"1","m":false,"T":1}"#.to_string(),
+            )),
+            Ok(Some(
+                r#"{"e":"trade","s":"BTCUSDT","p":"101","q":"2","m":true,"T":2}"#.to_string(),
+            )),
+        ]);
+        let mut binance = streaming_client(&ws);
+        binance.subscribe_trades(&symbol()).unwrap();
+
+        assert_eq!(
+            ws.connected_urls(),
+            vec!["wss://stream.binance.com:9443/ws".to_string()]
+        );
+        let sent = ws.sent();
+        assert!(sent[0].contains(r#""method":"SUBSCRIBE""#));
+        assert!(sent[0].contains("btcusdt@trade"));
+
+        let events = binance.poll_events();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0], Event::Trade(_)));
+        // Draining again yields nothing.
+        assert!(binance.poll_events().is_empty());
+    }
+
+    #[test]
+    fn book_and_ticker_subscriptions_reuse_one_connection() {
+        let ws = Arc::new(MockWsTransport::new());
+        ws.push_connection(vec![]);
+        let mut binance = streaming_client(&ws);
+        binance.subscribe_book(&symbol()).unwrap();
+        binance.subscribe_ticker(&symbol()).unwrap();
+
+        // One connection, two SUBSCRIBE frames on the right channels.
+        assert_eq!(ws.connected_urls().len(), 1);
+        let sent = ws.sent();
+        assert!(sent[0].contains("btcusdt@depth"));
+        assert!(sent[1].contains("btcusdt@ticker"));
+    }
+
+    #[test]
+    fn subscribe_without_ws_transport_errors() {
+        let http = Arc::new(MockHttpTransport::new());
+        let opts = ExchangeOptions::mainnet(MarketType::Spot);
+        let mut binance = Binance::with_http(Box::new(ArcTransport(http)), &opts);
+        assert!(matches!(
+            binance.subscribe_trades(&symbol()).unwrap_err(),
+            Error::NotConnected
+        ));
+    }
+
+    #[test]
+    fn poll_without_connection_is_empty() {
+        let http = Arc::new(MockHttpTransport::new());
+        let opts = ExchangeOptions::mainnet(MarketType::Spot);
+        let mut binance = Binance::with_http(Box::new(ArcTransport(http)), &opts);
+        assert!(binance.poll_events().is_empty());
     }
 }
