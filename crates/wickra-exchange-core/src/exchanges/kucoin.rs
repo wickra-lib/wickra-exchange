@@ -11,10 +11,11 @@ use crate::credentials::Credentials;
 use crate::error::{Error, Result};
 use crate::events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
 use crate::normalize::{format_decimal, parse_decimal};
-use crate::options::ExchangeOptions;
+use crate::options::{ExchangeOptions, MarginMode, MarketType};
+use crate::positions::{Position, PositionSide};
 use crate::signing::hmac_sha256_base64;
 use crate::symbol::Symbol;
-use crate::traits::{Exchange, Execution, MarketData};
+use crate::traits::{Derivatives, Exchange, Execution, MarketData};
 use crate::transport::{HttpMethod, HttpRequest, HttpTransport, WsConnection, WsTransport};
 use crate::types::{Balance, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker};
 use rust_decimal::Decimal;
@@ -35,29 +36,58 @@ pub struct KuCoin {
     http: Box<dyn HttpTransport>,
     ws: Option<Box<dyn WsTransport>>,
     rest_base: String,
+    market_type: MarketType,
     credentials: Option<Credentials>,
     now_ms: Box<dyn Fn() -> i64 + Send + Sync>,
     connection: Option<Box<dyn WsConnection>>,
     sub_messages: Vec<String>,
     subscriptions: Vec<(String, Symbol)>,
+    /// Leverage applied to futures orders. KuCoin sets leverage per order rather
+    /// than per account, so [`set_leverage`](Self::set_leverage) records it here.
+    leverage: u32,
 }
 
 impl KuCoin {
     fn build(
         http: Box<dyn HttpTransport>,
-        _options: &ExchangeOptions,
+        options: &ExchangeOptions,
         credentials: Option<Credentials>,
     ) -> Self {
+        let futures = options.market_type.is_derivatives();
         Self {
             http,
             ws: None,
-            rest_base: "https://api.kucoin.com".to_string(),
+            rest_base: if futures {
+                "https://api-futures.kucoin.com".to_string()
+            } else {
+                "https://api.kucoin.com".to_string()
+            },
+            market_type: options.market_type,
             credentials,
             now_ms: Box::new(system_now_ms),
             connection: None,
             sub_messages: Vec::new(),
             subscriptions: Vec::new(),
+            leverage: 1,
         }
+    }
+
+    /// Whether this client targets KuCoin Futures (a separate host and API with
+    /// contract symbols like `XBTUSDTM`) rather than spot.
+    fn is_futures(&self) -> bool {
+        self.market_type.is_derivatives()
+    }
+
+    /// The KuCoin **futures** contract symbol for a canonical [`Symbol`]:
+    /// `BTC/USDT` -> `XBTUSDTM` (KuCoin uses `XBT` for Bitcoin and a trailing
+    /// `M` for the USDⓈ-M perpetual).
+    fn futures_symbol(symbol: &Symbol) -> String {
+        let base = if symbol.base() == "BTC" {
+            "XBT"
+        } else {
+            symbol.base()
+        };
+        format!("{base}{}M", symbol.quote())
     }
 
     /// Build a public KuCoin client.
@@ -240,10 +270,15 @@ impl KuCoin {
             .client_order_id
             .clone()
             .unwrap_or_else(|| format!("wkex-{}", (self.now_ms)()));
+        let symbol_wire = if self.is_futures() {
+            Self::futures_symbol(&request.symbol)
+        } else {
+            Self::wire_symbol(&request.symbol)
+        };
         let mut body = serde_json::json!({
             "clientOid": client_oid,
             "side": side_str(request.side),
-            "symbol": Self::wire_symbol(&request.symbol),
+            "symbol": symbol_wire,
             "type": order_type_str(request.order_type),
             "size": format_decimal(request.quantity),
         });
@@ -252,6 +287,13 @@ impl KuCoin {
         }
         if request.post_only {
             body["postOnly"] = serde_json::json!(true);
+        }
+        if self.is_futures() {
+            // Futures orders carry the per-order leverage; size is in contracts.
+            body["leverage"] = serde_json::json!(self.leverage.to_string());
+            if request.reduce_only {
+                body["reduceOnly"] = serde_json::json!(true);
+            }
         }
         let data =
             self.signed_request(HttpMethod::Post, "/api/v1/orders", "", &body.to_string())?;
@@ -732,10 +774,155 @@ impl Execution for KuCoin {
     }
 }
 
+impl KuCoin {
+    /// Open futures positions (`/api/v1/positions` on the futures host); flat
+    /// positions are omitted. Quantities are in **contracts**, KuCoin's native
+    /// futures unit.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if credentials are missing or the request fails.
+    pub fn positions(&self, symbol: Option<&Symbol>) -> Result<Vec<Position>> {
+        let data = self.signed_request(HttpMethod::Get, "/api/v1/positions", "", "")?;
+        let list: Vec<RawKuPosition> = parse_json(data)?;
+        list.iter()
+            .filter(|p| symbol.is_none_or(|s| p.symbol == Self::futures_symbol(s)))
+            .filter_map(parse_ku_position)
+            .collect()
+    }
+
+    /// Record the leverage applied to subsequent futures orders. KuCoin has no
+    /// standalone set-leverage endpoint — leverage is a per-order field — so this
+    /// stores it locally rather than issuing a request.
+    ///
+    /// # Errors
+    /// Never errors; the signature matches the [`Derivatives`] trait.
+    pub fn set_leverage(&mut self, _symbol: &Symbol, leverage: u32) -> Result<()> {
+        self.leverage = leverage.max(1);
+        Ok(())
+    }
+
+    /// Set the margin mode for `symbol` (`/api/v1/position/changeMarginMode`).
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the change is rejected or the request fails.
+    pub fn set_margin_mode(&self, symbol: &Symbol, mode: MarginMode) -> Result<()> {
+        let margin = match mode {
+            MarginMode::Cross => "CROSS",
+            MarginMode::Isolated => "ISOLATED",
+        };
+        let body = serde_json::json!({
+            "symbol": Self::futures_symbol(symbol),
+            "marginMode": margin,
+        });
+        self.signed_request(
+            HttpMethod::Post,
+            "/api/v1/position/changeMarginMode",
+            "",
+            &body.to_string(),
+        )?;
+        Ok(())
+    }
+
+    /// Flatten the open position in `symbol` with a reduce-only market order
+    /// (size in contracts).
+    ///
+    /// # Errors
+    /// Returns [`Error::NotFound`] if there is no open position, or another
+    /// [`Error`] if the request fails.
+    pub fn close_position(&self, symbol: &Symbol) -> Result<Order> {
+        let position = self
+            .positions(Some(symbol))?
+            .into_iter()
+            .find(|p| &p.symbol == symbol)
+            .ok_or_else(|| Error::NotFound(format!("no open position for {symbol}")))?;
+        let request = match position.side {
+            PositionSide::Long => OrderRequest::market_sell(symbol.clone(), position.quantity),
+            PositionSide::Short => OrderRequest::market_buy(symbol.clone(), position.quantity),
+        }
+        .reduce_only();
+        self.place_order(&request)
+    }
+}
+
 impl Exchange for KuCoin {
     fn name(&self) -> &'static str {
         "kucoin"
     }
+}
+
+impl Derivatives for KuCoin {
+    fn positions(&mut self, symbol: Option<&Symbol>) -> Result<Vec<Position>> {
+        KuCoin::positions(self, symbol)
+    }
+    fn set_leverage(&mut self, symbol: &Symbol, leverage: u32) -> Result<()> {
+        KuCoin::set_leverage(self, symbol, leverage)
+    }
+    fn set_margin_mode(&mut self, symbol: &Symbol, mode: MarginMode) -> Result<()> {
+        KuCoin::set_margin_mode(self, symbol, mode)
+    }
+    fn close_position(&mut self, symbol: &Symbol) -> Result<Order> {
+        KuCoin::close_position(self, symbol)
+    }
+}
+
+/// Reconstruct a canonical [`Symbol`] from a KuCoin futures contract symbol
+/// (`XBTUSDTM` -> `BTC/USDT`): drop the trailing `M`, split off a known quote
+/// suffix, and map `XBT` back to `BTC`.
+fn symbol_from_futures(contract: &str) -> Symbol {
+    const QUOTES: &[&str] = &["USDT", "USDC", "USD"];
+    let stripped = contract.strip_suffix('M').unwrap_or(contract);
+    for quote in QUOTES {
+        if let Some(base) = stripped.strip_suffix(quote) {
+            if !base.is_empty() {
+                let base = if base == "XBT" { "BTC" } else { base };
+                return Symbol::new(base, *quote);
+            }
+        }
+    }
+    Symbol::new(stripped, "")
+}
+
+#[derive(Deserialize)]
+struct RawKuPosition {
+    symbol: String,
+    #[serde(rename = "currentQty")]
+    current_qty: f64,
+    #[serde(rename = "avgEntryPrice", default)]
+    avg_entry_price: f64,
+    #[serde(rename = "markPrice", default)]
+    mark_price: f64,
+    #[serde(rename = "realLeverage", default)]
+    real_leverage: f64,
+    #[serde(rename = "unrealisedPnl", default)]
+    unrealised_pnl: f64,
+    #[serde(rename = "crossMode", default)]
+    cross_mode: bool,
+}
+
+fn parse_ku_position(raw: &RawKuPosition) -> Option<Result<Position>> {
+    if raw.current_qty == 0.0 {
+        return None; // flat position
+    }
+    let side = if raw.current_qty < 0.0 {
+        PositionSide::Short
+    } else {
+        PositionSide::Long
+    };
+    let dec = |value: f64| Decimal::from_f64_retain(value).unwrap_or_default();
+    Some(Ok(Position {
+        symbol: symbol_from_futures(&raw.symbol),
+        side,
+        quantity: dec(raw.current_qty.abs()),
+        entry_price: dec(raw.avg_entry_price),
+        mark_price: dec(raw.mark_price),
+        leverage: dec(raw.real_leverage),
+        unrealized_pnl: dec(raw.unrealised_pnl),
+        margin_mode: if raw.cross_mode {
+            MarginMode::Cross
+        } else {
+            MarginMode::Isolated
+        },
+    }))
 }
 
 #[cfg(test)]
@@ -781,6 +968,85 @@ mod tests {
         )
         .with_clock(Box::new(move || now_ms));
         (kucoin, mock)
+    }
+
+    fn signed_futures_client(now_ms: i64) -> (KuCoin, Arc<MockHttpTransport>) {
+        let mock = Arc::new(MockHttpTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::UsdMFutures);
+        let kucoin = KuCoin::with_credentials(
+            Box::new(ArcTransport(Arc::clone(&mock))),
+            &opts,
+            Credentials::new("APIKEY", "SECRET").with_passphrase("PASS"),
+        )
+        .with_clock(Box::new(move || now_ms));
+        (kucoin, mock)
+    }
+
+    const KU_POSITIONS: &str = r#"{"code":"200000","data":[
+        {"symbol":"XBTUSDTM","currentQty":3,"avgEntryPrice":20000.0,"markPrice":20100.0,"realLeverage":10.0,"unrealisedPnl":30.0,"crossMode":false}
+    ]}"#;
+
+    #[test]
+    fn futures_client_uses_futures_host_and_contract_symbol() {
+        let (kucoin, _mock) = signed_futures_client(1000);
+        assert!(kucoin.rest_base.contains("api-futures.kucoin.com"));
+        assert_eq!(KuCoin::futures_symbol(&symbol()), "XBTUSDTM");
+    }
+
+    #[test]
+    fn futures_place_order_carries_leverage_and_contract_symbol() {
+        let (mut kucoin, mock) = signed_futures_client(1000);
+        kucoin.set_leverage(&symbol(), 5).unwrap();
+        mock.push_json(200, r#"{"code":"200000","data":{"orderId":"9"}}"#);
+        kucoin
+            .place_order(&OrderRequest::market_buy(symbol(), dec!(2)))
+            .unwrap();
+        let reqs = mock.recorded_requests();
+        let body = reqs[0].body.as_deref().unwrap();
+        assert!(body.contains(r#""symbol":"XBTUSDTM""#));
+        assert!(body.contains(r#""leverage":"5""#));
+        assert!(reqs[0].url.contains("api-futures.kucoin.com"));
+    }
+
+    #[test]
+    fn derivatives_positions_parse_contracts() {
+        let (mut kucoin, mock) = signed_futures_client(1000);
+        mock.push_json(200, KU_POSITIONS);
+        let positions = Derivatives::positions(&mut kucoin, Some(&symbol())).unwrap();
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].symbol, Symbol::new("BTC", "USDT"));
+        assert_eq!(positions[0].side, PositionSide::Long);
+        assert_eq!(positions[0].quantity, dec!(3)); // contracts
+        assert_eq!(positions[0].margin_mode, MarginMode::Isolated);
+        assert!(mock.recorded_requests()[0]
+            .url
+            .contains("/api/v1/positions"));
+    }
+
+    #[test]
+    fn derivatives_set_margin_mode_changes_mode() {
+        let (mut kucoin, mock) = signed_futures_client(1000);
+        mock.push_json(200, r#"{"code":"200000","data":{}}"#);
+        Derivatives::set_margin_mode(&mut kucoin, &symbol(), MarginMode::Cross).unwrap();
+        let req = &mock.recorded_requests()[0];
+        assert!(req.url.contains("/api/v1/position/changeMarginMode"));
+        assert!(req
+            .body
+            .as_deref()
+            .unwrap()
+            .contains(r#""marginMode":"CROSS""#));
+    }
+
+    #[test]
+    fn derivatives_close_position_reduce_only() {
+        let (mut kucoin, mock) = signed_futures_client(1000);
+        mock.push_json(200, KU_POSITIONS);
+        mock.push_json(200, r#"{"code":"200000","data":{"orderId":"9"}}"#);
+        Derivatives::close_position(&mut kucoin, &symbol()).unwrap();
+        let reqs = mock.recorded_requests();
+        let body = reqs[1].body.as_deref().unwrap();
+        assert!(body.contains(r#""side":"sell""#));
+        assert!(body.contains(r#""reduceOnly":true"#));
     }
 
     #[test]
