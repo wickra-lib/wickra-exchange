@@ -20,9 +20,9 @@ use std::sync::OnceLock;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use wickra_exchange::{
-    connect, connect_derivatives, Credentials, Derivatives, Error, Event, Exchange,
-    ExchangeOptions, MarginMode, MarketType, Order, OrderRequest, OrderSide, OrderStatus,
-    PaperExchange, PositionSide, ReplayExchange, Symbol, TradePrint,
+    connect, connect_advanced, connect_derivatives, AdvancedOrders, Credentials, Derivatives,
+    Error, Event, Exchange, ExchangeOptions, MarginMode, MarketType, Order, OrderRequest,
+    OrderSide, OrderStatus, PaperExchange, PositionSide, ReplayExchange, Symbol, TradePrint,
 };
 
 /// Success.
@@ -163,6 +163,12 @@ pub struct WickraDerivatives {
     inner: Box<dyn Derivatives>,
 }
 
+/// An opaque advanced-orders handle over a live client. Construct with
+/// `wickra_connect_advanced`; release with `wickra_advanced_free`.
+pub struct WickraAdvanced {
+    inner: Box<dyn AdvancedOrders>,
+}
+
 // ------------------------------- helpers -------------------------------------
 
 fn error_code(error: &Error) -> i32 {
@@ -291,6 +297,29 @@ fn parse_symbol(market: &str) -> Option<Symbol> {
         }
         _ => None,
     }
+}
+
+/// Collect `n` NUL-terminated C strings from a `*const *const c_char` array into
+/// owned `String`s. Returns `None` if any element is null or not valid UTF-8.
+///
+/// # Safety
+/// `ptr` must point to `n` valid elements (or be null when `n == 0`).
+unsafe fn collect_cstrs(ptr: *const *const c_char, n: usize) -> Option<Vec<String>> {
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let item = unsafe { *ptr.add(i) };
+        out.push(unsafe { opt_str(item) }?.to_string());
+    }
+    Some(out)
+}
+
+/// Interpret an `f64` argument where `NaN` means "leave unchanged": `NaN` ->
+/// `Ok(None)`, a finite value -> `Ok(Some(decimal))`, non-finite -> `Err(())`.
+fn opt_decimal_arg(value: f64) -> Result<Option<Decimal>, ()> {
+    if value.is_nan() {
+        return Ok(None);
+    }
+    Decimal::from_f64_retain(value).map(Some).ok_or(())
 }
 
 fn paper_with_costs(maker_bps: f64, taker_bps: f64, slippage_bps: f64) -> Option<PaperExchange> {
@@ -877,6 +906,136 @@ pub unsafe extern "C" fn wickra_derivatives_close_position(
     }
 }
 
+// --------------------------- advanced orders ---------------------------------
+
+/// Connect a live client for `name` as an advanced-orders handle (amend / batch
+/// cancel). `futures` selects the USDⓈ-M futures market. Returns null on failure
+/// or for a venue without an advanced-order surface (`coinbase`, `upbit`).
+///
+/// # Safety
+/// The non-null string arguments must be valid C strings.
+#[no_mangle]
+pub unsafe extern "C" fn wickra_connect_advanced(
+    name: *const c_char,
+    api_key: *const c_char,
+    api_secret: *const c_char,
+    passphrase: *const c_char,
+    private_key: *const c_char,
+    testnet: bool,
+    futures: bool,
+) -> *mut WickraAdvanced {
+    let (Some(name), Some(api_key), Some(api_secret)) =
+        (unsafe { (opt_str(name), opt_str(api_key), opt_str(api_secret)) })
+    else {
+        return core::ptr::null_mut();
+    };
+    let mut credentials = Credentials::new(api_key, api_secret);
+    if let Some(passphrase) = unsafe { opt_str(passphrase) } {
+        credentials = credentials.with_passphrase(passphrase);
+    }
+    if let Some(private_key) = unsafe { opt_str(private_key) } {
+        credentials = credentials.with_private_key(private_key);
+    }
+    let market_type = if futures {
+        MarketType::UsdMFutures
+    } else {
+        MarketType::Spot
+    };
+    let options = if testnet {
+        ExchangeOptions::testnet(market_type)
+    } else {
+        ExchangeOptions::mainnet(market_type)
+    };
+    match connect_advanced(name, credentials, &options) {
+        Ok(inner) => Box::into_raw(Box::new(WickraAdvanced { inner })),
+        Err(_) => core::ptr::null_mut(),
+    }
+}
+
+/// Release an advanced-orders handle. Safe to call with null.
+///
+/// # Safety
+/// `handle` must be null or a pointer from `wickra_connect_advanced`, freed
+/// exactly once.
+#[no_mangle]
+pub unsafe extern "C" fn wickra_advanced_free(handle: *mut WickraAdvanced) {
+    if !handle.is_null() {
+        drop(unsafe { Box::from_raw(handle) });
+    }
+}
+
+/// Amend a resting order's price and/or quantity in place; writes the refreshed
+/// order into `out`. Pass `NaN` for `new_price` / `new_quantity` to leave that
+/// field unchanged. Returns [`WICKRA_ERR_UNSUPPORTED`] on a venue without a
+/// native amend.
+///
+/// # Safety
+/// `handle` and `out` must be valid; `market` and `order_id` must be valid C strings.
+#[no_mangle]
+pub unsafe extern "C" fn wickra_advanced_amend_order(
+    handle: *mut WickraAdvanced,
+    market: *const c_char,
+    order_id: *const c_char,
+    new_price: f64,
+    new_quantity: f64,
+    out: *mut WickraOrder,
+) -> i32 {
+    let Some(handle) = (unsafe { handle.as_mut() }) else {
+        return WICKRA_ERR_NULL;
+    };
+    if out.is_null() {
+        return WICKRA_ERR_NULL;
+    }
+    let (Some(market), Some(order_id)) = (unsafe { (opt_str(market), opt_str(order_id)) }) else {
+        return WICKRA_ERR_INVALID_ARG;
+    };
+    let Some(symbol) = parse_symbol(market) else {
+        return WICKRA_ERR_INVALID_ARG;
+    };
+    let (Ok(price), Ok(quantity)) = (opt_decimal_arg(new_price), opt_decimal_arg(new_quantity))
+    else {
+        return WICKRA_ERR_INVALID_ARG;
+    };
+    match handle.inner.amend_order(&symbol, order_id, price, quantity) {
+        Ok(order) => {
+            unsafe { fill_order(&mut *out, &order) };
+            WICKRA_OK
+        }
+        Err(e) => error_code(&e),
+    }
+}
+
+/// Cancel several orders on `market` in one request. `order_ids` is an array of
+/// `n` NUL-terminated C strings.
+///
+/// # Safety
+/// `handle` must be valid; `market` must be a valid C string; `order_ids` must
+/// point to `n` valid C strings (or be null when `n == 0`).
+#[no_mangle]
+pub unsafe extern "C" fn wickra_advanced_cancel_batch(
+    handle: *mut WickraAdvanced,
+    market: *const c_char,
+    order_ids: *const *const c_char,
+    n: usize,
+) -> i32 {
+    let Some(handle) = (unsafe { handle.as_mut() }) else {
+        return WICKRA_ERR_NULL;
+    };
+    let Some(market) = (unsafe { opt_str(market) }) else {
+        return WICKRA_ERR_INVALID_ARG;
+    };
+    let Some(symbol) = parse_symbol(market) else {
+        return WICKRA_ERR_INVALID_ARG;
+    };
+    let Some(ids) = (unsafe { collect_cstrs(order_ids, n) }) else {
+        return WICKRA_ERR_INVALID_ARG;
+    };
+    match handle.inner.cancel_batch(&symbol, &ids) {
+        Ok(()) => WICKRA_OK,
+        Err(e) => error_code(&e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1138,5 +1297,88 @@ mod tests {
             WICKRA_ERR_INVALID_ARG
         );
         unsafe { wickra_derivatives_free(handle) };
+    }
+
+    #[test]
+    fn advanced_spot_only_venue_is_null() {
+        let (name, key, secret) = (cstr("upbit"), cstr("k"), cstr("s"));
+        let handle = unsafe {
+            wickra_connect_advanced(
+                name.as_ptr(),
+                key.as_ptr(),
+                secret.as_ptr(),
+                core::ptr::null(),
+                core::ptr::null(),
+                false,
+                false,
+            )
+        };
+        assert!(handle.is_null(), "upbit has no advanced-order surface");
+    }
+
+    #[test]
+    fn advanced_null_handle_guards() {
+        let (market, order_id) = (cstr("BTC/USDT"), cstr("1"));
+        let ids = [order_id.as_ptr()];
+        assert_eq!(
+            unsafe {
+                wickra_advanced_cancel_batch(
+                    core::ptr::null_mut(),
+                    market.as_ptr(),
+                    ids.as_ptr(),
+                    1,
+                )
+            },
+            WICKRA_ERR_NULL
+        );
+        assert_eq!(
+            unsafe {
+                wickra_advanced_amend_order(
+                    core::ptr::null_mut(),
+                    market.as_ptr(),
+                    order_id.as_ptr(),
+                    f64::NAN,
+                    f64::NAN,
+                    core::ptr::null_mut(),
+                )
+            },
+            WICKRA_ERR_NULL
+        );
+        unsafe { wickra_advanced_free(core::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn advanced_amend_rejects_non_finite_price() {
+        // Construction is offline; an infinite price argument is rejected before
+        // any network request.
+        let (name, key, secret) = (cstr("binance"), cstr("k"), cstr("s"));
+        let handle = unsafe {
+            wickra_connect_advanced(
+                name.as_ptr(),
+                key.as_ptr(),
+                secret.as_ptr(),
+                core::ptr::null(),
+                core::ptr::null(),
+                false,
+                false,
+            )
+        };
+        assert!(!handle.is_null());
+        let (market, order_id) = (cstr("BTC/USDT"), cstr("1"));
+        let mut out = empty_order();
+        assert_eq!(
+            unsafe {
+                wickra_advanced_amend_order(
+                    handle,
+                    market.as_ptr(),
+                    order_id.as_ptr(),
+                    f64::INFINITY,
+                    f64::NAN,
+                    &raw mut out,
+                )
+            },
+            WICKRA_ERR_INVALID_ARG
+        );
+        unsafe { wickra_advanced_free(handle) };
     }
 }
