@@ -21,7 +21,9 @@ use crate::options::{ExchangeOptions, MarginMode, MarketType, SelfTradePreventio
 use crate::positions::{Position, PositionSide};
 use crate::signing::hmac_sha256_base64;
 use crate::symbol::Symbol;
-use crate::traits::{AdvancedOrders, Derivatives, Exchange, Execution, MarketData, WsUserData};
+use crate::traits::{
+    AdvancedOrders, Derivatives, Exchange, Execution, MarketData, WsExecution, WsUserData,
+};
 use crate::transport::{HttpMethod, HttpRequest, HttpTransport, WsConnection, WsTransport};
 use crate::types::{
     Balance, OcoRequest, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker,
@@ -86,6 +88,10 @@ pub struct Okx {
     /// [`subscribe_user_data`](Self::subscribe_user_data) and drained by
     /// [`poll_events`](Self::poll_events) alongside the public stream.
     private_connection: Option<Box<dyn WsConnection>>,
+    /// A dedicated logged-in connection to the private WebSocket order API, opened
+    /// lazily on the first [`place_order_ws`](Self::place_order_ws) /
+    /// [`cancel_order_ws`](Self::cancel_order_ws) call.
+    ws_api_connection: Option<Box<dyn WsConnection>>,
 }
 
 impl Okx {
@@ -107,6 +113,7 @@ impl Okx {
             sub_messages: Vec::new(),
             subscriptions: Vec::new(),
             private_connection: None,
+            ws_api_connection: None,
         }
     }
 
@@ -320,25 +327,30 @@ impl Okx {
     /// Returns [`Error::InvalidCredentials`] without credentials or a passphrase,
     /// [`Error::NotConnected`] without a WebSocket transport, or another
     /// [`Error`] if the request fails.
-    pub fn subscribe_user_data(&mut self) -> Result<()> {
+    /// Build the OKX WS `op:login` frame. The login signs
+    /// `<timestamp>GET/users/self/verify`, where the timestamp is Unix epoch
+    /// seconds.
+    fn ws_login_frame(&self) -> Result<String> {
         let creds = self.credentials.as_ref().ok_or(Error::InvalidCredentials(
-            "user-data stream requires credentials",
+            "signed WebSocket requires credentials",
         ))?;
         let passphrase = creds
             .passphrase
             .as_deref()
             .ok_or(Error::InvalidCredentials("OKX requires a passphrase"))?;
-        // OKX WS login signs `<timestamp>GET/users/self/verify`, where the
-        // timestamp is Unix epoch seconds.
         let timestamp = (self.now_ms)() / 1000;
         let sign = hmac_sha256_base64(
             creds.api_secret.as_bytes(),
             format!("{timestamp}GET/users/self/verify").as_bytes(),
         );
-        let login = format!(
+        Ok(format!(
             r#"{{"op":"login","args":[{{"apiKey":"{}","passphrase":"{passphrase}","timestamp":"{timestamp}","sign":"{sign}"}}]}}"#,
             creds.api_key
-        );
+        ))
+    }
+
+    pub fn subscribe_user_data(&mut self) -> Result<()> {
+        let login = self.ws_login_frame()?;
         let subscribe = format!(
             r#"{{"op":"subscribe","args":[{{"channel":"orders","instType":"{}"}},{{"channel":"account"}}]}}"#,
             self.inst_type
@@ -349,6 +361,126 @@ impl Okx {
         connection.send(&subscribe)?;
         self.private_connection = Some(connection);
         Ok(())
+    }
+
+    /// Place an order over the OKX private WebSocket order API (`op:order`). Builds
+    /// the same args as the REST path and exchanges them on the lazily-opened,
+    /// logged-in connection.
+    ///
+    /// # Errors
+    /// Returns [`Error::NotConnected`] without a WebSocket transport, or another
+    /// [`Error`] if the order is invalid or the venue rejects it.
+    pub fn place_order_ws(&mut self, request: &OrderRequest) -> Result<Order> {
+        request.validate()?;
+        let ord_type = if request.post_only && request.order_type == OrderType::Limit {
+            "post_only"
+        } else {
+            ord_type_str(request.order_type)
+        };
+        let mut arg = serde_json::json!({
+            "instId": self.inst_id(&request.symbol),
+            "tdMode": self.td_mode,
+            "side": side_str(request.side),
+            "ordType": ord_type,
+            "sz": format_decimal(request.quantity),
+        });
+        if let Some(price) = request.price {
+            arg["px"] = serde_json::json!(format_decimal(price));
+        }
+        if let Some(id) = &request.client_order_id {
+            arg["clOrdId"] = serde_json::json!(id.clone());
+        }
+        let data = self.ws_order_request("order", &arg)?;
+        let list: Vec<PlaceResult> = parse_json(data)?;
+        let placed = list.into_iter().next().ok_or_else(|| Error::Exchange {
+            code: "empty".to_string(),
+            message: "empty order response".to_string(),
+        })?;
+        if placed.s_code != "0" {
+            return Err(Error::OrderRejected {
+                code: placed.s_code,
+                message: placed.s_msg,
+            });
+        }
+        Ok(Order {
+            id: placed.ord_id,
+            client_order_id: (!placed.cl_ord_id.is_empty()).then_some(placed.cl_ord_id),
+            symbol: request.symbol.clone(),
+            side: request.side,
+            order_type: request.order_type,
+            status: OrderStatus::New,
+            quantity: request.quantity,
+            filled_quantity: Decimal::ZERO,
+            price: request.price,
+            average_price: None,
+        })
+    }
+
+    /// Cancel an order over the OKX private WebSocket order API (`op:cancel-order`).
+    ///
+    /// # Errors
+    /// Returns [`Error::NotConnected`] without a WebSocket transport, or another
+    /// [`Error`] if the order is unknown or the request fails.
+    pub fn cancel_order_ws(&mut self, symbol: &Symbol, order_id: &str) -> Result<()> {
+        let arg = serde_json::json!({
+            "instId": self.inst_id(symbol),
+            "ordId": order_id,
+        });
+        self.ws_order_request("cancel-order", &arg)?;
+        Ok(())
+    }
+
+    /// Open and log into the private WebSocket order connection if needed,
+    /// consuming the login acknowledgement so later requests read their own
+    /// responses.
+    fn ensure_ws_api(&mut self) -> Result<()> {
+        if self.ws_api_connection.is_some() {
+            return Ok(());
+        }
+        let login = self.ws_login_frame()?;
+        let ws = self.ws.as_ref().ok_or(Error::NotConnected)?;
+        let mut connection = ws.connect(ws_private_url(self.testnet))?;
+        connection.send(&login)?;
+        connection.recv()?; // consume the login acknowledgement
+        self.ws_api_connection = Some(connection);
+        Ok(())
+    }
+
+    /// Send an order-API request frame and return its `data`, mapping a non-`"0"`
+    /// top-level `code` onto the error taxonomy.
+    fn ws_order_request(&mut self, op: &str, arg: &serde_json::Value) -> Result<serde_json::Value> {
+        self.ensure_ws_api()?;
+        let id = (self.now_ms)().to_string();
+        let frame = serde_json::json!({ "id": id, "op": op, "args": [arg] }).to_string();
+        let connection = self
+            .ws_api_connection
+            .as_mut()
+            .expect("ws order connection just ensured");
+        connection.send(&frame)?;
+        let Some(response) = connection.recv()? else {
+            return Err(Error::NotConnected);
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&response).map_err(|e| Error::Deserialization(e.to_string()))?;
+        let code = value
+            .get("code")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("1");
+        if code != "0" {
+            let message = value
+                .get("msg")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            return Err(Error::OrderRejected {
+                code: code.to_string(),
+                message,
+            });
+        }
+        Ok(value
+            .get("data")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null))
     }
 
     /// Place an order.
@@ -1002,6 +1134,15 @@ impl Exchange for Okx {
 impl WsUserData for Okx {
     fn subscribe_user_data(&mut self) -> Result<()> {
         Okx::subscribe_user_data(self)
+    }
+}
+
+impl WsExecution for Okx {
+    fn place_order_ws(&mut self, request: &OrderRequest) -> Result<Order> {
+        Okx::place_order_ws(self, request)
+    }
+    fn cancel_order_ws(&mut self, symbol: &Symbol, order_id: &str) -> Result<()> {
+        Okx::cancel_order_ws(self, symbol, order_id)
     }
 }
 
@@ -1841,6 +1982,78 @@ mod tests {
         .with_ws(Box::new(ArcWs(Arc::clone(&ws))));
         assert!(matches!(
             okx.subscribe_user_data().unwrap_err(),
+            Error::InvalidCredentials(_)
+        ));
+    }
+
+    #[test]
+    fn place_and_cancel_order_over_ws() {
+        let (mut okx, ws) = signed_ws_client(1_700_000_000_000);
+        ws.push_connection(vec![
+            Ok(Some(r#"{"event":"login","code":"0"}"#.to_string())),
+            Ok(Some(
+                r#"{"id":"1700000000","op":"order","code":"0","msg":"","data":[{"ordId":"55",
+                "clOrdId":"my","sCode":"0","sMsg":""}]}"#
+                    .to_string(),
+            )),
+            Ok(Some(
+                r#"{"id":"1700000000","op":"cancel-order","code":"0","msg":"","data":[{"ordId":"55",
+                "sCode":"0","sMsg":""}]}"#
+                    .to_string(),
+            )),
+        ]);
+        let order = okx
+            .place_order_ws(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)))
+            .unwrap();
+        assert_eq!(order.id, "55");
+        assert_eq!(order.client_order_id.as_deref(), Some("my"));
+        assert_eq!(order.status, OrderStatus::New);
+        assert_eq!(
+            ws.connected_urls()[0],
+            "wss://ws.okx.com:8443/ws/v5/private"
+        );
+        // The login frame is sent first, then the order request.
+        assert!(ws.sent()[0].contains(r#""op":"login""#));
+        assert!(ws.sent()[1].contains(r#""op":"order""#));
+        assert!(ws.sent()[1].contains(r#""instId":"BTC-USDT""#));
+
+        okx.cancel_order_ws(&symbol(), "55").unwrap();
+        assert!(ws.sent()[2].contains(r#""op":"cancel-order""#));
+        assert!(ws.sent()[2].contains(r#""ordId":"55""#));
+    }
+
+    #[test]
+    fn ws_order_surfaces_rejection() {
+        let (mut okx, ws) = signed_ws_client(1000);
+        ws.push_connection(vec![
+            Ok(Some(r#"{"event":"login","code":"0"}"#.to_string())),
+            Ok(Some(
+                r#"{"id":"1000","op":"order","code":"1","msg":"","data":[{"ordId":"","clOrdId":"",
+                "sCode":"51008","sMsg":"insufficient balance"}]}"#
+                    .to_string(),
+            )),
+        ]);
+        assert!(matches!(
+            okx.place_order_ws(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)))
+                .unwrap_err(),
+            Error::OrderRejected { .. }
+        ));
+    }
+
+    #[test]
+    fn ws_order_requires_a_passphrase() {
+        let http = Arc::new(MockHttpTransport::new());
+        let ws = Arc::new(MockWsTransport::new());
+        let opts = ExchangeOptions::mainnet(MarketType::Spot);
+        let mut okx = Okx::with_credentials(
+            Box::new(ArcTransport(http)),
+            &opts,
+            Credentials::new("APIKEY", "SECRET"),
+        )
+        .with_ws(Box::new(ArcWs(Arc::clone(&ws))));
+        assert!(matches!(
+            okx.place_order_ws(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)))
+                .unwrap_err(),
             Error::InvalidCredentials(_)
         ));
     }
