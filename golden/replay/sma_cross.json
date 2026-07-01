@@ -1,0 +1,10 @@
+{
+  "description": "A rising trade tape that crosses a 3-period SMA, on a frictionless paper book.",
+  "market": "BTC/USDT",
+  "tape": [100.0, 101.0, 102.0, 110.0, 112.0],
+  "balances": { "USDT": 100000.0 },
+  "sma_period": 3,
+  "maker_bps": 0.0,
+  "taker_bps": 0.0,
+  "slippage_bps": 0.0
+}
