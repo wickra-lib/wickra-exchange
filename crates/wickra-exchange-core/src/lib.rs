@@ -67,7 +67,7 @@ pub use signing::{
     hmac_sha512_bytes, hmac_sha512_hex, sha256, sha512_hex,
 };
 pub use symbol::Symbol;
-pub use traits::{Exchange, Execution, MarketData};
+pub use traits::{Derivatives, Exchange, Execution, MarketData};
 pub use transport::{
     HttpMethod, HttpRequest, HttpResponse, HttpTransport, MockHttpTransport, MockWsConnection,
     MockWsTransport, WsConnection, WsTransport,

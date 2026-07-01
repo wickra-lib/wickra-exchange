@@ -15,6 +15,8 @@
 
 use crate::error::Result;
 use crate::events::{Event, OrderBookSnapshot};
+use crate::options::MarginMode;
+use crate::positions::Position;
 use crate::symbol::Symbol;
 use crate::types::{Balance, Order, OrderRequest, Ticker};
 use wickra_core::Candle;
@@ -102,4 +104,35 @@ pub trait Execution {
 pub trait Exchange: MarketData + Execution {
     /// The venue's lowercase identifier (e.g. `"binance"`).
     fn name(&self) -> &'static str;
+}
+
+/// Derivatives (perpetual / futures) account operations: positions, leverage and
+/// margin mode. Implemented only by venues that offer derivatives markets and
+/// meaningful only on a derivatives [`MarketType`](crate::MarketType); spot-only
+/// venues (Coinbase, Upbit) do not implement it.
+pub trait Derivatives {
+    /// Open positions, optionally filtered to one `symbol`; flat positions are omitted.
+    ///
+    /// # Errors
+    /// Returns an [`Error`](crate::Error) if credentials are missing or the request fails.
+    fn positions(&mut self, symbol: Option<&Symbol>) -> Result<Vec<Position>>;
+
+    /// Set the account leverage for `symbol`.
+    ///
+    /// # Errors
+    /// Returns an [`Error`](crate::Error) if the leverage is rejected or the request fails.
+    fn set_leverage(&mut self, symbol: &Symbol, leverage: u32) -> Result<()>;
+
+    /// Set the margin mode (cross / isolated) for `symbol`.
+    ///
+    /// # Errors
+    /// Returns an [`Error`](crate::Error) if the change is rejected or the request fails.
+    fn set_margin_mode(&mut self, symbol: &Symbol, mode: MarginMode) -> Result<()>;
+
+    /// Flatten the open position in `symbol` with a reduce-only market order.
+    ///
+    /// # Errors
+    /// Returns [`Error::NotFound`](crate::Error::NotFound) if there is no open
+    /// position, or another [`Error`](crate::Error) if the request fails.
+    fn close_position(&mut self, symbol: &Symbol) -> Result<Order>;
 }

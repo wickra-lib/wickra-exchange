@@ -17,10 +17,11 @@ use crate::error::{Error, Result};
 use crate::events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
 use crate::instruments::{Instrument, InstrumentCache, InstrumentFilters};
 use crate::normalize::{format_decimal, parse_decimal};
-use crate::options::{ExchangeOptions, MarketType};
+use crate::options::{ExchangeOptions, MarginMode, MarketType};
+use crate::positions::{Position, PositionSide};
 use crate::signing::hmac_sha256_hex;
 use crate::symbol::Symbol;
-use crate::traits::{Exchange, Execution, MarketData};
+use crate::traits::{Derivatives, Exchange, Execution, MarketData};
 use crate::transport::{
     HttpMethod, HttpRequest, HttpResponse, HttpTransport, WsConnection, WsTransport,
 };
@@ -117,6 +118,30 @@ impl Binance {
         self.market_type
     }
 
+    /// Whether this client targets the USDⓈ-M futures market (fapi paths) rather
+    /// than spot (api/v3 paths).
+    fn is_futures(&self) -> bool {
+        matches!(self.market_type, MarketType::UsdMFutures)
+    }
+
+    /// The single-order endpoint (place/cancel/query) for this market.
+    fn order_path(&self) -> &'static str {
+        if self.is_futures() {
+            "/fapi/v1/order"
+        } else {
+            "/api/v3/order"
+        }
+    }
+
+    /// The open-orders endpoint for this market.
+    fn open_orders_path(&self) -> &'static str {
+        if self.is_futures() {
+            "/fapi/v1/openOrders"
+        } else {
+            "/api/v3/openOrders"
+        }
+    }
+
     /// The Binance wire symbol for a canonical [`Symbol`] (`BTC/USDT` -> `BTCUSDT`).
     #[must_use]
     pub fn wire_symbol(symbol: &Symbol) -> String {
@@ -129,8 +154,21 @@ impl Binance {
     /// Returns an [`Error`] if the request fails or the symbol is unknown.
     pub fn ticker(&self, symbol: &Symbol) -> Result<Ticker> {
         let query = format!("symbol={}", Self::wire_symbol(symbol));
-        let body = self.get("/api/v3/ticker/24hr", &query)?;
-        let raw: RawTicker = deserialize(&body)?;
+        if self.is_futures() {
+            // The futures 24-hour ticker carries no bid/ask, so combine it with
+            // the book ticker for the top-of-book quote.
+            let stats: RawFuturesTicker = deserialize(&self.get("/fapi/v1/ticker/24hr", &query)?)?;
+            let book: RawBookTicker =
+                deserialize(&self.get("/fapi/v1/ticker/bookTicker", &query)?)?;
+            return Ok(Ticker {
+                symbol: symbol.clone(),
+                last: parse_decimal(&stats.last_price)?,
+                bid: parse_decimal(&book.bid_price)?,
+                ask: parse_decimal(&book.ask_price)?,
+                volume: parse_decimal(&stats.volume)?,
+            });
+        }
+        let raw: RawTicker = deserialize(&self.get("/api/v3/ticker/24hr", &query)?)?;
         Ok(Ticker {
             symbol: symbol.clone(),
             last: parse_decimal(&raw.last_price)?,
@@ -149,7 +187,12 @@ impl Binance {
             "symbol={}&interval={interval}&limit={limit}",
             Self::wire_symbol(symbol)
         );
-        let body = self.get("/api/v3/klines", &query)?;
+        let path = if self.is_futures() {
+            "/fapi/v1/klines"
+        } else {
+            "/api/v3/klines"
+        };
+        let body = self.get(path, &query)?;
         let rows: Vec<Vec<serde_json::Value>> = deserialize(&body)?;
         rows.iter().map(|row| parse_kline_row(row)).collect()
     }
@@ -160,7 +203,12 @@ impl Binance {
     /// Returns an [`Error`] if the request fails or the response cannot be parsed.
     pub fn order_book(&self, symbol: &Symbol, depth: u32) -> Result<OrderBookSnapshot> {
         let query = format!("symbol={}&limit={depth}", Self::wire_symbol(symbol));
-        let body = self.get("/api/v3/depth", &query)?;
+        let path = if self.is_futures() {
+            "/fapi/v1/depth"
+        } else {
+            "/api/v3/depth"
+        };
+        let body = self.get(path, &query)?;
         let raw: RawDepth = deserialize(&body)?;
         Ok(OrderBookSnapshot {
             symbol: symbol.clone(),
@@ -177,7 +225,12 @@ impl Binance {
     /// # Errors
     /// Returns an [`Error`] if the request fails or the response cannot be parsed.
     pub fn load_instruments(&mut self) -> Result<()> {
-        let body = self.get("/api/v3/exchangeInfo", "")?;
+        let path = if self.is_futures() {
+            "/fapi/v1/exchangeInfo"
+        } else {
+            "/api/v3/exchangeInfo"
+        };
+        let body = self.get(path, "")?;
         let raw: RawExchangeInfo = deserialize(&body)?;
         let now = (self.now_ms)();
         let instruments: Vec<Instrument> = raw.symbols.iter().map(parse_instrument).collect();
@@ -319,7 +372,7 @@ impl Binance {
         if request.reduce_only {
             params.push_str("&reduceOnly=true");
         }
-        let body = self.signed_request(HttpMethod::Post, "/api/v3/order", &params)?;
+        let body = self.signed_request(HttpMethod::Post, self.order_path(), &params)?;
         parse_order(&request.symbol, &body)
     }
 
@@ -329,7 +382,7 @@ impl Binance {
     /// Returns an [`Error`] if credentials are missing or the venue rejects it.
     pub fn cancel_order(&self, symbol: &Symbol, order_id: &str) -> Result<()> {
         let params = format!("symbol={}&orderId={order_id}", Self::wire_symbol(symbol));
-        self.signed_request(HttpMethod::Delete, "/api/v3/order", &params)?;
+        self.signed_request(HttpMethod::Delete, self.order_path(), &params)?;
         Ok(())
     }
 
@@ -339,7 +392,7 @@ impl Binance {
     /// Returns an [`Error`] if credentials are missing or the order is unknown.
     pub fn query_order(&self, symbol: &Symbol, order_id: &str) -> Result<Order> {
         let params = format!("symbol={}&orderId={order_id}", Self::wire_symbol(symbol));
-        let body = self.signed_request(HttpMethod::Get, "/api/v3/order", &params)?;
+        let body = self.signed_request(HttpMethod::Get, self.order_path(), &params)?;
         parse_order(symbol, &body)
     }
 
@@ -349,6 +402,22 @@ impl Binance {
     /// # Errors
     /// Returns an [`Error`] if credentials are missing or the request fails.
     pub fn balances(&self) -> Result<Vec<Balance>> {
+        if self.is_futures() {
+            let body = self.signed_request(HttpMethod::Get, "/fapi/v2/balance", "")?;
+            let raw: Vec<RawFuturesBalance> = deserialize(&body)?;
+            return raw
+                .iter()
+                .map(|b| {
+                    let total = parse_decimal(&b.balance)?;
+                    let free = parse_decimal(&b.available_balance)?;
+                    Ok(Balance {
+                        asset: b.asset.clone(),
+                        free,
+                        locked: total - free,
+                    })
+                })
+                .collect();
+        }
         let body = self.signed_request(HttpMethod::Get, "/api/v3/account", "")?;
         let raw: RawAccount = deserialize(&body)?;
         raw.balances
@@ -374,7 +443,7 @@ impl Binance {
             Some(s) => format!("symbol={}", Self::wire_symbol(s)),
             None => String::new(),
         };
-        let body = self.signed_request(HttpMethod::Get, "/api/v3/openOrders", &params)?;
+        let body = self.signed_request(HttpMethod::Get, self.open_orders_path(), &params)?;
         let raws: Vec<RawOrder> = deserialize(&body)?;
         raws.iter()
             .map(|raw| {
@@ -480,6 +549,108 @@ impl Exchange for Binance {
     }
 }
 
+impl Binance {
+    /// Open positions on the USDⓈ-M futures account (`/fapi/v2/positionRisk`).
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if credentials are missing or the request fails.
+    pub fn positions(&self, symbol: Option<&Symbol>) -> Result<Vec<Position>> {
+        let params =
+            symbol.map_or_else(String::new, |s| format!("symbol={}", Self::wire_symbol(s)));
+        let body = self.signed_request(HttpMethod::Get, "/fapi/v2/positionRisk", &params)?;
+        parse_positions(&body)
+    }
+
+    /// Set the leverage for `symbol` (`/fapi/v1/leverage`).
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the leverage is rejected or the request fails.
+    pub fn set_leverage(&self, symbol: &Symbol, leverage: u32) -> Result<()> {
+        let params = format!("symbol={}&leverage={leverage}", Self::wire_symbol(symbol));
+        self.signed_request(HttpMethod::Post, "/fapi/v1/leverage", &params)?;
+        Ok(())
+    }
+
+    /// Set the margin mode for `symbol` (`/fapi/v1/marginType`).
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the change is rejected or the request fails.
+    pub fn set_margin_mode(&self, symbol: &Symbol, mode: MarginMode) -> Result<()> {
+        let margin = match mode {
+            MarginMode::Isolated => "ISOLATED",
+            MarginMode::Cross => "CROSSED",
+        };
+        let params = format!("symbol={}&marginType={margin}", Self::wire_symbol(symbol));
+        self.signed_request(HttpMethod::Post, "/fapi/v1/marginType", &params)?;
+        Ok(())
+    }
+
+    /// Flatten the open position in `symbol` with a reduce-only market order.
+    ///
+    /// # Errors
+    /// Returns [`Error::NotFound`] if there is no open position, or another
+    /// [`Error`] if the request fails.
+    pub fn close_position(&self, symbol: &Symbol) -> Result<Order> {
+        let position = self
+            .positions(Some(symbol))?
+            .into_iter()
+            .find(|p| &p.symbol == symbol)
+            .ok_or_else(|| Error::NotFound(format!("no open position for {symbol}")))?;
+        let request = match position.side {
+            PositionSide::Long => OrderRequest::market_sell(symbol.clone(), position.quantity),
+            PositionSide::Short => OrderRequest::market_buy(symbol.clone(), position.quantity),
+        }
+        .reduce_only();
+        self.place_order(&request)
+    }
+}
+
+impl Derivatives for Binance {
+    fn positions(&mut self, symbol: Option<&Symbol>) -> Result<Vec<Position>> {
+        Binance::positions(self, symbol)
+    }
+    fn set_leverage(&mut self, symbol: &Symbol, leverage: u32) -> Result<()> {
+        Binance::set_leverage(self, symbol, leverage)
+    }
+    fn set_margin_mode(&mut self, symbol: &Symbol, mode: MarginMode) -> Result<()> {
+        Binance::set_margin_mode(self, symbol, mode)
+    }
+    fn close_position(&mut self, symbol: &Symbol) -> Result<Order> {
+        Binance::close_position(self, symbol)
+    }
+}
+
+fn parse_positions(body: &str) -> Result<Vec<Position>> {
+    let raw: Vec<RawPosition> = deserialize(body)?;
+    let mut positions = Vec::new();
+    for entry in raw {
+        let amount = parse_decimal(&entry.position_amt)?;
+        if amount.is_zero() {
+            continue;
+        }
+        let side = if amount.is_sign_negative() {
+            PositionSide::Short
+        } else {
+            PositionSide::Long
+        };
+        positions.push(Position {
+            symbol: split_wire_symbol(&entry.symbol),
+            side,
+            quantity: amount.abs(),
+            entry_price: parse_decimal(&entry.entry_price)?,
+            mark_price: parse_decimal(&entry.mark_price)?,
+            leverage: parse_decimal(&entry.leverage)?,
+            unrealized_pnl: parse_decimal(&entry.unrealized)?,
+            margin_mode: if entry.margin_type.eq_ignore_ascii_case("isolated") {
+                MarginMode::Isolated
+            } else {
+                MarginMode::Cross
+            },
+        });
+    }
+    Ok(positions)
+}
+
 fn side_str(side: OrderSide) -> &'static str {
     match side {
         OrderSide::Buy => "BUY",
@@ -543,7 +714,12 @@ fn parse_order(symbol: &Symbol, body: &str) -> Result<Order> {
 
 fn order_from_raw(symbol: Symbol, raw: &RawOrder) -> Result<Order> {
     let executed = parse_decimal(&raw.executed_qty)?;
-    let average_price = if executed > Decimal::ZERO {
+    // Futures reports the fill price directly as `avgPrice`; spot reports the
+    // cumulative quote quantity, from which the average is derived.
+    let avg = parse_decimal(&raw.avg_price).unwrap_or(Decimal::ZERO);
+    let average_price = if avg > Decimal::ZERO {
+        Some(avg)
+    } else if executed > Decimal::ZERO && !raw.cummulative_quote_qty.is_empty() {
         Some(parse_decimal(&raw.cummulative_quote_qty)? / executed)
     } else {
         None
@@ -730,8 +906,10 @@ struct RawOrder {
     orig_qty: String,
     #[serde(rename = "executedQty")]
     executed_qty: String,
-    #[serde(rename = "cummulativeQuoteQty")]
+    #[serde(rename = "cummulativeQuoteQty", default)]
     cummulative_quote_qty: String,
+    #[serde(rename = "avgPrice", default)]
+    avg_price: String,
     price: String,
 }
 
@@ -745,6 +923,45 @@ struct RawBalance {
     asset: String,
     free: String,
     locked: String,
+}
+
+#[derive(Deserialize)]
+struct RawFuturesTicker {
+    #[serde(rename = "lastPrice")]
+    last_price: String,
+    volume: String,
+}
+
+#[derive(Deserialize)]
+struct RawBookTicker {
+    #[serde(rename = "bidPrice")]
+    bid_price: String,
+    #[serde(rename = "askPrice")]
+    ask_price: String,
+}
+
+#[derive(Deserialize)]
+struct RawFuturesBalance {
+    asset: String,
+    balance: String,
+    #[serde(rename = "availableBalance")]
+    available_balance: String,
+}
+
+#[derive(Deserialize)]
+struct RawPosition {
+    symbol: String,
+    #[serde(rename = "positionAmt")]
+    position_amt: String,
+    #[serde(rename = "entryPrice")]
+    entry_price: String,
+    #[serde(rename = "markPrice")]
+    mark_price: String,
+    #[serde(rename = "unRealizedProfit")]
+    unrealized: String,
+    leverage: String,
+    #[serde(rename = "marginType")]
+    margin_type: String,
 }
 
 #[derive(Deserialize)]
@@ -1056,6 +1273,118 @@ mod tests {
         )
         .with_clock(Box::new(move || now_ms));
         (binance, mock)
+    }
+
+    /// An authenticated USDⓈ-M futures client over a mock transport.
+    fn signed_futures_client(now_ms: i64) -> (Binance, Arc<MockHttpTransport>) {
+        let mock = Arc::new(MockHttpTransport::new());
+        let opts = ExchangeOptions::mainnet(MarketType::UsdMFutures);
+        let binance = Binance::with_credentials(
+            Box::new(ArcTransport(Arc::clone(&mock))),
+            &opts,
+            Credentials::new("APIKEY", "SECRET"),
+        )
+        .with_clock(Box::new(move || now_ms));
+        (binance, mock)
+    }
+
+    #[test]
+    fn futures_ticker_combines_stats_and_book() {
+        let (binance, mock) = signed_futures_client(1000);
+        mock.push_json(
+            200,
+            r#"{"symbol":"BTCUSDT","lastPrice":"20000.0","volume":"1234.0"}"#,
+        );
+        mock.push_json(
+            200,
+            r#"{"symbol":"BTCUSDT","bidPrice":"19999.0","askPrice":"20001.0"}"#,
+        );
+        let ticker = binance.ticker(&symbol()).unwrap();
+        assert_eq!(ticker.last, dec!(20000));
+        assert_eq!(ticker.bid, dec!(19999));
+        assert_eq!(ticker.ask, dec!(20001));
+        assert_eq!(ticker.volume, dec!(1234));
+        let reqs = mock.recorded_requests();
+        assert!(reqs[0].url.contains("fapi.binance.com/fapi/v1/ticker/24hr"));
+        assert!(reqs[1].url.contains("/fapi/v1/ticker/bookTicker"));
+    }
+
+    #[test]
+    fn futures_balances_use_fapi_v2_balance() {
+        let (binance, mock) = signed_futures_client(1000);
+        mock.push_json(
+            200,
+            r#"[{"asset":"USDT","balance":"1000.0","availableBalance":"800.0"}]"#,
+        );
+        let balances = binance.balances().unwrap();
+        assert_eq!(balances[0].asset, "USDT");
+        assert_eq!(balances[0].free, dec!(800));
+        assert_eq!(balances[0].locked, dec!(200));
+        assert!(mock.recorded_requests()[0].url.contains("/fapi/v2/balance"));
+    }
+
+    #[test]
+    fn futures_place_order_uses_fapi_order_path() {
+        let (binance, mock) = signed_futures_client(1000);
+        mock.push_json(200, ORDER_JSON);
+        binance
+            .place_order(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(20000)))
+            .unwrap();
+        assert!(mock.recorded_requests()[0].url.contains("/fapi/v1/order"));
+    }
+
+    #[test]
+    fn derivatives_positions_parse_and_skip_flat() {
+        let (mut binance, mock) = signed_futures_client(1000);
+        mock.push_json(
+            200,
+            r#"[
+              {"symbol":"BTCUSDT","positionAmt":"0.5","entryPrice":"20000.0","markPrice":"20100.0","unRealizedProfit":"50.0","leverage":"10","marginType":"isolated"},
+              {"symbol":"ETHUSDT","positionAmt":"0.0","entryPrice":"0.0","markPrice":"0.0","unRealizedProfit":"0.0","leverage":"5","marginType":"cross"},
+              {"symbol":"XRPUSDT","positionAmt":"-100.0","entryPrice":"0.5","markPrice":"0.48","unRealizedProfit":"2.0","leverage":"20","marginType":"cross"}
+            ]"#,
+        );
+        let positions = Derivatives::positions(&mut binance, None).unwrap();
+        assert_eq!(positions.len(), 2); // the flat ETH position is skipped
+        assert_eq!(positions[0].symbol, Symbol::new("BTC", "USDT"));
+        assert_eq!(positions[0].side, PositionSide::Long);
+        assert_eq!(positions[0].quantity, dec!(0.5));
+        assert_eq!(positions[0].leverage, dec!(10));
+        assert_eq!(positions[0].margin_mode, MarginMode::Isolated);
+        assert_eq!(positions[1].side, PositionSide::Short);
+        assert_eq!(positions[1].quantity, dec!(100));
+        assert!(mock.recorded_requests()[0]
+            .url
+            .contains("/fapi/v2/positionRisk"));
+    }
+
+    #[test]
+    fn derivatives_set_leverage_and_margin_mode() {
+        let (mut binance, mock) = signed_futures_client(1000);
+        mock.push_json(200, r#"{"leverage":10,"symbol":"BTCUSDT"}"#);
+        Derivatives::set_leverage(&mut binance, &symbol(), 10).unwrap();
+        mock.push_json(200, r#"{"code":200,"msg":"success"}"#);
+        Derivatives::set_margin_mode(&mut binance, &symbol(), MarginMode::Isolated).unwrap();
+        let reqs = mock.recorded_requests();
+        assert!(reqs[0].url.contains("/fapi/v1/leverage"));
+        assert!(reqs[0].url.contains("leverage=10"));
+        assert!(reqs[1].url.contains("/fapi/v1/marginType"));
+        assert!(reqs[1].url.contains("marginType=ISOLATED"));
+    }
+
+    #[test]
+    fn derivatives_close_position_places_reduce_only_market() {
+        let (mut binance, mock) = signed_futures_client(1000);
+        mock.push_json(
+            200,
+            r#"[{"symbol":"BTCUSDT","positionAmt":"0.5","entryPrice":"20000.0","markPrice":"20100.0","unRealizedProfit":"50.0","leverage":"10","marginType":"isolated"}]"#,
+        );
+        mock.push_json(200, ORDER_JSON);
+        Derivatives::close_position(&mut binance, &symbol()).unwrap();
+        let reqs = mock.recorded_requests();
+        assert!(reqs[1].url.contains("/fapi/v1/order"));
+        assert!(reqs[1].url.contains("side=SELL"));
+        assert!(reqs[1].url.contains("reduceOnly=true"));
     }
 
     #[test]
