@@ -16,6 +16,7 @@ mod kraken;
 mod kucoin;
 mod okx;
 mod paper;
+mod replay;
 mod upbit;
 
 pub use binance::Binance;
@@ -28,4 +29,5 @@ pub use kraken::Kraken;
 pub use kucoin::KuCoin;
 pub use okx::Okx;
 pub use paper::PaperExchange;
+pub use replay::ReplayExchange;
 pub use upbit::Upbit;
