@@ -55,4 +55,15 @@ repeat {
 stopifnot(bought)
 stopifnot(abs(wkex_balance(rex, "BTC") - 1) < 1e-9)
 
+## Derivatives + advanced surface: construction is offline, so the spot-only
+## rejection and the futures construct are checked without a network.
+for (venue in c("coinbase", "upbit", "ftx")) {
+  stopifnot(inherits(try(wkex_derivatives(venue, "k", "s"), silent = TRUE), "try-error"))
+  stopifnot(inherits(try(wkex_advanced(venue, "k", "s"), silent = TRUE), "try-error"))
+}
+deriv <- wkex_derivatives("binance", "k", "s")
+stopifnot(inherits(deriv, "wickra_derivatives"))
+adv <- wkex_advanced("binance", "k", "s", futures = TRUE)
+stopifnot(inherits(adv, "wickra_advanced"))
+
 cat("wickra.exchange R tests passed\n")
