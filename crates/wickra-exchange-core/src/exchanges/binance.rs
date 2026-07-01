@@ -9,8 +9,10 @@
 //! URL/symbol mapping, the Binance error taxonomy, HMAC-SHA256 signed execution
 //! (place/cancel/query/open orders, balances) with `exchangeInfo` filter
 //! validation, and the pull-based WebSocket market streams (trade/depth/ticker
-//! subscribe + `poll_events`). The user-data stream (listenKey) and the real
-//! socket adapter land in a later slice.
+//! subscribe + `poll_events`), and the private user-data stream (listen key ->
+//! `wss://.../ws/<listenKey>`, whose order/balance frames `poll_events` surfaces
+//! as [`Event::OrderUpdate`]/[`Event::BalanceUpdate`]). The listen-key keepalive
+//! `PUT` and the real socket adapter land in a later slice.
 //!
 //! Binance is also the reference for [`AdvancedOrders`]: self-trade-prevention
 //! (the `stp` field maps to `selfTradePreventionMode`), amend (native
@@ -33,7 +35,9 @@ use crate::options::{ExchangeOptions, MarginMode, MarketType, SelfTradePreventio
 use crate::positions::{Position, PositionSide};
 use crate::signing::hmac_sha256_hex;
 use crate::symbol::Symbol;
-use crate::traits::{AdvancedOrders, Derivatives, Exchange, Execution, MarketData, WsExecution};
+use crate::traits::{
+    AdvancedOrders, Derivatives, Exchange, Execution, MarketData, WsExecution, WsUserData,
+};
 use crate::transport::{
     HttpMethod, HttpRequest, HttpResponse, HttpTransport, WsConnection, WsTransport,
 };
@@ -73,6 +77,10 @@ pub struct Binance {
     /// A dedicated connection to the WebSocket order API (`ws-api`), opened lazily
     /// on the first [`place_order_ws`](Self::place_order_ws) call.
     ws_api_connection: Option<Box<dyn WsConnection>>,
+    /// A dedicated connection to the private user-data stream, opened by
+    /// [`subscribe_user_data`](Self::subscribe_user_data) and drained by
+    /// [`poll_events`](Self::poll_events) alongside the public stream.
+    user_data_connection: Option<Box<dyn WsConnection>>,
 }
 
 impl Binance {
@@ -96,6 +104,7 @@ impl Binance {
             sub_messages: Vec::new(),
             instruments: InstrumentCache::new(),
             ws_api_connection: None,
+            user_data_connection: None,
         }
     }
 
@@ -328,6 +337,16 @@ impl Binance {
         };
         let mut events = Vec::new();
         if let Some(connection) = self.connection.as_mut() {
+            while let Ok(Some(frame)) = connection.recv() {
+                if let Ok(Some(event)) = parse_ws_message(&frame, &resolve) {
+                    events.push(event);
+                }
+            }
+        }
+        // Drain the private user-data stream (order/balance updates), if open.
+        // Reconnecting it requires a fresh listen-key, tracked as a keepalive
+        // follow-up; here it is best-effort until dropped.
+        if let Some(connection) = self.user_data_connection.as_mut() {
             while let Ok(Some(frame)) = connection.recv() {
                 if let Ok(Some(event)) = parse_ws_message(&frame, &resolve) {
                     events.push(event);
@@ -830,6 +849,49 @@ impl Binance {
         Ok(())
     }
 
+    /// Open the private user-data stream. Creates a listen key over REST
+    /// (`POST /api/v3/userDataStream` for spot, `POST /fapi/v1/listenKey` for
+    /// futures — both keyed but unsigned), then opens `wss://.../ws/<listenKey>`.
+    /// Afterwards [`poll_events`](Self::poll_events) also surfaces the account's
+    /// own [`Event::OrderUpdate`] and [`Event::BalanceUpdate`].
+    ///
+    /// The listen key expires after 60 minutes without a keepalive `PUT`; issuing
+    /// that keepalive is tracked as a follow-up.
+    ///
+    /// # Errors
+    /// Returns [`Error::InvalidCredentials`] without an API key, [`Error::NotConnected`]
+    /// without a WebSocket transport, or another [`Error`] if the request fails.
+    pub fn subscribe_user_data(&mut self) -> Result<()> {
+        let creds = self.credentials.as_ref().ok_or(Error::InvalidCredentials(
+            "user-data stream requires credentials",
+        ))?;
+        let path = if self.is_futures() {
+            "/fapi/v1/listenKey"
+        } else {
+            "/api/v3/userDataStream"
+        };
+        let url = format!("{}{path}", self.rest_base);
+        let request = HttpRequest::new(HttpMethod::Post, url)
+            .with_header("X-MBX-APIKEY", creds.api_key.clone());
+        let response = self.http.execute(&request)?;
+        if !response.is_success() {
+            return Err(map_error(&response));
+        }
+        let value: serde_json::Value = serde_json::from_str(&response.body)
+            .map_err(|e| Error::Deserialization(e.to_string()))?;
+        let listen_key = value
+            .get("listenKey")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| Error::Deserialization("missing listenKey".to_string()))?;
+        let ws = self.ws.as_ref().ok_or(Error::NotConnected)?;
+        let stream_url = format!(
+            "{}/{listen_key}",
+            ws_base_url(self.market_type, self.testnet)
+        );
+        self.user_data_connection = Some(ws.connect(&stream_url)?);
+        Ok(())
+    }
+
     /// Sign `params`, wrap them in a `ws-api` request frame, send it on the
     /// dedicated connection and return the response `result`.
     fn ws_request(
@@ -907,6 +969,12 @@ impl WsExecution for Binance {
     }
     fn cancel_order_ws(&mut self, symbol: &Symbol, order_id: &str) -> Result<()> {
         Binance::cancel_order_ws(self, symbol, order_id)
+    }
+}
+
+impl WsUserData for Binance {
+    fn subscribe_user_data(&mut self) -> Result<()> {
+        Binance::subscribe_user_data(self)
     }
 }
 
@@ -1240,8 +1308,111 @@ fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Opt
             ask: parse_decimal(field_str(data, "a")?)?,
             volume: parse_decimal(field_str(data, "v")?)?,
         }))),
+        // Private user-data frames. The wire symbol is split directly (the
+        // user-data stream carries no public subscription to resolve against).
+        "executionReport" => {
+            let symbol = split_wire_symbol(field_str(data, "s")?);
+            Ok(Some(Event::OrderUpdate(order_from_user_stream(
+                symbol, data, false,
+            )?)))
+        }
+        "outboundAccountPosition" => Ok(Some(Event::BalanceUpdate(parse_stream_balances(
+            data, "f", "l",
+        )?))),
+        "ORDER_TRADE_UPDATE" => {
+            let order = data
+                .get("o")
+                .ok_or_else(|| Error::Deserialization("missing order payload 'o'".to_string()))?;
+            let symbol = split_wire_symbol(field_str(order, "s")?);
+            Ok(Some(Event::OrderUpdate(order_from_user_stream(
+                symbol, order, true,
+            )?)))
+        }
+        "ACCOUNT_UPDATE" => {
+            let account = data
+                .get("a")
+                .ok_or_else(|| Error::Deserialization("missing account payload 'a'".to_string()))?;
+            // Futures reports a wallet balance `wb`; there is no separate locked
+            // amount, so the free balance carries the wallet balance.
+            Ok(Some(Event::BalanceUpdate(parse_stream_balances(
+                account, "wb", "",
+            )?)))
+        }
         _ => Ok(None),
     }
+}
+
+/// Build an [`Order`] from a spot `executionReport` or a futures
+/// `ORDER_TRADE_UPDATE` order payload. The field names are shared; futures
+/// reports the average fill price directly as `ap`, while spot derives it from
+/// the cumulative quote `Z` over the cumulative filled quantity `z`.
+fn order_from_user_stream(
+    symbol: Symbol,
+    order: &serde_json::Value,
+    futures: bool,
+) -> Result<Order> {
+    let executed = parse_decimal(field_str(order, "z")?)?;
+    let average_price = if futures {
+        let ap = parse_decimal(field_str(order, "ap")?).unwrap_or(Decimal::ZERO);
+        (ap > Decimal::ZERO).then_some(ap)
+    } else {
+        let cum_quote = order
+            .get("Z")
+            .and_then(serde_json::Value::as_str)
+            .map_or(Ok(Decimal::ZERO), parse_decimal)?;
+        (executed > Decimal::ZERO && cum_quote > Decimal::ZERO).then(|| cum_quote / executed)
+    };
+    let parsed_price = parse_decimal(field_str(order, "p")?)?;
+    let price = (parsed_price > Decimal::ZERO).then_some(parsed_price);
+    let order_id = order
+        .get("i")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| Error::Deserialization("missing order id 'i'".to_string()))?;
+    let client_id = order
+        .get("c")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    Ok(Order {
+        id: order_id.to_string(),
+        client_order_id: (!client_id.is_empty()).then(|| client_id.to_string()),
+        symbol,
+        side: parse_side(field_str(order, "S")?)?,
+        order_type: parse_order_type(field_str(order, "o")?)?,
+        status: parse_status(field_str(order, "X")?)?,
+        quantity: parse_decimal(field_str(order, "q")?)?,
+        filled_quantity: executed,
+        price,
+        average_price,
+    })
+}
+
+/// Parse a user-data balance array `B` of `{a, <free_key>, <locked_key>}` into
+/// [`Balance`]s. An empty `locked_key` treats the locked amount as zero (futures
+/// reports only a wallet balance).
+fn parse_stream_balances(
+    payload: &serde_json::Value,
+    free_key: &str,
+    locked_key: &str,
+) -> Result<Vec<Balance>> {
+    let array = payload
+        .get("B")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| Error::Deserialization("missing balances 'B'".to_string()))?;
+    array
+        .iter()
+        .map(|balance| {
+            let locked = if locked_key.is_empty() {
+                Decimal::ZERO
+            } else {
+                parse_decimal(field_str(balance, locked_key)?)?
+            };
+            Ok(Balance {
+                asset: field_str(balance, "a")?.to_string(),
+                free: parse_decimal(field_str(balance, free_key)?)?,
+                locked,
+            })
+        })
+        .collect()
 }
 
 /// The REST base URL for a market type and network.
@@ -1957,6 +2128,120 @@ mod tests {
                 .place_order_ws(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)))
                 .unwrap_err(),
             Error::NotConnected
+        ));
+    }
+
+    /// A credentialed client wired to both a shared HTTP mock (for the listen-key
+    /// POST) and a shared WS mock (for the private stream frames).
+    fn user_data_client(
+        market_type: MarketType,
+    ) -> (Binance, Arc<MockHttpTransport>, Arc<MockWsTransport>) {
+        let http = Arc::new(MockHttpTransport::new());
+        let ws = Arc::new(MockWsTransport::new());
+        let opts = ExchangeOptions::mainnet(market_type);
+        let binance = Binance::with_credentials(
+            Box::new(ArcTransport(Arc::clone(&http))),
+            &opts,
+            Credentials::new("APIKEY", "SECRET"),
+        )
+        .with_ws(Box::new(ArcWs(Arc::clone(&ws))));
+        (binance, http, ws)
+    }
+
+    #[test]
+    fn subscribe_user_data_spot_streams_orders_and_balances() {
+        let (mut binance, http, ws) = user_data_client(MarketType::Spot);
+        http.push_json(200, r#"{"listenKey":"listen-abc"}"#);
+        ws.push_connection(vec![
+            Ok(Some(
+                r#"{"e":"executionReport","s":"BTCUSDT","i":123,"c":"myid","S":"BUY","o":"LIMIT",
+                "X":"FILLED","q":"1.5","z":"1.5","p":"100","Z":"150"}"#
+                    .to_string(),
+            )),
+            Ok(Some(
+                r#"{"e":"outboundAccountPosition","B":[{"a":"USDT","f":"1000","l":"50"},
+                {"a":"BTC","f":"2","l":"0"}]}"#
+                    .to_string(),
+            )),
+        ]);
+        binance.subscribe_user_data().unwrap();
+
+        let reqs = http.recorded_requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].method, HttpMethod::Post);
+        assert!(reqs[0].url.contains("/api/v3/userDataStream"));
+        assert_eq!(
+            ws.connected_urls()[0],
+            "wss://stream.binance.com:9443/ws/listen-abc"
+        );
+
+        let events = binance.poll_events();
+        assert_eq!(events.len(), 2);
+        let Event::OrderUpdate(order) = &events[0] else {
+            panic!("first event must be an order update");
+        };
+        assert_eq!(order.id, "123");
+        assert_eq!(order.client_order_id.as_deref(), Some("myid"));
+        assert_eq!(order.symbol, symbol());
+        assert_eq!(order.side, OrderSide::Buy);
+        assert_eq!(order.status, OrderStatus::Filled);
+        assert_eq!(order.filled_quantity, dec!(1.5));
+        assert_eq!(order.average_price, Some(dec!(100)));
+        let Event::BalanceUpdate(balances) = &events[1] else {
+            panic!("second event must be a balance update");
+        };
+        assert_eq!(balances.len(), 2);
+        assert_eq!(balances[0].asset, "USDT");
+        assert_eq!(balances[0].free, dec!(1000));
+        assert_eq!(balances[0].locked, dec!(50));
+    }
+
+    #[test]
+    fn subscribe_user_data_futures_parses_order_and_account_updates() {
+        let (mut binance, http, ws) = user_data_client(MarketType::UsdMFutures);
+        http.push_json(200, r#"{"listenKey":"fk"}"#);
+        ws.push_connection(vec![
+            Ok(Some(
+                r#"{"e":"ORDER_TRADE_UPDATE","o":{"s":"BTCUSDT","i":456,"c":"","S":"SELL",
+                "o":"LIMIT","X":"PARTIALLY_FILLED","q":"3","z":"1","p":"105","ap":"104.5"}}"#
+                    .to_string(),
+            )),
+            Ok(Some(
+                r#"{"e":"ACCOUNT_UPDATE","a":{"B":[{"a":"USDT","wb":"5000","cw":"5000"}]}}"#
+                    .to_string(),
+            )),
+        ]);
+        binance.subscribe_user_data().unwrap();
+
+        let reqs = http.recorded_requests();
+        assert!(reqs[0].url.contains("/fapi/v1/listenKey"));
+        assert_eq!(ws.connected_urls()[0], "wss://fstream.binance.com/ws/fk");
+
+        let events = binance.poll_events();
+        assert_eq!(events.len(), 2);
+        let Event::OrderUpdate(order) = &events[0] else {
+            panic!("first event must be an order update");
+        };
+        assert_eq!(order.id, "456");
+        assert_eq!(order.side, OrderSide::Sell);
+        assert_eq!(order.status, OrderStatus::PartiallyFilled);
+        assert_eq!(order.filled_quantity, dec!(1));
+        assert_eq!(order.average_price, Some(dec!(104.5)));
+        let Event::BalanceUpdate(balances) = &events[1] else {
+            panic!("second event must be a balance update");
+        };
+        assert_eq!(balances.len(), 1);
+        assert_eq!(balances[0].asset, "USDT");
+        assert_eq!(balances[0].free, dec!(5000));
+        assert_eq!(balances[0].locked, Decimal::ZERO);
+    }
+
+    #[test]
+    fn subscribe_user_data_requires_credentials() {
+        let (mut binance, _http) = client(MarketType::Spot, false);
+        assert!(matches!(
+            binance.subscribe_user_data().unwrap_err(),
+            Error::InvalidCredentials(_)
         ));
     }
 
