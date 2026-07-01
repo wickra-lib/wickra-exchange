@@ -367,9 +367,12 @@ jobs:
         with:
           tool: cargo-llvm-cov
       - name: Generate coverage (lcov)
+        # Only the core is measured: the facade crate holds the thin real-socket
+        # transport adapters, which are exercised by gated integration tests, not
+        # the offline unit suite.
         run: >
           cargo llvm-cov --all-features
-          -p wickra-exchange-core -p wickra-exchange
+          -p wickra-exchange-core
           --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
