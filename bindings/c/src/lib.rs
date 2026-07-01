@@ -21,8 +21,9 @@ use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use wickra_exchange::{
     connect, connect_advanced, connect_derivatives, AdvancedOrders, Credentials, Derivatives,
-    Error, Event, Exchange, ExchangeOptions, MarginMode, MarketType, Order, OrderRequest,
-    OrderSide, OrderStatus, PaperExchange, PositionSide, ReplayExchange, Symbol, TradePrint,
+    Error, Event, Exchange, ExchangeOptions, MarginMode, MarketType, OcoRequest, Order,
+    OrderRequest, OrderSide, OrderStatus, PaperExchange, Position, PositionSide, ReplayExchange,
+    Symbol, TradePrint,
 };
 
 /// Success.
@@ -270,6 +271,20 @@ fn position_side_code(side: PositionSide) -> i32 {
     }
 }
 
+fn fill_position(dst: &mut WickraPosition, position: &Position) {
+    write_cstr(&mut dst.symbol, &position.symbol.to_string());
+    dst.side = position_side_code(position.side);
+    dst.quantity = to_float(position.quantity);
+    dst.entry_price = to_float(position.entry_price);
+    dst.mark_price = to_float(position.mark_price);
+    dst.leverage = to_float(position.leverage);
+    dst.unrealized_pnl = to_float(position.unrealized_pnl);
+    dst.margin_mode = match position.margin_mode {
+        MarginMode::Cross => WICKRA_MARGIN_CROSS,
+        MarginMode::Isolated => WICKRA_MARGIN_ISOLATED,
+    };
+}
+
 /// Collect `(asset, amount)` pairs from parallel C arrays into a paper account.
 ///
 /// # Safety
@@ -320,6 +335,25 @@ fn opt_decimal_arg(value: f64) -> Result<Option<Decimal>, ()> {
         return Ok(None);
     }
     Decimal::from_f64_retain(value).map(Some).ok_or(())
+}
+
+/// Build an [`OrderRequest`] from C-ABI scalars: `side` is `WICKRA_SIDE_*`,
+/// a finite `price` yields a limit order and `NaN` a market order. Returns
+/// `None` on a bad side code or a non-finite quantity/price.
+fn build_request(symbol: Symbol, side: i32, quantity: f64, price: f64) -> Option<OrderRequest> {
+    let quantity = Decimal::from_f64_retain(quantity)?;
+    let price = if price.is_nan() {
+        None
+    } else {
+        Some(Decimal::from_f64_retain(price)?)
+    };
+    match (side, price) {
+        (WICKRA_SIDE_BUY, None) => Some(OrderRequest::market_buy(symbol, quantity)),
+        (WICKRA_SIDE_SELL, None) => Some(OrderRequest::market_sell(symbol, quantity)),
+        (WICKRA_SIDE_BUY, Some(price)) => Some(OrderRequest::limit_buy(symbol, quantity, price)),
+        (WICKRA_SIDE_SELL, Some(price)) => Some(OrderRequest::limit_sell(symbol, quantity, price)),
+        _ => None,
+    }
 }
 
 fn paper_with_costs(maker_bps: f64, taker_bps: f64, slippage_bps: f64) -> Option<PaperExchange> {
@@ -801,22 +835,55 @@ pub unsafe extern "C" fn wickra_derivatives_position(
     match handle.inner.positions(Some(&symbol)) {
         Ok(positions) => match positions.into_iter().find(|p| p.symbol == symbol) {
             Some(position) => {
-                let dst = unsafe { &mut *out };
-                write_cstr(&mut dst.symbol, &position.symbol.to_string());
-                dst.side = position_side_code(position.side);
-                dst.quantity = to_float(position.quantity);
-                dst.entry_price = to_float(position.entry_price);
-                dst.mark_price = to_float(position.mark_price);
-                dst.leverage = to_float(position.leverage);
-                dst.unrealized_pnl = to_float(position.unrealized_pnl);
-                dst.margin_mode = match position.margin_mode {
-                    MarginMode::Cross => WICKRA_MARGIN_CROSS,
-                    MarginMode::Isolated => WICKRA_MARGIN_ISOLATED,
-                };
+                fill_position(unsafe { &mut *out }, &position);
                 WICKRA_OK
             }
             None => WICKRA_ERR_NOT_FOUND,
         },
+        Err(e) => error_code(&e),
+    }
+}
+
+/// List every open position into `out` (capacity `cap`). Pass a `market` C
+/// string to scope to one symbol, or null for all. Returns the total number of
+/// open positions (`>= 0`) or a negative error code; when the return exceeds
+/// `cap` the buffer was truncated — re-call with a larger buffer.
+///
+/// # Safety
+/// `handle` must be valid; `market` must be null or a valid C string; `out` must
+/// be writable for `cap` elements.
+#[no_mangle]
+pub unsafe extern "C" fn wickra_derivatives_positions(
+    handle: *mut WickraDerivatives,
+    market: *const c_char,
+    out: *mut WickraPosition,
+    cap: usize,
+) -> i32 {
+    let Some(handle) = (unsafe { handle.as_mut() }) else {
+        return WICKRA_ERR_NULL;
+    };
+    if out.is_null() && cap != 0 {
+        return WICKRA_ERR_NULL;
+    }
+    let symbol = if market.is_null() {
+        None
+    } else {
+        let Some(market) = (unsafe { opt_str(market) }) else {
+            return WICKRA_ERR_INVALID_ARG;
+        };
+        let Some(symbol) = parse_symbol(market) else {
+            return WICKRA_ERR_INVALID_ARG;
+        };
+        Some(symbol)
+    };
+    match handle.inner.positions(symbol.as_ref()) {
+        Ok(positions) => {
+            let written = positions.len().min(cap);
+            for (i, position) in positions.iter().take(written).enumerate() {
+                fill_position(unsafe { &mut *out.add(i) }, position);
+            }
+            i32::try_from(positions.len()).unwrap_or(i32::MAX)
+        }
         Err(e) => error_code(&e),
     }
 }
@@ -1032,6 +1099,145 @@ pub unsafe extern "C" fn wickra_advanced_cancel_batch(
     };
     match handle.inner.cancel_batch(&symbol, &ids) {
         Ok(()) => WICKRA_OK,
+        Err(e) => error_code(&e),
+    }
+}
+
+/// Place a one-cancels-other bracket on `market`: a take-profit limit leg at
+/// `price` paired with a stop leg triggered at `stop_price`. A finite
+/// `stop_limit_price` makes the stop leg a stop-limit; `NaN` leaves it a
+/// stop-market. The resulting legs are written into `out` (capacity `cap`);
+/// returns the number of legs placed (`>= 0`, typically 2) or a negative error
+/// code. When the return exceeds `cap` the buffer was truncated.
+///
+/// # Safety
+/// `handle` must be valid; `market` must be a valid C string; `out` must be
+/// writable for `cap` elements.
+#[no_mangle]
+pub unsafe extern "C" fn wickra_advanced_place_oco(
+    handle: *mut WickraAdvanced,
+    market: *const c_char,
+    side: i32,
+    quantity: f64,
+    price: f64,
+    stop_price: f64,
+    stop_limit_price: f64,
+    out: *mut WickraOrder,
+    cap: usize,
+) -> i32 {
+    let Some(handle) = (unsafe { handle.as_mut() }) else {
+        return WICKRA_ERR_NULL;
+    };
+    if out.is_null() && cap != 0 {
+        return WICKRA_ERR_NULL;
+    }
+    let Some(market) = (unsafe { opt_str(market) }) else {
+        return WICKRA_ERR_INVALID_ARG;
+    };
+    let Some(symbol) = parse_symbol(market) else {
+        return WICKRA_ERR_INVALID_ARG;
+    };
+    let side = match side {
+        WICKRA_SIDE_BUY => OrderSide::Buy,
+        WICKRA_SIDE_SELL => OrderSide::Sell,
+        _ => return WICKRA_ERR_INVALID_ARG,
+    };
+    let (Some(quantity), Some(price), Some(stop_price)) = (
+        Decimal::from_f64_retain(quantity),
+        Decimal::from_f64_retain(price),
+        Decimal::from_f64_retain(stop_price),
+    ) else {
+        return WICKRA_ERR_INVALID_ARG;
+    };
+    let mut request = OcoRequest::new(symbol, side, quantity, price, stop_price);
+    if !stop_limit_price.is_nan() {
+        let Some(slp) = Decimal::from_f64_retain(stop_limit_price) else {
+            return WICKRA_ERR_INVALID_ARG;
+        };
+        request = request.with_stop_limit_price(slp);
+    }
+    match handle.inner.place_oco(&request) {
+        Ok(orders) => {
+            let written = orders.len().min(cap);
+            for (i, order) in orders.iter().take(written).enumerate() {
+                fill_order(unsafe { &mut *out.add(i) }, order);
+            }
+            i32::try_from(orders.len()).unwrap_or(i32::MAX)
+        }
+        Err(e) => error_code(&e),
+    }
+}
+
+/// Place several orders in one request. The `n` orders are described by parallel
+/// arrays: `markets[i]` (C string), `sides[i]` (`WICKRA_SIDE_*`), `quantities[i]`,
+/// and `prices[i]` (finite for a limit order, `NaN` for market). Each order's
+/// outcome is written into `out[i]` and its per-order status into `out_codes[i]`
+/// (`WICKRA_OK` on success, else a negative error code with `out[i]` left empty).
+/// Returns the number of results written (`>= 0`, capped at `cap`) or a negative
+/// error code for a whole-request failure.
+///
+/// # Safety
+/// `handle` must be valid; `markets`/`sides`/`quantities`/`prices` must each
+/// point to `n` valid elements; `out` and `out_codes` must be writable for `cap`
+/// elements.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn wickra_advanced_place_batch(
+    handle: *mut WickraAdvanced,
+    markets: *const *const c_char,
+    sides: *const i32,
+    quantities: *const f64,
+    prices: *const f64,
+    n: usize,
+    out: *mut WickraOrder,
+    out_codes: *mut i32,
+    cap: usize,
+) -> i32 {
+    let Some(handle) = (unsafe { handle.as_mut() }) else {
+        return WICKRA_ERR_NULL;
+    };
+    if (out.is_null() || out_codes.is_null()) && cap != 0 {
+        return WICKRA_ERR_NULL;
+    }
+    if n != 0 && (markets.is_null() || sides.is_null() || quantities.is_null() || prices.is_null())
+    {
+        return WICKRA_ERR_NULL;
+    }
+    let mut requests = Vec::with_capacity(n);
+    for i in 0..n {
+        let Some(market) = (unsafe { opt_str(*markets.add(i)) }) else {
+            return WICKRA_ERR_INVALID_ARG;
+        };
+        let Some(symbol) = parse_symbol(market) else {
+            return WICKRA_ERR_INVALID_ARG;
+        };
+        let side = unsafe { *sides.add(i) };
+        let quantity = unsafe { *quantities.add(i) };
+        let price = unsafe { *prices.add(i) };
+        let Some(request) = build_request(symbol, side, quantity, price) else {
+            return WICKRA_ERR_INVALID_ARG;
+        };
+        requests.push(request);
+    }
+    match handle.inner.place_batch(&requests) {
+        Ok(results) => {
+            let written = results.len().min(cap);
+            for (i, result) in results.iter().take(written).enumerate() {
+                let slot = unsafe { &mut *out.add(i) };
+                let code = unsafe { &mut *out_codes.add(i) };
+                match result {
+                    Ok(order) => {
+                        fill_order(slot, order);
+                        *code = WICKRA_OK;
+                    }
+                    Err(e) => {
+                        *slot = empty_order();
+                        *code = error_code(e);
+                    }
+                }
+            }
+            i32::try_from(results.len()).unwrap_or(i32::MAX)
+        }
         Err(e) => error_code(&e),
     }
 }
@@ -1375,6 +1581,176 @@ mod tests {
                     f64::INFINITY,
                     f64::NAN,
                     &raw mut out,
+                )
+            },
+            WICKRA_ERR_INVALID_ARG
+        );
+        unsafe { wickra_advanced_free(handle) };
+    }
+
+    fn live_derivatives(name: &str) -> *mut WickraDerivatives {
+        let (name, key, secret) = (cstr(name), cstr("k"), cstr("s"));
+        unsafe {
+            wickra_connect_derivatives(
+                name.as_ptr(),
+                key.as_ptr(),
+                secret.as_ptr(),
+                core::ptr::null(),
+                core::ptr::null(),
+                false,
+            )
+        }
+    }
+
+    fn live_advanced(name: &str) -> *mut WickraAdvanced {
+        let (name, key, secret) = (cstr(name), cstr("k"), cstr("s"));
+        unsafe {
+            wickra_connect_advanced(
+                name.as_ptr(),
+                key.as_ptr(),
+                secret.as_ptr(),
+                core::ptr::null(),
+                core::ptr::null(),
+                false,
+                false,
+            )
+        }
+    }
+
+    #[test]
+    fn derivatives_positions_null_and_bad_arg() {
+        // Null handle is rejected without touching the buffer.
+        let mut buf: [WickraPosition; 2] = unsafe { core::mem::zeroed() };
+        assert_eq!(
+            unsafe {
+                wickra_derivatives_positions(
+                    core::ptr::null_mut(),
+                    core::ptr::null(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            },
+            WICKRA_ERR_NULL
+        );
+        // Live handle (offline until an RPC): a malformed market is rejected.
+        let handle = live_derivatives("binance");
+        assert!(!handle.is_null());
+        let bad_market = cstr("BTCUSDT");
+        assert_eq!(
+            unsafe {
+                wickra_derivatives_positions(
+                    handle,
+                    bad_market.as_ptr(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            },
+            WICKRA_ERR_INVALID_ARG
+        );
+        unsafe { wickra_derivatives_free(handle) };
+    }
+
+    #[test]
+    fn advanced_place_oco_null_and_bad_args() {
+        let market = cstr("BTC/USDT");
+        let mut buf: [WickraOrder; 2] = [empty_order(), empty_order()];
+        assert_eq!(
+            unsafe {
+                wickra_advanced_place_oco(
+                    core::ptr::null_mut(),
+                    market.as_ptr(),
+                    WICKRA_SIDE_SELL,
+                    1.0,
+                    110.0,
+                    90.0,
+                    f64::NAN,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            },
+            WICKRA_ERR_NULL
+        );
+        let handle = live_advanced("binance");
+        assert!(!handle.is_null());
+        // A bad side code is rejected before any network request.
+        assert_eq!(
+            unsafe {
+                wickra_advanced_place_oco(
+                    handle,
+                    market.as_ptr(),
+                    42,
+                    1.0,
+                    110.0,
+                    90.0,
+                    f64::NAN,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            },
+            WICKRA_ERR_INVALID_ARG
+        );
+        // A non-finite stop-limit price is rejected.
+        assert_eq!(
+            unsafe {
+                wickra_advanced_place_oco(
+                    handle,
+                    market.as_ptr(),
+                    WICKRA_SIDE_SELL,
+                    1.0,
+                    110.0,
+                    90.0,
+                    f64::INFINITY,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            },
+            WICKRA_ERR_INVALID_ARG
+        );
+        unsafe { wickra_advanced_free(handle) };
+    }
+
+    #[test]
+    fn advanced_place_batch_null_and_bad_arg() {
+        let good = cstr("BTC/USDT");
+        let markets = [good.as_ptr()];
+        let sides = [WICKRA_SIDE_BUY];
+        let quantities = [1.0_f64];
+        let prices = [f64::NAN];
+        let mut out: [WickraOrder; 1] = [empty_order()];
+        let mut codes = [0_i32; 1];
+        assert_eq!(
+            unsafe {
+                wickra_advanced_place_batch(
+                    core::ptr::null_mut(),
+                    markets.as_ptr(),
+                    sides.as_ptr(),
+                    quantities.as_ptr(),
+                    prices.as_ptr(),
+                    1,
+                    out.as_mut_ptr(),
+                    codes.as_mut_ptr(),
+                    out.len(),
+                )
+            },
+            WICKRA_ERR_NULL
+        );
+        // A malformed market in the array is rejected before any request.
+        let handle = live_advanced("binance");
+        assert!(!handle.is_null());
+        let bad = cstr("BTCUSDT");
+        let bad_markets = [bad.as_ptr()];
+        assert_eq!(
+            unsafe {
+                wickra_advanced_place_batch(
+                    handle,
+                    bad_markets.as_ptr(),
+                    sides.as_ptr(),
+                    quantities.as_ptr(),
+                    prices.as_ptr(),
+                    1,
+                    out.as_mut_ptr(),
+                    codes.as_mut_ptr(),
+                    out.len(),
                 )
             },
             WICKRA_ERR_INVALID_ARG

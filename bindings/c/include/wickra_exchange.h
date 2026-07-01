@@ -406,6 +406,21 @@ int32_t wickra_derivatives_position(WickraDerivatives *handle,
                                     WickraPosition *out);
 
 /**
+ * List every open position into `out` (capacity `cap`). Pass a `market` C
+ * string to scope to one symbol, or null for all. Returns the total number of
+ * open positions (`>= 0`) or a negative error code; when the return exceeds
+ * `cap` the buffer was truncated — re-call with a larger buffer.
+ *
+ * # Safety
+ * `handle` must be valid; `market` must be null or a valid C string; `out` must
+ * be writable for `cap` elements.
+ */
+int32_t wickra_derivatives_positions(WickraDerivatives *handle,
+                                     const char *market,
+                                     WickraPosition *out,
+                                     uintptr_t cap);
+
+/**
  * Set the leverage for `market`.
  *
  * # Safety
@@ -489,6 +504,52 @@ int32_t wickra_advanced_cancel_batch(WickraAdvanced *handle,
                                      const char *market,
                                      const char *const *order_ids,
                                      uintptr_t n);
+
+/**
+ * Place a one-cancels-other bracket on `market`: a take-profit limit leg at
+ * `price` paired with a stop leg triggered at `stop_price`. A finite
+ * `stop_limit_price` makes the stop leg a stop-limit; `NaN` leaves it a
+ * stop-market. The resulting legs are written into `out` (capacity `cap`);
+ * returns the number of legs placed (`>= 0`, typically 2) or a negative error
+ * code. When the return exceeds `cap` the buffer was truncated.
+ *
+ * # Safety
+ * `handle` must be valid; `market` must be a valid C string; `out` must be
+ * writable for `cap` elements.
+ */
+int32_t wickra_advanced_place_oco(WickraAdvanced *handle,
+                                  const char *market,
+                                  int32_t side,
+                                  double quantity,
+                                  double price,
+                                  double stop_price,
+                                  double stop_limit_price,
+                                  WickraOrder *out,
+                                  uintptr_t cap);
+
+/**
+ * Place several orders in one request. The `n` orders are described by parallel
+ * arrays: `markets[i]` (C string), `sides[i]` (`WICKRA_SIDE_*`), `quantities[i]`,
+ * and `prices[i]` (finite for a limit order, `NaN` for market). Each order's
+ * outcome is written into `out[i]` and its per-order status into `out_codes[i]`
+ * (`WICKRA_OK` on success, else a negative error code with `out[i]` left empty).
+ * Returns the number of results written (`>= 0`, capped at `cap`) or a negative
+ * error code for a whole-request failure.
+ *
+ * # Safety
+ * `handle` must be valid; `markets`/`sides`/`quantities`/`prices` must each
+ * point to `n` valid elements; `out` and `out_codes` must be writable for `cap`
+ * elements.
+ */
+int32_t wickra_advanced_place_batch(WickraAdvanced *handle,
+                                    const char *const *markets,
+                                    const int32_t *sides,
+                                    const double *quantities,
+                                    const double *prices,
+                                    uintptr_t n,
+                                    WickraOrder *out,
+                                    int32_t *out_codes,
+                                    uintptr_t cap);
 
 #ifdef __cplusplus
 }  // extern "C"
