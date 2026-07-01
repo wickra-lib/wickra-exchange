@@ -256,7 +256,7 @@ public sealed unsafe class Exchange : IDisposable
 
     // ---------------------------- helpers ------------------------------------
 
-    private static byte[] Utf8(string value)
+    internal static byte[] Utf8(string value)
     {
         int len = Encoding.UTF8.GetByteCount(value);
         var bytes = new byte[len + 1];
@@ -287,13 +287,13 @@ public sealed unsafe class Exchange : IDisposable
         }
     }
 
-    private static string CString(ReadOnlySpan<byte> buf)
+    internal static string CString(ReadOnlySpan<byte> buf)
     {
         int end = buf.IndexOf((byte)0);
         return Encoding.UTF8.GetString(end < 0 ? buf : buf[..end]);
     }
 
-    private static OrderInfo ReadOrder(Native.Order order)
+    internal static OrderInfo ReadOrder(Native.Order order)
     {
         string id;
         var span = new Span<byte>(order.Id, Native.StrCap);
@@ -316,7 +316,7 @@ public sealed unsafe class Exchange : IDisposable
         return new EventInfo((EventKind)ev.Kind, symbol, price, qty, side, order);
     }
 
-    private static void Check(int code)
+    internal static void Check(int code)
     {
         if (code != Native.Ok)
         {
