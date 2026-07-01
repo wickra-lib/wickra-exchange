@@ -30,7 +30,9 @@ use crate::options::{ExchangeOptions, MarginMode, MarketType, SelfTradePreventio
 use crate::positions::{Position, PositionSide};
 use crate::signing::hmac_sha256_hex;
 use crate::symbol::Symbol;
-use crate::traits::{AdvancedOrders, Derivatives, Exchange, Execution, MarketData, WsUserData};
+use crate::traits::{
+    AdvancedOrders, Derivatives, Exchange, Execution, MarketData, WsExecution, WsUserData,
+};
 use crate::transport::{HttpMethod, HttpRequest, HttpTransport, WsConnection, WsTransport};
 use crate::types::{
     Balance, OcoRequest, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker,
@@ -67,6 +69,10 @@ pub struct Bybit {
     /// [`subscribe_user_data`](Self::subscribe_user_data) and drained by
     /// [`poll_events`](Self::poll_events) alongside the public stream.
     private_connection: Option<Box<dyn WsConnection>>,
+    /// A dedicated connection to the WebSocket trade API (`/v5/trade`), opened and
+    /// authenticated lazily on the first [`place_order_ws`](Self::place_order_ws)
+    /// / [`cancel_order_ws`](Self::cancel_order_ws) call.
+    ws_api_connection: Option<Box<dyn WsConnection>>,
 }
 
 impl Bybit {
@@ -92,6 +98,7 @@ impl Bybit {
             sub_messages: Vec::new(),
             subscriptions: Vec::new(),
             private_connection: None,
+            ws_api_connection: None,
         }
     }
 
@@ -396,6 +403,145 @@ impl Bybit {
         });
         self.signed_request(HttpMethod::Post, "/v5/order/cancel", "", &body.to_string())?;
         Ok(())
+    }
+
+    /// Place an order over the Bybit WebSocket trade API (`order.create`). Builds
+    /// the same args as the REST path and exchanges them on the lazily-opened,
+    /// authenticated `/v5/trade` connection. Bybit returns only the ids, so the
+    /// resulting [`Order`] carries the request's fields with a `New` status.
+    ///
+    /// # Errors
+    /// Returns [`Error::NotConnected`] without a WebSocket transport, or another
+    /// [`Error`] if the order is invalid or rejected.
+    pub fn place_order_ws(&mut self, request: &OrderRequest) -> Result<Order> {
+        request.validate()?;
+        let time_in_force = if request.post_only {
+            "PostOnly"
+        } else {
+            tif_str(request.time_in_force)
+        };
+        let mut arg = serde_json::json!({
+            "category": self.category,
+            "symbol": Self::wire_symbol(&request.symbol),
+            "side": side_str(request.side),
+            "orderType": order_type_str(request.order_type),
+            "qty": format_decimal(request.quantity),
+            "timeInForce": time_in_force,
+        });
+        if let Some(price) = request.price {
+            arg["price"] = serde_json::json!(format_decimal(price));
+        }
+        if let Some(id) = &request.client_order_id {
+            arg["orderLinkId"] = serde_json::json!(id.clone());
+        }
+        if request.reduce_only {
+            arg["reduceOnly"] = serde_json::json!(true);
+        }
+        let data = self.ws_trade_request("order.create", &arg)?;
+        let created: CreateResult =
+            serde_json::from_value(data).map_err(|e| Error::Deserialization(e.to_string()))?;
+        Ok(Order {
+            id: created.order_id,
+            client_order_id: (!created.order_link_id.is_empty()).then_some(created.order_link_id),
+            symbol: request.symbol.clone(),
+            side: request.side,
+            order_type: request.order_type,
+            status: OrderStatus::New,
+            quantity: request.quantity,
+            filled_quantity: Decimal::ZERO,
+            price: request.price,
+            average_price: None,
+        })
+    }
+
+    /// Cancel an order over the Bybit WebSocket trade API (`order.cancel`).
+    ///
+    /// # Errors
+    /// Returns [`Error::NotConnected`] without a WebSocket transport, or another
+    /// [`Error`] if the order is unknown or the request fails.
+    pub fn cancel_order_ws(&mut self, symbol: &Symbol, order_id: &str) -> Result<()> {
+        let arg = serde_json::json!({
+            "category": self.category,
+            "symbol": Self::wire_symbol(symbol),
+            "orderId": order_id,
+        });
+        self.ws_trade_request("order.cancel", &arg)?;
+        Ok(())
+    }
+
+    /// Open and authenticate the `/v5/trade` connection if needed. Sends the
+    /// `op:auth` frame (same signature as the private stream) and consumes the
+    /// auth acknowledgement so later requests read their own responses.
+    fn ensure_ws_trade(&mut self) -> Result<()> {
+        if self.ws_api_connection.is_some() {
+            return Ok(());
+        }
+        let creds = self.credentials.as_ref().ok_or(Error::InvalidCredentials(
+            "WebSocket trade requires credentials",
+        ))?;
+        let expires = (self.now_ms)() + i64::try_from(self.recv_window_ms).unwrap_or(5000);
+        let signature = hmac_sha256_hex(
+            creds.api_secret.as_bytes(),
+            format!("GET/realtime{expires}").as_bytes(),
+        );
+        let auth = format!(
+            r#"{{"op":"auth","args":["{}",{expires},"{signature}"]}}"#,
+            creds.api_key
+        );
+        let ws = self.ws.as_ref().ok_or(Error::NotConnected)?;
+        let mut connection = ws.connect(&ws_trade_url(self.testnet))?;
+        connection.send(&auth)?;
+        // Consume the auth acknowledgement.
+        connection.recv()?;
+        self.ws_api_connection = Some(connection);
+        Ok(())
+    }
+
+    /// Send a signed trade request frame and return its `data`, mapping a non-zero
+    /// `retCode` onto the error taxonomy.
+    fn ws_trade_request(&mut self, op: &str, arg: &serde_json::Value) -> Result<serde_json::Value> {
+        self.ensure_ws_trade()?;
+        let now = (self.now_ms)();
+        let frame = serde_json::json!({
+            "reqId": now.to_string(),
+            "header": {
+                "X-BAPI-TIMESTAMP": now.to_string(),
+                "X-BAPI-RECV-WINDOW": self.recv_window_ms.to_string(),
+            },
+            "op": op,
+            "args": [arg],
+        })
+        .to_string();
+        let connection = self
+            .ws_api_connection
+            .as_mut()
+            .expect("ws-trade connection just ensured");
+        connection.send(&frame)?;
+        let Some(response) = connection.recv()? else {
+            return Err(Error::NotConnected);
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&response).map_err(|e| Error::Deserialization(e.to_string()))?;
+        let ret_code = value
+            .get("retCode")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(-1);
+        if ret_code == 0 {
+            Ok(value
+                .get("data")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null))
+        } else {
+            let message = value
+                .get("retMsg")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            Err(Error::OrderRejected {
+                code: ret_code.to_string(),
+                message,
+            })
+        }
     }
 
     /// Query a single order by venue id.
@@ -824,6 +970,16 @@ fn ws_private_url(testnet: bool) -> String {
     format!("{host}/v5/private")
 }
 
+/// The WebSocket trade-API URL for a network.
+fn ws_trade_url(testnet: bool) -> String {
+    let host = if testnet {
+        "wss://stream-testnet.bybit.com"
+    } else {
+        "wss://stream.bybit.com"
+    };
+    format!("{host}/v5/trade")
+}
+
 fn field_str<'a>(value: &'a serde_json::Value, key: &str) -> Result<&'a str> {
     value
         .get(key)
@@ -1242,6 +1398,15 @@ impl Exchange for Bybit {
 impl WsUserData for Bybit {
     fn subscribe_user_data(&mut self) -> Result<()> {
         Bybit::subscribe_user_data(self)
+    }
+}
+
+impl WsExecution for Bybit {
+    fn place_order_ws(&mut self, request: &OrderRequest) -> Result<Order> {
+        Bybit::place_order_ws(self, request)
+    }
+    fn cancel_order_ws(&mut self, symbol: &Symbol, order_id: &str) -> Result<()> {
+        Bybit::cancel_order_ws(self, symbol, order_id)
     }
 }
 
@@ -1869,6 +2034,70 @@ mod tests {
         let mut bybit = streaming_client(&ws);
         assert!(matches!(
             bybit.subscribe_user_data().unwrap_err(),
+            Error::InvalidCredentials(_)
+        ));
+    }
+
+    #[test]
+    fn place_and_cancel_order_over_ws_trade() {
+        let (mut bybit, ws) = signed_ws_client(1000);
+        ws.push_connection(vec![
+            Ok(Some(
+                r#"{"op":"auth","retCode":0,"retMsg":"OK"}"#.to_string(),
+            )),
+            Ok(Some(
+                r#"{"reqId":"1000","retCode":0,"retMsg":"OK","op":"order.create",
+                "data":{"orderId":"55","orderLinkId":"my"}}"#
+                    .to_string(),
+            )),
+            Ok(Some(
+                r#"{"reqId":"1000","retCode":0,"retMsg":"OK","op":"order.cancel",
+                "data":{"orderId":"55"}}"#
+                    .to_string(),
+            )),
+        ]);
+        let order = bybit
+            .place_order_ws(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)))
+            .unwrap();
+        assert_eq!(order.id, "55");
+        assert_eq!(order.client_order_id.as_deref(), Some("my"));
+        assert_eq!(order.status, OrderStatus::New);
+        assert_eq!(ws.connected_urls()[0], "wss://stream.bybit.com/v5/trade");
+        // The auth frame is sent first, then the order request.
+        assert!(ws.sent()[0].contains(r#""op":"auth""#));
+        assert!(ws.sent()[1].contains(r#""op":"order.create""#));
+        assert!(ws.sent()[1].contains(r#""symbol":"BTCUSDT""#));
+
+        bybit.cancel_order_ws(&symbol(), "55").unwrap();
+        assert!(ws.sent()[2].contains(r#""op":"order.cancel""#));
+        assert!(ws.sent()[2].contains(r#""orderId":"55""#));
+    }
+
+    #[test]
+    fn ws_trade_surfaces_rejection() {
+        let (mut bybit, ws) = signed_ws_client(1000);
+        ws.push_connection(vec![
+            Ok(Some(r#"{"op":"auth","retCode":0}"#.to_string())),
+            Ok(Some(
+                r#"{"reqId":"1000","retCode":10001,"retMsg":"insufficient balance"}"#.to_string(),
+            )),
+        ]);
+        assert!(matches!(
+            bybit
+                .place_order_ws(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)))
+                .unwrap_err(),
+            Error::OrderRejected { .. }
+        ));
+    }
+
+    #[test]
+    fn ws_trade_requires_credentials() {
+        let ws = Arc::new(MockWsTransport::new());
+        let mut bybit = streaming_client(&ws);
+        assert!(matches!(
+            bybit
+                .place_order_ws(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)))
+                .unwrap_err(),
             Error::InvalidCredentials(_)
         ));
     }
