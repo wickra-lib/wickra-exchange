@@ -22,8 +22,10 @@ use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 
 use wickra_exchange::{
-    connect, Credentials, Event, Exchange, ExchangeOptions, MarketType, Order, OrderRequest,
-    OrderSide, OrderStatus, PaperExchange, ReplayExchange, Symbol, Ticker, TradePrint,
+    connect, connect_advanced, connect_derivatives, AdvancedOrders, Credentials, Derivatives,
+    Event, Exchange, ExchangeOptions, MarginMode, MarketType, OcoRequest, Order, OrderRequest,
+    OrderSide, OrderStatus, PaperExchange, Position, PositionSide, ReplayExchange, Symbol, Ticker,
+    TradePrint,
 };
 
 /// Parse a `"BASE/QUOTE"` market string into a [`Symbol`].
@@ -80,6 +82,55 @@ fn order_dict<'py>(py: Python<'py>, order: &Order) -> PyResult<Bound<'py, PyDict
     dict.set_item("price", order.price.map(to_float))?;
     dict.set_item("average_price", order.average_price.map(to_float))?;
     Ok(dict)
+}
+
+fn position_side_str(side: PositionSide) -> &'static str {
+    match side {
+        PositionSide::Long => "long",
+        PositionSide::Short => "short",
+    }
+}
+
+/// Build a Python dict describing a [`Position`].
+fn position_dict<'py>(py: Python<'py>, position: &Position) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("symbol", position.symbol.to_string())?;
+    dict.set_item("side", position_side_str(position.side))?;
+    dict.set_item("quantity", to_float(position.quantity))?;
+    dict.set_item("entry_price", to_float(position.entry_price))?;
+    dict.set_item("mark_price", to_float(position.mark_price))?;
+    dict.set_item("leverage", to_float(position.leverage))?;
+    dict.set_item("unrealized_pnl", to_float(position.unrealized_pnl))?;
+    dict.set_item(
+        "margin_mode",
+        match position.margin_mode {
+            MarginMode::Cross => "cross",
+            MarginMode::Isolated => "isolated",
+        },
+    )?;
+    Ok(dict)
+}
+
+/// Parse a margin-mode string (`"cross"` / `"isolated"`).
+fn margin_mode_from_str(mode: &str) -> PyResult<MarginMode> {
+    match mode {
+        "cross" => Ok(MarginMode::Cross),
+        "isolated" => Ok(MarginMode::Isolated),
+        other => Err(PyValueError::new_err(format!(
+            "margin_mode must be 'cross' or 'isolated', got {other:?}"
+        ))),
+    }
+}
+
+/// Parse an order-side string (`"buy"` / `"sell"`).
+fn side_from_str(side: &str) -> PyResult<OrderSide> {
+    match side {
+        "buy" => Ok(OrderSide::Buy),
+        "sell" => Ok(OrderSide::Sell),
+        other => Err(PyValueError::new_err(format!(
+            "side must be 'buy' or 'sell', got {other:?}"
+        ))),
+    }
 }
 
 /// Build a Python dict describing a stream [`Event`].
@@ -389,6 +440,191 @@ impl PyExchange {
     }
 }
 
+/// A live derivatives (futures/perpetual) client: positions, leverage, margin
+/// mode and reduce-only close. Available on the eight venues with futures markets.
+#[pyclass(name = "Derivatives", unsendable)]
+pub struct PyDerivatives {
+    inner: Box<dyn Derivatives>,
+}
+
+#[pymethods]
+impl PyDerivatives {
+    /// Connect a USDⓈ-M futures client for `name`. Raises for a spot-only venue.
+    #[staticmethod]
+    #[pyo3(signature = (name, credentials, testnet=false))]
+    fn connect(name: &str, credentials: &PyCredentials, testnet: bool) -> PyResult<Self> {
+        let options = if testnet {
+            ExchangeOptions::testnet(MarketType::UsdMFutures)
+        } else {
+            ExchangeOptions::mainnet(MarketType::UsdMFutures)
+        };
+        let inner = connect_derivatives(name, credentials.inner.clone(), &options)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(Self { inner })
+    }
+
+    /// Open positions, optionally filtered to one `market`; each as a dict.
+    #[pyo3(signature = (market=None))]
+    fn positions<'py>(
+        &mut self,
+        py: Python<'py>,
+        market: Option<&str>,
+    ) -> PyResult<Vec<Bound<'py, PyDict>>> {
+        let symbol = market.map(parse_symbol).transpose()?;
+        self.inner
+            .positions(symbol.as_ref())
+            .map_err(|e| PyValueError::new_err(e.to_string()))?
+            .iter()
+            .map(|p| position_dict(py, p))
+            .collect()
+    }
+
+    /// Set the leverage for `market`.
+    fn set_leverage(&mut self, market: &str, leverage: u32) -> PyResult<()> {
+        self.inner
+            .set_leverage(&parse_symbol(market)?, leverage)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
+    /// Set the margin mode for `market` (`"cross"` or `"isolated"`).
+    fn set_margin_mode(&mut self, market: &str, mode: &str) -> PyResult<()> {
+        self.inner
+            .set_margin_mode(&parse_symbol(market)?, margin_mode_from_str(mode)?)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
+    /// Flatten the open position in `market` with a reduce-only market order.
+    fn close_position<'py>(
+        &mut self,
+        py: Python<'py>,
+        market: &str,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let order = self
+            .inner
+            .close_position(&parse_symbol(market)?)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        order_dict(py, &order)
+    }
+}
+
+/// A live advanced-orders client: amend, batch place/cancel and OCO. Available
+/// on the eight trading venues (native where supported, else a documented error).
+#[pyclass(name = "AdvancedOrders", unsendable)]
+pub struct PyAdvancedOrders {
+    inner: Box<dyn AdvancedOrders>,
+}
+
+#[pymethods]
+impl PyAdvancedOrders {
+    /// Connect an advanced-orders client for `name`. `futures` selects the
+    /// USDⓈ-M futures market. Raises for a venue without an advanced-order surface.
+    #[staticmethod]
+    #[pyo3(signature = (name, credentials, testnet=false, futures=false))]
+    fn connect(
+        name: &str,
+        credentials: &PyCredentials,
+        testnet: bool,
+        futures: bool,
+    ) -> PyResult<Self> {
+        let market_type = if futures {
+            MarketType::UsdMFutures
+        } else {
+            MarketType::Spot
+        };
+        let options = if testnet {
+            ExchangeOptions::testnet(market_type)
+        } else {
+            ExchangeOptions::mainnet(market_type)
+        };
+        let inner = connect_advanced(name, credentials.inner.clone(), &options)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(Self { inner })
+    }
+
+    /// Amend a resting order's price and/or quantity in place; `None` leaves that
+    /// field unchanged. Returns the refreshed order as a dict.
+    #[pyo3(signature = (market, order_id, new_price=None, new_quantity=None))]
+    fn amend_order<'py>(
+        &mut self,
+        py: Python<'py>,
+        market: &str,
+        order_id: &str,
+        new_price: Option<f64>,
+        new_quantity: Option<f64>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let price = new_price.map(to_decimal).transpose()?;
+        let quantity = new_quantity.map(to_decimal).transpose()?;
+        let order = self
+            .inner
+            .amend_order(&parse_symbol(market)?, order_id, price, quantity)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        order_dict(py, &order)
+    }
+
+    /// Place several orders in one request; returns a list where each element is
+    /// the order dict, or `{"error": ...}` for a rejected leg.
+    fn place_batch<'py>(
+        &mut self,
+        py: Python<'py>,
+        requests: Vec<PyRef<'py, PyOrderRequest>>,
+    ) -> PyResult<Vec<Bound<'py, PyDict>>> {
+        let orders: Vec<OrderRequest> = requests.iter().map(|r| r.inner.clone()).collect();
+        let results = self
+            .inner
+            .place_batch(&orders)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        results
+            .iter()
+            .map(|result| match result {
+                Ok(order) => order_dict(py, order),
+                Err(e) => {
+                    let dict = PyDict::new(py);
+                    dict.set_item("error", e.to_string())?;
+                    Ok(dict)
+                }
+            })
+            .collect()
+    }
+
+    /// Cancel several orders on `market` in one request.
+    fn cancel_batch(&mut self, market: &str, order_ids: Vec<String>) -> PyResult<()> {
+        self.inner
+            .cancel_batch(&parse_symbol(market)?, &order_ids)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
+    /// Place a one-cancels-other bracket (take-profit `price` + `stop_price`
+    /// trigger, optional `stop_limit_price`); returns the resulting order legs.
+    #[pyo3(signature = (market, side, quantity, price, stop_price, stop_limit_price=None))]
+    fn place_oco<'py>(
+        &mut self,
+        py: Python<'py>,
+        market: &str,
+        side: &str,
+        quantity: f64,
+        price: f64,
+        stop_price: f64,
+        stop_limit_price: Option<f64>,
+    ) -> PyResult<Vec<Bound<'py, PyDict>>> {
+        let mut request = OcoRequest::new(
+            parse_symbol(market)?,
+            side_from_str(side)?,
+            to_decimal(quantity)?,
+            to_decimal(price)?,
+            to_decimal(stop_price)?,
+        );
+        if let Some(slp) = stop_limit_price {
+            request = request.with_stop_limit_price(to_decimal(slp)?);
+        }
+        self.inner
+            .place_oco(&request)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?
+            .iter()
+            .map(|order| order_dict(py, order))
+            .collect()
+    }
+}
+
 /// The `_wickra_exchange` extension module.
 #[pymodule]
 fn _wickra_exchange(module: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -396,5 +632,7 @@ fn _wickra_exchange(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyCredentials>()?;
     module.add_class::<PyOrderRequest>()?;
     module.add_class::<PyExchange>()?;
+    module.add_class::<PyDerivatives>()?;
+    module.add_class::<PyAdvancedOrders>()?;
     Ok(())
 }
