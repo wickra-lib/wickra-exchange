@@ -31,3 +31,26 @@ loop {
 `OrderUpdate`, `BalanceUpdate`, `Subscribed`, `Disconnected`, `Reconnected`.
 Execution events (order/balance updates) flow through the same `poll_events`
 drain as market data.
+
+## Reconnect and the dead-man's-switch
+
+When the peer closes a stream, the client transparently **reconnects and replays
+every subscription** — the consumer only sees a `Disconnected` followed by a
+`Reconnected` event, and the buffer keeps filling.
+
+For live trading, pair that with a **dead-man's-switch** (`DeadMansSwitch`): arm
+it and feed it a heartbeat on every message; if the deadline passes without one,
+`is_expired` fires and you cancel every resting order (via the venue's cancel-all
+endpoint, or `PaperExchange::cancel_all` in simulation) so nothing works
+unattended after a disconnect.
+
+```rust
+use wickra_exchange::DeadMansSwitch;
+use std::time::Duration;
+
+let mut guard = DeadMansSwitch::new(Duration::from_secs(10));
+guard.heartbeat(now_ms);            // on every successful message
+if guard.is_expired(now_ms) {
+    exchange_cancel_all();          // heartbeat lost -> pull all orders
+}
+```

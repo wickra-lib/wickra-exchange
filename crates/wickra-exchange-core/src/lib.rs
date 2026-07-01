@@ -17,6 +17,7 @@
 
 mod clock;
 mod credentials;
+mod deadman;
 mod error;
 mod events;
 mod exchanges;
@@ -40,6 +41,7 @@ mod wsutil;
 
 pub use clock::{NonceGenerator, ServerClock, TokenTtl};
 pub use credentials::Credentials;
+pub use deadman::DeadMansSwitch;
 pub use error::{Error, Result};
 pub use events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
 pub use exchanges::{
