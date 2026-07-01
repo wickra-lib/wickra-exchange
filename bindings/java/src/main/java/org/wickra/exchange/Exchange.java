@@ -237,7 +237,7 @@ public final class Exchange implements AutoCloseable {
         return new OrderInfo(id, side, status, quantity, filled, price, avg);
     }
 
-    private static Event readEvent(MemorySegment event) {
+    static Event readEvent(MemorySegment event) {
         Kind kind = Kind.values()[event.get(ValueLayout.JAVA_INT, Native.E_KIND)];
         String symbol = Native.readCString(event, Native.E_SYMBOL, Native.STR_CAP);
         if (symbol.isEmpty()) {

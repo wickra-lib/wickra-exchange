@@ -123,6 +123,24 @@ final class Native {
     static final MethodHandle ADVANCED_PLACE_BATCH = handle("wickra_advanced_place_batch",
             FunctionDescriptor.of(C_INT, C_PTR, C_PTR, C_PTR, C_PTR, C_PTR, C_SIZE, C_PTR, C_PTR, C_SIZE));
 
+    static final MethodHandle CONNECT_USER_DATA = handle("wickra_connect_user_data",
+            FunctionDescriptor.of(C_PTR, C_PTR, C_PTR, C_PTR, C_PTR, C_PTR, C_BOOL, C_BOOL));
+    static final MethodHandle USER_DATA_FREE = handle("wickra_user_data_free",
+            FunctionDescriptor.ofVoid(C_PTR));
+    static final MethodHandle USER_DATA_SUBSCRIBE = handle("wickra_user_data_subscribe",
+            FunctionDescriptor.of(C_INT, C_PTR));
+    static final MethodHandle USER_DATA_POLL = handle("wickra_user_data_poll",
+            FunctionDescriptor.of(C_INT, C_PTR, C_PTR, C_SIZE));
+
+    static final MethodHandle CONNECT_WS_EXECUTION = handle("wickra_connect_ws_execution",
+            FunctionDescriptor.of(C_PTR, C_PTR, C_PTR, C_PTR, C_PTR, C_PTR, C_BOOL, C_BOOL));
+    static final MethodHandle WS_EXECUTION_FREE = handle("wickra_ws_execution_free",
+            FunctionDescriptor.ofVoid(C_PTR));
+    static final MethodHandle WS_PLACE_ORDER = handle("wickra_ws_place_order",
+            FunctionDescriptor.of(C_INT, C_PTR, C_PTR, C_INT, C_DOUBLE, C_DOUBLE, C_PTR));
+    static final MethodHandle WS_CANCEL_ORDER = handle("wickra_ws_cancel_order",
+            FunctionDescriptor.of(C_INT, C_PTR, C_PTR, C_PTR));
+
     private static SymbolLookup loadLibrary() {
         String dir = System.getProperty("native.lib.dir");
         String libFile = System.mapLibraryName("wickra_exchange");
