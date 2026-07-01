@@ -8,7 +8,7 @@
 
 use base64::Engine;
 use hmac::{Hmac, Mac};
-use sha2::{Sha256, Sha512};
+use sha2::{Digest, Sha256, Sha512};
 
 type HmacSha256 = Hmac<Sha256>;
 type HmacSha512 = Hmac<Sha512>;
@@ -48,6 +48,35 @@ pub fn hmac_sha512_hex(secret: &[u8], message: &[u8]) -> String {
 #[must_use]
 pub fn hmac_sha512_base64(secret: &[u8], message: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(hmac_sha512(secret, message))
+}
+
+/// The raw SHA-256 digest of `data` (Kraken hashes `nonce + body` before the HMAC).
+#[must_use]
+pub fn sha256(data: &[u8]) -> Vec<u8> {
+    Sha256::digest(data).to_vec()
+}
+
+/// SHA-512 of `data`, lower-case hex (Gate.io hashes the request body).
+#[must_use]
+pub fn sha512_hex(data: &[u8]) -> String {
+    hex::encode(Sha512::digest(data))
+}
+
+/// HMAC-SHA512 of `message` under a base64-decoded `secret`, standard base64.
+/// Kraken supplies its private key base64-encoded; this decodes it first.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidCredentials`](crate::Error::InvalidCredentials) if the
+/// secret is not valid base64.
+pub fn hmac_sha512_base64_with_b64_secret(
+    secret_b64: &str,
+    message: &[u8],
+) -> crate::Result<String> {
+    let secret = base64::engine::general_purpose::STANDARD
+        .decode(secret_b64.trim())
+        .map_err(|_| crate::Error::InvalidCredentials("api secret must be valid base64"))?;
+    Ok(hmac_sha512_base64(&secret, message))
 }
 
 #[cfg(test)]
@@ -92,5 +121,28 @@ mod tests {
             hmac_sha256_hex(secret, payload.as_bytes()),
             "b89008e7051ffbf2242be7dc5ae67fd146e6430688627b802c0cbec146e46aef"
         );
+    }
+
+    #[test]
+    fn plain_hash_vectors() {
+        assert_eq!(
+            hex::encode(sha256(b"abc")),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            sha512_hex(b"abc"),
+            "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a\
+             2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
+        );
+    }
+
+    #[test]
+    fn hmac_with_base64_secret_matches_decoded() {
+        // base64("key") == "a2V5".
+        assert_eq!(
+            hmac_sha512_base64_with_b64_secret("a2V5", MSG).unwrap(),
+            hmac_sha512_base64(b"key", MSG)
+        );
+        assert!(hmac_sha512_base64_with_b64_secret("not base64!!!", MSG).is_err());
     }
 }
