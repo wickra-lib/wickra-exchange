@@ -35,7 +35,7 @@ use crate::options::{ExchangeOptions, MarginMode, MarketType};
 use crate::positions::{Position, PositionSide};
 use crate::signing::{hmac_sha512_base64_with_b64_secret, sha256};
 use crate::symbol::Symbol;
-use crate::traits::{AdvancedOrders, Derivatives, Exchange, Execution, MarketData};
+use crate::traits::{AdvancedOrders, Derivatives, Exchange, Execution, MarketData, WsUserData};
 use crate::transport::{HttpMethod, HttpRequest, HttpTransport, WsConnection, WsTransport};
 use crate::types::{
     Balance, OcoRequest, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker,
@@ -71,6 +71,10 @@ pub struct Kraken {
     /// [`positions`](Self::positions) can report it (the venue omits per-position
     /// leverage in `openpositions`).
     leverage: Cell<u32>,
+    /// The private user-data connection, opened by
+    /// [`subscribe_user_data`](Self::subscribe_user_data) and drained by
+    /// [`poll_events`](Self::poll_events) alongside the public stream.
+    private_connection: Option<Box<dyn WsConnection>>,
 }
 
 impl Kraken {
@@ -90,6 +94,7 @@ impl Kraken {
             connection: None,
             sub_messages: Vec::new(),
             leverage: Cell::new(1),
+            private_connection: None,
         }
     }
 
@@ -301,6 +306,15 @@ impl Kraken {
                 }
             }
         }
+        // Drain the private user-data (executions/balances) stream, if open.
+        // Re-issuing a fresh WebSockets token on reconnect is a keepalive follow-up.
+        if let Some(connection) = self.private_connection.as_mut() {
+            while let Ok(Some(frame)) = connection.recv() {
+                if let Ok(mut parsed) = parse_ws_message(&frame) {
+                    events.append(&mut parsed);
+                }
+            }
+        }
         let url = "wss://ws.kraken.com/v2";
         crate::wsutil::reconnect_if_dropped(
             self.ws.as_deref(),
@@ -310,6 +324,50 @@ impl Kraken {
             &mut events,
         );
         events
+    }
+
+    /// Open the private user-data stream. Fetches a single-use token over REST
+    /// (`POST /0/private/GetWebSocketsToken`, signed), connects
+    /// `wss://ws-auth.kraken.com/v2`, then subscribes to the token-authenticated
+    /// `executions` and `balances` channels. Afterwards
+    /// [`poll_events`](Self::poll_events) also surfaces the account's own
+    /// [`Event::OrderUpdate`] and [`Event::BalanceUpdate`].
+    ///
+    /// Re-issuing a fresh token on reconnect is a keepalive follow-up.
+    ///
+    /// # Errors
+    /// Returns [`Error::Exchange`] on the **futures** client (Kraken Futures uses
+    /// a separate WebSocket feed with challenge/response auth, not the spot v2
+    /// token), [`Error::InvalidCredentials`] without credentials,
+    /// [`Error::NotConnected`] without a WebSocket transport, or another
+    /// [`Error`] if the token request fails.
+    pub fn subscribe_user_data(&mut self) -> Result<()> {
+        if self.is_futures() {
+            return Err(Error::Exchange {
+                code: "unsupported".to_string(),
+                message: "Kraken Futures exposes a separate WebSocket feed \
+                          (challenge/response auth on futures.kraken.com); the spot \
+                          v2 executions stream is not available for the futures client"
+                    .to_string(),
+            });
+        }
+        let result = self.signed_post("/0/private/GetWebSocketsToken", &[])?;
+        let token = result
+            .get("token")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| Error::Deserialization("missing WebSockets token".to_string()))?;
+        let executions = format!(
+            r#"{{"method":"subscribe","params":{{"channel":"executions","token":"{token}","snap_orders":true}}}}"#
+        );
+        let balances = format!(
+            r#"{{"method":"subscribe","params":{{"channel":"balances","token":"{token}","snap_balances":true}}}}"#
+        );
+        let ws = self.ws.as_ref().ok_or(Error::NotConnected)?;
+        let mut connection = ws.connect("wss://ws-auth.kraken.com/v2")?;
+        connection.send(&executions)?;
+        connection.send(&balances)?;
+        self.private_connection = Some(connection);
+        Ok(())
     }
 
     /// Place an order.
@@ -1295,8 +1353,88 @@ fn parse_ws_message(text: &str) -> Result<Vec<Event>> {
                 }
             })
             .collect(),
+        // Private order-execution channel. An order update is emitted only when
+        // the frame carries the order's static fields (the snapshot and full
+        // new/amended updates); pure fill-delta frames that omit side/order_type
+        // are not surfaced as standalone updates.
+        "executions" => {
+            let mut out = Vec::new();
+            for exec in data {
+                let (Some(side), Some(order_type)) = (
+                    exec.get("side").and_then(serde_json::Value::as_str),
+                    exec.get("order_type").and_then(serde_json::Value::as_str),
+                ) else {
+                    continue;
+                };
+                out.push(Event::OrderUpdate(ws_exec_order(exec, side, order_type)?));
+            }
+            Ok(out)
+        }
+        // Private balances channel. The v2 frame reports each asset's wallet
+        // balance; a per-hold breakdown lives under `wallets` and is not surfaced,
+        // so the locked amount is reported as zero.
+        "balances" => {
+            let balances = data
+                .iter()
+                .map(|entry| {
+                    Ok(Balance {
+                        asset: entry
+                            .get("asset")
+                            .and_then(serde_json::Value::as_str)
+                            .ok_or_else(|| {
+                                Error::Deserialization("missing balance asset".to_string())
+                            })?
+                            .to_string(),
+                        free: decimal_field(entry, "balance")?,
+                        locked: Decimal::ZERO,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(vec![Event::BalanceUpdate(balances)])
+        }
         _ => Ok(Vec::new()),
     }
+}
+
+/// Map a Kraken v2 `executions` order status to an [`OrderStatus`].
+fn ws_exec_status(raw: &str) -> OrderStatus {
+    match raw {
+        "partially_filled" => OrderStatus::PartiallyFilled,
+        "filled" => OrderStatus::Filled,
+        "canceled" | "cancelled" => OrderStatus::Canceled,
+        "expired" => OrderStatus::Expired,
+        _ => OrderStatus::New, // new, pending_new, pending_cancel, ...
+    }
+}
+
+/// Build an [`Order`] from a Kraken v2 `executions` frame that carries the
+/// order's static fields.
+fn ws_exec_order(exec: &serde_json::Value, side: &str, order_type: &str) -> Result<Order> {
+    let id = exec
+        .get("order_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| Error::Deserialization("missing order_id".to_string()))?;
+    let status = ws_exec_status(
+        exec.get("order_status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("new"),
+    );
+    Ok(Order {
+        id: id.to_string(),
+        client_order_id: exec
+            .get("cl_ord_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        symbol: resolve_ws_symbol(exec)?,
+        side: parse_side(side)?,
+        order_type: parse_order_type(order_type)?,
+        status,
+        quantity: decimal_field(exec, "order_qty").unwrap_or(Decimal::ZERO),
+        filled_quantity: decimal_field(exec, "cum_qty").unwrap_or(Decimal::ZERO),
+        price: decimal_field(exec, "limit_price").ok().and_then(nonzero),
+        average_price: decimal_field(exec, "avg_price").ok().and_then(nonzero),
+    })
 }
 
 fn resolve_ws_symbol(data: &serde_json::Value) -> Result<Symbol> {
@@ -1353,6 +1491,12 @@ impl Execution for Kraken {
 impl Exchange for Kraken {
     fn name(&self) -> &'static str {
         "kraken"
+    }
+}
+
+impl WsUserData for Kraken {
+    fn subscribe_user_data(&mut self) -> Result<()> {
+        Kraken::subscribe_user_data(self)
     }
 }
 
@@ -1521,6 +1665,83 @@ mod tests {
         )
         .with_clock(Box::new(move || now_ms));
         (kraken, mock)
+    }
+
+    fn signed_ws_client(now_ms: i64) -> (Kraken, Arc<MockHttpTransport>, Arc<MockWsTransport>) {
+        let http = Arc::new(MockHttpTransport::new());
+        let ws = Arc::new(MockWsTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::Spot);
+        let kraken = Kraken::with_credentials(
+            Box::new(ArcTransport(Arc::clone(&http))),
+            &opts,
+            Credentials::new("APIKEY", "c2VjcmV0"),
+        )
+        .with_ws(Box::new(ArcWs(Arc::clone(&ws))))
+        .with_clock(Box::new(move || now_ms));
+        (kraken, http, ws)
+    }
+
+    #[test]
+    fn subscribe_user_data_fetches_token_and_streams_executions_and_balances() {
+        let (mut kraken, http, ws) = signed_ws_client(1000);
+        http.push_json(
+            200,
+            r#"{"error":[],"result":{"token":"tok","expires":900}}"#,
+        );
+        ws.push_connection(vec![
+            Ok(Some(
+                r#"{"method":"subscribe","success":true,"result":{"channel":"executions"}}"#
+                    .to_string(),
+            )),
+            Ok(Some(
+                r#"{"channel":"executions","type":"snapshot","data":[{"order_id":"O123",
+                "symbol":"BTC/USDT","side":"buy","order_type":"limit","order_status":"filled",
+                "order_qty":1.0,"cum_qty":1.0,"limit_price":100,"avg_price":100,"cl_ord_id":"my"}]}"#
+                    .to_string(),
+            )),
+            Ok(Some(
+                r#"{"channel":"balances","type":"snapshot","data":[{"asset":"USDT",
+                "balance":900.0}]}"#
+                    .to_string(),
+            )),
+        ]);
+        kraken.subscribe_user_data().unwrap();
+
+        let reqs = http.recorded_requests();
+        assert!(reqs[0].url.contains("/0/private/GetWebSocketsToken"));
+        assert_eq!(ws.connected_urls()[0], "wss://ws-auth.kraken.com/v2");
+        assert!(ws.sent()[0].contains(r#""channel":"executions""#));
+        assert!(ws.sent()[0].contains(r#""token":"tok""#));
+        assert!(ws.sent()[1].contains(r#""channel":"balances""#));
+
+        let events = kraken.poll_events();
+        assert_eq!(events.len(), 2);
+        let Event::OrderUpdate(order) = &events[0] else {
+            panic!("first event must be an order update");
+        };
+        assert_eq!(order.id, "O123");
+        assert_eq!(order.client_order_id.as_deref(), Some("my"));
+        assert_eq!(order.symbol, symbol());
+        assert_eq!(order.side, OrderSide::Buy);
+        assert_eq!(order.status, OrderStatus::Filled);
+        assert_eq!(order.filled_quantity, dec!(1));
+        assert_eq!(order.average_price, Some(dec!(100)));
+        let Event::BalanceUpdate(balances) = &events[1] else {
+            panic!("second event must be a balance update");
+        };
+        assert_eq!(balances.len(), 1);
+        assert_eq!(balances[0].asset, "USDT");
+        assert_eq!(balances[0].free, dec!(900));
+    }
+
+    #[test]
+    fn subscribe_user_data_rejects_the_futures_client() {
+        // Kraken Futures uses a separate WebSocket feed, documented as a gap.
+        let (mut kraken, _mock) = futures_client();
+        assert!(matches!(
+            kraken.subscribe_user_data().unwrap_err(),
+            Error::Exchange { .. }
+        ));
     }
 
     #[test]
