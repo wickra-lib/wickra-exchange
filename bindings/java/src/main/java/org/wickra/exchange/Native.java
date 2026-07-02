@@ -60,6 +60,28 @@ final class Native {
     static final long E_SIDE = 88;
     static final long E_ORDER = 96;
 
+    // WickraTicker field offsets (repr(C), 8-aligned; total 96 bytes).
+    static final long TICKER_SIZE = 96;
+    static final long T_SYMBOL = 0;
+    static final long T_LAST = 64;
+    static final long T_BID = 72;
+    static final long T_ASK = 80;
+    static final long T_VOLUME = 88;
+
+    // WickraCandle field offsets (repr(C), 8-aligned; total 48 bytes).
+    static final long CANDLE_SIZE = 48;
+    static final long C_OPEN = 0;
+    static final long C_HIGH = 8;
+    static final long C_LOW = 16;
+    static final long C_CLOSE = 24;
+    static final long C_VOLUME = 32;
+    static final long C_TIMESTAMP = 40;
+
+    // WickraBookLevel field offsets (repr(C), 8-aligned; total 16 bytes).
+    static final long BOOK_LEVEL_SIZE = 16;
+    static final long BL_PRICE = 0;
+    static final long BL_QUANTITY = 8;
+
     private static final Linker LINKER = Linker.nativeLinker();
     private static final Arena LIB_ARENA = Arena.ofShared();
     private static final SymbolLookup LOOKUP = loadLibrary();
@@ -94,6 +116,22 @@ final class Native {
             FunctionDescriptor.of(C_INT, C_PTR, C_PTR, C_PTR));
     static final MethodHandle POLL = handle("wickra_exchange_poll",
             FunctionDescriptor.of(C_INT, C_PTR, C_PTR, C_SIZE));
+    static final MethodHandle EXCHANGE_TICKER = handle("wickra_exchange_ticker",
+            FunctionDescriptor.of(C_INT, C_PTR, C_PTR, C_PTR));
+    static final MethodHandle EXCHANGE_KLINES = handle("wickra_exchange_klines",
+            FunctionDescriptor.of(C_INT, C_PTR, C_PTR, C_PTR, C_INT, C_PTR, C_SIZE));
+    static final MethodHandle EXCHANGE_ORDER_BOOK = handle("wickra_exchange_order_book",
+            FunctionDescriptor.of(C_INT, C_PTR, C_PTR, C_INT, C_PTR, C_SIZE, C_PTR, C_SIZE, C_PTR, C_PTR));
+    static final MethodHandle EXCHANGE_SUBSCRIBE_TRADES = handle("wickra_exchange_subscribe_trades",
+            FunctionDescriptor.of(C_INT, C_PTR, C_PTR));
+    static final MethodHandle EXCHANGE_SUBSCRIBE_BOOK = handle("wickra_exchange_subscribe_book",
+            FunctionDescriptor.of(C_INT, C_PTR, C_PTR));
+    static final MethodHandle EXCHANGE_SUBSCRIBE_TICKER = handle("wickra_exchange_subscribe_ticker",
+            FunctionDescriptor.of(C_INT, C_PTR, C_PTR));
+    static final MethodHandle EXCHANGE_QUERY_ORDER = handle("wickra_exchange_query_order",
+            FunctionDescriptor.of(C_INT, C_PTR, C_PTR, C_PTR, C_PTR));
+    static final MethodHandle EXCHANGE_OPEN_ORDERS = handle("wickra_exchange_open_orders",
+            FunctionDescriptor.of(C_INT, C_PTR, C_PTR, C_PTR, C_SIZE));
 
     static final MethodHandle CONNECT_DERIVATIVES = handle("wickra_connect_derivatives",
             FunctionDescriptor.of(C_PTR, C_PTR, C_PTR, C_PTR, C_PTR, C_PTR, C_BOOL));

@@ -2,6 +2,7 @@ package org.wickra.exchange;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.List;
@@ -79,6 +80,40 @@ class ExchangeTest {
 
             assertTrue(bought);
             assertTrue(Math.abs(ex.balance("BTC") - 1.0) < 1e-9);
+        }
+    }
+
+    @Test
+    void marketDataReads() {
+        try (Exchange ex = Exchange.paper(Map.of("USDT", 100_000.0), 0.0, 0.0, 0.0)) {
+            ex.setPrice("BTC/USDT", 20_000.0);
+
+            // ticker reflects the mark on both sides.
+            Exchange.TickerInfo ticker = ex.ticker("BTC/USDT");
+            assertEquals("BTC/USDT", ticker.symbol());
+            assertTrue(Math.abs(ticker.last() - 20_000.0) < 1e-9);
+
+            // subscribe_* are accepted by the paper feed.
+            ex.subscribeTrades("BTC/USDT");
+            ex.subscribeBook("BTC/USDT");
+            ex.subscribeTicker("BTC/USDT");
+
+            // paper has no historical / depth feed: both throw.
+            assertThrows(RuntimeException.class, () -> ex.klines("BTC/USDT", "1m", 10));
+            assertThrows(RuntimeException.class, () -> ex.orderBook("BTC/USDT", 10));
+
+            // A resting limit can be read back by id and appears in open orders.
+            Exchange.OrderInfo resting = ex.placeLimit("BTC/USDT", Exchange.Side.BUY, 1.0, 19_000.0);
+            assertEquals(Exchange.Status.NEW, resting.status());
+
+            Exchange.OrderInfo queried = ex.queryOrder("BTC/USDT", resting.id());
+            assertEquals(resting.id(), queried.id());
+
+            List<Exchange.OrderInfo> opens = ex.openOrders(null);
+            assertEquals(1, opens.size());
+            assertEquals(resting.id(), opens.get(0).id());
+            assertEquals(1, ex.openOrders("BTC/USDT").size());
+            assertTrue(ex.openOrders("ETH/USDT").isEmpty());
         }
     }
 }
