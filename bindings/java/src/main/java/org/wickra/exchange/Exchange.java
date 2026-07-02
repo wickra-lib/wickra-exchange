@@ -39,6 +39,22 @@ public final class Exchange implements AutoCloseable {
         }
     }
 
+    /** A point-in-time ticker snapshot. */
+    public record TickerInfo(String symbol, double last, double bid, double ask, double volume) {}
+
+    /** A single OHLCV candle. */
+    public record CandleInfo(double open, double high, double low, double close,
+                             double volume, long timestamp) {}
+
+    /** A single order-book level: price and resting quantity. */
+    public record BookLevelInfo(double price, double quantity) {}
+
+    /**
+     * A depth snapshot, best-first on each side. {@code symbol} echoes the
+     * requested market; the venue sequence id is available on the native bindings.
+     */
+    public record OrderBookInfo(String symbol, List<BookLevelInfo> bids, List<BookLevelInfo> asks) {}
+
     private MemorySegment handle;
 
     private Exchange(MemorySegment handle) {
@@ -168,6 +184,143 @@ public final class Exchange implements AutoCloseable {
         }
     }
 
+    /** The current ticker for {@code market}. */
+    public TickerInfo ticker(String market) {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment out = arena.allocate(Native.TICKER_SIZE, 8);
+            check((int) Native.EXCHANGE_TICKER.invokeExact(handle, arena.allocateFrom(market), out));
+            return readTicker(out);
+        } catch (Throwable t) {
+            throw new RuntimeException(t);
+        }
+    }
+
+    /** Up to {@code limit} historical candles for {@code market} at {@code interval}. */
+    public List<CandleInfo> klines(String market, String interval, int limit) {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment marketSeg = arena.allocateFrom(market);
+            MemorySegment intervalSeg = arena.allocateFrom(interval);
+            int cap = 128;
+            while (true) {
+                MemorySegment buf = arena.allocate(Native.CANDLE_SIZE * cap, 8);
+                int count = (int) Native.EXCHANGE_KLINES.invokeExact(
+                        handle, marketSeg, intervalSeg, limit, buf, (long) cap);
+                if (count < 0) {
+                    throw new RuntimeException("klines failed with code " + count);
+                }
+                if (count > cap) {
+                    cap = count;
+                    continue;
+                }
+                List<CandleInfo> candles = new ArrayList<>(count);
+                for (int i = 0; i < count; i++) {
+                    candles.add(readCandle(buf.asSlice(i * Native.CANDLE_SIZE, Native.CANDLE_SIZE)));
+                }
+                return candles;
+            }
+        } catch (Throwable t) {
+            throw new RuntimeException(t);
+        }
+    }
+
+    /** Depth snapshot for {@code market} (up to {@code depth} levels per side). */
+    public OrderBookInfo orderBook(String market, int depth) {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment marketSeg = arena.allocateFrom(market);
+            int cap = 64;
+            while (true) {
+                MemorySegment bids = arena.allocate(Native.BOOK_LEVEL_SIZE * cap, 8);
+                MemorySegment asks = arena.allocate(Native.BOOK_LEVEL_SIZE * cap, 8);
+                MemorySegment bidCount = arena.allocate(ValueLayout.JAVA_LONG);
+                MemorySegment askCount = arena.allocate(ValueLayout.JAVA_LONG);
+                check((int) Native.EXCHANGE_ORDER_BOOK.invokeExact(
+                        handle, marketSeg, depth, bids, (long) cap, asks, (long) cap, bidCount, askCount));
+                int nb = (int) bidCount.get(ValueLayout.JAVA_LONG, 0);
+                int na = (int) askCount.get(ValueLayout.JAVA_LONG, 0);
+                if (nb > cap || na > cap) {
+                    cap = Math.max(nb, na);
+                    continue;
+                }
+                List<BookLevelInfo> bidList = new ArrayList<>(nb);
+                for (int i = 0; i < nb; i++) {
+                    bidList.add(readBookLevel(bids.asSlice(i * Native.BOOK_LEVEL_SIZE, Native.BOOK_LEVEL_SIZE)));
+                }
+                List<BookLevelInfo> askList = new ArrayList<>(na);
+                for (int i = 0; i < na; i++) {
+                    askList.add(readBookLevel(asks.asSlice(i * Native.BOOK_LEVEL_SIZE, Native.BOOK_LEVEL_SIZE)));
+                }
+                return new OrderBookInfo(market, bidList, askList);
+            }
+        } catch (Throwable t) {
+            throw new RuntimeException(t);
+        }
+    }
+
+    /** Subscribe to the public trade stream for {@code market}. */
+    public void subscribeTrades(String market) {
+        try (Arena arena = Arena.ofConfined()) {
+            check((int) Native.EXCHANGE_SUBSCRIBE_TRADES.invokeExact(handle, arena.allocateFrom(market)));
+        } catch (Throwable t) {
+            throw new RuntimeException(t);
+        }
+    }
+
+    /** Subscribe to the order-book stream for {@code market}. */
+    public void subscribeBook(String market) {
+        try (Arena arena = Arena.ofConfined()) {
+            check((int) Native.EXCHANGE_SUBSCRIBE_BOOK.invokeExact(handle, arena.allocateFrom(market)));
+        } catch (Throwable t) {
+            throw new RuntimeException(t);
+        }
+    }
+
+    /** Subscribe to the ticker stream for {@code market}. */
+    public void subscribeTicker(String market) {
+        try (Arena arena = Arena.ofConfined()) {
+            check((int) Native.EXCHANGE_SUBSCRIBE_TICKER.invokeExact(handle, arena.allocateFrom(market)));
+        } catch (Throwable t) {
+            throw new RuntimeException(t);
+        }
+    }
+
+    /** Look up a single order by venue id. */
+    public OrderInfo queryOrder(String market, String orderId) {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment out = arena.allocate(Native.ORDER_SIZE, 8);
+            check((int) Native.EXCHANGE_QUERY_ORDER.invokeExact(
+                    handle, arena.allocateFrom(market), arena.allocateFrom(orderId), out));
+            return readOrder(out);
+        } catch (Throwable t) {
+            throw new RuntimeException(t);
+        }
+    }
+
+    /** Open orders, optionally filtered to one {@code market} (null for all). */
+    public List<OrderInfo> openOrders(String market) {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment marketSeg = market == null ? MemorySegment.NULL : arena.allocateFrom(market);
+            int cap = 16;
+            while (true) {
+                MemorySegment buf = arena.allocate(Native.ORDER_SIZE * cap, 8);
+                int count = (int) Native.EXCHANGE_OPEN_ORDERS.invokeExact(handle, marketSeg, buf, (long) cap);
+                if (count < 0) {
+                    throw new RuntimeException("open_orders failed with code " + count);
+                }
+                if (count > cap) {
+                    cap = count;
+                    continue;
+                }
+                List<OrderInfo> orders = new ArrayList<>(count);
+                for (int i = 0; i < count; i++) {
+                    orders.add(readOrder(buf.asSlice(i * Native.ORDER_SIZE, Native.ORDER_SIZE)));
+                }
+                return orders;
+            }
+        } catch (Throwable t) {
+            throw new RuntimeException(t);
+        }
+    }
+
     /** Drain buffered events (up to {@code capacity} per call). */
     public List<Event> poll(int capacity) {
         try (Arena arena = Arena.ofConfined()) {
@@ -235,6 +388,31 @@ public final class Exchange implements AutoCloseable {
         Double price = nanToNull(order.get(ValueLayout.JAVA_DOUBLE, Native.O_PRICE));
         Double avg = nanToNull(order.get(ValueLayout.JAVA_DOUBLE, Native.O_AVG));
         return new OrderInfo(id, side, status, quantity, filled, price, avg);
+    }
+
+    static TickerInfo readTicker(MemorySegment ticker) {
+        String symbol = Native.readCString(ticker, Native.T_SYMBOL, Native.STR_CAP);
+        double last = ticker.get(ValueLayout.JAVA_DOUBLE, Native.T_LAST);
+        double bid = ticker.get(ValueLayout.JAVA_DOUBLE, Native.T_BID);
+        double ask = ticker.get(ValueLayout.JAVA_DOUBLE, Native.T_ASK);
+        double volume = ticker.get(ValueLayout.JAVA_DOUBLE, Native.T_VOLUME);
+        return new TickerInfo(symbol, last, bid, ask, volume);
+    }
+
+    static CandleInfo readCandle(MemorySegment candle) {
+        return new CandleInfo(
+                candle.get(ValueLayout.JAVA_DOUBLE, Native.C_OPEN),
+                candle.get(ValueLayout.JAVA_DOUBLE, Native.C_HIGH),
+                candle.get(ValueLayout.JAVA_DOUBLE, Native.C_LOW),
+                candle.get(ValueLayout.JAVA_DOUBLE, Native.C_CLOSE),
+                candle.get(ValueLayout.JAVA_DOUBLE, Native.C_VOLUME),
+                candle.get(ValueLayout.JAVA_LONG, Native.C_TIMESTAMP));
+    }
+
+    static BookLevelInfo readBookLevel(MemorySegment level) {
+        return new BookLevelInfo(
+                level.get(ValueLayout.JAVA_DOUBLE, Native.BL_PRICE),
+                level.get(ValueLayout.JAVA_DOUBLE, Native.BL_QUANTITY));
     }
 
     static Event readEvent(MemorySegment event) {
