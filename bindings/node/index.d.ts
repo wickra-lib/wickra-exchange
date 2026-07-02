@@ -84,6 +84,18 @@ export declare class Exchange {
   balances(): Record<string, number>
   /** Subscribe to the public trade stream for `market`. */
   subscribeTrades(market: string): void
+  /** Subscribe to the order-book stream for `market`. */
+  subscribeBook(market: string): void
+  /** Subscribe to the ticker stream for `market`. */
+  subscribeTicker(market: string): void
+  /** Up to `limit` historical candles for `market` at `interval`. */
+  klines(market: string, interval: string, limit: number): Array<CandleInfo>
+  /** Order-book snapshot for `market` (up to `depth` levels per side). */
+  orderBook(market: string, depth: number): OrderBookInfo
+  /** Look up a single order by venue id. */
+  queryOrder(market: string, orderId: string): OrderInfo
+  /** Open orders, optionally filtered to one `market`. */
+  openOrders(market?: string | undefined | null): Array<OrderInfo>
   /** Drain all events buffered since the last call. */
   pollEvents(): Array<StreamEvent>
 }
@@ -146,6 +158,30 @@ export declare class WsExecution {
 export interface BatchOrderResult {
   order?: OrderInfo
   error?: string
+}
+
+/** A single order-book level: price and resting quantity. */
+export interface BookLevelInfo {
+  price: number
+  quantity: number
+}
+
+/** A single OHLCV candle. */
+export interface CandleInfo {
+  open: number
+  high: number
+  low: number
+  close: number
+  volume: number
+  timestamp: number
+}
+
+/** A depth snapshot, best-first on each side. */
+export interface OrderBookInfo {
+  symbol: string
+  lastUpdateId: number
+  bids: Array<BookLevelInfo>
+  asks: Array<BookLevelInfo>
 }
 
 /** An order as reported by the exchange. */
