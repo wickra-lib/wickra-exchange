@@ -17,6 +17,6 @@ try (Exchange ex = Exchange.paper(Map.of("USDT", 100_000.0), 0, 5, 0)) {
 }
 ```
 
-Requires Java 25+ (FFM). The native library path is set via the `native.lib.dir`
+Requires Java 22+ (FFM). The native library path is set via the `native.lib.dir`
 system property. The same strategy runs **paper, replay and live** by swapping the
 constructor. Licensed under `MIT OR Apache-2.0`.
