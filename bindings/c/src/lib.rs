@@ -21,9 +21,10 @@ use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use wickra_exchange::{
     connect, connect_advanced, connect_derivatives, connect_user_data, connect_ws_execution,
-    AdvancedOrders, Credentials, Derivatives, Error, Event, Exchange, ExchangeOptions, MarginMode,
-    MarketType, OcoRequest, Order, OrderRequest, OrderSide, OrderStatus, PaperExchange, Position,
-    PositionSide, ReplayExchange, Symbol, TradePrint, WsExecution, WsUserData,
+    AdvancedOrders, BookLevel, Candle, Credentials, Derivatives, Error, Event, Exchange,
+    ExchangeOptions, MarginMode, MarketType, OcoRequest, Order, OrderRequest, OrderSide,
+    OrderStatus, PaperExchange, Position, PositionSide, ReplayExchange, Symbol, Ticker, TradePrint,
+    WsExecution, WsUserData,
 };
 
 /// Success.
@@ -156,6 +157,49 @@ pub struct WickraPosition {
     pub unrealized_pnl: f64,
     /// `WICKRA_MARGIN_*` (cross / isolated).
     pub margin_mode: i32,
+}
+
+/// A ticker snapshot (C-ABI mirror of `Ticker`).
+#[repr(C)]
+pub struct WickraTicker {
+    /// Market symbol, NUL-terminated (`base/quote`).
+    pub symbol: [c_char; WICKRA_STR_CAP],
+    /// Last traded price.
+    pub last: f64,
+    /// Best bid price.
+    pub bid: f64,
+    /// Best ask price.
+    pub ask: f64,
+    /// Rolling base-asset volume.
+    pub volume: f64,
+}
+
+/// A single OHLCV candle (C-ABI mirror of `Candle`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct WickraCandle {
+    /// Bar open price.
+    pub open: f64,
+    /// Bar high price.
+    pub high: f64,
+    /// Bar low price.
+    pub low: f64,
+    /// Bar close price.
+    pub close: f64,
+    /// Bar volume.
+    pub volume: f64,
+    /// Bar timestamp (venue epoch / resolution).
+    pub timestamp: i64,
+}
+
+/// A single order-book level: price and quantity (C-ABI mirror of `BookLevel`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct WickraBookLevel {
+    /// Price at this level.
+    pub price: f64,
+    /// Resting quantity at this level.
+    pub quantity: f64,
 }
 
 /// An opaque derivatives handle over a live futures client. Construct with
@@ -295,6 +339,36 @@ fn fill_position(dst: &mut WickraPosition, position: &Position) {
         MarginMode::Cross => WICKRA_MARGIN_CROSS,
         MarginMode::Isolated => WICKRA_MARGIN_ISOLATED,
     };
+}
+
+fn fill_ticker(dst: &mut WickraTicker, ticker: &Ticker) {
+    write_cstr(&mut dst.symbol, &ticker.symbol.to_string());
+    dst.last = to_float(ticker.last);
+    dst.bid = to_float(ticker.bid);
+    dst.ask = to_float(ticker.ask);
+    dst.volume = to_float(ticker.volume);
+}
+
+fn fill_candle(dst: &mut WickraCandle, candle: &Candle) {
+    dst.open = candle.open;
+    dst.high = candle.high;
+    dst.low = candle.low;
+    dst.close = candle.close;
+    dst.volume = candle.volume;
+    dst.timestamp = candle.timestamp;
+}
+
+fn fill_book_level(dst: &mut WickraBookLevel, level: &BookLevel) {
+    dst.price = to_float(level.price);
+    dst.quantity = to_float(level.quantity);
+}
+
+/// Which market-data stream `subscribe` opens.
+#[derive(Clone, Copy)]
+enum SubKind {
+    Trades,
+    Book,
+    Ticker,
 }
 
 /// Collect `(asset, amount)` pairs from parallel C arrays into a paper account.
@@ -766,6 +840,269 @@ fn fill_event(slot: &mut WickraEvent, event: &Event) {
         Event::BalanceUpdate(_) => slot.kind = WICKRA_EVENT_BALANCE_UPDATE,
         Event::Subscribed { .. } => slot.kind = WICKRA_EVENT_SUBSCRIBED,
         _ => slot.kind = WICKRA_EVENT_OTHER,
+    }
+}
+
+/// Fetch the current ticker for `market`, writing it into `out`.
+///
+/// # Safety
+/// `handle` and `out` must be valid; `market` must be a valid C string.
+#[no_mangle]
+pub unsafe extern "C" fn wickra_exchange_ticker(
+    handle: *mut WickraExchange,
+    market: *const c_char,
+    out: *mut WickraTicker,
+) -> i32 {
+    let Some(exchange) = (unsafe { handle.as_mut() }) else {
+        return WICKRA_ERR_NULL;
+    };
+    if out.is_null() {
+        return WICKRA_ERR_NULL;
+    }
+    let Some(market) = (unsafe { opt_str(market) }) else {
+        return WICKRA_ERR_INVALID_ARG;
+    };
+    let Some(symbol) = parse_symbol(market) else {
+        return WICKRA_ERR_INVALID_ARG;
+    };
+    match exchange.inner.as_exchange().ticker(&symbol) {
+        Ok(ticker) => {
+            unsafe { fill_ticker(&mut *out, &ticker) };
+            WICKRA_OK
+        }
+        Err(e) => error_code(&e),
+    }
+}
+
+/// Fetch up to `limit` candles for `market` at `interval` into `out` (capacity
+/// `cap`). Returns the total candle count (`>= 0`); when it exceeds `cap` the
+/// buffer was truncated — re-call with a larger buffer.
+///
+/// # Safety
+/// `handle` must be valid; `market`/`interval` must be valid C strings; `out`
+/// must be writable for `cap` elements.
+#[no_mangle]
+pub unsafe extern "C" fn wickra_exchange_klines(
+    handle: *mut WickraExchange,
+    market: *const c_char,
+    interval: *const c_char,
+    limit: u32,
+    out: *mut WickraCandle,
+    cap: usize,
+) -> i32 {
+    let Some(exchange) = (unsafe { handle.as_mut() }) else {
+        return WICKRA_ERR_NULL;
+    };
+    if out.is_null() && cap != 0 {
+        return WICKRA_ERR_NULL;
+    }
+    let (Some(market), Some(interval)) = (unsafe { (opt_str(market), opt_str(interval)) }) else {
+        return WICKRA_ERR_INVALID_ARG;
+    };
+    let Some(symbol) = parse_symbol(market) else {
+        return WICKRA_ERR_INVALID_ARG;
+    };
+    match exchange
+        .inner
+        .as_exchange()
+        .klines(&symbol, interval, limit)
+    {
+        Ok(candles) => {
+            let written = candles.len().min(cap);
+            for (i, candle) in candles.iter().take(written).enumerate() {
+                fill_candle(unsafe { &mut *out.add(i) }, candle);
+            }
+            i32::try_from(candles.len()).unwrap_or(i32::MAX)
+        }
+        Err(e) => error_code(&e),
+    }
+}
+
+/// Fetch a depth snapshot for `market` (up to `depth` levels per side) into the
+/// `bids_out`/`asks_out` buffers (capacities `bids_cap`/`asks_cap`), writing the
+/// total per-side level counts into `out_bid_count`/`out_ask_count` (either may
+/// exceed its cap — the buffer was truncated). Returns `WICKRA_OK` or an error.
+///
+/// # Safety
+/// `handle`, `out_bid_count` and `out_ask_count` must be valid; `market` must be
+/// a valid C string; `bids_out`/`asks_out` must be writable for their caps.
+#[no_mangle]
+pub unsafe extern "C" fn wickra_exchange_order_book(
+    handle: *mut WickraExchange,
+    market: *const c_char,
+    depth: u32,
+    bids_out: *mut WickraBookLevel,
+    bids_cap: usize,
+    asks_out: *mut WickraBookLevel,
+    asks_cap: usize,
+    out_bid_count: *mut usize,
+    out_ask_count: *mut usize,
+) -> i32 {
+    let Some(exchange) = (unsafe { handle.as_mut() }) else {
+        return WICKRA_ERR_NULL;
+    };
+    if out_bid_count.is_null() || out_ask_count.is_null() {
+        return WICKRA_ERR_NULL;
+    }
+    if (bids_out.is_null() && bids_cap != 0) || (asks_out.is_null() && asks_cap != 0) {
+        return WICKRA_ERR_NULL;
+    }
+    let Some(market) = (unsafe { opt_str(market) }) else {
+        return WICKRA_ERR_INVALID_ARG;
+    };
+    let Some(symbol) = parse_symbol(market) else {
+        return WICKRA_ERR_INVALID_ARG;
+    };
+    match exchange.inner.as_exchange().order_book(&symbol, depth) {
+        Ok(book) => {
+            let bids_written = book.bids.len().min(bids_cap);
+            for (i, level) in book.bids.iter().take(bids_written).enumerate() {
+                fill_book_level(unsafe { &mut *bids_out.add(i) }, level);
+            }
+            let asks_written = book.asks.len().min(asks_cap);
+            for (i, level) in book.asks.iter().take(asks_written).enumerate() {
+                fill_book_level(unsafe { &mut *asks_out.add(i) }, level);
+            }
+            unsafe {
+                *out_bid_count = book.bids.len();
+                *out_ask_count = book.asks.len();
+            }
+            WICKRA_OK
+        }
+        Err(e) => error_code(&e),
+    }
+}
+
+fn subscribe(handle: *mut WickraExchange, market: *const c_char, which: SubKind) -> i32 {
+    let Some(exchange) = (unsafe { handle.as_mut() }) else {
+        return WICKRA_ERR_NULL;
+    };
+    let Some(market) = (unsafe { opt_str(market) }) else {
+        return WICKRA_ERR_INVALID_ARG;
+    };
+    let Some(symbol) = parse_symbol(market) else {
+        return WICKRA_ERR_INVALID_ARG;
+    };
+    let exchange = exchange.inner.as_exchange();
+    let result = match which {
+        SubKind::Trades => exchange.subscribe_trades(&symbol),
+        SubKind::Book => exchange.subscribe_book(&symbol),
+        SubKind::Ticker => exchange.subscribe_ticker(&symbol),
+    };
+    match result {
+        Ok(()) => WICKRA_OK,
+        Err(e) => error_code(&e),
+    }
+}
+
+/// Subscribe to the public trade stream for `market`.
+///
+/// # Safety
+/// `handle` must be valid; `market` must be a valid C string.
+#[no_mangle]
+pub unsafe extern "C" fn wickra_exchange_subscribe_trades(
+    handle: *mut WickraExchange,
+    market: *const c_char,
+) -> i32 {
+    subscribe(handle, market, SubKind::Trades)
+}
+
+/// Subscribe to the order-book stream for `market`.
+///
+/// # Safety
+/// `handle` must be valid; `market` must be a valid C string.
+#[no_mangle]
+pub unsafe extern "C" fn wickra_exchange_subscribe_book(
+    handle: *mut WickraExchange,
+    market: *const c_char,
+) -> i32 {
+    subscribe(handle, market, SubKind::Book)
+}
+
+/// Subscribe to the ticker stream for `market`.
+///
+/// # Safety
+/// `handle` must be valid; `market` must be a valid C string.
+#[no_mangle]
+pub unsafe extern "C" fn wickra_exchange_subscribe_ticker(
+    handle: *mut WickraExchange,
+    market: *const c_char,
+) -> i32 {
+    subscribe(handle, market, SubKind::Ticker)
+}
+
+/// Look up a single order by venue id, writing it into `out`.
+///
+/// # Safety
+/// `handle` and `out` must be valid; `market`/`order_id` must be valid C strings.
+#[no_mangle]
+pub unsafe extern "C" fn wickra_exchange_query_order(
+    handle: *mut WickraExchange,
+    market: *const c_char,
+    order_id: *const c_char,
+    out: *mut WickraOrder,
+) -> i32 {
+    let Some(exchange) = (unsafe { handle.as_mut() }) else {
+        return WICKRA_ERR_NULL;
+    };
+    if out.is_null() {
+        return WICKRA_ERR_NULL;
+    }
+    let (Some(market), Some(order_id)) = (unsafe { (opt_str(market), opt_str(order_id)) }) else {
+        return WICKRA_ERR_INVALID_ARG;
+    };
+    let Some(symbol) = parse_symbol(market) else {
+        return WICKRA_ERR_INVALID_ARG;
+    };
+    match exchange.inner.as_exchange().query_order(&symbol, order_id) {
+        Ok(order) => {
+            unsafe { fill_order(&mut *out, &order) };
+            WICKRA_OK
+        }
+        Err(e) => error_code(&e),
+    }
+}
+
+/// List open orders into `out` (capacity `cap`). Pass a `market` C string to
+/// scope to one symbol, or null for all. Returns the total number of open orders
+/// (`>= 0`); when it exceeds `cap` the buffer was truncated.
+///
+/// # Safety
+/// `handle` must be valid; `market` must be null or a valid C string; `out` must
+/// be writable for `cap` elements.
+#[no_mangle]
+pub unsafe extern "C" fn wickra_exchange_open_orders(
+    handle: *mut WickraExchange,
+    market: *const c_char,
+    out: *mut WickraOrder,
+    cap: usize,
+) -> i32 {
+    let Some(exchange) = (unsafe { handle.as_mut() }) else {
+        return WICKRA_ERR_NULL;
+    };
+    if out.is_null() && cap != 0 {
+        return WICKRA_ERR_NULL;
+    }
+    let symbol = if market.is_null() {
+        None
+    } else {
+        let Some(market) = (unsafe { opt_str(market) }) else {
+            return WICKRA_ERR_INVALID_ARG;
+        };
+        let Some(symbol) = parse_symbol(market) else {
+            return WICKRA_ERR_INVALID_ARG;
+        };
+        Some(symbol)
+    };
+    match exchange.inner.as_exchange().open_orders(symbol.as_ref()) {
+        Ok(orders) => {
+            let written = orders.len().min(cap);
+            for (i, order) in orders.iter().take(written).enumerate() {
+                fill_order(unsafe { &mut *out.add(i) }, order);
+            }
+            i32::try_from(orders.len()).unwrap_or(i32::MAX)
+        }
+        Err(e) => error_code(&e),
     }
 }
 
@@ -1552,6 +1889,231 @@ mod tests {
             assert!((free - 1.0).abs() < 1e-9);
 
             wickra_exchange_free(ex);
+        }
+    }
+
+    #[test]
+    fn market_data_reads_over_the_abi() {
+        let market = cstr("BTC/USDT");
+        let usdt = cstr("USDT");
+        let assets = [usdt.as_ptr()];
+        let amounts = [100_000.0_f64];
+        let interval = cstr("1m");
+
+        unsafe {
+            let ex = wickra_paper_new(assets.as_ptr(), amounts.as_ptr(), 1, 1.0, 5.0, 10.0);
+            assert!(!ex.is_null());
+            assert_eq!(
+                wickra_exchange_set_price(ex, market.as_ptr(), 20_000.0),
+                WICKRA_OK
+            );
+
+            // ticker reflects the mark on both sides.
+            let mut ticker = WickraTicker {
+                symbol: [0; WICKRA_STR_CAP],
+                last: 0.0,
+                bid: 0.0,
+                ask: 0.0,
+                volume: -1.0,
+            };
+            assert_eq!(
+                wickra_exchange_ticker(ex, market.as_ptr(), &raw mut ticker),
+                WICKRA_OK
+            );
+            assert_eq!(read_field(&ticker.symbol), "BTC/USDT");
+            assert!((ticker.last - 20_000.0).abs() < 1e-9);
+            assert!((ticker.bid - ticker.ask).abs() < 1e-9);
+
+            // subscribe_* are accepted by the paper feed.
+            assert_eq!(
+                wickra_exchange_subscribe_trades(ex, market.as_ptr()),
+                WICKRA_OK
+            );
+            assert_eq!(
+                wickra_exchange_subscribe_book(ex, market.as_ptr()),
+                WICKRA_OK
+            );
+            assert_eq!(
+                wickra_exchange_subscribe_ticker(ex, market.as_ptr()),
+                WICKRA_OK
+            );
+
+            // paper has no historical / depth feed: these report an error.
+            let mut candles = [WickraCandle {
+                open: 0.0,
+                high: 0.0,
+                low: 0.0,
+                close: 0.0,
+                volume: 0.0,
+                timestamp: 0,
+            }; 4];
+            assert!(
+                wickra_exchange_klines(
+                    ex,
+                    market.as_ptr(),
+                    interval.as_ptr(),
+                    10,
+                    candles.as_mut_ptr(),
+                    4
+                ) < 0
+            );
+            let mut bids = [WickraBookLevel {
+                price: 0.0,
+                quantity: 0.0,
+            }; 4];
+            let mut asks = [WickraBookLevel {
+                price: 0.0,
+                quantity: 0.0,
+            }; 4];
+            let mut bid_count = 0usize;
+            let mut ask_count = 0usize;
+            assert!(
+                wickra_exchange_order_book(
+                    ex,
+                    market.as_ptr(),
+                    10,
+                    bids.as_mut_ptr(),
+                    4,
+                    asks.as_mut_ptr(),
+                    4,
+                    &raw mut bid_count,
+                    &raw mut ask_count,
+                ) < 0
+            );
+
+            wickra_exchange_free(ex);
+        }
+    }
+
+    #[test]
+    fn order_lifecycle_reads_over_the_abi() {
+        let market = cstr("BTC/USDT");
+        let usdt = cstr("USDT");
+        let assets = [usdt.as_ptr()];
+        let amounts = [100_000.0_f64];
+
+        unsafe {
+            let ex = wickra_paper_new(assets.as_ptr(), amounts.as_ptr(), 1, 1.0, 5.0, 10.0);
+            assert!(!ex.is_null());
+            assert_eq!(
+                wickra_exchange_set_price(ex, market.as_ptr(), 20_000.0),
+                WICKRA_OK
+            );
+
+            // A resting limit can be read back by id and appears in open_orders.
+            let mut resting = empty_order();
+            assert_eq!(
+                wickra_exchange_place_limit(
+                    ex,
+                    market.as_ptr(),
+                    WICKRA_SIDE_BUY,
+                    1.0,
+                    19_000.0,
+                    &raw mut resting,
+                ),
+                WICKRA_OK
+            );
+            assert_eq!(resting.status, WICKRA_STATUS_NEW);
+            let order_id = cstr(&read_field(&resting.id));
+
+            let mut queried = empty_order();
+            assert_eq!(
+                wickra_exchange_query_order(
+                    ex,
+                    market.as_ptr(),
+                    order_id.as_ptr(),
+                    &raw mut queried
+                ),
+                WICKRA_OK
+            );
+            assert_eq!(read_field(&queried.id), read_field(&resting.id));
+
+            let mut open = [empty_order()];
+            assert_eq!(
+                wickra_exchange_open_orders(ex, market.as_ptr(), open.as_mut_ptr(), 1),
+                1
+            );
+            assert_eq!(read_field(&open[0].id), read_field(&resting.id));
+
+            wickra_exchange_free(ex);
+        }
+    }
+
+    #[test]
+    fn market_data_null_handle_guards() {
+        let market = cstr("BTC/USDT");
+        let interval = cstr("1m");
+        let order_id = cstr("x");
+        unsafe {
+            let mut ticker = WickraTicker {
+                symbol: [0; WICKRA_STR_CAP],
+                last: 0.0,
+                bid: 0.0,
+                ask: 0.0,
+                volume: 0.0,
+            };
+            assert_eq!(
+                wickra_exchange_ticker(core::ptr::null_mut(), market.as_ptr(), &raw mut ticker),
+                WICKRA_ERR_NULL
+            );
+            assert_eq!(
+                wickra_exchange_klines(
+                    core::ptr::null_mut(),
+                    market.as_ptr(),
+                    interval.as_ptr(),
+                    10,
+                    core::ptr::null_mut(),
+                    0,
+                ),
+                WICKRA_ERR_NULL
+            );
+            let mut bid_count = 0usize;
+            let mut ask_count = 0usize;
+            assert_eq!(
+                wickra_exchange_order_book(
+                    core::ptr::null_mut(),
+                    market.as_ptr(),
+                    10,
+                    core::ptr::null_mut(),
+                    0,
+                    core::ptr::null_mut(),
+                    0,
+                    &raw mut bid_count,
+                    &raw mut ask_count,
+                ),
+                WICKRA_ERR_NULL
+            );
+            assert_eq!(
+                wickra_exchange_subscribe_trades(core::ptr::null_mut(), market.as_ptr()),
+                WICKRA_ERR_NULL
+            );
+            assert_eq!(
+                wickra_exchange_subscribe_book(core::ptr::null_mut(), market.as_ptr()),
+                WICKRA_ERR_NULL
+            );
+            assert_eq!(
+                wickra_exchange_subscribe_ticker(core::ptr::null_mut(), market.as_ptr()),
+                WICKRA_ERR_NULL
+            );
+            let mut order = empty_order();
+            assert_eq!(
+                wickra_exchange_query_order(
+                    core::ptr::null_mut(),
+                    market.as_ptr(),
+                    order_id.as_ptr(),
+                    &raw mut order,
+                ),
+                WICKRA_ERR_NULL
+            );
+            assert_eq!(
+                wickra_exchange_open_orders(
+                    core::ptr::null_mut(),
+                    market.as_ptr(),
+                    core::ptr::null_mut(),
+                    0,
+                ),
+                WICKRA_ERR_NULL
+            );
         }
     }
 
