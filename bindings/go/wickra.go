@@ -89,6 +89,39 @@ type Event struct {
 // IsTrade reports whether this is a trade event.
 func (e Event) IsTrade() bool { return e.Kind == KindTrade }
 
+// Ticker is a point-in-time ticker snapshot.
+type Ticker struct {
+	Symbol string
+	Last   float64
+	Bid    float64
+	Ask    float64
+	Volume float64
+}
+
+// Candle is a single OHLCV bar.
+type Candle struct {
+	Open      float64
+	High      float64
+	Low       float64
+	Close     float64
+	Volume    float64
+	Timestamp int64
+}
+
+// BookLevel is a single order-book level: price and resting quantity.
+type BookLevel struct {
+	Price    float64
+	Quantity float64
+}
+
+// OrderBook is a depth snapshot, best-first on each side. Symbol echoes the
+// requested market; the venue sequence id is available on the native bindings.
+type OrderBook struct {
+	Symbol string
+	Bids   []BookLevel
+	Asks   []BookLevel
+}
+
 // Version returns the library version.
 func Version() string {
 	return C.GoString(C.wickra_version())
@@ -207,6 +240,139 @@ func (e *Exchange) Balance(asset string) (float64, error) {
 	return float64(out), nil
 }
 
+// Ticker returns the current ticker for market.
+func (e *Exchange) Ticker(market string) (Ticker, error) {
+	cMarket := C.CString(market)
+	defer C.free(unsafe.Pointer(cMarket))
+	var out C.WickraTicker
+	if err := codeError(C.wickra_exchange_ticker(e.handle, cMarket, &out)); err != nil {
+		return Ticker{}, err
+	}
+	return readTicker(&out), nil
+}
+
+// Klines returns up to limit historical candles for market at interval.
+func (e *Exchange) Klines(market, interval string, limit uint32) ([]Candle, error) {
+	cMarket := C.CString(market)
+	cInterval := C.CString(interval)
+	defer C.free(unsafe.Pointer(cMarket))
+	defer C.free(unsafe.Pointer(cInterval))
+	capN := 128
+	for {
+		buf := make([]C.WickraCandle, capN)
+		rc := C.wickra_exchange_klines(e.handle, cMarket, cInterval, C.uint32_t(limit), &buf[0], C.uintptr_t(capN))
+		if rc < 0 {
+			return nil, fmt.Errorf("wickra: klines failed with code %d", int(rc))
+		}
+		total := int(rc)
+		if total > capN {
+			capN = total
+			continue
+		}
+		candles := make([]Candle, total)
+		for i := 0; i < total; i++ {
+			candles[i] = readCandle(&buf[i])
+		}
+		return candles, nil
+	}
+}
+
+// OrderBook returns a depth snapshot for market (up to depth levels per side).
+func (e *Exchange) OrderBook(market string, depth uint32) (OrderBook, error) {
+	cMarket := C.CString(market)
+	defer C.free(unsafe.Pointer(cMarket))
+	capN := 64
+	for {
+		bids := make([]C.WickraBookLevel, capN)
+		asks := make([]C.WickraBookLevel, capN)
+		var bidCount, askCount C.uintptr_t
+		rc := C.wickra_exchange_order_book(e.handle, cMarket, C.uint32_t(depth),
+			&bids[0], C.uintptr_t(capN), &asks[0], C.uintptr_t(capN), &bidCount, &askCount)
+		if err := codeError(rc); err != nil {
+			return OrderBook{}, err
+		}
+		nb, na := int(bidCount), int(askCount)
+		if nb > capN || na > capN {
+			if nb > capN {
+				capN = nb
+			}
+			if na > capN {
+				capN = na
+			}
+			continue
+		}
+		book := OrderBook{Symbol: market, Bids: make([]BookLevel, nb), Asks: make([]BookLevel, na)}
+		for i := 0; i < nb; i++ {
+			book.Bids[i] = readBookLevel(&bids[i])
+		}
+		for i := 0; i < na; i++ {
+			book.Asks[i] = readBookLevel(&asks[i])
+		}
+		return book, nil
+	}
+}
+
+// SubscribeTrades subscribes to the public trade stream for market.
+func (e *Exchange) SubscribeTrades(market string) error {
+	cMarket := C.CString(market)
+	defer C.free(unsafe.Pointer(cMarket))
+	return codeError(C.wickra_exchange_subscribe_trades(e.handle, cMarket))
+}
+
+// SubscribeBook subscribes to the order-book stream for market.
+func (e *Exchange) SubscribeBook(market string) error {
+	cMarket := C.CString(market)
+	defer C.free(unsafe.Pointer(cMarket))
+	return codeError(C.wickra_exchange_subscribe_book(e.handle, cMarket))
+}
+
+// SubscribeTicker subscribes to the ticker stream for market.
+func (e *Exchange) SubscribeTicker(market string) error {
+	cMarket := C.CString(market)
+	defer C.free(unsafe.Pointer(cMarket))
+	return codeError(C.wickra_exchange_subscribe_ticker(e.handle, cMarket))
+}
+
+// QueryOrder looks up a single order by venue id.
+func (e *Exchange) QueryOrder(market, orderID string) (Order, error) {
+	cMarket := C.CString(market)
+	cOrder := C.CString(orderID)
+	defer C.free(unsafe.Pointer(cMarket))
+	defer C.free(unsafe.Pointer(cOrder))
+	var out C.WickraOrder
+	if err := codeError(C.wickra_exchange_query_order(e.handle, cMarket, cOrder, &out)); err != nil {
+		return Order{}, err
+	}
+	return readOrder(&out), nil
+}
+
+// OpenOrders lists open orders, optionally filtered to one market ("" for all).
+func (e *Exchange) OpenOrders(market string) ([]Order, error) {
+	var cMarket *C.char
+	if market != "" {
+		cMarket = C.CString(market)
+		defer C.free(unsafe.Pointer(cMarket))
+	}
+	capN := 16
+	for {
+		buf := make([]C.WickraOrder, capN)
+		rc := C.wickra_exchange_open_orders(e.handle, cMarket, &buf[0], C.uintptr_t(capN))
+		if rc < 0 {
+			return nil, fmt.Errorf("wickra: open_orders failed with code %d", int(rc))
+		}
+		total := int(rc)
+		if total > capN {
+			capN = total
+			continue
+		}
+		orders := make([]Order, total)
+		for i := 0; i < total; i++ {
+			orders[i] = readOrder(&buf[i])
+		}
+		return orders, nil
+	}
+}
+
 // Poll drains buffered events (up to capacity per call).
 func (e *Exchange) Poll(capacity int) ([]Event, error) {
 	buf := make([]C.WickraEvent, capacity)
@@ -293,6 +459,31 @@ func readPosition(p *C.WickraPosition) Position {
 		UnrealizedPnl: float64(p.unrealized_pnl),
 		MarginMode:    MarginMode(p.margin_mode),
 	}
+}
+
+func readTicker(t *C.WickraTicker) Ticker {
+	return Ticker{
+		Symbol: C.GoString(&t.symbol[0]),
+		Last:   float64(t.last),
+		Bid:    float64(t.bid),
+		Ask:    float64(t.ask),
+		Volume: float64(t.volume),
+	}
+}
+
+func readCandle(c *C.WickraCandle) Candle {
+	return Candle{
+		Open:      float64(c.open),
+		High:      float64(c.high),
+		Low:       float64(c.low),
+		Close:     float64(c.close),
+		Volume:    float64(c.volume),
+		Timestamp: int64(c.timestamp),
+	}
+}
+
+func readBookLevel(l *C.WickraBookLevel) BookLevel {
+	return BookLevel{Price: float64(l.price), Quantity: float64(l.quantity)}
 }
 
 func readEvent(e *C.WickraEvent) Event {

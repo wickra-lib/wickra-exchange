@@ -97,3 +97,58 @@ func TestReplayParity(t *testing.T) {
 		t.Fatalf("BTC = %v, want 1", btc)
 	}
 }
+
+func TestMarketDataReads(t *testing.T) {
+	ex, err := Paper(map[string]float64{"USDT": 100000}, 0, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ex.Close()
+	if err := ex.SetPrice("BTC/USDT", 20000); err != nil {
+		t.Fatal(err)
+	}
+
+	// ticker reflects the mark on both sides.
+	ticker, err := ex.Ticker("BTC/USDT")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ticker.Symbol != "BTC/USDT" || math.Abs(ticker.Last-20000) > 1e-9 {
+		t.Fatalf("ticker = %+v", ticker)
+	}
+
+	// subscribe_* are accepted by the paper feed.
+	for _, sub := range []func(string) error{ex.SubscribeTrades, ex.SubscribeBook, ex.SubscribeTicker} {
+		if err := sub("BTC/USDT"); err != nil {
+			t.Fatalf("subscribe: %v", err)
+		}
+	}
+
+	// paper has no historical / depth feed: both report an error.
+	if _, err := ex.Klines("BTC/USDT", "1m", 10); err == nil {
+		t.Fatal("klines must error on paper")
+	}
+	if _, err := ex.OrderBook("BTC/USDT", 10); err == nil {
+		t.Fatal("order_book must error on paper")
+	}
+
+	// A resting limit can be read back by id and appears in open orders.
+	resting, err := ex.PlaceLimit("BTC/USDT", Buy, 1, 19000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	queried, err := ex.QueryOrder("BTC/USDT", resting.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if queried.ID != resting.ID {
+		t.Fatalf("query id = %q, want %q", queried.ID, resting.ID)
+	}
+	opens, err := ex.OpenOrders("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(opens) != 1 || opens[0].ID != resting.ID {
+		t.Fatalf("open orders = %+v", opens)
+	}
+}
