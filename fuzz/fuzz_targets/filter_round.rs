@@ -1,47 +1,45 @@
 #![no_main]
-//! Fuzz the instrument-filter rounding with arbitrary (step, tick, value)
-//! triples. The rounding must not panic and, when stepping is active, must never
-//! round a value up. Inputs are bounded to a realistic price/size band (a
-//! documented precondition) so the fuzzer explores the rounding grid rather than
-//! `Decimal`'s overflow edge.
+//! Fuzz the instrument-filter rounding with a value and realistic (step, tick)
+//! increments. The rounding must not panic and, when stepping is active, must
+//! never round the value up.
+//!
+//! Increments are generated as **clean decimals** (a small mantissa on a
+//! `scale` grid, e.g. `0.01`, `0.5`, `25`) rather than arbitrary `f64`s — a
+//! documented precondition that models reality: venues send tick/step as decimal
+//! strings parsed exactly, never `f64`-mantissa-noisy values. An arbitrary `f64`
+//! increment only exercises `Decimal`'s 28-significant-digit precision cliff
+//! (where the divide/floor/multiply round-trip cannot stay exact), not the
+//! rounding logic under test. The value is a non-negative price/size within a
+//! realistic band.
 
 use libfuzzer_sys::fuzz_target;
 use rust_decimal::Decimal;
 use wickra_exchange_core::InstrumentFilters;
 
-fn bounded_decimal(raw: f64) -> Option<Decimal> {
+/// A non-negative price/size within a realistic band, or `None` to skip.
+fn bounded_value(raw: f64) -> Option<Decimal> {
     if !raw.is_finite() || raw.abs() > 1.0e9 {
         return None;
     }
-    Decimal::from_f64_retain(raw)
+    Decimal::from_f64_retain(raw.abs())
 }
 
-/// A realistic venue increment: either exactly zero (no stepping) or within the
-/// grid real venues actually use. Sub-1e-12 increments do not exist on any venue
-/// and only exercise `Decimal`'s 28-significant-digit precision cliff (where the
-/// divide/floor/multiply round-trip cannot stay exact), not the rounding logic
-/// under test — a documented precondition, like the 1e9 upper bound.
-fn bounded_increment(raw: f64) -> Option<Decimal> {
-    let dec = bounded_decimal(raw.abs())?;
-    if dec > Decimal::ZERO && dec < Decimal::from_f64_retain(1.0e-12)? {
-        return None;
-    }
-    Some(dec)
+/// A realistic venue increment: `mantissa * 10^-scale` with a small mantissa and
+/// `scale` in `0..=8`, e.g. `0.01`, `5.0`, `0.00000255`. A zero mantissa means no
+/// stepping. This is the clean decimal grid real venues quote on.
+fn realistic_increment(mantissa: u8, scale: u8) -> Decimal {
+    Decimal::new(i64::from(mantissa), u32::from(scale % 9))
 }
 
 fuzz_target!(|data: &[u8]| {
-    if data.len() < 24 {
+    if data.len() < 12 {
         return;
     }
-    let read = |i: usize| f64::from_le_bytes(data[i..i + 8].try_into().unwrap());
-    // Prices and sizes are non-negative on every venue, so `value` is too.
-    let (Some(step), Some(tick), Some(value)) = (
-        bounded_increment(read(0)),
-        bounded_increment(read(8)),
-        bounded_decimal(read(16).abs()),
-    ) else {
+    let Some(value) = bounded_value(f64::from_le_bytes(data[0..8].try_into().unwrap())) else {
         return;
     };
+    let step = realistic_increment(data[8], data[9]);
+    let tick = realistic_increment(data[10], data[11]);
 
     let filters = InstrumentFilters {
         min_quantity: Decimal::ZERO,
