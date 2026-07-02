@@ -60,6 +60,8 @@ class DerivativesTest {
     @Test
     void userDataConstructsAndPolls() {
         try (UserData userData = UserData.connect("binance", "k", "s", null, null, false, false)) {
+            // Keepalive is a no-op before subscribeUserData; it must not throw.
+            userData.keepaliveUserData();
             // WsUserData: MarketData, so the client can poll (nothing buffered offline).
             assertTrue(userData.poll(4).isEmpty());
         }

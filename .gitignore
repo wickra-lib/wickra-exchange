@@ -1,4 +1,8 @@
 /target
+# cargo-fuzz builds in a detached workspace under fuzz/; its build dir and
+# resolved lockfile are local artifacts, never committed.
+/fuzz/target
+/fuzz/Cargo.lock
 **/*.rs.bk
 Cargo.lock.bak
 .DS_Store

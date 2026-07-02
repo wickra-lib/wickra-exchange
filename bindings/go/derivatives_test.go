@@ -90,6 +90,10 @@ func TestUserDataConstructsAndPolls(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer u.Close()
+	// Keepalive is a no-op before SubscribeUserData; it must not error.
+	if err := u.KeepaliveUserData(); err != nil {
+		t.Fatalf("keepalive must not error: %v", err)
+	}
 	// WsUserData: MarketData, so the client can poll (nothing buffered offline).
 	events, err := u.Poll(4)
 	if err != nil {

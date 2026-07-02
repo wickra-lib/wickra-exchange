@@ -425,6 +425,10 @@ SEXP wkex_user_data_subscribe(SEXP ext) {
     return Rf_ScalarInteger(wickra_user_data_subscribe(user_data_of(ext)));
 }
 
+SEXP wkex_user_data_keepalive(SEXP ext) {
+    return Rf_ScalarInteger(wickra_user_data_keepalive(user_data_of(ext)));
+}
+
 SEXP wkex_user_data_poll(SEXP ext, SEXP capacity) {
     int cap = Rf_asInteger(capacity);
     WickraEvent *buf = (WickraEvent *)R_alloc(cap, sizeof(WickraEvent));
@@ -515,6 +519,7 @@ static const R_CallMethodDef CallEntries[] = {
     {"wkex_advanced_place_batch", (DL_FUNC)&wkex_advanced_place_batch, 5},
     {"wkex_connect_user_data", (DL_FUNC)&wkex_connect_user_data, 7},
     {"wkex_user_data_subscribe", (DL_FUNC)&wkex_user_data_subscribe, 1},
+    {"wkex_user_data_keepalive", (DL_FUNC)&wkex_user_data_keepalive, 1},
     {"wkex_user_data_poll", (DL_FUNC)&wkex_user_data_poll, 2},
     {"wkex_connect_ws_execution", (DL_FUNC)&wkex_connect_ws_execution, 7},
     {"wkex_ws_place_order", (DL_FUNC)&wkex_ws_place_order, 5},

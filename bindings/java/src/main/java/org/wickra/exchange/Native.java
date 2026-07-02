@@ -129,6 +129,8 @@ final class Native {
             FunctionDescriptor.ofVoid(C_PTR));
     static final MethodHandle USER_DATA_SUBSCRIBE = handle("wickra_user_data_subscribe",
             FunctionDescriptor.of(C_INT, C_PTR));
+    static final MethodHandle USER_DATA_KEEPALIVE = handle("wickra_user_data_keepalive",
+            FunctionDescriptor.of(C_INT, C_PTR));
     static final MethodHandle USER_DATA_POLL = handle("wickra_user_data_poll",
             FunctionDescriptor.of(C_INT, C_PTR, C_PTR, C_SIZE));
 

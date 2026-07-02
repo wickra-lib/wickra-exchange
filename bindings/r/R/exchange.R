@@ -329,6 +329,19 @@ wkex_subscribe_user_data <- function(ud) {
   invisible(.Call(C_wkex_user_data_subscribe, ud$handle))
 }
 
+#' Keep the private user-data stream alive.
+#'
+#' Refreshes the venue session / sends a heartbeat so the stream is not dropped
+#' for inactivity; call it periodically. A dropped stream is also recovered
+#' automatically on the next [wkex_user_data_poll()]. A no-op before
+#' [wkex_subscribe_user_data()].
+#' @param ud A `wickra_user_data` object.
+#' @return Invisibly, `ud`.
+#' @export
+wkex_keepalive_user_data <- function(ud) {
+  invisible(.Call(C_wkex_user_data_keepalive, ud$handle))
+}
+
 #' Drain buffered user-data events.
 #' @param ud A `wickra_user_data` object.
 #' @param capacity Maximum events to return per call.

@@ -47,6 +47,19 @@ public final class UserData implements AutoCloseable {
         }
     }
 
+    /**
+     * Keep the private stream alive (refresh the venue session / send a heartbeat) so it is not
+     * dropped for inactivity; call it periodically. A dropped stream is also recovered
+     * automatically on the next {@link #poll}. A no-op before {@link #subscribeUserData}.
+     */
+    public void keepaliveUserData() {
+        try {
+            Exchange.check((int) Native.USER_DATA_KEEPALIVE.invokeExact(handle));
+        } catch (Throwable t) {
+            throw new RuntimeException(t);
+        }
+    }
+
     /** Drain buffered events (up to {@code capacity} per call). */
     public List<Exchange.Event> poll(int capacity) {
         try (Arena arena = Arena.ofConfined()) {

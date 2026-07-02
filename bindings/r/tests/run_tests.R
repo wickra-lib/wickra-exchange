@@ -89,6 +89,8 @@ for (venue in c("coinbase", "upbit", "ftx")) {
 }
 ud <- wkex_user_data("binance", "k", "s")
 stopifnot(inherits(ud, "wickra_user_data"))
+## Keepalive is a no-op before subscribe; it must not error.
+wkex_keepalive_user_data(ud)
 ## WsUserData: MarketData, so the client can poll (nothing buffered offline).
 stopifnot(length(wkex_user_data_poll(ud)) == 0)
 wse <- wkex_ws_execution("bybit", "k", "s")
