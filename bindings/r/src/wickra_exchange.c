@@ -106,6 +106,40 @@ static SEXP event_to_list(const WickraEvent *event) {
     return out;
 }
 
+static SEXP ticker_to_list(const WickraTicker *t) {
+    const char *names[] = {"symbol", "last", "bid", "ask", "volume", ""};
+    SEXP out = PROTECT(Rf_mkNamed(VECSXP, names));
+    SET_VECTOR_ELT(out, 0, Rf_mkString(t->symbol));
+    SET_VECTOR_ELT(out, 1, Rf_ScalarReal(t->last));
+    SET_VECTOR_ELT(out, 2, Rf_ScalarReal(t->bid));
+    SET_VECTOR_ELT(out, 3, Rf_ScalarReal(t->ask));
+    SET_VECTOR_ELT(out, 4, Rf_ScalarReal(t->volume));
+    UNPROTECT(1);
+    return out;
+}
+
+static SEXP candle_to_list(const WickraCandle *c) {
+    const char *names[] = {"open", "high", "low", "close", "volume", "timestamp", ""};
+    SEXP out = PROTECT(Rf_mkNamed(VECSXP, names));
+    SET_VECTOR_ELT(out, 0, Rf_ScalarReal(c->open));
+    SET_VECTOR_ELT(out, 1, Rf_ScalarReal(c->high));
+    SET_VECTOR_ELT(out, 2, Rf_ScalarReal(c->low));
+    SET_VECTOR_ELT(out, 3, Rf_ScalarReal(c->close));
+    SET_VECTOR_ELT(out, 4, Rf_ScalarReal(c->volume));
+    SET_VECTOR_ELT(out, 5, Rf_ScalarReal((double)c->timestamp));
+    UNPROTECT(1);
+    return out;
+}
+
+static SEXP book_level_to_list(const WickraBookLevel *l) {
+    const char *names[] = {"price", "quantity", ""};
+    SEXP out = PROTECT(Rf_mkNamed(VECSXP, names));
+    SET_VECTOR_ELT(out, 0, Rf_ScalarReal(l->price));
+    SET_VECTOR_ELT(out, 1, Rf_ScalarReal(l->quantity));
+    UNPROTECT(1);
+    return out;
+}
+
 /* --- exports ------------------------------------------------------------- */
 
 SEXP wkex_version(void) {
@@ -188,6 +222,121 @@ SEXP wkex_poll(SEXP ext, SEXP capacity) {
     }
     UNPROTECT(1);
     return out;
+}
+
+SEXP wkex_exchange_ticker(SEXP ext, SEXP market) {
+    WickraTicker t;
+    int rc = wickra_exchange_ticker(handle_of(ext), CHAR(STRING_ELT(market, 0)), &t);
+    if (rc != WICKRA_OK) {
+        Rf_error("wickra: ticker failed with code %d", rc);
+    }
+    return ticker_to_list(&t);
+}
+
+SEXP wkex_exchange_klines(SEXP ext, SEXP market, SEXP interval, SEXP limit) {
+    const char *m = CHAR(STRING_ELT(market, 0));
+    const char *iv = CHAR(STRING_ELT(interval, 0));
+    uint32_t lim = (uint32_t)Rf_asInteger(limit);
+    int cap = 128;
+    for (;;) {
+        WickraCandle *buf = (WickraCandle *)R_alloc(cap, sizeof(WickraCandle));
+        int count = wickra_exchange_klines(handle_of(ext), m, iv, lim, buf, (size_t)cap);
+        if (count < 0) {
+            Rf_error("wickra: klines failed with code %d", count);
+        }
+        if (count > cap) {
+            cap = count;
+            continue;
+        }
+        SEXP out = PROTECT(Rf_allocVector(VECSXP, count));
+        for (int i = 0; i < count; i++) {
+            SET_VECTOR_ELT(out, i, candle_to_list(&buf[i]));
+        }
+        UNPROTECT(1);
+        return out;
+    }
+}
+
+SEXP wkex_exchange_order_book(SEXP ext, SEXP market, SEXP depth) {
+    const char *m = CHAR(STRING_ELT(market, 0));
+    uint32_t d = (uint32_t)Rf_asInteger(depth);
+    int cap = 64;
+    for (;;) {
+        WickraBookLevel *bids = (WickraBookLevel *)R_alloc(cap, sizeof(WickraBookLevel));
+        WickraBookLevel *asks = (WickraBookLevel *)R_alloc(cap, sizeof(WickraBookLevel));
+        uintptr_t bid_count = 0, ask_count = 0;
+        int rc = wickra_exchange_order_book(handle_of(ext), m, d, bids, (size_t)cap, asks,
+                                            (size_t)cap, &bid_count, &ask_count);
+        if (rc != WICKRA_OK) {
+            Rf_error("wickra: order_book failed with code %d", rc);
+        }
+        if ((int)bid_count > cap || (int)ask_count > cap) {
+            cap = (int)(bid_count > ask_count ? bid_count : ask_count);
+            continue;
+        }
+        const char *names[] = {"symbol", "bids", "asks", ""};
+        SEXP out = PROTECT(Rf_mkNamed(VECSXP, names));
+        SET_VECTOR_ELT(out, 0, Rf_mkString(m));
+        SEXP bid_list = PROTECT(Rf_allocVector(VECSXP, (R_xlen_t)bid_count));
+        for (uintptr_t i = 0; i < bid_count; i++) {
+            SET_VECTOR_ELT(bid_list, (R_xlen_t)i, book_level_to_list(&bids[i]));
+        }
+        SET_VECTOR_ELT(out, 1, bid_list);
+        SEXP ask_list = PROTECT(Rf_allocVector(VECSXP, (R_xlen_t)ask_count));
+        for (uintptr_t i = 0; i < ask_count; i++) {
+            SET_VECTOR_ELT(ask_list, (R_xlen_t)i, book_level_to_list(&asks[i]));
+        }
+        SET_VECTOR_ELT(out, 2, ask_list);
+        UNPROTECT(3);
+        return out;
+    }
+}
+
+SEXP wkex_exchange_subscribe_trades(SEXP ext, SEXP market) {
+    return Rf_ScalarInteger(
+        wickra_exchange_subscribe_trades(handle_of(ext), CHAR(STRING_ELT(market, 0))));
+}
+
+SEXP wkex_exchange_subscribe_book(SEXP ext, SEXP market) {
+    return Rf_ScalarInteger(
+        wickra_exchange_subscribe_book(handle_of(ext), CHAR(STRING_ELT(market, 0))));
+}
+
+SEXP wkex_exchange_subscribe_ticker(SEXP ext, SEXP market) {
+    return Rf_ScalarInteger(
+        wickra_exchange_subscribe_ticker(handle_of(ext), CHAR(STRING_ELT(market, 0))));
+}
+
+SEXP wkex_exchange_query_order(SEXP ext, SEXP market, SEXP order_id) {
+    WickraOrder order;
+    int rc = wickra_exchange_query_order(handle_of(ext), CHAR(STRING_ELT(market, 0)),
+                                         CHAR(STRING_ELT(order_id, 0)), &order);
+    if (rc != WICKRA_OK) {
+        Rf_error("wickra: query_order failed with code %d", rc);
+    }
+    return order_to_list(&order);
+}
+
+SEXP wkex_exchange_open_orders(SEXP ext, SEXP market) {
+    const char *m = opt_cstr(market);
+    int cap = 16;
+    for (;;) {
+        WickraOrder *buf = (WickraOrder *)R_alloc(cap, sizeof(WickraOrder));
+        int count = wickra_exchange_open_orders(handle_of(ext), m, buf, (size_t)cap);
+        if (count < 0) {
+            Rf_error("wickra: open_orders failed with code %d", count);
+        }
+        if (count > cap) {
+            cap = count;
+            continue;
+        }
+        SEXP out = PROTECT(Rf_allocVector(VECSXP, count));
+        for (int i = 0; i < count; i++) {
+            SET_VECTOR_ELT(out, i, order_to_list(&buf[i]));
+        }
+        UNPROTECT(1);
+        return out;
+    }
 }
 
 /* --- derivatives --------------------------------------------------------- */
@@ -506,6 +655,14 @@ static const R_CallMethodDef CallEntries[] = {
     {"wkex_cancel", (DL_FUNC)&wkex_cancel, 3},
     {"wkex_balance", (DL_FUNC)&wkex_balance, 2},
     {"wkex_poll", (DL_FUNC)&wkex_poll, 2},
+    {"wkex_exchange_ticker", (DL_FUNC)&wkex_exchange_ticker, 2},
+    {"wkex_exchange_klines", (DL_FUNC)&wkex_exchange_klines, 4},
+    {"wkex_exchange_order_book", (DL_FUNC)&wkex_exchange_order_book, 3},
+    {"wkex_exchange_subscribe_trades", (DL_FUNC)&wkex_exchange_subscribe_trades, 2},
+    {"wkex_exchange_subscribe_book", (DL_FUNC)&wkex_exchange_subscribe_book, 2},
+    {"wkex_exchange_subscribe_ticker", (DL_FUNC)&wkex_exchange_subscribe_ticker, 2},
+    {"wkex_exchange_query_order", (DL_FUNC)&wkex_exchange_query_order, 3},
+    {"wkex_exchange_open_orders", (DL_FUNC)&wkex_exchange_open_orders, 2},
     {"wkex_connect_derivatives", (DL_FUNC)&wkex_connect_derivatives, 6},
     {"wkex_derivatives_position", (DL_FUNC)&wkex_derivatives_position, 2},
     {"wkex_derivatives_positions", (DL_FUNC)&wkex_derivatives_positions, 2},
