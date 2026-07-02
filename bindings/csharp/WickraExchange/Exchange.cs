@@ -51,6 +51,21 @@ public sealed record EventInfo(EventKind Kind, string? Symbol, double? Price, do
     public bool IsTrade => Kind == EventKind.Trade;
 }
 
+/// <summary>A point-in-time ticker snapshot.</summary>
+public sealed record TickerInfo(string Symbol, double Last, double Bid, double Ask, double Volume);
+
+/// <summary>A single OHLCV candle.</summary>
+public sealed record CandleInfo(double Open, double High, double Low, double Close, double Volume, long Timestamp);
+
+/// <summary>A single order-book level: price and resting quantity.</summary>
+public sealed record BookLevelInfo(double Price, double Quantity);
+
+/// <summary>
+/// A depth snapshot, best-first on each side. <see cref="Symbol"/> echoes the
+/// requested market; the venue sequence id is available on the native bindings.
+/// </summary>
+public sealed record OrderBookInfo(string Symbol, IReadOnlyList<BookLevelInfo> Bids, IReadOnlyList<BookLevelInfo> Asks);
+
 /// <summary>
 /// A unified exchange client over the synchronous, pull-based API. Construct with
 /// <see cref="Paper"/>, <see cref="ReplayTrades"/> or <see cref="Connect"/>; the
@@ -224,6 +239,168 @@ public sealed unsafe class Exchange : IDisposable
         return free;
     }
 
+    /// <summary>The current ticker for <paramref name="market"/>.</summary>
+    public TickerInfo Ticker(string market)
+    {
+        var m = Utf8(market);
+        Native.Ticker t;
+        fixed (byte* mp = m)
+        {
+            Check(Native.wickra_exchange_ticker(_handle, mp, &t));
+        }
+        return ReadTicker(t);
+    }
+
+    /// <summary>Up to <paramref name="limit"/> historical candles for <paramref name="market"/> at <paramref name="interval"/>.</summary>
+    public IReadOnlyList<CandleInfo> Klines(string market, string interval, uint limit)
+    {
+        var m = Utf8(market);
+        var iv = Utf8(interval);
+        int cap = 128;
+        while (true)
+        {
+            var buffer = new Native.Candle[cap];
+            int count;
+            fixed (byte* mp = m)
+            fixed (byte* ip = iv)
+            fixed (Native.Candle* bp = buffer)
+            {
+                count = Native.wickra_exchange_klines(_handle, mp, ip, limit, bp, (nuint)cap);
+            }
+            if (count < 0)
+            {
+                throw new WickraException($"klines failed with code {count}");
+            }
+            if (count > cap)
+            {
+                cap = count;
+                continue;
+            }
+            var result = new List<CandleInfo>(count);
+            for (int i = 0; i < count; i++)
+            {
+                var c = buffer[i];
+                result.Add(new CandleInfo(c.Open, c.High, c.Low, c.Close, c.Volume, c.Timestamp));
+            }
+            return result;
+        }
+    }
+
+    /// <summary>Depth snapshot for <paramref name="market"/> (up to <paramref name="depth"/> levels per side).</summary>
+    public OrderBookInfo OrderBook(string market, uint depth)
+    {
+        var m = Utf8(market);
+        int cap = 64;
+        while (true)
+        {
+            var bids = new Native.BookLevel[cap];
+            var asks = new Native.BookLevel[cap];
+            nuint bidCount, askCount;
+            int rc;
+            fixed (byte* mp = m)
+            fixed (Native.BookLevel* bp = bids)
+            fixed (Native.BookLevel* ap = asks)
+            {
+                rc = Native.wickra_exchange_order_book(
+                    _handle, mp, depth, bp, (nuint)cap, ap, (nuint)cap, &bidCount, &askCount);
+            }
+            Check(rc);
+            int nb = (int)bidCount, na = (int)askCount;
+            if (nb > cap || na > cap)
+            {
+                cap = Math.Max(nb, na);
+                continue;
+            }
+            var bidList = new List<BookLevelInfo>(nb);
+            for (int i = 0; i < nb; i++)
+            {
+                bidList.Add(new BookLevelInfo(bids[i].Price, bids[i].Quantity));
+            }
+            var askList = new List<BookLevelInfo>(na);
+            for (int i = 0; i < na; i++)
+            {
+                askList.Add(new BookLevelInfo(asks[i].Price, asks[i].Quantity));
+            }
+            return new OrderBookInfo(market, bidList, askList);
+        }
+    }
+
+    /// <summary>Subscribe to the public trade stream for <paramref name="market"/>.</summary>
+    public void SubscribeTrades(string market)
+    {
+        var m = Utf8(market);
+        fixed (byte* mp = m)
+        {
+            Check(Native.wickra_exchange_subscribe_trades(_handle, mp));
+        }
+    }
+
+    /// <summary>Subscribe to the order-book stream for <paramref name="market"/>.</summary>
+    public void SubscribeBook(string market)
+    {
+        var m = Utf8(market);
+        fixed (byte* mp = m)
+        {
+            Check(Native.wickra_exchange_subscribe_book(_handle, mp));
+        }
+    }
+
+    /// <summary>Subscribe to the ticker stream for <paramref name="market"/>.</summary>
+    public void SubscribeTicker(string market)
+    {
+        var m = Utf8(market);
+        fixed (byte* mp = m)
+        {
+            Check(Native.wickra_exchange_subscribe_ticker(_handle, mp));
+        }
+    }
+
+    /// <summary>Look up a single order by venue id.</summary>
+    public OrderInfo QueryOrder(string market, string orderId)
+    {
+        var m = Utf8(market);
+        var o = Utf8(orderId);
+        Native.Order order;
+        fixed (byte* mp = m)
+        fixed (byte* op = o)
+        {
+            Check(Native.wickra_exchange_query_order(_handle, mp, op, &order));
+        }
+        return ReadOrder(order);
+    }
+
+    /// <summary>Open orders, optionally filtered to one <paramref name="market"/>.</summary>
+    public IReadOnlyList<OrderInfo> OpenOrders(string? market = null)
+    {
+        byte[]? m = market is null ? null : Utf8(market);
+        int cap = 16;
+        while (true)
+        {
+            var buffer = new Native.Order[cap];
+            int count;
+            fixed (byte* mp = m)
+            fixed (Native.Order* bp = buffer)
+            {
+                count = Native.wickra_exchange_open_orders(_handle, mp, bp, (nuint)cap);
+            }
+            if (count < 0)
+            {
+                throw new WickraException($"open_orders failed with code {count}");
+            }
+            if (count > cap)
+            {
+                cap = count;
+                continue;
+            }
+            var result = new List<OrderInfo>(count);
+            for (int i = 0; i < count; i++)
+            {
+                result.Add(ReadOrder(buffer[i]));
+            }
+            return result;
+        }
+    }
+
     /// <summary>Drain buffered events (up to <paramref name="capacity"/> per call).</summary>
     public IReadOnlyList<EventInfo> Poll(int capacity = 16)
     {
@@ -309,6 +486,12 @@ public sealed unsafe class Exchange : IDisposable
         double? price = double.IsNaN(order.Price) ? null : order.Price;
         double? avg = double.IsNaN(order.AveragePrice) ? null : order.AveragePrice;
         return new OrderInfo(id, (Side)order.Side, (OrderStatus)order.Status, order.Quantity, order.FilledQuantity, price, avg);
+    }
+
+    internal static TickerInfo ReadTicker(Native.Ticker t)
+    {
+        var symbol = CString(new Span<byte>(t.Symbol, Native.StrCap));
+        return new TickerInfo(symbol, t.Last, t.Bid, t.Ask, t.Volume);
     }
 
     internal static EventInfo ReadEvent(Native.Event ev)

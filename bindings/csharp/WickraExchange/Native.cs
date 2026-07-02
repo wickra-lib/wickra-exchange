@@ -101,6 +101,63 @@ internal static unsafe class Native
     public static extern int wickra_exchange_poll(nint handle, Event* outBuf, nuint cap);
 
     [StructLayout(LayoutKind.Sequential)]
+    public struct Ticker
+    {
+        public fixed byte Symbol[StrCap];
+        public double Last;
+        public double Bid;
+        public double Ask;
+        public double Volume;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct Candle
+    {
+        public double Open;
+        public double High;
+        public double Low;
+        public double Close;
+        public double Volume;
+        public long Timestamp;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct BookLevel
+    {
+        public double Price;
+        public double Quantity;
+    }
+
+    [DllImport(Lib)]
+    public static extern int wickra_exchange_ticker(nint handle, byte* market, Ticker* outTicker);
+
+    [DllImport(Lib)]
+    public static extern int wickra_exchange_klines(
+        nint handle, byte* market, byte* interval, uint limit, Candle* outBuf, nuint cap);
+
+    [DllImport(Lib)]
+    public static extern int wickra_exchange_order_book(
+        nint handle, byte* market, uint depth,
+        BookLevel* bidsOut, nuint bidsCap, BookLevel* asksOut, nuint asksCap,
+        nuint* outBidCount, nuint* outAskCount);
+
+    [DllImport(Lib)]
+    public static extern int wickra_exchange_subscribe_trades(nint handle, byte* market);
+
+    [DllImport(Lib)]
+    public static extern int wickra_exchange_subscribe_book(nint handle, byte* market);
+
+    [DllImport(Lib)]
+    public static extern int wickra_exchange_subscribe_ticker(nint handle, byte* market);
+
+    [DllImport(Lib)]
+    public static extern int wickra_exchange_query_order(
+        nint handle, byte* market, byte* orderId, Order* outOrder);
+
+    [DllImport(Lib)]
+    public static extern int wickra_exchange_open_orders(nint handle, byte* market, Order* outBuf, nuint cap);
+
+    [StructLayout(LayoutKind.Sequential)]
     public struct Position
     {
         public fixed byte Symbol[StrCap];
