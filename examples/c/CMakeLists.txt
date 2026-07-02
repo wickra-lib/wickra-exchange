@@ -37,6 +37,22 @@ add_executable(paper paper.cpp)
 target_include_directories(paper PRIVATE "${WICKRA_EXCHANGE_INCLUDE}")
 target_link_libraries(paper PRIVATE "${WICKRA_EXCHANGE_LIB}")
 
+# On Windows the runtime DLL must sit next to the executable (there is no
+# rpath); without it the loader pops a modal "DLL not found" dialog that hangs
+# ctest. Copy it next to each example after build. (Unix resolves the .so/.dylib
+# via the linker's embedded path, so this is Windows-only.)
+if(WIN32)
+    foreach(example replay paper)
+        add_custom_command(TARGET ${example} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${WICKRA_EXCHANGE_LIB_DIR}/wickra_exchange.dll"
+                "$<TARGET_FILE_DIR:${example}>"
+            VERBATIM)
+    endforeach()
+endif()
+
 enable_testing()
 add_test(NAME replay COMMAND replay)
 add_test(NAME paper COMMAND paper)
+# A missing runtime dependency must fail fast, never block the runner for hours.
+set_tests_properties(replay paper PROPERTIES TIMEOUT 60)
