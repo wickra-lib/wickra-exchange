@@ -89,4 +89,38 @@ public class ExchangeTests
         Assert.True(bought);
         Assert.True(Math.Abs(ex.Balance("BTC") - 1.0) < 1e-9);
     }
+
+    [Fact]
+    public void MarketDataReads()
+    {
+        using var ex = Exchange.Paper(new Dictionary<string, double> { ["USDT"] = 100_000.0 });
+        ex.SetPrice("BTC/USDT", 20_000.0);
+
+        // ticker reflects the mark on both sides.
+        var ticker = ex.Ticker("BTC/USDT");
+        Assert.Equal("BTC/USDT", ticker.Symbol);
+        Assert.True(Math.Abs(ticker.Last - 20_000.0) < 1e-9);
+
+        // subscribe_* are accepted by the paper feed.
+        ex.SubscribeTrades("BTC/USDT");
+        ex.SubscribeBook("BTC/USDT");
+        ex.SubscribeTicker("BTC/USDT");
+
+        // paper has no historical / depth feed: both throw.
+        Assert.Throws<WickraException>(() => ex.Klines("BTC/USDT", "1m", 10));
+        Assert.Throws<WickraException>(() => ex.OrderBook("BTC/USDT", 10));
+
+        // A resting limit can be read back by id and appears in open orders.
+        var resting = ex.PlaceLimit("BTC/USDT", Side.Buy, 1.0, 19_000.0);
+        Assert.Equal(OrderStatus.New, resting.Status);
+
+        var queried = ex.QueryOrder("BTC/USDT", resting.Id);
+        Assert.Equal(resting.Id, queried.Id);
+
+        var opens = ex.OpenOrders();
+        Assert.Single(opens);
+        Assert.Equal(resting.Id, opens[0].Id);
+        Assert.Single(ex.OpenOrders("BTC/USDT"));
+        Assert.Empty(ex.OpenOrders("ETH/USDT"));
+    }
 }
