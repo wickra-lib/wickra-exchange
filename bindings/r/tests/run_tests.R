@@ -122,4 +122,19 @@ stopifnot(inherits(wse, "wickra_ws_execution"))
 stopifnot(is.function(wkex_ws_place_order))
 stopifnot(is.function(wkex_ws_cancel_order))
 
+## Completeness guard: every canonical verb is exported as a function, so a
+## dropped wrapper fails loudly here (mirrors the main wickra repo's check).
+for (verb in c(
+  "wkex_ticker", "wkex_klines", "wkex_order_book", "wkex_subscribe_trades",
+  "wkex_subscribe_book", "wkex_subscribe_ticker", "wkex_poll", "wkex_place_market",
+  "wkex_place_limit", "wkex_cancel", "wkex_query_order", "wkex_open_orders",
+  "wkex_balance", "wkex_name",
+  "wkex_positions", "wkex_set_leverage", "wkex_set_margin_mode", "wkex_close_position",
+  "wkex_amend_order", "wkex_place_batch", "wkex_cancel_batch", "wkex_place_oco",
+  "wkex_subscribe_user_data", "wkex_keepalive_user_data", "wkex_user_data_poll",
+  "wkex_ws_place_order", "wkex_ws_cancel_order"
+)) {
+  stopifnot(is.function(get(verb, envir = asNamespace("wickraexchange"))))
+}
+
 cat("wickra.exchange R tests passed\n")
