@@ -29,6 +29,16 @@ stop-limit; time-in-force GTC / IOC / FOK; `reduce_only` and `post_only` flags.
 Per-symbol filters (lot step, price tick, min-notional) are enforced through
 `InstrumentFilters` before an order is sent.
 
+> **Full read/execution surface in every binding.** The complete `MarketData`
+> surface (`ticker`, `klines`, `order_book`, `subscribe_trades` /
+> `subscribe_book` / `subscribe_ticker`, `poll_events`) and `Execution` surface
+> (`place_order`, `cancel_order`, `query_order`, `open_orders`, `balances`) are
+> reachable from **all nine language bindings** — Python, Node.js, the C ABI hub,
+> and the Go / C# / Java / R wrappers over it — not just from Rust. A
+> per-binding completeness test pins the canonical verb set so a dropped method
+> fails CI. (The C-ABI `order_book` projects the bid/ask levels; the venue
+> sequence id stays on the native Rust/Python/Node path.)
+
 > **WS user-data streams** ([`WsUserData`]) push the account's own order and
 > balance updates: `subscribe_user_data` opens a private stream (Binance listen
 > key, Bybit/OKX/Bitget signed login, KuCoin bullet-private token, Gate signed
