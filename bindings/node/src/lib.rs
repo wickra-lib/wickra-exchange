@@ -25,11 +25,12 @@ use rust_decimal::Decimal;
 
 use wickra_exchange::{
     connect, connect_advanced, connect_derivatives, connect_user_data, connect_ws_execution,
-    AdvancedOrders as CoreAdvancedOrders, Credentials as CoreCredentials,
-    Derivatives as CoreDerivatives, Event, Exchange as CoreExchange, ExchangeOptions, MarginMode,
-    MarketType, OcoRequest, Order, OrderRequest as CoreOrderRequest, OrderSide, OrderStatus,
-    PaperExchange, Position, PositionSide, ReplayExchange, Symbol, TradePrint,
-    WsExecution as CoreWsExecution, WsUserData as CoreWsUserData,
+    AdvancedOrders as CoreAdvancedOrders, BookLevel as CoreBookLevel,
+    Credentials as CoreCredentials, Derivatives as CoreDerivatives, Event,
+    Exchange as CoreExchange, ExchangeOptions, MarginMode, MarketType, OcoRequest, Order,
+    OrderRequest as CoreOrderRequest, OrderSide, OrderStatus, PaperExchange, Position,
+    PositionSide, ReplayExchange, Symbol, TradePrint, WsExecution as CoreWsExecution,
+    WsUserData as CoreWsUserData,
 };
 
 fn err(message: impl Into<String>) -> NapiError {
@@ -187,6 +188,33 @@ pub struct TickerInfo {
     pub bid: f64,
     pub ask: f64,
     pub volume: f64,
+}
+
+/// A single OHLCV candle.
+#[napi(object)]
+pub struct CandleInfo {
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    pub volume: f64,
+    pub timestamp: i64,
+}
+
+/// A single order-book level: price and resting quantity.
+#[napi(object)]
+pub struct BookLevelInfo {
+    pub price: f64,
+    pub quantity: f64,
+}
+
+/// A depth snapshot, best-first on each side.
+#[napi(object)]
+pub struct OrderBookInfo {
+    pub symbol: String,
+    pub last_update_id: f64,
+    pub bids: Vec<BookLevelInfo>,
+    pub asks: Vec<BookLevelInfo>,
 }
 
 /// A single stream event. `kind` discriminates the payload
@@ -505,6 +533,100 @@ impl Exchange {
             .as_exchange()
             .subscribe_trades(&parse_symbol(&market)?)
             .map_err(map_err)
+    }
+
+    /// Subscribe to the order-book stream for `market`.
+    #[napi]
+    pub fn subscribe_book(&mut self, market: String) -> napi::Result<()> {
+        self.inner
+            .as_exchange()
+            .subscribe_book(&parse_symbol(&market)?)
+            .map_err(map_err)
+    }
+
+    /// Subscribe to the ticker stream for `market`.
+    #[napi]
+    pub fn subscribe_ticker(&mut self, market: String) -> napi::Result<()> {
+        self.inner
+            .as_exchange()
+            .subscribe_ticker(&parse_symbol(&market)?)
+            .map_err(map_err)
+    }
+
+    /// Up to `limit` historical candles for `market` at `interval`.
+    #[napi]
+    pub fn klines(
+        &mut self,
+        market: String,
+        interval: String,
+        limit: u32,
+    ) -> napi::Result<Vec<CandleInfo>> {
+        let candles = self
+            .inner
+            .as_exchange()
+            .klines(&parse_symbol(&market)?, &interval, limit)
+            .map_err(map_err)?;
+        Ok(candles
+            .iter()
+            .map(|candle| CandleInfo {
+                open: candle.open,
+                high: candle.high,
+                low: candle.low,
+                close: candle.close,
+                volume: candle.volume,
+                timestamp: candle.timestamp,
+            })
+            .collect())
+    }
+
+    /// Order-book snapshot for `market` (up to `depth` levels per side).
+    #[napi]
+    pub fn order_book(&mut self, market: String, depth: u32) -> napi::Result<OrderBookInfo> {
+        let book = self
+            .inner
+            .as_exchange()
+            .order_book(&parse_symbol(&market)?, depth)
+            .map_err(map_err)?;
+        let levels = |side: &[CoreBookLevel]| {
+            side.iter()
+                .map(|level| BookLevelInfo {
+                    price: to_float(level.price),
+                    quantity: to_float(level.quantity),
+                })
+                .collect()
+        };
+        Ok(OrderBookInfo {
+            symbol: book.symbol.to_string(),
+            last_update_id: book.last_update_id as f64,
+            bids: levels(&book.bids),
+            asks: levels(&book.asks),
+        })
+    }
+
+    /// Look up a single order by venue id.
+    #[napi]
+    pub fn query_order(&mut self, market: String, order_id: String) -> napi::Result<OrderInfo> {
+        let order = self
+            .inner
+            .as_exchange()
+            .query_order(&parse_symbol(&market)?, &order_id)
+            .map_err(map_err)?;
+        Ok(OrderInfo::from(&order))
+    }
+
+    /// Open orders, optionally filtered to one `market`.
+    #[napi]
+    pub fn open_orders(&mut self, market: Option<String>) -> napi::Result<Vec<OrderInfo>> {
+        let symbol = match market {
+            Some(market) => Some(parse_symbol(&market)?),
+            None => None,
+        };
+        let orders = self
+            .inner
+            .as_exchange()
+            .open_orders(symbol.as_ref())
+            .map_err(map_err)?;
+        Ok(orders.iter().map(OrderInfo::from).collect())
     }
 
     /// Drain all events buffered since the last call.
