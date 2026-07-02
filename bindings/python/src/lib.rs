@@ -23,9 +23,9 @@ use rust_decimal::Decimal;
 
 use wickra_exchange::{
     connect, connect_advanced, connect_derivatives, connect_user_data, connect_ws_execution,
-    AdvancedOrders, Credentials, Derivatives, Event, Exchange, ExchangeOptions, MarginMode,
-    MarketType, OcoRequest, Order, OrderRequest, OrderSide, OrderStatus, PaperExchange, Position,
-    PositionSide, ReplayExchange, Symbol, Ticker, TradePrint, WsExecution, WsUserData,
+    AdvancedOrders, BookLevel, Credentials, Derivatives, Event, Exchange, ExchangeOptions,
+    MarginMode, MarketType, OcoRequest, Order, OrderRequest, OrderSide, OrderStatus, PaperExchange,
+    Position, PositionSide, ReplayExchange, Symbol, Ticker, TradePrint, WsExecution, WsUserData,
 };
 
 /// Parse a `"BASE/QUOTE"` market string into a [`Symbol`].
@@ -427,6 +427,117 @@ impl PyExchange {
             .as_exchange()
             .subscribe_trades(&parse_symbol(market)?)
             .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
+    /// Subscribe to the order-book stream for `market`.
+    fn subscribe_book(&mut self, market: &str) -> PyResult<()> {
+        self.inner
+            .as_exchange()
+            .subscribe_book(&parse_symbol(market)?)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
+    /// Subscribe to the ticker stream for `market`.
+    fn subscribe_ticker(&mut self, market: &str) -> PyResult<()> {
+        self.inner
+            .as_exchange()
+            .subscribe_ticker(&parse_symbol(market)?)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
+    /// Up to `limit` historical candles for `market` at `interval`; each a dict
+    /// with `open`/`high`/`low`/`close`/`volume`/`timestamp`.
+    fn klines<'py>(
+        &mut self,
+        py: Python<'py>,
+        market: &str,
+        interval: &str,
+        limit: u32,
+    ) -> PyResult<Vec<Bound<'py, PyDict>>> {
+        let candles = self
+            .inner
+            .as_exchange()
+            .klines(&parse_symbol(market)?, interval, limit)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        candles
+            .iter()
+            .map(|candle| {
+                let dict = PyDict::new(py);
+                dict.set_item("open", candle.open)?;
+                dict.set_item("high", candle.high)?;
+                dict.set_item("low", candle.low)?;
+                dict.set_item("close", candle.close)?;
+                dict.set_item("volume", candle.volume)?;
+                dict.set_item("timestamp", candle.timestamp)?;
+                Ok(dict)
+            })
+            .collect()
+    }
+
+    /// Order-book snapshot for `market` (up to `depth` levels per side) as a dict
+    /// with `symbol`, `last_update_id`, and `bids`/`asks` lists of `{price, quantity}`.
+    fn order_book<'py>(
+        &mut self,
+        py: Python<'py>,
+        market: &str,
+        depth: u32,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let book = self
+            .inner
+            .as_exchange()
+            .order_book(&parse_symbol(market)?, depth)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let side = |levels: &[BookLevel]| -> PyResult<Vec<Bound<'py, PyDict>>> {
+            levels
+                .iter()
+                .map(|level| {
+                    let dict = PyDict::new(py);
+                    dict.set_item("price", to_float(level.price))?;
+                    dict.set_item("quantity", to_float(level.quantity))?;
+                    Ok(dict)
+                })
+                .collect()
+        };
+        let dict = PyDict::new(py);
+        dict.set_item("symbol", book.symbol.to_string())?;
+        dict.set_item("last_update_id", book.last_update_id)?;
+        dict.set_item("bids", side(&book.bids)?)?;
+        dict.set_item("asks", side(&book.asks)?)?;
+        Ok(dict)
+    }
+
+    /// Look up a single order by venue id; returns the order as a dict.
+    fn query_order<'py>(
+        &mut self,
+        py: Python<'py>,
+        market: &str,
+        order_id: &str,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let order = self
+            .inner
+            .as_exchange()
+            .query_order(&parse_symbol(market)?, order_id)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        order_dict(py, &order)
+    }
+
+    /// Open orders, optionally filtered to one `market`; each as a dict.
+    #[pyo3(signature = (market=None))]
+    fn open_orders<'py>(
+        &mut self,
+        py: Python<'py>,
+        market: Option<&str>,
+    ) -> PyResult<Vec<Bound<'py, PyDict>>> {
+        let symbol = match market {
+            Some(market) => Some(parse_symbol(market)?),
+            None => None,
+        };
+        let orders = self
+            .inner
+            .as_exchange()
+            .open_orders(symbol.as_ref())
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        orders.iter().map(|order| order_dict(py, order)).collect()
     }
 
     /// Drain all events buffered since the last call, each as a dict.
