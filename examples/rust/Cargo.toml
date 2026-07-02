@@ -2,6 +2,7 @@
 name = "wickra-exchange-examples"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 publish = false
 description = "Runnable examples for wickra-exchange (not published)."
 

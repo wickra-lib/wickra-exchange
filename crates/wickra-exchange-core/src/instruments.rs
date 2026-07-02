@@ -37,7 +37,18 @@ fn round_down_to(value: Decimal, increment: Decimal) -> Decimal {
     if increment <= Decimal::ZERO {
         return value;
     }
-    (value / increment).floor() * increment
+    // A vanishingly small increment relative to the value (e.g. a malformed
+    // venue filter) makes `value / increment` exceed `Decimal`'s range. Use the
+    // checked ops and fall back to the unrounded value rather than panicking on
+    // untrusted filter data.
+    match value
+        .checked_div(increment)
+        .map(|steps| steps.floor())
+        .and_then(|steps| steps.checked_mul(increment))
+    {
+        Some(rounded) => rounded,
+        None => value,
+    }
 }
 
 impl InstrumentFilters {
@@ -216,6 +227,21 @@ mod tests {
         };
         assert_eq!(f.round_quantity(dec!(1.23456789)), dec!(1.23456789));
         assert_eq!(f.round_price(dec!(1.23456789)), dec!(1.23456789));
+    }
+
+    #[test]
+    fn tiny_increment_does_not_panic_on_overflow() {
+        // A vanishingly small step relative to the value overflows the
+        // intermediate `value / increment`; rounding must fall back to the
+        // value rather than panic (found by the `filter_round` fuzz target).
+        let f = InstrumentFilters {
+            step_size: dec!(0.0000000000000000000000001), // 1e-25
+            tick_size: dec!(0.0000000000000000000000001),
+            ..filters()
+        };
+        let value = dec!(1000000000); // 1e9; 1e9 / 1e-25 = 1e34 > Decimal::MAX
+        assert_eq!(f.round_quantity(value), value);
+        assert_eq!(f.round_price(value), value);
     }
 
     #[test]
