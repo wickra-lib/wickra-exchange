@@ -141,6 +141,82 @@ wkex_poll <- function(ex, capacity = 16L) {
   lapply(.Call(C_wkex_poll, ex$handle, as.integer(capacity)), .wkex_event)
 }
 
+#' The current ticker for a market.
+#' @param ex A `wickra_exchange` object.
+#' @param market Market symbol, e.g. "BTC/USDT".
+#' @return A list with `symbol`, `last`, `bid`, `ask`, `volume`.
+#' @export
+wkex_ticker <- function(ex, market) {
+  .Call(C_wkex_exchange_ticker, ex$handle, market)
+}
+
+#' Historical candles for a market.
+#' @param ex A `wickra_exchange` object.
+#' @param market Market symbol, e.g. "BTC/USDT".
+#' @param interval Candle interval, e.g. "1m".
+#' @param limit Maximum candles to return.
+#' @return A list of OHLCV lists (`open`/`high`/`low`/`close`/`volume`/`timestamp`).
+#' @export
+wkex_klines <- function(ex, market, interval, limit) {
+  .Call(C_wkex_exchange_klines, ex$handle, market, interval, as.integer(limit))
+}
+
+#' Order-book depth snapshot for a market.
+#' @param ex A `wickra_exchange` object.
+#' @param market Market symbol, e.g. "BTC/USDT".
+#' @param depth Maximum levels per side.
+#' @return A list with `symbol` and `bids`/`asks` lists of `{price, quantity}`.
+#' @export
+wkex_order_book <- function(ex, market, depth) {
+  .Call(C_wkex_exchange_order_book, ex$handle, market, as.integer(depth))
+}
+
+#' Subscribe to the public trade stream for a market.
+#' @param ex A `wickra_exchange` object.
+#' @param market Market symbol, e.g. "BTC/USDT".
+#' @return Invisibly, `ex`.
+#' @export
+wkex_subscribe_trades <- function(ex, market) {
+  invisible(.Call(C_wkex_exchange_subscribe_trades, ex$handle, market))
+}
+
+#' Subscribe to the order-book stream for a market.
+#' @param ex A `wickra_exchange` object.
+#' @param market Market symbol, e.g. "BTC/USDT".
+#' @return Invisibly, `ex`.
+#' @export
+wkex_subscribe_book <- function(ex, market) {
+  invisible(.Call(C_wkex_exchange_subscribe_book, ex$handle, market))
+}
+
+#' Subscribe to the ticker stream for a market.
+#' @param ex A `wickra_exchange` object.
+#' @param market Market symbol, e.g. "BTC/USDT".
+#' @return Invisibly, `ex`.
+#' @export
+wkex_subscribe_ticker <- function(ex, market) {
+  invisible(.Call(C_wkex_exchange_subscribe_ticker, ex$handle, market))
+}
+
+#' Look up a single order by venue id.
+#' @param ex A `wickra_exchange` object.
+#' @param market Market symbol, e.g. "BTC/USDT".
+#' @param order_id Venue order id.
+#' @return The order as a list.
+#' @export
+wkex_query_order <- function(ex, market, order_id) {
+  .wkex_order(.Call(C_wkex_exchange_query_order, ex$handle, market, order_id))
+}
+
+#' Open orders, optionally filtered to one market.
+#' @param ex A `wickra_exchange` object.
+#' @param market Market symbol, or `NULL` for all markets.
+#' @return A list of order lists.
+#' @export
+wkex_open_orders <- function(ex, market = NULL) {
+  lapply(.Call(C_wkex_exchange_open_orders, ex$handle, market), .wkex_order)
+}
+
 .wkex_position <- function(raw) {
   raw$side <- if (raw$side == 1L) "short" else "long"
   raw$margin_mode <- if (raw$margin_mode == 1L) "isolated" else "cross"

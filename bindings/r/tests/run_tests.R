@@ -55,6 +55,30 @@ repeat {
 stopifnot(bought)
 stopifnot(abs(wkex_balance(rex, "BTC") - 1) < 1e-9)
 
+## Market-data + order-lifecycle read surface on the paper exchange.
+mex <- wkex_paper(c(USDT = 100000))
+wkex_set_price(mex, "BTC/USDT", 20000)
+tkr <- wkex_ticker(mex, "BTC/USDT")
+stopifnot(tkr$symbol == "BTC/USDT")
+stopifnot(abs(tkr$last - 20000) < 1e-9)
+## subscribe_* are accepted by the paper feed.
+wkex_subscribe_trades(mex, "BTC/USDT")
+wkex_subscribe_book(mex, "BTC/USDT")
+wkex_subscribe_ticker(mex, "BTC/USDT")
+## paper has no historical / depth feed: both error.
+stopifnot(inherits(try(wkex_klines(mex, "BTC/USDT", "1m", 10), silent = TRUE), "try-error"))
+stopifnot(inherits(try(wkex_order_book(mex, "BTC/USDT", 10), silent = TRUE), "try-error"))
+## A resting limit can be read back by id and appears in open orders.
+resting <- wkex_place_limit(mex, "BTC/USDT", "buy", 1, 19000)
+stopifnot(resting$status == "new")
+queried <- wkex_query_order(mex, "BTC/USDT", resting$id)
+stopifnot(queried$id == resting$id)
+opens <- wkex_open_orders(mex)
+stopifnot(length(opens) == 1L)
+stopifnot(opens[[1]]$id == resting$id)
+stopifnot(length(wkex_open_orders(mex, "BTC/USDT")) == 1L)
+stopifnot(length(wkex_open_orders(mex, "ETH/USDT")) == 0L)
+
 ## Derivatives + advanced surface: construction is offline, so the spot-only
 ## rejection and the futures construct are checked without a network.
 for (venue in c("coinbase", "upbit", "ftx")) {
