@@ -173,6 +173,9 @@ internal static unsafe class Native
     public static extern int wickra_user_data_subscribe(nint handle);
 
     [DllImport(Lib)]
+    public static extern int wickra_user_data_keepalive(nint handle);
+
+    [DllImport(Lib)]
     public static extern int wickra_user_data_poll(nint handle, Event* outBuf, nuint cap);
 
     [DllImport(Lib)]

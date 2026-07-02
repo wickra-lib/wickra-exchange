@@ -71,6 +71,8 @@ public class DerivativesTests
     {
         using var userData = UserData.Connect("binance", "k", "s");
         Assert.NotNull(userData);
+        // Keepalive is a no-op before Subscribe; it must not throw.
+        userData.Keepalive();
         // WsUserData: MarketData, so the client can poll (nothing buffered offline).
         Assert.Empty(userData.Poll());
     }

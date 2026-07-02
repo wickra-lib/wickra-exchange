@@ -1327,6 +1327,24 @@ pub unsafe extern "C" fn wickra_user_data_subscribe(handle: *mut WickraUserData)
     }
 }
 
+/// Keep the private stream alive (refresh the venue session / send a heartbeat)
+/// so it is not dropped for inactivity; call this periodically. A dropped stream
+/// is also recovered automatically on the next `wickra_user_data_poll`. A no-op
+/// before `wickra_user_data_subscribe`.
+///
+/// # Safety
+/// `handle` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn wickra_user_data_keepalive(handle: *mut WickraUserData) -> i32 {
+    let Some(handle) = (unsafe { handle.as_mut() }) else {
+        return WICKRA_ERR_NULL;
+    };
+    match handle.inner.keepalive_user_data() {
+        Ok(()) => WICKRA_OK,
+        Err(e) => error_code(&e),
+    }
+}
+
 /// Drain buffered user-data events into `out` (capacity `cap`). Returns the
 /// number written (`>= 0`) or a negative error code.
 ///
@@ -1797,6 +1815,8 @@ mod tests {
             unsafe { wickra_user_data_poll(handle, buf.as_mut_ptr(), buf.len()) },
             0
         );
+        // Keepalive is a no-op before subscribe (no stream open yet).
+        assert_eq!(unsafe { wickra_user_data_keepalive(handle) }, WICKRA_OK);
         unsafe { wickra_user_data_free(handle) };
     }
 
@@ -1804,6 +1824,10 @@ mod tests {
     fn user_data_null_handle_guards() {
         assert_eq!(
             unsafe { wickra_user_data_subscribe(core::ptr::null_mut()) },
+            WICKRA_ERR_NULL
+        );
+        assert_eq!(
+            unsafe { wickra_user_data_keepalive(core::ptr::null_mut()) },
             WICKRA_ERR_NULL
         );
         let mut buf: [WickraEvent; 1] = unsafe { core::mem::zeroed() };

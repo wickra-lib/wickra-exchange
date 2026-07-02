@@ -597,6 +597,17 @@ void wickra_user_data_free(WickraUserData *handle);
 int32_t wickra_user_data_subscribe(WickraUserData *handle);
 
 /**
+ * Keep the private stream alive (refresh the venue session / send a heartbeat)
+ * so it is not dropped for inactivity; call this periodically. A dropped stream
+ * is also recovered automatically on the next `wickra_user_data_poll`. A no-op
+ * before `wickra_user_data_subscribe`.
+ *
+ * # Safety
+ * `handle` must be valid.
+ */
+int32_t wickra_user_data_keepalive(WickraUserData *handle);
+
+/**
  * Drain buffered user-data events into `out` (capacity `cap`). Returns the
  * number written (`>= 0`) or a negative error code.
  *

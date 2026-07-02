@@ -405,6 +405,16 @@ public sealed unsafe class UserData : IDisposable
         Exchange.Check(Native.wickra_user_data_subscribe(_handle));
     }
 
+    /// <summary>
+    /// Keep the private stream alive (refresh the venue session / send a heartbeat) so it is
+    /// not dropped for inactivity; call it periodically. A dropped stream is also recovered
+    /// automatically on the next <see cref="Poll"/>. A no-op before <see cref="Subscribe"/>.
+    /// </summary>
+    public void Keepalive()
+    {
+        Exchange.Check(Native.wickra_user_data_keepalive(_handle));
+    }
+
     /// <summary>Drain buffered events (up to <paramref name="capacity"/> per call).</summary>
     public IReadOnlyList<EventInfo> Poll(int capacity = 16)
     {

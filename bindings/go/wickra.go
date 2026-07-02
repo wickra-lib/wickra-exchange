@@ -666,6 +666,14 @@ func (u *UserData) SubscribeUserData() error {
 	return codeError(C.wickra_user_data_subscribe(u.handle))
 }
 
+// KeepaliveUserData keeps the private stream alive (refresh the venue session /
+// send a heartbeat) so it is not dropped for inactivity; call it periodically. A
+// dropped stream is also recovered automatically on the next Poll. A no-op before
+// SubscribeUserData.
+func (u *UserData) KeepaliveUserData() error {
+	return codeError(C.wickra_user_data_keepalive(u.handle))
+}
+
 // Poll drains buffered user-data events (up to capacity per call).
 func (u *UserData) Poll(capacity int) ([]Event, error) {
 	buf := make([]C.WickraEvent, capacity)
