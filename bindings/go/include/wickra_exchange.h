@@ -211,6 +211,76 @@ typedef struct {
 } WickraEvent;
 
 /**
+ * A ticker snapshot (C-ABI mirror of `Ticker`).
+ */
+typedef struct {
+    /**
+     * Market symbol, NUL-terminated (`base/quote`).
+     */
+    char symbol[WICKRA_STR_CAP];
+    /**
+     * Last traded price.
+     */
+    double last;
+    /**
+     * Best bid price.
+     */
+    double bid;
+    /**
+     * Best ask price.
+     */
+    double ask;
+    /**
+     * Rolling base-asset volume.
+     */
+    double volume;
+} WickraTicker;
+
+/**
+ * A single OHLCV candle (C-ABI mirror of `Candle`).
+ */
+typedef struct {
+    /**
+     * Bar open price.
+     */
+    double open;
+    /**
+     * Bar high price.
+     */
+    double high;
+    /**
+     * Bar low price.
+     */
+    double low;
+    /**
+     * Bar close price.
+     */
+    double close;
+    /**
+     * Bar volume.
+     */
+    double volume;
+    /**
+     * Bar timestamp (venue epoch / resolution).
+     */
+    int64_t timestamp;
+} WickraCandle;
+
+/**
+ * A single order-book level: price and quantity (C-ABI mirror of `BookLevel`).
+ */
+typedef struct {
+    /**
+     * Price at this level.
+     */
+    double price;
+    /**
+     * Resting quantity at this level.
+     */
+    double quantity;
+} WickraBookLevel;
+
+/**
  * A derivatives position (C-ABI mirror of `Position`).
  */
 typedef struct {
@@ -381,6 +451,99 @@ int32_t wickra_exchange_balance(WickraExchange *handle, const char *asset, doubl
  * `handle` must be valid; `out` must be writable for `cap` elements.
  */
 int32_t wickra_exchange_poll(WickraExchange *handle, WickraEvent *out, uintptr_t cap);
+
+/**
+ * Fetch the current ticker for `market`, writing it into `out`.
+ *
+ * # Safety
+ * `handle` and `out` must be valid; `market` must be a valid C string.
+ */
+int32_t wickra_exchange_ticker(WickraExchange *handle, const char *market, WickraTicker *out);
+
+/**
+ * Fetch up to `limit` candles for `market` at `interval` into `out` (capacity
+ * `cap`). Returns the total candle count (`>= 0`); when it exceeds `cap` the
+ * buffer was truncated — re-call with a larger buffer.
+ *
+ * # Safety
+ * `handle` must be valid; `market`/`interval` must be valid C strings; `out`
+ * must be writable for `cap` elements.
+ */
+int32_t wickra_exchange_klines(WickraExchange *handle,
+                               const char *market,
+                               const char *interval,
+                               uint32_t limit,
+                               WickraCandle *out,
+                               uintptr_t cap);
+
+/**
+ * Fetch a depth snapshot for `market` (up to `depth` levels per side) into the
+ * `bids_out`/`asks_out` buffers (capacities `bids_cap`/`asks_cap`), writing the
+ * total per-side level counts into `out_bid_count`/`out_ask_count` (either may
+ * exceed its cap — the buffer was truncated). Returns `WICKRA_OK` or an error.
+ *
+ * # Safety
+ * `handle`, `out_bid_count` and `out_ask_count` must be valid; `market` must be
+ * a valid C string; `bids_out`/`asks_out` must be writable for their caps.
+ */
+int32_t wickra_exchange_order_book(WickraExchange *handle,
+                                   const char *market,
+                                   uint32_t depth,
+                                   WickraBookLevel *bids_out,
+                                   uintptr_t bids_cap,
+                                   WickraBookLevel *asks_out,
+                                   uintptr_t asks_cap,
+                                   uintptr_t *out_bid_count,
+                                   uintptr_t *out_ask_count);
+
+/**
+ * Subscribe to the public trade stream for `market`.
+ *
+ * # Safety
+ * `handle` must be valid; `market` must be a valid C string.
+ */
+int32_t wickra_exchange_subscribe_trades(WickraExchange *handle, const char *market);
+
+/**
+ * Subscribe to the order-book stream for `market`.
+ *
+ * # Safety
+ * `handle` must be valid; `market` must be a valid C string.
+ */
+int32_t wickra_exchange_subscribe_book(WickraExchange *handle, const char *market);
+
+/**
+ * Subscribe to the ticker stream for `market`.
+ *
+ * # Safety
+ * `handle` must be valid; `market` must be a valid C string.
+ */
+int32_t wickra_exchange_subscribe_ticker(WickraExchange *handle, const char *market);
+
+/**
+ * Look up a single order by venue id, writing it into `out`.
+ *
+ * # Safety
+ * `handle` and `out` must be valid; `market`/`order_id` must be valid C strings.
+ */
+int32_t wickra_exchange_query_order(WickraExchange *handle,
+                                    const char *market,
+                                    const char *order_id,
+                                    WickraOrder *out);
+
+/**
+ * List open orders into `out` (capacity `cap`). Pass a `market` C string to
+ * scope to one symbol, or null for all. Returns the total number of open orders
+ * (`>= 0`); when it exceeds `cap` the buffer was truncated.
+ *
+ * # Safety
+ * `handle` must be valid; `market` must be null or a valid C string; `out` must
+ * be writable for `cap` elements.
+ */
+int32_t wickra_exchange_open_orders(WickraExchange *handle,
+                                    const char *market,
+                                    WickraOrder *out,
+                                    uintptr_t cap);
 
 /**
  * Connect a live **derivatives** (USDⓈ-M futures) client for `name`, returning
