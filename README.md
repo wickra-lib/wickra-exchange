@@ -235,6 +235,21 @@ also need a C compiler, and Java runs with `--enable-native-access=ALL-UNNAMED`.
 | Java     | Maven Central · `org.wickra:wickra-exchange` | Java 22 (FFM / Panama)   |
 | R        | r-universe · `wickraexchange`              | R ≥ 2.10 (Rtools on Win.)  |
 
+## Ecosystem
+
+Part of the [Wickra](https://github.com/wickra-lib/wickra) family — each one a
+data-driven core with a CLI and the same ten-language binding surface:
+
+- [**wickra**](https://github.com/wickra-lib/wickra) — the core library: 514 O(1) streaming indicators across ten languages
+- [**wickra-backtest**](https://github.com/wickra-lib/wickra-backtest) — event-driven backtester over the Wickra core
+- [**wickra-terminal**](https://github.com/wickra-lib/wickra-terminal) — the trading terminal: a TUI and a browser renderer over the stack
+- [**wickra-screener**](https://github.com/wickra-lib/wickra-screener) — parallel multi-symbol screening over 514 streaming indicators
+- [**wickra-xray**](https://github.com/wickra-lib/wickra-xray) — market-microstructure explorer: footprint, order-book heatmap, liquidation map, funding/OI divergence
+- **wickra-radar**, **wickra-copilot**, **wickra-shazam** — *coming soon*
+
+Docs at [docs.wickra.org](https://docs.wickra.org); the marketing site and
+in-browser demo at [wickra.org](https://wickra.org).
+
 ## Contributing
 
 Contributions are welcome — issues, bug reports, ideas and pull requests all land
