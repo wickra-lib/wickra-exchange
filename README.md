@@ -21,12 +21,17 @@
 [![Build provenance](https://raw.githubusercontent.com/wickra-lib/.github/main/profile/badges/wickra-exchange/provenance.svg)](https://github.com/wickra-lib/wickra-exchange/attestations)
 [![Docs](https://raw.githubusercontent.com/wickra-lib/.github/main/profile/badges/wickra-exchange/docs.svg)](https://wickra.org)
 [![Verified across 8 languages](https://raw.githubusercontent.com/wickra-lib/.github/main/profile/badges/wickra-exchange/verified.svg)](golden/)
+[![Live demo](https://img.shields.io/badge/live%20demo-live.wickra.org-3b82f6)](https://live.wickra.org)
 
 ---
 
 **One typed API. Ten exchanges. Eight languages.** Streaming-native crypto-exchange
 connectivity — market data *and* signed order execution — built on the
 [Wickra](https://github.com/wickra-lib/wickra) core.
+
+> **▶ Live demo:** all 514 indicators over real Binance market data, computed live in your browser — **[live.wickra.org](https://live.wickra.org)** · zero backend, powered by `wickra-wasm`.
+
+> **Part of the [Wickra ecosystem](https://github.com/wickra-lib):** the same data-driven core and ten-language binding surface also power [wickra-exchange](https://github.com/wickra-lib/wickra-exchange), [wickra-backtest](https://github.com/wickra-lib/wickra-backtest), [wickra-terminal](https://github.com/wickra-lib/wickra-terminal), [wickra-screener](https://github.com/wickra-lib/wickra-screener), [wickra-xray](https://github.com/wickra-lib/wickra-xray), [wickra-radar](https://github.com/wickra-lib/wickra-radar), [wickra-copilot](https://github.com/wickra-lib/wickra-copilot) and [wickra-shazam](https://github.com/wickra-lib/wickra-shazam).
 
 A single, compile-time-typed `Exchange` trait spans the ten largest venues
 (Binance, OKX, Bybit, Coinbase, Upbit, Bitget, Gate.io, Kraken, KuCoin, HTX)
@@ -241,11 +246,14 @@ Part of the [Wickra](https://github.com/wickra-lib/wickra) family — each one a
 data-driven core with a CLI and the same ten-language binding surface:
 
 - [**wickra**](https://github.com/wickra-lib/wickra) — the core library: 514 O(1) streaming indicators across ten languages
+- [**wickra-exchange**](https://github.com/wickra-lib/wickra-exchange) — unified market-data + execution across ten crypto exchanges
 - [**wickra-backtest**](https://github.com/wickra-lib/wickra-backtest) — event-driven backtester over the Wickra core
 - [**wickra-terminal**](https://github.com/wickra-lib/wickra-terminal) — the trading terminal: a TUI and a browser renderer over the stack
 - [**wickra-screener**](https://github.com/wickra-lib/wickra-screener) — parallel multi-symbol screening over 514 streaming indicators
 - [**wickra-xray**](https://github.com/wickra-lib/wickra-xray) — market-microstructure explorer: footprint, order-book heatmap, liquidation map, funding/OI divergence
-- **wickra-radar**, **wickra-copilot**, **wickra-shazam** — *coming soon*
+- [**wickra-radar**](https://github.com/wickra-lib/wickra-radar) — perp-universe alert radar: OI delta, funding flip, book imbalance, liquidation clusters, OI/price divergence
+- [**wickra-copilot**](https://github.com/wickra-lib/wickra-copilot) — local market copilot grounded in real order-book, liquidation and funding microstructure
+- [**wickra-shazam**](https://github.com/wickra-lib/wickra-shazam) — match an asset's current microstructure fingerprint against its entire history
 
 Docs at [docs.wickra.org](https://docs.wickra.org); the marketing site and
 in-browser demo at [wickra.org](https://wickra.org).
