@@ -297,17 +297,5 @@ full terms.
 ---
 
 <p align="center">
-  <a href="https://github.com/wickra-lib/wickra-exchange/stargazers">
-    <img alt="GitHub stars" src="https://img.shields.io/github/stars/wickra-lib/wickra-exchange?style=social">
-  </a>
-  <a href="https://github.com/wickra-lib/wickra-exchange/network/members">
-    <img alt="GitHub forks" src="https://img.shields.io/github/forks/wickra-lib/wickra-exchange?style=social">
-  </a>
-  <a href="https://github.com/wickra-lib/wickra-exchange/issues">
-    <img alt="GitHub issues" src="https://img.shields.io/github/issues/wickra-lib/wickra-exchange">
-  </a>
-</p>
-
-<p align="center">
   Built on <a href="https://github.com/wickra-lib/wickra">Wickra</a>. If it saved you time, ⭐ the repo.
 </p>
