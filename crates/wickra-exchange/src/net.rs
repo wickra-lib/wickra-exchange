@@ -133,12 +133,14 @@ impl WsTransport for TungsteniteWsTransport {
                     tokio::select! {
                         incoming = source.next() => match incoming {
                             Some(Ok(Message::Text(text))) => {
-                                if inbound_tx.send(Ok(Some(text))).is_err() {
+                                // tungstenite 0.29 carries text as `Utf8Bytes`; the
+                                // channel speaks owned `String`.
+                                if inbound_tx.send(Ok(Some(text.to_string()))).is_err() {
                                     break;
                                 }
                             }
                             Some(Ok(Message::Binary(bytes))) => {
-                                if let Ok(text) = String::from_utf8(bytes) {
+                                if let Ok(text) = String::from_utf8(bytes.to_vec()) {
                                     if inbound_tx.send(Ok(Some(text))).is_err() {
                                         break;
                                     }
@@ -159,7 +161,7 @@ impl WsTransport for TungsteniteWsTransport {
                         },
                         outgoing = outbound_rx.recv() => {
                             if let Some(text) = outgoing {
-                                if sink.send(Message::Text(text)).await.is_err() {
+                                if sink.send(Message::Text(text.into())).await.is_err() {
                                     break;
                                 }
                             } else {

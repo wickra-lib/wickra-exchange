@@ -1,9 +1,10 @@
 //! Throughput benchmarks for the hot connectivity paths: request signing,
 //! response parsing, filter rounding and local order-book diffing.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
+use std::hint::black_box;
 use wickra_exchange_core::{
     format_decimal, hmac_sha256_hex, hmac_sha512_hex, parse_decimal, sha256, BookDelta, BookLevel,
     Event, InstrumentFilters, OrderBookBuilder, OrderBookSnapshot, OrderSide, Symbol, TradePrint,
