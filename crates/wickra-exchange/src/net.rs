@@ -268,23 +268,23 @@ mod tests {
         use std::time::Duration;
 
         let transport = TungsteniteWsTransport::new();
-        // The WS handshake is rejected (non-101) when the runner IP is
-        // geo-restricted; treat "cannot reach the venue" as a skip, not a
+        let mut connection = transport
+            .connect("wss://stream.binance.com:9443/ws/btcusdt@trade")
+            .unwrap();
+        // The connect is lazy — a geo-restricted runner (Binance blocks
+        // data-centre / CI IP ranges) surfaces the rejected handshake as an
+        // error from recv(). Treat "venue unreachable" as a skip, not a
         // failure, so the nightly job stays green where Binance is blocked.
-        let mut connection =
-            match transport.connect("wss://stream.binance.com:9443/ws/btcusdt@trade") {
-                Ok(connection) => connection,
+        let mut got = None;
+        for _ in 0..50 {
+            let frame = match connection.recv() {
+                Ok(frame) => frame,
                 Err(err) => {
-                    eprintln!(
-                        "skipping live_ws_receives_binance_trades: cannot open WS to venue ({err})"
-                    );
+                    eprintln!("skipping live_ws_receives_binance_trades: WS unreachable ({err})");
                     return;
                 }
             };
-        // Poll for a few seconds until a frame arrives.
-        let mut got = None;
-        for _ in 0..50 {
-            if let Some(frame) = connection.recv().unwrap() {
+            if let Some(frame) = frame {
                 got = Some(frame);
                 break;
             }
