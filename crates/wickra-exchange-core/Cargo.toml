@@ -25,7 +25,7 @@ base64 = { workspace = true }
 hex = { workspace = true }
 # ECDSA P-256 (ES256) for Coinbase's per-request JWT. RustCrypto ECDSA uses
 # deterministic RFC-6979 nonces, so signatures are reproducible under test.
-p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
+p256 = { version = "0.14", features = ["ecdsa", "pkcs8", "pem"] }
 
 [dev-dependencies]
 rust_decimal_macros = { workspace = true }
