@@ -4,7 +4,9 @@ updates:
   - package-ecosystem: cargo
     directory: "/"
     schedule:
-      interval: weekly
+      interval: monthly
+      time: "06:00"
+      timezone: "Etc/UTC"
     open-pull-requests-limit: 10
     cooldown:
       default-days: 7
@@ -24,7 +26,9 @@ updates:
   - package-ecosystem: npm
     directory: "/bindings/node"
     schedule:
-      interval: weekly
+      interval: monthly
+      time: "06:00"
+      timezone: "Etc/UTC"
     open-pull-requests-limit: 10
     cooldown:
       default-days: 7
@@ -38,7 +42,9 @@ updates:
   - package-ecosystem: pip
     directory: "/bindings/python"
     schedule:
-      interval: weekly
+      interval: monthly
+      time: "06:00"
+      timezone: "Etc/UTC"
     open-pull-requests-limit: 10
     cooldown:
       default-days: 7
@@ -53,7 +59,9 @@ updates:
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
-      interval: weekly
+      interval: monthly
+      time: "06:00"
+      timezone: "Etc/UTC"
     open-pull-requests-limit: 10
     cooldown:
       default-days: 7
@@ -73,7 +81,9 @@ updates:
   - package-ecosystem: maven
     directory: "/bindings/java"
     schedule:
-      interval: weekly
+      interval: monthly
+      time: "06:00"
+      timezone: "Etc/UTC"
     open-pull-requests-limit: 10
     cooldown:
       default-days: 7
@@ -89,7 +99,9 @@ updates:
   - package-ecosystem: nuget
     directory: "/bindings/csharp/WickraExchange.Tests"
     schedule:
-      interval: weekly
+      interval: monthly
+      time: "06:00"
+      timezone: "Etc/UTC"
     open-pull-requests-limit: 10
     cooldown:
       default-days: 7
@@ -104,7 +116,9 @@ updates:
   - package-ecosystem: gomod
     directory: "/bindings/go"
     schedule:
-      interval: weekly
+      interval: monthly
+      time: "06:00"
+      timezone: "Etc/UTC"
     open-pull-requests-limit: 10
     cooldown:
       default-days: 7
