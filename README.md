@@ -7,12 +7,20 @@
 [![CI](https://raw.githubusercontent.com/wickra-lib/.github/main/profile/badges/wickra-exchange/ci.svg)](https://github.com/wickra-lib/wickra-exchange/actions/workflows/ci.yml)
 [![CodeQL](https://raw.githubusercontent.com/wickra-lib/.github/main/profile/badges/wickra-exchange/codeql.svg)](https://github.com/wickra-lib/wickra-exchange/actions/workflows/codeql.yml)
 [![codecov](https://raw.githubusercontent.com/wickra-lib/.github/main/profile/badges/wickra-exchange/codecov.svg)](https://codecov.io/gh/wickra-lib/wickra-exchange)
+[![GitHub release](https://raw.githubusercontent.com/wickra-lib/.github/main/profile/badges/wickra-exchange/release.svg)](https://github.com/wickra-lib/wickra-exchange/releases/latest)
+[![crates.io](https://raw.githubusercontent.com/wickra-lib/.github/main/profile/badges/wickra-exchange/crates.svg)](https://crates.io/crates/wickra-exchange)
+[![PyPI](https://raw.githubusercontent.com/wickra-lib/.github/main/profile/badges/wickra-exchange/pypi.svg)](https://pypi.org/project/wickra-exchange/)
+[![npm](https://raw.githubusercontent.com/wickra-lib/.github/main/profile/badges/wickra-exchange/npm.svg)](https://www.npmjs.com/package/wickra-exchange)
+[![NuGet](https://raw.githubusercontent.com/wickra-lib/.github/main/profile/badges/wickra-exchange/nuget.svg)](https://www.nuget.org/packages/WickraExchange)
+[![Maven Central](https://raw.githubusercontent.com/wickra-lib/.github/main/profile/badges/wickra-exchange/maven.svg)](https://central.sonatype.com/artifact/org.wickra/wickra-exchange)
+[![Go module](https://raw.githubusercontent.com/wickra-lib/.github/main/profile/badges/wickra-exchange/go.svg)](https://pkg.go.dev/github.com/wickra-lib/wickra-exchange-go)
+[![R-universe](https://raw.githubusercontent.com/wickra-lib/.github/main/profile/badges/wickra-exchange/r-universe.svg)](https://wickra-lib.r-universe.dev)
 [![License: MIT OR Apache-2.0](https://raw.githubusercontent.com/wickra-lib/.github/main/profile/badges/wickra-exchange/license.svg)](#license)
 [![OpenSSF Scorecard](https://raw.githubusercontent.com/wickra-lib/.github/main/profile/badges/wickra-exchange/scorecard.svg)](https://scorecard.dev/viewer/?uri=github.com/wickra-lib/wickra-exchange)
-[![OpenSSF Best Practices](https://raw.githubusercontent.com/wickra-lib/.github/main/profile/badges/wickra-exchange/best-practices.svg)](https://www.bestpractices.dev/)
+[![OpenSSF Best Practices](https://raw.githubusercontent.com/wickra-lib/.github/main/profile/badges/wickra-exchange/best-practices.svg)](https://www.bestpractices.dev)
 [![Build provenance](https://raw.githubusercontent.com/wickra-lib/.github/main/profile/badges/wickra-exchange/provenance.svg)](https://github.com/wickra-lib/wickra-exchange/attestations)
 [![Docs](https://raw.githubusercontent.com/wickra-lib/.github/main/profile/badges/wickra-exchange/docs.svg)](https://wickra.org)
-[![Verified across 8 languages](https://raw.githubusercontent.com/wickra-lib/.github/main/profile/badges/wickra-exchange/verified.svg)](golden/)
+[![Verified across 9 languages](https://raw.githubusercontent.com/wickra-lib/.github/main/profile/badges/wickra-exchange/verified.svg)](golden/)
 [![Live demo](https://img.shields.io/badge/live%20demo-live.wickra.org-3b82f6)](https://live.wickra.org)
 
 ---
@@ -298,4 +306,27 @@ full terms.
 
 <p align="center">
   Built on <a href="https://github.com/wickra-lib/wickra">Wickra</a>. If it saved you time, ⭐ the repo.
+</p>
+
+---
+
+<p align="center">
+  <a href="https://github.com/wickra-lib/wickra-exchange">
+    <img alt="GitHub stars" src="https://raw.githubusercontent.com/wickra-lib/.github/main/profile/badges/wickra-exchange/stars.svg">
+  </a>
+  <a href="https://github.com/wickra-lib/wickra-exchange/network/members">
+    <img alt="GitHub forks" src="https://raw.githubusercontent.com/wickra-lib/.github/main/profile/badges/wickra-exchange/forks.svg">
+  </a>
+  <a href="https://github.com/wickra-lib/wickra-exchange/issues">
+    <img alt="GitHub issues" src="https://raw.githubusercontent.com/wickra-lib/.github/main/profile/badges/wickra-exchange/issues.svg">
+  </a>
+</p>
+
+<p align="center">
+  Built on <a href="https://github.com/wickra-lib/wickra">Wickra</a>. If it saved you time, the cheapest way to say thanks is to ⭐ the repo.
+</p>
+
+<p align="center">
+  <img alt="wickra-exchange star history" width="640"
+       src="https://raw.githubusercontent.com/wickra-lib/.github/main/profile/badges/wickra-exchange/star-history.svg">
 </p>
