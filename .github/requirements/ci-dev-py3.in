@@ -1,0 +1,10 @@
+# Python 3.10+ dev/test tooling for the ci.yml python job (covers the
+# 3.11 / 3.12 / 3.13 matrix rows). Locked output: ci-dev-py3.txt
+# Refresh via scripts/update-lockfiles.sh.
+#
+# Deliberately short: the binding's tests import pytest and wickra_exchange and
+# nothing else. wickra locks numpy and hypothesis here because its tests use
+# them; adding them for symmetry would pin two libraries this repository never
+# imports.
+maturin
+pytest

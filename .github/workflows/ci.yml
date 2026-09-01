@@ -82,6 +82,50 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo build -p wickra-exchange-node
 
+  binding-surface:
+    name: Binding surface parity
+    runs-on: ubuntu-latest
+    timeout-minutes: 10 # backstop against a hung job, not a budget
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Each binding is written separately and tested separately, so a method
+      # missing from one of them fails nowhere -- nothing compared the bindings
+      # to each other. The first run of this found that the R binding had no
+      # `wkex_connect`: an R user could open the derivatives and user-data
+      # handles against a live venue and never construct a plain exchange.
+      - name: Compare every binding's surface with the Rust traits
+        run: python3 scripts/check_binding_surface.py
+
+      # The version lives in twenty-odd declarations across six package
+      # managers. A bump that misses one ships a package pinning a binary that
+      # was never published, and that surfaces on a user's machine after the
+      # tag, which is irreversible.
+      - name: Every version declaration agrees
+        run: python3 scripts/check_version_sync.py
+
+      # Each bindings/*/README.md is, or is a workflow line away from being, a
+      # published package's long description: PyPI renders the Python one, NuGet
+      # the C# one, pkg.go.dev the Go one. A link that leaves the package is
+      # dead there while resolving fine on GitHub, so nothing says so.
+      - name: Binding READMEs link only to what travels with them
+        run: python3 scripts/check_readme_links.py
+
+      # An SPDX expression in a manifest is a reference to two documents, not
+      # the documents. cargo decides what to package from git, so the copies
+      # have to be committed -- and committed copies drift.
+      - name: Every published package carries its licence texts
+        run: python3 scripts/check_license_copies.py
+
+      # src/Makevars takes the header and library from WKEX_INC / WKEX_LIB,
+      # supplied from outside, so nothing in the R job proves the wrapper's
+      # calls match the header it is handed -- CI points both at the tree, where
+      # they agree by construction.
+      - name: The R wrapper matches the C ABI in this tree
+        run: python3 scripts/check_r_abi_skew.py
+
   supply-chain:
     name: Supply-chain (cargo-deny + osv-scanner)
     runs-on: ubuntu-latest
@@ -140,7 +184,19 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - uses: ./.github/actions/setup-rust
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - run: pip install maturin pytest
+      # Hash-pinned rather than `pip install maturin pytest`: an unpinned
+      # install resolves whatever the index serves that minute, so a CI run can
+      # differ from the one before it for reasons nothing records. Locked twice
+      # because a lock is resolved against one interpreter version and 3.9 is at
+      # the end of its life. Regenerate with scripts/update-lockfiles.sh.
+      - name: Install pinned Python tooling
+        shell: bash
+        run: |
+          if [ "${{ matrix.python-version }}" = "3.9" ]; then
+            python -m pip install --require-hashes -r .github/requirements/ci-dev-py39.txt
+          else
+            python -m pip install --require-hashes -r .github/requirements/ci-dev-py3.txt
+          fi
       - run: maturin build --out dist
         working-directory: bindings/python
       - run: pip install --no-index --find-links bindings/python/dist wickra-exchange
