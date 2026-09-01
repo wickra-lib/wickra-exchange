@@ -14,7 +14,14 @@ wickra-exchange-core = { workspace = true }
 rust_decimal = { workspace = true }
 rust_decimal_macros = { workspace = true }
 serde_json = { workspace = true }
-criterion = "0.8"
+# CodSpeed's drop-in replacement, pulled in under the name `criterion` so the
+# benches keep their `use criterion::{...}` and not a line of throughput.rs has
+# to change. Off a CodSpeed runner it behaves exactly as criterion does, so
+# `cargo bench -p wickra-exchange-bench` locally is unaffected.
+#
+# Without the alias the benches still build and still run -- and report
+# nothing. That failure is silent, which is why it is spelled out here.
+criterion = { package = "codspeed-criterion-compat", version = "5.0.1", features = ["html_reports"] }
 
 [[bench]]
 name = "throughput"
