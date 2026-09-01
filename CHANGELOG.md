@@ -70,6 +70,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Dependabot no longer proposes version updates for `.github/requirements`. The
+  two lockfiles there are resolved against different interpreters — 3.9 and 3.11
+  — and Dependabot cannot see that: it reads two requirements files in one
+  directory and bumps both to the same version. Its first two attempts each put
+  pytest 9 into the 3.9 row, and pytest 9 declares `requires-python >= 3.10`, so
+  `pip install --require-hashes` would fail on the bound. Regeneration stays with
+  `scripts/update-lockfiles.sh`, which passes each row's target Python to `uv`.
+  Security updates are exempt from the limit and still arrive, which is why there
+  is deliberately no `ignore` list.
 - The committed `bindings/node/index.js` and `index.d.ts` are checked against
   what `napi build` produces. Both are generated and committed so consumers get
   types without a build step, and nothing compared the pair — napi rewrites them
