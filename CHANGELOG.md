@@ -34,6 +34,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **CodSpeed on every pull request.** `bench.yml` runs nightly and prints numbers
+  a person has to read, so a slowdown is found by somebody re-measuring by hand,
+  weeks after it landed. This counts instructions under instrumentation instead
+  of timing wall clock, which is what makes a shared runner usable — the figure
+  does not move because a neighbour VM got busy. The bench crate's `criterion`
+  now resolves to `codspeed-criterion-compat` under that name; without the alias
+  the job succeeds and measures nothing, and a green job that measured nothing
+  looks exactly like a green job that found no regression.
 - The five long-form issue templates and the detailed pull-request template,
   adapted to this domain rather than copied — venues and order execution where
   the originals ask about indicators and TA-Lib, and no WASM row, because there
