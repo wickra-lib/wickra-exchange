@@ -28,6 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Dependabot no longer proposes `base64` 0.23. Its first rebase after #156
+  reverted the declaration back to `"0.23"`, which reintroduces the second
+  copy of the crate that #156 removed, so the constraint is recorded in
+  `dependabot.yml` instead of being re-fixed every month. To be lifted when
+  `reqwest` itself moves to 0.23.
 - **Every published artefact now carries its licence text.** `wickra-exchange`
   and `wickra-exchange-core` are packed from their own directories, so a crates.io
   release shipped without `LICENSE-MIT`/`LICENSE-APACHE`; the six npm platform
