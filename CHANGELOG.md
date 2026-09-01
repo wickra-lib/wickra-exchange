@@ -48,6 +48,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The napi configuration uses `binaryName` and `targets` instead of the
   deprecated `name` and `triples`. Both produce a byte-identical `index.js` and
   the same binary name, so nothing downstream moves.
+- The `uv` pin in `scripts/update-lockfiles.sh` moves 0.12.7 -> 0.12.9. The
+  script bootstraps that exact version when no `uv` is on PATH, so the pin
+  decides which resolver produces the committed locks.
+- `SECURITY.md` names the concrete first release, `0.1.0`, alongside the
+  supported minor line. The blueprint audit reads this file as a version
+  touchpoint and looks for the exact version, while `check_version_sync.py`
+  deliberately looks for the minor line `0.1.x`, on the argument that a support
+  statement is about a line and not a patch. Both are right, so the file now
+  says both rather than either check being bent to fit the other.
 
 ### Added
 
@@ -124,6 +133,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The universal npm package was packing every platform's native binary.**
+  `bindings/node/package.json` listed `npm` and `*.node` in `files`, and
+  `napi artifacts` places the six freshly built `.node` binaries into
+  `npm/<platform>/` immediately before the package is packed — so the one
+  package that exists to carry *no* binary would have shipped all six, plus the
+  six stub manifests that are published as packages in their own right. A local
+  `npm pack --dry-run` already showed 5 MB of unpacked content and a
+  `win32-x64-msvc` binary in the universal tarball. `files` now names only the
+  loader, the type definitions and the two licence texts, which is what the
+  platform-package layout assumes and what `wickra` ships.
 - `bindings/node/src/lib.rs` is excluded from CodeQL after all. It was left in
   when the config was written, on the argument that it is hand-written here
   rather than generated as in `wickra`. The first runs settled it: five
