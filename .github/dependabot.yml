@@ -31,6 +31,30 @@ updates:
         patterns: ["*"]
         exclude-patterns: ["napi", "napi-derive", "napi-build"]
 
+  # Fuzz targets (their own detached workspace, built on nightly by cargo-fuzz).
+  - package-ecosystem: cargo
+    directory: "/fuzz"
+    schedule:
+      interval: monthly
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 10
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "deps(cargo-fuzz)"
+    # A second cargo entry does not inherit the root entry's ignores, and the
+    # fuzz crate depends on wickra-exchange-core by `path` -- so a proposal that
+    # arrives titled "/fuzz" can change the main tree. base64 is repeated here
+    # for that reason: without it this entry would re-propose the 0.23 line the
+    # root entry blocks, and compile a second copy of the crate again (#156).
+    ignore:
+      - dependency-name: "base64"
+        versions: [">= 0.23"]
+    groups:
+      cargo-fuzz:
+        patterns: ["*"]
+
   # Node binding npm dependencies.
   - package-ecosystem: npm
     directory: "/bindings/node"

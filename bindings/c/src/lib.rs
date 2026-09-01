@@ -15,6 +15,7 @@
 use core::ffi::{c_char, CStr};
 use core::slice;
 use std::ffi::CString;
+use std::fmt;
 use std::sync::OnceLock;
 
 use rust_decimal::prelude::ToPrimitive;
@@ -81,6 +82,7 @@ pub const WICKRA_STR_CAP: usize = 64;
 
 /// An order as reported by the exchange (C-ABI mirror of `Order`).
 #[repr(C)]
+#[derive(Debug)]
 pub struct WickraOrder {
     /// Venue order id, NUL-terminated (truncated to `WICKRA_STR_CAP - 1` bytes).
     pub id: [c_char; WICKRA_STR_CAP],
@@ -100,6 +102,7 @@ pub struct WickraOrder {
 
 /// A single stream event (C-ABI projection of `Event`).
 #[repr(C)]
+#[derive(Debug)]
 pub struct WickraEvent {
     /// `WICKRA_EVENT_*`.
     pub kind: i32,
@@ -122,6 +125,19 @@ enum Inner {
     Live(Box<dyn Exchange>),
 }
 
+/// Hand-written: the `Live` variant holds `Box<dyn Exchange>`, which no derive can
+/// reach. It is shown by the venue's own name -- the one piece of a live client
+/// that identifies it without touching credentials or connection state.
+impl fmt::Debug for Inner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Inner::Paper(paper) => f.debug_tuple("Paper").field(paper).finish(),
+            Inner::Replay(replay) => f.debug_tuple("Replay").field(replay).finish(),
+            Inner::Live(client) => f.debug_tuple("Live").field(&client.name()).finish(),
+        }
+    }
+}
+
 impl Inner {
     fn as_exchange(&mut self) -> &mut dyn Exchange {
         match self {
@@ -134,12 +150,14 @@ impl Inner {
 
 /// An opaque exchange handle. Construct with `wickra_paper_new` /
 /// `wickra_replay_new` / `wickra_connect`; release with `wickra_exchange_free`.
+#[derive(Debug)]
 pub struct WickraExchange {
     inner: Inner,
 }
 
 /// A derivatives position (C-ABI mirror of `Position`).
 #[repr(C)]
+#[derive(Debug)]
 pub struct WickraPosition {
     /// Market symbol, NUL-terminated (`base/quote`).
     pub symbol: [c_char; WICKRA_STR_CAP],
@@ -161,6 +179,7 @@ pub struct WickraPosition {
 
 /// A ticker snapshot (C-ABI mirror of `Ticker`).
 #[repr(C)]
+#[derive(Debug)]
 pub struct WickraTicker {
     /// Market symbol, NUL-terminated (`base/quote`).
     pub symbol: [c_char; WICKRA_STR_CAP],
@@ -176,7 +195,7 @@ pub struct WickraTicker {
 
 /// A single OHLCV candle (C-ABI mirror of `Candle`).
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct WickraCandle {
     /// Bar open price.
     pub open: f64,
@@ -194,7 +213,7 @@ pub struct WickraCandle {
 
 /// A single order-book level: price and quantity (C-ABI mirror of `BookLevel`).
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct WickraBookLevel {
     /// Price at this level.
     pub price: f64,
@@ -208,10 +227,28 @@ pub struct WickraDerivatives {
     inner: Box<dyn Derivatives>,
 }
 
+/// Hand-written: the handle holds `Box<dyn Derivatives>`, which no derive can reach,
+/// and the trait exposes nothing to print. The type name is the whole of what an
+/// opaque handle can honestly report.
+impl fmt::Debug for WickraDerivatives {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WickraDerivatives").finish_non_exhaustive()
+    }
+}
+
 /// An opaque advanced-orders handle over a live client. Construct with
 /// `wickra_connect_advanced`; release with `wickra_advanced_free`.
 pub struct WickraAdvanced {
     inner: Box<dyn AdvancedOrders>,
+}
+
+/// Hand-written: the handle holds `Box<dyn AdvancedOrders>`, which no derive can reach,
+/// and the trait exposes nothing to print. The type name is the whole of what an
+/// opaque handle can honestly report.
+impl fmt::Debug for WickraAdvanced {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WickraAdvanced").finish_non_exhaustive()
+    }
 }
 
 /// An opaque private user-data handle over a live client. Construct with
@@ -220,10 +257,28 @@ pub struct WickraUserData {
     inner: Box<dyn WsUserData>,
 }
 
+/// Hand-written: the handle holds `Box<dyn WsUserData>`, which no derive can reach,
+/// and the trait exposes nothing to print. The type name is the whole of what an
+/// opaque handle can honestly report.
+impl fmt::Debug for WickraUserData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WickraUserData").finish_non_exhaustive()
+    }
+}
+
 /// An opaque WebSocket order-API handle over a live client. Construct with
 /// `wickra_connect_ws_execution`; release with `wickra_ws_execution_free`.
 pub struct WickraWsExecution {
     inner: Box<dyn WsExecution>,
+}
+
+/// Hand-written: the handle holds `Box<dyn WsExecution>`, which no derive can reach,
+/// and the trait exposes nothing to print. The type name is the whole of what an
+/// opaque handle can honestly report.
+impl fmt::Debug for WickraWsExecution {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WickraWsExecution").finish_non_exhaustive()
+    }
 }
 
 // ------------------------------- helpers -------------------------------------

@@ -65,6 +65,15 @@ hex = "0.4"
 # Test/dev.
 proptest = "1"
 
+[workspace.lints.rust]
+# `forbid`, not `deny`: nothing in the workspace may opt back in. The C binding
+# overrides this to `allow` in its own manifest, because a C ABI is unsafe by
+# definition; every other crate inherits the ban.
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+unused_must_use = "deny"
+
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }

@@ -14,6 +14,7 @@
 #![allow(clippy::unused_self)]
 
 use std::collections::HashMap;
+use std::fmt;
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -177,6 +178,7 @@ fn event_dict<'py>(py: Python<'py>, event: &Event) -> PyResult<Bound<'py, PyDict
 
 /// API credentials for a venue.
 #[pyclass(name = "Credentials")]
+#[derive(Debug)]
 pub struct PyCredentials {
     inner: Credentials,
 }
@@ -204,6 +206,7 @@ impl PyCredentials {
 
 /// An order request, built with the market/limit constructors.
 #[pyclass(name = "OrderRequest")]
+#[derive(Debug)]
 pub struct PyOrderRequest {
     inner: OrderRequest,
 }
@@ -254,6 +257,19 @@ enum Inner {
     Live(Box<dyn Exchange>),
 }
 
+/// Hand-written: the `Live` variant holds `Box<dyn Exchange>`, which no derive can
+/// reach. It is shown by the venue's own name -- the one piece of a live client
+/// that identifies it without touching credentials or connection state.
+impl fmt::Debug for Inner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Inner::Paper(paper) => f.debug_tuple("Paper").field(paper).finish(),
+            Inner::Replay(replay) => f.debug_tuple("Replay").field(replay).finish(),
+            Inner::Live(client) => f.debug_tuple("Live").field(&client.name()).finish(),
+        }
+    }
+}
+
 impl Inner {
     fn as_exchange(&mut self) -> &mut dyn Exchange {
         match self {
@@ -270,6 +286,7 @@ impl Inner {
 /// [`replay_trades`](PyExchange::replay_trades) or [`connect`](PyExchange::connect);
 /// the methods are identical whichever backend you chose.
 #[pyclass(name = "Exchange", unsendable)]
+#[derive(Debug)]
 pub struct PyExchange {
     inner: Inner,
 }
@@ -558,6 +575,15 @@ pub struct PyDerivatives {
     inner: Box<dyn Derivatives>,
 }
 
+/// Hand-written: the handle holds `Box<dyn Derivatives>`, which no derive can reach,
+/// and the trait exposes nothing to print. The type name is the whole of what an
+/// opaque handle can honestly report.
+impl fmt::Debug for PyDerivatives {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PyDerivatives").finish_non_exhaustive()
+    }
+}
+
 #[pymethods]
 impl PyDerivatives {
     /// Connect a USDⓈ-M futures client for `name`. Raises for a spot-only venue.
@@ -623,6 +649,15 @@ impl PyDerivatives {
 #[pyclass(name = "AdvancedOrders", unsendable)]
 pub struct PyAdvancedOrders {
     inner: Box<dyn AdvancedOrders>,
+}
+
+/// Hand-written: the handle holds `Box<dyn AdvancedOrders>`, which no derive can reach,
+/// and the trait exposes nothing to print. The type name is the whole of what an
+/// opaque handle can honestly report.
+impl fmt::Debug for PyAdvancedOrders {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PyAdvancedOrders").finish_non_exhaustive()
+    }
 }
 
 #[pymethods]
@@ -744,6 +779,15 @@ pub struct PyUserData {
     inner: Box<dyn WsUserData>,
 }
 
+/// Hand-written: the handle holds `Box<dyn WsUserData>`, which no derive can reach,
+/// and the trait exposes nothing to print. The type name is the whole of what an
+/// opaque handle can honestly report.
+impl fmt::Debug for PyUserData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PyUserData").finish_non_exhaustive()
+    }
+}
+
 #[pymethods]
 impl PyUserData {
     /// Connect a user-data client for `name`. `futures` selects the USDⓈ-M
@@ -804,6 +848,15 @@ impl PyUserData {
 #[pyclass(name = "WsExecution", unsendable)]
 pub struct PyWsExecution {
     inner: Box<dyn WsExecution>,
+}
+
+/// Hand-written: the handle holds `Box<dyn WsExecution>`, which no derive can reach,
+/// and the trait exposes nothing to print. The type name is the whole of what an
+/// opaque handle can honestly report.
+impl fmt::Debug for PyWsExecution {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PyWsExecution").finish_non_exhaustive()
+    }
 }
 
 #[pymethods]

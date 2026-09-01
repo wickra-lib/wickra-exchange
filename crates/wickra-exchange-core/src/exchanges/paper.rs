@@ -51,6 +51,7 @@ fn bps_fraction(bps: Decimal) -> Decimal {
 
 /// A deterministic, network-free exchange that simulates fills through an
 /// internal portfolio. See the [module docs](self) for the fill model.
+#[derive(Debug)]
 pub struct PaperExchange {
     market_type: MarketType,
     maker_bps: Decimal,
@@ -679,5 +680,13 @@ mod tests {
         assert_eq!(ex.market_type(), MarketType::UsdMFutures);
         assert_eq!(ex.maker_bps(), dec!(2));
         assert_eq!(ex.taker_bps(), dec!(7));
+    }
+
+    /// The derived `Debug` is part of the public surface: a paper client ends up
+    /// in test output and error messages.
+    #[test]
+    fn debug_renders() {
+        let rendered = format!("{:?}", seeded());
+        assert!(rendered.starts_with("PaperExchange {"));
     }
 }

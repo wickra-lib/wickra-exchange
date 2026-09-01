@@ -17,9 +17,16 @@ publish = false
 name = "wickra_exchange"
 crate-type = ["cdylib", "staticlib"]
 
-# The C ABI inherently needs `unsafe` (raw pointers across the FFI boundary). The
-# workspace lints do not forbid unsafe here; this crate is the one place the
-# boundary lives. Mirrors the workspace clippy set.
+# The C ABI inherently needs `unsafe` (raw pointers across the FFI boundary), so
+# this crate opts out of the workspace `unsafe_code = "forbid"` -- it is the one
+# place the boundary lives. Everything else in the workspace rust set still
+# applies, and the clippy set below mirrors the workspace one.
+[lints.rust]
+unsafe_code = "allow"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+unused_must_use = "deny"
+
 [lints.clippy]
 all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }

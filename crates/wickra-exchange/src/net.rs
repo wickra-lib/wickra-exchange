@@ -20,6 +20,7 @@ use wickra_exchange_core::{
 /// A synchronous HTTP transport backed by `reqwest`'s blocking client (rustls
 /// TLS). The blocking client keeps the public surface synchronous with no tokio
 /// runtime for callers to manage.
+#[derive(Debug)]
 pub struct ReqwestHttpTransport {
     client: reqwest::blocking::Client,
 }
@@ -86,7 +87,7 @@ impl HttpTransport for ReqwestHttpTransport {
 /// inbound channel non-blockingly (`recv` returns `Ok(None)` when nothing is
 /// pending), so the pull model needs no runtime on the caller's side. Dropping
 /// the connection closes the outbound channel, which shuts the reader down.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct TungsteniteWsTransport;
 
 impl TungsteniteWsTransport {

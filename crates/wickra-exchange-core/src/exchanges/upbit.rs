@@ -21,6 +21,7 @@ use crate::transport::{
 use crate::types::{Balance, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker};
 use base64::Engine;
 use rust_decimal::Decimal;
+use std::fmt;
 use wickra_core::Candle;
 
 fn system_now_ms() -> i64 {
@@ -44,6 +45,23 @@ pub struct Upbit {
     now_ms: Box<dyn Fn() -> i64 + Send + Sync>,
     connection: Option<Box<dyn WsConnection>>,
     sub_messages: Vec<String>,
+}
+
+/// Hand-written: the client holds `Box<dyn HttpTransport>`, `Box<dyn WsTransport>`
+/// and a `Box<dyn Fn() -> i64>` clock, none of which a derive can reach. The
+/// transports are shown by whether a connection is open rather than by value, and
+/// the credentials only by whether they are set -- printing them would put secret
+/// material into every log line that formats a client.
+impl fmt::Debug for Upbit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Upbit")
+            .field("ws", &self.ws.is_some())
+            .field("rest_base", &self.rest_base)
+            .field("authenticated", &self.credentials.is_some())
+            .field("connection", &self.connection.is_some())
+            .field("sub_messages", &self.sub_messages.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Upbit {
@@ -932,5 +950,19 @@ mod tests {
     #[test]
     fn system_clock_is_sane() {
         assert!(system_now_ms() > 1_600_000_000_000);
+    }
+
+    /// `Debug` reports connection state, never secret material. A client is
+    /// formatted into logs and error messages, so anything it prints is
+    /// somewhere a credential must not be.
+    #[test]
+    fn debug_reports_state_without_credentials() {
+        let (client, _http) = signed_client(1_700_000_000_000);
+        let rendered = format!("{client:?}");
+
+        assert!(rendered.starts_with("Upbit {"));
+        assert!(rendered.contains("authenticated: true"));
+        assert!(!rendered.contains("SECRET"));
+        assert!(!rendered.contains("APIKEY"));
     }
 }

@@ -24,6 +24,7 @@ use base64::Engine;
 use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 use p256::pkcs8::DecodePrivateKey;
 use rust_decimal::Decimal;
+use std::fmt;
 use wickra_core::Candle;
 
 const HOST: &str = "api.coinbase.com";
@@ -49,6 +50,23 @@ pub struct Coinbase {
     now_ms: Box<dyn Fn() -> i64 + Send + Sync>,
     connection: Option<Box<dyn WsConnection>>,
     sub_messages: Vec<String>,
+}
+
+/// Hand-written: the client holds `Box<dyn HttpTransport>`, `Box<dyn WsTransport>`
+/// and a `Box<dyn Fn() -> i64>` clock, none of which a derive can reach. The
+/// transports are shown by whether a connection is open rather than by value, and
+/// the credentials only by whether they are set -- printing them would put secret
+/// material into every log line that formats a client.
+impl fmt::Debug for Coinbase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Coinbase")
+            .field("ws", &self.ws.is_some())
+            .field("rest_base", &self.rest_base)
+            .field("authenticated", &self.credentials.is_some())
+            .field("connection", &self.connection.is_some())
+            .field("sub_messages", &self.sub_messages.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Coinbase {
@@ -1025,5 +1043,21 @@ wHvqY4aizCFHQFTVNQCzDGy8/TOhRANCAAS69zNVQjOQ4RgxJVI8esP+jMfHLSTw\n\
     #[test]
     fn system_clock_is_sane() {
         assert!(system_now_ms() > 1_600_000_000_000);
+    }
+
+    /// `Debug` reports connection state, never secret material. A client is
+    /// formatted into logs and error messages, so anything it prints is
+    /// somewhere a credential must not be.
+    #[test]
+    fn debug_reports_state_without_credentials() {
+        let (client, _http) = signed_client(1_700_000_000_000);
+        let rendered = format!("{client:?}");
+
+        assert!(rendered.starts_with("Coinbase {"));
+        assert!(rendered.contains("authenticated: true"));
+        // The PKCS#8 private key is the secret here.
+        assert!(!rendered.contains("BEGIN PRIVATE KEY"));
+        assert!(!rendered.contains("MIGHAgEAMBMGByqGSM49"));
+        assert!(!rendered.contains("organizations/x/apiKeys/y"));
     }
 }

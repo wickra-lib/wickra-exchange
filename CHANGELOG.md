@@ -28,6 +28,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`[workspace.lints.rust]` exists.** Only the clippy half was ever declared, so
+  every crate inheriting `[lints] workspace = true` got no `unsafe_code`,
+  `missing_debug_implementations`, `unreachable_pub` or `unused_must_use` rule at
+  all — and `bindings/node/Cargo.toml` carried a comment describing itself as
+  "relaxed from the workspace `forbid`" against a `forbid` that did not exist.
+  The C binding now overrides `unsafe_code` to `allow` in its own manifest, which
+  is where a C ABI belongs, and both bindings mirror the remaining three rules
+  instead of only claiming to.
+- 35 public types gained a `Debug` implementation, which the new lint required.
+  The ten venue clients hold `Box<dyn HttpTransport>`, `Box<dyn WsTransport>` and
+  a boxed clock closure, so those are hand-written: they report whether a
+  connection is open rather than the transport itself, and **never** print
+  credentials — only whether any are set. The opaque C-ABI and Python handles
+  report their type name, which is all an opaque handle can honestly say.
+- `[package.metadata.docs.rs] all-features = true` on both published crates.
+  docs.rs otherwise builds them with default features and silently omits
+  everything behind a feature gate.
 - Dependabot no longer proposes `base64` 0.23. Its first rebase after #156
   reverted the declaration back to `"0.23"`, which reintroduces the second
   copy of the crate that #156 removed, so the constraint is recorded in

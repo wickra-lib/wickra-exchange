@@ -12,6 +12,9 @@ keywords.workspace = true
 categories.workspace = true
 description = "Streaming-native, typed, unified connectivity for the ten largest crypto exchanges (market data + signed order execution), built on the Wickra core."
 
+[package.metadata.docs.rs]
+all-features = true
+
 [lints]
 workspace = true
 
