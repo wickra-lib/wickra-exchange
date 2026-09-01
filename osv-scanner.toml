@@ -23,6 +23,31 @@
 # Not fixable by upgrading: rust_decimal 1.42.1 is the newest release, and it is
 # the crate that pins rkyv ^0.7.46 for that feature. Revisit when rust_decimal
 # moves its optional dependency to the 0.8 line.
+# pytest's tmpdir handling: on UNIX it uses the predictable path
+# /tmp/pytest-of-{user}, which lets another *local* user on the same machine
+# cause a denial of service or possibly gain privileges (CVSS AV:L, low across
+# C/I/A). Fixed in pytest 9.0.3.
+#
+# Two reasons this stays:
+#
+#   * Not reachable where it runs. pytest runs on ephemeral single-user GitHub
+#     runners; there is no second local user to be the attacker. A developer
+#     running the suite locally faces the ordinary shared-/tmp exposure of any
+#     tool that writes there.
+#   * Not fixable on the row it is reported for. The finding is in
+#     ci-dev-py39.txt, which is resolved for Python 3.9, and pytest 9.0.3
+#     declares `requires-python >= 3.10`. Every version that carries the fix
+#     refuses to install on the interpreter the row exists to test. Two
+#     Dependabot pull requests (#163, #164) proposed exactly that and were
+#     closed for it.
+#
+# The 3.10+ row (ci-dev-py3.txt) is on pytest 9.1.1 and unaffected; only the 3.9
+# row is pinned to 8.x. Remove this entry when the support matrix drops Python
+# 3.9, which is the real fix.
+[[IgnoredVulns]]
+id = "GHSA-6w46-j5rx-g56g"
+reason = "pytest tmpdir handling; local attack vector only, and CI runners are single-user and ephemeral. The fix (9.0.3+) requires Python >= 3.10, so it cannot be applied to the 3.9 row it is reported for. Drop with Python 3.9 support."
+
 [[IgnoredVulns]]
 id = "RUSTSEC-2026-0235"
 reason = "rkyv is an optional rust_decimal feature this workspace does not enable; the crate is in Cargo.lock but in no build graph (`cargo tree -i rkyv --target all` prints nothing), so the out-of-bounds read in archive validation is unreachable."

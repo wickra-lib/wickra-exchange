@@ -384,6 +384,14 @@ jobs:
       # the one it checks teaches people to ignore it. Nothing is lost: every
       # lockfile -- Cargo.lock, package-lock.json, go.mod -- is still scanned in
       # full and transitively, because a lockfile needs no resolution.
+      # The two --lockfile arguments are not redundant with --recursive.
+      # OSV-Scanner discovers lockfiles by *filename*, and neither
+      # ci-dev-py3.txt nor ci-dev-py39.txt matches a pattern it recognises, so
+      # the recursive walk skipped both: the first run of this job listed seven
+      # scanned files and neither was among them. They are named after the
+      # interpreter they target rather than after the format, which is the right
+      # name for a reader and the wrong one for the scanner, so the format is
+      # stated explicitly instead of renaming the files.
       - name: osv-scanner
         uses: google/osv-scanner-action/osv-scanner-action@6e4298ebc4db23e847df9b2e2de2939d6f066c67 # v2.5.1
         with:
@@ -391,6 +399,8 @@ jobs:
             --recursive
             --no-resolve
             --config=osv-scanner.toml
+            --lockfile=requirements.txt:.github/requirements/ci-dev-py3.txt
+            --lockfile=requirements.txt:.github/requirements/ci-dev-py39.txt
             ./
 
   python:
