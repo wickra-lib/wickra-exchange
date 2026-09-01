@@ -28,6 +28,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`examples-smoke` CI job — every example is now built or parsed.** Only
+  `examples/c` was ever compiled, so the other seven could rot with nothing to
+  say so, and one had: the C# example called a method the binding does not have
+  and sat that way in the tree. Syntax-checking would not have caught it —
+  `Balances()` is valid C#. The compiled examples are therefore compiled against
+  the binding in this tree: C# via `dotnet build`, Go through a throwaway module
+  with a `replace` onto `bindings/go`, Java with `javac` against the freshly
+  packaged jar. Node, Python and R are parsed.
+- **`python-wheel-container-smoke` CI job.** The manylinux and musllinux wheels
+  were built for the first time by the release itself, which is irreversible.
+  This builds both on every change *and installs and imports them under the
+  matching libc* — a musllinux wheel cannot be installed on the glibc runner, so
+  importing it there would prove nothing.
+- `semver` CI job (`cargo-semver-checks`). Neither crate is on crates.io yet, so
+  it looks the baseline up first and skips loudly until there is one; from the
+  first release it starts checking on its own. Deliberately not
+  `continue-on-error`, which would hide the API break it exists to catch.
+- Non-blocking `links` job on pull requests. `links.yml`'s header has described
+  this job since the repository was seeded — it just did not exist.
 - **`scripts/check_binding_surface.py`** — reads the trait methods out of
   `crates/wickra-exchange-core/src/traits.rs` and holds all seven bindings to
   them. Each binding is written separately and tested separately, so a method
@@ -51,6 +70,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The committed `bindings/node/index.js` and `index.d.ts` are checked against
+  what `napi build` produces. Both are generated and committed so consumers get
+  types without a build step, and nothing compared the pair — napi rewrites them
+  only when somebody rebuilds, and a rebuild is not part of committing.
+- `lycheeverse/lychee-action` carried the pin comment `# v2`, too coarse for
+  Dependabot to resolve a version from — the same defect as `rust-cache`.
 - **R could not connect to a live venue.** The binding had `wkex_paper` and
   `wkex_replay_trades` and no `wkex_connect`, so an R user could open the
   derivatives, advanced-orders, user-data and ws-execution handles — each of
