@@ -28,6 +28,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Every published artefact now carries its licence text.** `wickra-exchange`
+  and `wickra-exchange-core` are packed from their own directories, so a crates.io
+  release shipped without `LICENSE-MIT`/`LICENSE-APACHE`; the six npm platform
+  packages declared `MIT OR Apache-2.0` while their `files` array named only the
+  `.node` binary, and nothing copied the texts into the stub directories. Copies
+  now live beside each published crate and beside the Python binding, the stubs
+  list both files, and `release.yml` stages them and then proves with
+  `npm pack --dry-run` that npm really packs them — `files` and what npm produces
+  can disagree, and that failure is silent.
+- `bindings/r/LICENSE` names the same copyright holder as the rest of the family
+  ("kingchenc and the Wickra contributors").
+- `CITATION.cff` carries `version` and `date-released`. GitHub's citation box and
+  Zenodo read both from there, and neither was present.
 - `github-release` now waits for `csharp-publish`, `java-publish` and
   `go-mirror` as well, so the release page cannot be assembled before every
   artefact that belongs on it exists.
@@ -50,6 +63,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- SPDX-named licence copies under `LICENSES/` (`MIT.txt`,
+  `Apache-2.0.txt`) for REUSE-style tooling.
 - Repository scaffolding mirrored from the `wickra-backtest` template: Cargo
   workspace, the `wickra-exchange-core` and `wickra-exchange` facade crates,
   supply-chain configuration (`deny.toml`, `osv-scanner.toml`), lint configuration

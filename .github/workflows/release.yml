@@ -360,6 +360,38 @@ jobs:
         working-directory: bindings/node
         run: npx napi artifacts --output-dir artifacts
 
+      # The stubs declare `MIT OR Apache-2.0` but shipped no licence text: their
+      # `files` array named only the .node binary, and nothing copied the texts
+      # into the stub directories. Both are fixed here -- the copy, and a check
+      # that npm really packs them, because `files` and what `npm pack` produces
+      # can disagree (an .npmignore, a stale entry) and the failure is silent:
+      # the package publishes, just without its licence.
+      - name: Stage the licence texts and prove they will be packed
+        working-directory: bindings/node
+        run: |
+          set -euo pipefail
+          for dir in . npm/*/; do
+            cp ../../LICENSE-MIT ../../LICENSE-APACHE "$dir/"
+          done
+          for dir in . npm/*/; do
+            # The ${...} below are JavaScript template literals inside a
+            # single-quoted node script, not shell expansions.
+            # shellcheck disable=SC2016
+            ( cd "$dir" && npm pack --dry-run --json ) | node -e '
+              const chunks = [];
+              process.stdin.on("data", c => chunks.push(c));
+              process.stdin.on("end", () => {
+                const pkg = JSON.parse(chunks.join(""))[0];
+                const names = pkg.files.map(f => f.path);
+                const missing = ["LICENSE-MIT", "LICENSE-APACHE"].filter(n => !names.includes(n));
+                if (missing.length) {
+                  console.error(`::error::${pkg.name} would publish without ${missing.join(" and ")}`);
+                  process.exit(1);
+                }
+                console.log(`${pkg.name}: licence texts present`);
+              });'
+          done
+
       - name: Publish platform packages (idempotent)
         working-directory: bindings/node
         env:
