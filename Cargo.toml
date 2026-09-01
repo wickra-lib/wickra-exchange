@@ -60,7 +60,7 @@ url = "2"
 # across both lines.
 hmac = "0.13"
 sha2 = "0.11"
-base64 = "0.22"
+base64 = "0.23"
 hex = "0.4"
 # Test/dev.
 proptest = "1"
