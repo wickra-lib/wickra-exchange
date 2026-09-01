@@ -60,6 +60,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`bindings/c/include/wickra_exchange.hpp`** — an optional, header-only C++
+  layer over the C ABI. The ABI hands out five kinds of opaque handle, each
+  released exactly once by its own `wickra_*_free`; every early return between
+  the constructor and that call leaks one, and a thrown exception leaks it
+  unconditionally. `wickra::Handle` is a move-only RAII owner that frees at
+  scope exit however the scope is left, with an alias per handle type
+  (`wickra::Exchange`, `Derivatives`, `Advanced`, `UserData`, `WsExecution`) so
+  a handle cannot be paired with the wrong free function. Copying is deleted
+  rather than defaulted: two owners of one handle would free it twice.
+  `examples/c/paper.cpp` now uses it instead of a hand-written free at the end
+  of `main`, so the header is compiled and run on all three CI operating
+  systems rather than only existing. Unlike `wickra_exchange.h`, this file is
+  hand-written and no generator touches it.
+
 - **CodSpeed on every pull request.** `bench.yml` runs nightly and prints numbers
   a person has to read, so a slowdown is found by somebody re-measuring by hand,
   weeks after it landed. This counts instructions under instrumentation instead
