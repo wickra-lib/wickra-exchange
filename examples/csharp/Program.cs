@@ -10,7 +10,9 @@ ex.SetPrice("BTC/USDT", 20_000.0);
 var order = ex.PlaceMarket("BTC/USDT", Side.Buy, 1.0);
 Console.WriteLine($"filled at {order.AveragePrice} (status {order.Status})");
 
-foreach (var (asset, free) in ex.Balances())
+// The C ABI exposes a per-asset balance rather than the whole map, so the C#,
+// Go, Java and R wrappers ask for one asset at a time.
+foreach (var asset in new[] { "USDT", "BTC" })
 {
-    Console.WriteLine($"  {asset} free: {free}");
+    Console.WriteLine($"  {asset} free: {ex.Balance(asset)}");
 }

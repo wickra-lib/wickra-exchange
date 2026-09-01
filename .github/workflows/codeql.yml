@@ -23,6 +23,7 @@ jobs:
   analyze:
     name: Analyze (${{ matrix.language }})
     runs-on: ubuntu-latest
+    timeout-minutes: 30 # backstop against a hung job, not a budget
     permissions:
       security-events: write # upload CodeQL results to code-scanning
       packages: read
@@ -38,19 +39,110 @@ jobs:
             build-mode: none
           - language: javascript-typescript
             build-mode: none
+          # The matrix covered three of the eight languages this repository
+          # ships. The five it left out are the ones where a memory mistake is
+          # possible at all: bindings/c is the raw-pointer boundary, bindings/go
+          # hands slice base addresses to C through unsafe.Pointer, bindings/r
+          # compiles C into the CRAN package, and the C# and Java bindings own
+          # handle lifetimes across an FFI arena.
+          #
+          # autobuild for Go rather than a manual command: with a manual build
+          # CodeQL traces it and then finalises an empty database. The Go
+          # extractor runs its own build and finds the module in the
+          # subdirectory. The C ABI library is still staged in front of it,
+          # because cgo has to link.
+          - language: go
+            build-mode: autobuild
+          - language: c-cpp
+            build-mode: manual
+          # C# and Java are compiled rather than read as source: without a build
+          # no dependency resolves, and CodeQL reports an unresolved call graph
+          # as low-quality analysis. `manual` over `autobuild` because guessing
+          # which project to build is how a scan ends up quietly covering the
+          # wrong one.
+          - language: csharp
+            build-mode: manual
+          - language: java-kotlin
+            build-mode: manual
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
+      # A language toolchain belongs before codeql-action/init, so CodeQL sees
+      # the compiler it will trace; a build belongs after it, because being
+      # traced is the point.
+      - name: Set up JDK 25
+        if: matrix.language == 'java-kotlin'
+        uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c # v6.0.0
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - name: Set up Go
+        if: matrix.language == 'go'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "stable"
+          cache: false
+
+      # Go and C/C++ both need the C ABI library present before they build: the
+      # Go binding links it through cgo, and the C examples link it via CMake.
+      # One cargo build serves both.
+      - name: Install Rust toolchain
+        if: matrix.language == 'go' || matrix.language == 'c-cpp'
+        uses: ./.github/actions/setup-rust
+
+      - name: Build the C ABI library
+        if: matrix.language == 'go' || matrix.language == 'c-cpp'
+        run: cargo build -p wickra-exchange-c --release
+
+      # The cgo LDFLAGS point at ${SRCDIR}/lib/<goos>_<goarch>, so without the
+      # library there the build cannot link and nothing is extracted.
+      - name: Stage the native library for cgo
+        if: matrix.language == 'go'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p bindings/go/lib/linux_amd64
+          cp target/release/libwickra_exchange.so bindings/go/lib/linux_amd64/
+
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # v4.37.8
+        uses: github/codeql-action/init@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
+          config-file: .github/codeql/codeql-config.yml
+
+      # The C examples consume the header, and paper.cpp exercises it from C++ --
+      # compiling them is what puts both in the database.
+      - name: Build the C and C++ examples
+        if: matrix.language == 'c-cpp'
+        run: |
+          cmake -S examples/c -B examples/c/build
+          cmake --build examples/c/build --config Release
+
+      # CodeQL sees exactly what the compiler walks, so anything not built is not
+      # analysed. Example code is attack surface -- it is what readers copy into
+      # their own programs -- so the example project is built alongside the
+      # binding and its tests rather than left out.
+      - name: Build the C# binding, tests and examples
+        if: matrix.language == 'csharp'
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet build bindings/csharp/WickraExchange.Tests/WickraExchange.Tests.csproj -c Release
+          dotnet build examples/csharp/PaperTrade.csproj -c Release
+
+      # -DskipTests, not -Dmaven.test.skip: the hand-written tests still compile,
+      # and CodeQL needs the code compiled, not exercised.
+      - name: Build the Java binding
+        if: matrix.language == 'java-kotlin'
+        shell: bash
+        run: mvn -B -f bindings/java test-compile -DskipTests
 
       - name: Perform CodeQL analysis
-        uses: github/codeql-action/analyze@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # v4.37.8
+        uses: github/codeql-action/analyze@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
         with:
           category: "/language:${{ matrix.language }}"

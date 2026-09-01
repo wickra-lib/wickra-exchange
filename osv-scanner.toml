@@ -1,8 +1,28 @@
 # OSV-Scanner suppressions (VEX record). Consumed by OSV-Scanner and the
 # OpenSSF Scorecard Vulnerabilities check. Each entry is an advisory assessed as
-# not affecting wickra-backtest; this mirrors the cargo-deny `ignore` list in
+# not affecting wickra-exchange; this mirrors the cargo-deny `ignore` list in
 # deny.toml at the OSV layer.
 #
-# There are currently no suppressed advisories. Add an [[IgnoredVulns]] entry
-# here (with an `id` and a `reason`) only after assessing that the advisory does
-# not affect this project, and keep it in lock-step with deny.toml.
+# Add an [[IgnoredVulns]] entry here (with an `id` and a `reason`) only after
+# assessing that the advisory does not affect this project, and keep it in
+# lock-step with deny.toml.
+
+# rkyv is an *optional* dependency of rust_decimal, behind a feature this
+# workspace does not enable -- we take `features = ["serde"]` only. Cargo.lock
+# records optional dependencies whether or not their feature is on, so the crate
+# appears in the lockfile while never being compiled into anything:
+#
+#     $ cargo tree -i rkyv --target all
+#     warning: nothing to print.
+#
+# That is also why cargo-deny is silent: it resolves the real dependency graph,
+# where rkyv does not appear, while OSV-Scanner reads the lockfile. There is
+# deliberately no matching deny.toml entry -- one would suppress a finding
+# cargo-deny never makes.
+#
+# Not fixable by upgrading: rust_decimal 1.42.1 is the newest release, and it is
+# the crate that pins rkyv ^0.7.46 for that feature. Revisit when rust_decimal
+# moves its optional dependency to the 0.8 line.
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0235"
+reason = "rkyv is an optional rust_decimal feature this workspace does not enable; the crate is in Cargo.lock but in no build graph (`cargo tree -i rkyv --target all` prints nothing), so the out-of-bounds read in archive validation is unreachable."
