@@ -1,0 +1,9 @@
+# Prebuilt wickra-exchange C ABI libraries are provisioned locally and in CI
+# (cargo build -p wickra-exchange-c), never committed. .gitkeep holds the
+# directory, because the cgo LDFLAGS point at ${SRCDIR}/lib/<goos>_<goarch>.
+*.so
+*.dylib
+*.dll
+*.a
+*.lib
+*.exp

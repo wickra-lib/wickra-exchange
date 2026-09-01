@@ -34,6 +34,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The five long-form issue templates and the detailed pull-request template,
+  adapted to this domain rather than copied — venues and order execution where
+  the originals ask about indicators and TA-Lib, and no WASM row, because there
+  is no WASM binding. The main PR template now points at the long form: GitHub
+  offers no picker for a second template, so it is reachable only by appending
+  `?template=detailed.md` to the URL, and a template nothing mentions is a
+  template nobody uses.
+- `docs/README.md` — an index of the eight pages in `docs/`, and a note that they
+  live beside the code on purpose: there is no separate docs repository here, so
+  a page and the behaviour it documents cannot drift apart across two merges.
+- `fuzz/README.md` and `fuzz/.gitignore` — what each of the five targets
+  exercises, and why: everything a remote server can put on the wire is
+  untrusted, and a panic across the C ABI is undefined behaviour.
+- `.gitignore` for the C#, Java, Go and R bindings. The root file covers build
+  output; these cover what the *release* stages into the tree —
+  `WickraExchange/runtimes/`, `src/main/resources/native/`, `bindings/go/lib/` —
+  which is where a multi-megabyte native library would otherwise be committed by
+  accident.
+- README sections **Testing** and **Benchmarks**, and `## Building from source`
+  is now `## Building everything from source`. The Testing section ends with what
+  the offline suites *cannot* tell you: every venue test feeds the client a
+  response the test itself wrote, which proves the parser handles that shape and
+  not that the shape is what the venue sends.
 - **`examples-smoke` CI job — every example is now built or parsed.** Only
   `examples/c` was ever compiled, so the other seven could rot with nothing to
   say so, and one had: the C# example called a method the binding does not have

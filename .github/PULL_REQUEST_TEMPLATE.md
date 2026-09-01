@@ -1,3 +1,9 @@
+<!-- Changing the release process, the C ABI, the shared binding surface or a
+     venue's signing? There is a longer template that asks what such a change
+     has to answer: reopen this pull request with ?template=detailed.md
+     appended to the URL. GitHub offers no picker for a second template, so it
+     is only reachable that way. -->
+
 <!-- Keep it short. One logical change per PR. -->
 
 ## What
