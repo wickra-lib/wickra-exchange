@@ -67,6 +67,25 @@ wkex_replay_trades <- function(market, tape, balances, maker_bps = 0, taker_bps 
   structure(list(handle = handle), class = "wickra_exchange")
 }
 
+#' Connect a live client for a venue.
+#'
+#' The derivatives, advanced-orders, user-data and ws-execution constructors
+#' each connect internally, so this was the one missing door: without it R could
+#' reach those handles against a real venue while having no way to build a plain
+#' exchange for market data and order execution.
+#' @param name Venue identifier, e.g. "binance".
+#' @param api_key,api_secret API credentials.
+#' @param passphrase,private_key Optional extra credentials (NULL if unused).
+#' @param testnet Use the venue testnet.
+#' @return A `wickra_exchange` object.
+#' @export
+wkex_connect <- function(name, api_key, api_secret,
+                         passphrase = NULL, private_key = NULL, testnet = FALSE) {
+  handle <- .Call(C_wkex_connect, name, api_key, api_secret,
+                  passphrase, private_key, as.logical(testnet))
+  structure(list(handle = handle), class = "wickra_exchange")
+}
+
 #' The venue identifier of an exchange.
 #' @param ex A `wickra_exchange` object.
 #' @return The venue name ("paper", "replay", "binance", ...).

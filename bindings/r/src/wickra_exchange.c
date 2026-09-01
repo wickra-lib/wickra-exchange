@@ -146,6 +146,20 @@ SEXP wkex_version(void) {
     return Rf_mkString(wickra_version());
 }
 
+/* A live client for `name`. The derivatives, advanced, user-data and
+ * ws-execution handles each connect internally, so R could reach those against
+ * a real venue while having no way to construct a plain exchange -- market data
+ * and order execution were unreachable from R for any venue but paper and
+ * replay. */
+SEXP wkex_connect(SEXP name, SEXP api_key, SEXP api_secret, SEXP passphrase,
+                  SEXP private_key, SEXP testnet) {
+    WickraExchange *h = wickra_connect(
+        CHAR(STRING_ELT(name, 0)), CHAR(STRING_ELT(api_key, 0)),
+        CHAR(STRING_ELT(api_secret, 0)), opt_cstr(passphrase),
+        opt_cstr(private_key), (bool)Rf_asLogical(testnet));
+    return wrap_handle(h, "live");
+}
+
 SEXP wkex_paper_new(SEXP assets, SEXP amounts, SEXP maker, SEXP taker, SEXP slippage) {
     R_xlen_t n = Rf_xlength(assets);
     const char **c_assets = string_vec(assets, n);
@@ -647,6 +661,7 @@ SEXP wkex_ws_cancel_order(SEXP ext, SEXP market, SEXP order_id) {
 
 static const R_CallMethodDef CallEntries[] = {
     {"wkex_version", (DL_FUNC)&wkex_version, 0},
+    {"wkex_connect", (DL_FUNC)&wkex_connect, 6},
     {"wkex_paper_new", (DL_FUNC)&wkex_paper_new, 5},
     {"wkex_replay_new", (DL_FUNC)&wkex_replay_new, 7},
     {"wkex_name", (DL_FUNC)&wkex_name, 1},

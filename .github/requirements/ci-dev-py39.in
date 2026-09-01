@@ -1,0 +1,8 @@
+# Python 3.9 dev/test tooling for the ci.yml python job.
+# Locked output: ci-dev-py39.txt. Refresh via scripts/update-lockfiles.sh.
+#
+# Separate from ci-dev-py3 because a lock is resolved against one interpreter
+# version: 3.9 is at the end of its life and several projects have stopped
+# shipping cp39 wheels, so the two resolutions genuinely differ.
+maturin
+pytest

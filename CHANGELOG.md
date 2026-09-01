@@ -28,6 +28,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`scripts/check_binding_surface.py`** — reads the trait methods out of
+  `crates/wickra-exchange-core/src/traits.rs` and holds all seven bindings to
+  them. Each binding is written separately and tested separately, so a method
+  missing from one of them failed nowhere; nothing compared the bindings to each
+  other.
+- `scripts/check_version_sync.py`, `check_readme_links.py`,
+  `check_license_copies.py`, `check_r_abi_skew.py` and
+  `scripts/update-lockfiles.sh`, all wired into a `binding-surface` CI job.
+- `.github/requirements/ci-dev-py3.{in,txt}` and `ci-dev-py39.{in,txt}` —
+  hash-pinned. The Python job installed `maturin pytest` unpinned, so a run could
+  differ from the one before it for reasons nothing recorded.
 - `actionlint` workflow. zizmor reads the workflows for security; actionlint
   reads them for whether they work at all — unknown contexts, invalid `needs`
   references, and, through its bundled shellcheck, every `run:` block.
@@ -40,6 +51,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **R could not connect to a live venue.** The binding had `wkex_paper` and
+  `wkex_replay_trades` and no `wkex_connect`, so an R user could open the
+  derivatives, advanced-orders, user-data and ws-execution handles — each of
+  which connects internally — while having no way to construct a plain exchange
+  for market data and order execution. Found by the first run of
+  `check_binding_surface.py`; a verb check could not have found it, because a
+  constructor is not a trait method.
 - **The release published a crate that does not exist.** `release.yml` ran
   `cargo publish -p wickra-exchange-cli`, `cargo package -p wickra-exchange-cli`
   and copied its SBOM — for a `wkex` CLI crate the workspace does not contain and

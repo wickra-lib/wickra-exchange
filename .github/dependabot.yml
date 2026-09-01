@@ -55,6 +55,24 @@ updates:
       cargo-fuzz:
         patterns: ["*"]
 
+  # CI's own Python tooling (.github/requirements/*.txt), hash-pinned.
+  # A separate entry from the binding's pip manifest: these are the versions CI
+  # runs with, and they move on their own schedule.
+  - package-ecosystem: pip
+    directory: "/.github/requirements"
+    schedule:
+      interval: monthly
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 10
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "deps(ci-python)"
+    groups:
+      ci-python:
+        patterns: ["*"]
+
   # Node binding npm dependencies.
   - package-ecosystem: npm
     directory: "/bindings/node"
