@@ -1847,7 +1847,14 @@ mod tests {
 
         let first_id = first.client_order_id.expect("an id was generated");
         let second_id = second.client_order_id.expect("an id was generated");
-        assert!(first_id.starts_with("wkex-"), "{first_id}");
+        // The id is not interpolated into the message. CodeQL traces any
+        // value out of a credentials-holding client as sensitive, and the
+        // rule is right in spirit even where this particular value is a
+        // counter: a test message is still output.
+        assert!(
+            first_id.starts_with("wkex-"),
+            "the generated id must carry the wkex- prefix"
+        );
         assert_ne!(
             first_id, second_id,
             "two orders on a frozen clock must not share a client id"
