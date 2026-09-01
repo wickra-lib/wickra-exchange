@@ -31,29 +31,26 @@
     "LICENSE-APACHE"
   ],
   "napi": {
-    "name": "wickra-exchange",
-    "triples": {
-      "defaults": false,
-      "additional": [
-        "x86_64-unknown-linux-gnu",
-        "aarch64-unknown-linux-gnu",
-        "x86_64-apple-darwin",
-        "aarch64-apple-darwin",
-        "x86_64-pc-windows-msvc",
-        "aarch64-pc-windows-msvc"
-      ]
-    }
+    "binaryName": "wickra-exchange",
+    "targets": [
+      "x86_64-unknown-linux-gnu",
+      "aarch64-unknown-linux-gnu",
+      "x86_64-apple-darwin",
+      "aarch64-apple-darwin",
+      "x86_64-pc-windows-msvc",
+      "aarch64-pc-windows-msvc"
+    ]
   },
   "engines": {
     "node": ">= 22"
   },
   "optionalDependencies": {
-    "wickra-exchange-linux-x64-gnu": "0.1.0",
-    "wickra-exchange-linux-arm64-gnu": "0.1.0",
-    "wickra-exchange-darwin-x64": "0.1.0",
     "wickra-exchange-darwin-arm64": "0.1.0",
-    "wickra-exchange-win32-x64-msvc": "0.1.0",
-    "wickra-exchange-win32-arm64-msvc": "0.1.0"
+    "wickra-exchange-darwin-x64": "0.1.0",
+    "wickra-exchange-linux-arm64-gnu": "0.1.0",
+    "wickra-exchange-linux-x64-gnu": "0.1.0",
+    "wickra-exchange-win32-arm64-msvc": "0.1.0",
+    "wickra-exchange-win32-x64-msvc": "0.1.0"
   },
   "scripts": {
     "build": "napi build --platform --release",
@@ -63,6 +60,6 @@
     "test": "node --test"
   },
   "devDependencies": {
-    "@napi-rs/cli": "^3.7.4"
+    "@napi-rs/cli": "^3.8.6"
   }
 }
