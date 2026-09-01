@@ -32,6 +32,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   while Scorecard reported Signed-Releases green regardless — it looks for a
   provenance file on the release, not for coverage of what the release contains.
 
+### Changed
+
+- `@napi-rs/cli` 3.7.4 → 3.8.6, with the regenerated `bindings/node/index.js`.
+  The new CLI emits a different native loader — it chains load errors instead of
+  discarding all but the last — so the committed file had to move with it. The
+  drift check added alongside it caught this on its first real occasion; a
+  Dependabot bump would otherwise have landed a stale loader.
+- The napi configuration uses `binaryName` and `targets` instead of the
+  deprecated `name` and `triples`. Both produce a byte-identical `index.js` and
+  the same binary name, so nothing downstream moves.
+
 ### Added
 
 - **CodSpeed on every pull request.** `bench.yml` runs nightly and prints numbers
