@@ -1,0 +1,29 @@
+# CodeQL analysis configuration, referenced from .github/workflows/codeql.yml.
+#
+# The rule for adding to this list: a path belongs here when a generator owns
+# the file end to end and stamps it as such, never because a finding in it was
+# inconvenient.
+#
+# `bindings/node/index.js` and `index.d.ts` are written by `napi build` from the
+# Rust source and committed so consumers get types without a build step. Neither
+# is edited by hand, and a finding in either points at the generator rather than
+# at anything a reader can act on.
+#
+# Deliberately NOT excluded, unlike the wickra repository:
+#
+# - `bindings/node/src/lib.rs`. napi-derive expands every `#[napi]` into FFI glue
+#   that dereferences raw `napi_env` / `napi_value` handles, and CodeQL
+#   attributes that generated code back to the macro's source span -- so each
+#   exported class can raise one `rust/access-invalid-pointer` finding anchored
+#   on a struct identifier rather than on a pointer expression. wickra excludes
+#   the file for that reason, but there it is ~22,000 lines of generated
+#   delegation. Here it is hand-written and under a thousand lines, so excluding
+#   it would drop real code from analysis to silence a handful of false
+#   positives. If the first runs show the noise is real, add it then, with the
+#   count in the commit message.
+# - The C#, Java, Go and R bindings. This repository has no code generator, so
+#   there are no `.g.cs` or generated `org/wickra/*.java` files to exclude --
+#   every one of those files is hand-written and belongs in the database.
+paths-ignore:
+  - bindings/node/index.js
+  - bindings/node/index.d.ts
