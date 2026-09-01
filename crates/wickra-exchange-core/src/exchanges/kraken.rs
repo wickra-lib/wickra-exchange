@@ -48,6 +48,7 @@ use crate::types::{
 };
 use rust_decimal::Decimal;
 use std::cell::Cell;
+use std::fmt;
 use wickra_core::Candle;
 
 /// Spot REST host.
@@ -89,6 +90,29 @@ pub struct Kraken {
     /// call, together with the WebSocket token each request carries.
     ws_api_connection: Option<Box<dyn WsConnection>>,
     ws_api_token: Option<String>,
+}
+
+/// Hand-written: the client holds `Box<dyn HttpTransport>`, `Box<dyn WsTransport>`
+/// and a `Box<dyn Fn() -> i64>` clock, none of which a derive can reach. The
+/// transports are shown by whether a connection is open rather than by value, and
+/// the credentials only by whether they are set -- printing them would put secret
+/// material into every log line that formats a client.
+impl fmt::Debug for Kraken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Kraken")
+            .field("ws", &self.ws.is_some())
+            .field("rest_base", &self.rest_base)
+            .field("market_type", &self.market_type)
+            .field("authenticated", &self.credentials.is_some())
+            .field("connection", &self.connection.is_some())
+            .field("sub_messages", &self.sub_messages.len())
+            .field("leverage", &self.leverage)
+            .field("private_connection", &self.private_connection.is_some())
+            .field("user_data_active", &self.user_data_active)
+            .field("ws_api_connection", &self.ws_api_connection.is_some())
+            .field("ws_api_token", &self.ws_api_token)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Kraken {

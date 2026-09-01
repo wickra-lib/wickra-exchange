@@ -23,6 +23,7 @@ use wickra_core::Candle;
 
 /// A network-free exchange that replays a recorded feed and fills against it.
 /// See the [module docs](self) for the model.
+#[derive(Debug)]
 pub struct ReplayExchange {
     frames: Vec<Event>,
     cursor: usize,

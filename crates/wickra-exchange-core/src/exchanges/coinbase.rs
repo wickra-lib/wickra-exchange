@@ -24,6 +24,7 @@ use base64::Engine;
 use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 use p256::pkcs8::DecodePrivateKey;
 use rust_decimal::Decimal;
+use std::fmt;
 use wickra_core::Candle;
 
 const HOST: &str = "api.coinbase.com";
@@ -49,6 +50,23 @@ pub struct Coinbase {
     now_ms: Box<dyn Fn() -> i64 + Send + Sync>,
     connection: Option<Box<dyn WsConnection>>,
     sub_messages: Vec<String>,
+}
+
+/// Hand-written: the client holds `Box<dyn HttpTransport>`, `Box<dyn WsTransport>`
+/// and a `Box<dyn Fn() -> i64>` clock, none of which a derive can reach. The
+/// transports are shown by whether a connection is open rather than by value, and
+/// the credentials only by whether they are set -- printing them would put secret
+/// material into every log line that formats a client.
+impl fmt::Debug for Coinbase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Coinbase")
+            .field("ws", &self.ws.is_some())
+            .field("rest_base", &self.rest_base)
+            .field("authenticated", &self.credentials.is_some())
+            .field("connection", &self.connection.is_some())
+            .field("sub_messages", &self.sub_messages.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Coinbase {

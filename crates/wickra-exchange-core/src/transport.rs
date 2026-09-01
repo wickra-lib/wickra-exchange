@@ -188,7 +188,7 @@ pub trait WsConnection: Send {
 /// it was given. Queue responses with [`MockHttpTransport::push_response`] /
 /// [`push_json`](MockHttpTransport::push_json) / [`push_error`](MockHttpTransport::push_error);
 /// they are returned FIFO.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct MockHttpTransport {
     responses: Mutex<VecDeque<Result<HttpResponse>>>,
     requests: Mutex<Vec<HttpRequest>>,
@@ -240,7 +240,7 @@ impl HttpTransport for MockHttpTransport {
 /// script (a list of `recv` results) for the next [`connect`](WsTransport::connect).
 /// Frames sent by the client are recorded and readable via
 /// [`sent`](MockWsTransport::sent).
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct MockWsTransport {
     scripts: Mutex<VecDeque<Vec<Result<Option<String>>>>>,
     connected_urls: Mutex<Vec<String>>,
@@ -287,6 +287,7 @@ impl WsTransport for MockWsTransport {
 }
 
 /// A scripted [`WsConnection`] produced by [`MockWsTransport`].
+#[derive(Debug)]
 pub struct MockWsConnection {
     incoming: VecDeque<Result<Option<String>>>,
     sent: Arc<Mutex<Vec<String>>>,

@@ -23,6 +23,9 @@ crate-type = ["cdylib"]
 # our own code.
 [lints.rust]
 unsafe_code = "deny"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+unused_must_use = "deny"
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }

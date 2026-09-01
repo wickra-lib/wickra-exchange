@@ -40,6 +40,7 @@ use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::fmt;
 use wickra_core::Candle;
 
 fn system_now_ms() -> i64 {
@@ -76,6 +77,29 @@ pub struct Gate {
     /// on the first [`place_order_ws`](Self::place_order_ws) /
     /// [`cancel_order_ws`](Self::cancel_order_ws) call.
     ws_api_connection: Option<Box<dyn WsConnection>>,
+}
+
+/// Hand-written: the client holds `Box<dyn HttpTransport>`, `Box<dyn WsTransport>`
+/// and a `Box<dyn Fn() -> i64>` clock, none of which a derive can reach. The
+/// transports are shown by whether a connection is open rather than by value, and
+/// the credentials only by whether they are set -- printing them would put secret
+/// material into every log line that formats a client.
+impl fmt::Debug for Gate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Gate")
+            .field("ws", &self.ws.is_some())
+            .field("rest_base", &self.rest_base)
+            .field("market_type", &self.market_type)
+            .field("authenticated", &self.credentials.is_some())
+            .field("connection", &self.connection.is_some())
+            .field("sub_messages", &self.sub_messages.len())
+            .field("subscriptions", &self.subscriptions.len())
+            .field("leverage", &self.leverage)
+            .field("private_connection", &self.private_connection.is_some())
+            .field("user_data_active", &self.user_data_active)
+            .field("ws_api_connection", &self.ws_api_connection.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Gate {

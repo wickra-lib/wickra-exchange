@@ -31,5 +31,8 @@ p256 = { version = "0.14", features = ["ecdsa", "pkcs8", "pem"] }
 rust_decimal_macros = { workspace = true }
 proptest = { workspace = true }
 
+[package.metadata.docs.rs]
+all-features = true
+
 [lints]
 workspace = true

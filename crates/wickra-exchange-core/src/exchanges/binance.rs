@@ -49,6 +49,7 @@ use crate::types::{
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::fmt;
 use wickra_core::Candle;
 
 /// The current Unix time in milliseconds, from the system clock.
@@ -88,6 +89,33 @@ pub struct Binance {
     /// Set once the private stream is subscribed, so [`poll_events`](Self::poll_events)
     /// re-subscribes it after a drop.
     user_data_active: bool,
+}
+
+/// Hand-written: the client holds `Box<dyn HttpTransport>`, `Box<dyn WsTransport>`
+/// and a `Box<dyn Fn() -> i64>` clock, none of which a derive can reach. The
+/// transports are shown by whether a connection is open rather than by value, and
+/// the credentials only by whether they are set -- printing them would put secret
+/// material into every log line that formats a client.
+impl fmt::Debug for Binance {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Binance")
+            .field("ws", &self.ws.is_some())
+            .field("rest_base", &self.rest_base)
+            .field("market_type", &self.market_type)
+            .field("testnet", &self.testnet)
+            .field("authenticated", &self.credentials.is_some())
+            .field("recv_window_ms", &self.recv_window_ms)
+            .field("connection", &self.connection.is_some())
+            .field("subscriptions", &self.subscriptions.len())
+            .field("sub_id", &self.sub_id)
+            .field("sub_messages", &self.sub_messages.len())
+            .field("instruments", &self.instruments)
+            .field("ws_api_connection", &self.ws_api_connection.is_some())
+            .field("user_data_connection", &self.user_data_connection.is_some())
+            .field("user_data_listen_key", &self.user_data_listen_key)
+            .field("user_data_active", &self.user_data_active)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Binance {

@@ -31,6 +31,7 @@ use crate::types::{
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::fmt;
 use wickra_core::Candle;
 
 /// The current Unix time in milliseconds, from the system clock.
@@ -95,6 +96,30 @@ pub struct Okx {
     /// lazily on the first [`place_order_ws`](Self::place_order_ws) /
     /// [`cancel_order_ws`](Self::cancel_order_ws) call.
     ws_api_connection: Option<Box<dyn WsConnection>>,
+}
+
+/// Hand-written: the client holds `Box<dyn HttpTransport>`, `Box<dyn WsTransport>`
+/// and a `Box<dyn Fn() -> i64>` clock, none of which a derive can reach. The
+/// transports are shown by whether a connection is open rather than by value, and
+/// the credentials only by whether they are set -- printing them would put secret
+/// material into every log line that formats a client.
+impl fmt::Debug for Okx {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Okx")
+            .field("ws", &self.ws.is_some())
+            .field("rest_base", &self.rest_base)
+            .field("inst_type", &self.inst_type)
+            .field("td_mode", &self.td_mode)
+            .field("testnet", &self.testnet)
+            .field("authenticated", &self.credentials.is_some())
+            .field("connection", &self.connection.is_some())
+            .field("sub_messages", &self.sub_messages.len())
+            .field("subscriptions", &self.subscriptions.len())
+            .field("private_connection", &self.private_connection.is_some())
+            .field("user_data_active", &self.user_data_active)
+            .field("ws_api_connection", &self.ws_api_connection.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Okx {
