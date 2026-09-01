@@ -124,6 +124,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Client order ids could repeat, and a repeated one is a refused order.**
+  `ClientIdGenerator` existed and was called by nothing. Where the caller
+  supplied no `client_order_id`, three sites derived one from the wall clock in
+  milliseconds — so two orders placed inside the same millisecond carried the
+  same id, and Coinbase and KuCoin deduplicate on it. Two more derived it from
+  the order's index within its batch, so the first order of *every* Bitget batch
+  was `wbatch-0`. All five now draw from a generator seeded from the clock at
+  construction and monotonic from there: the seed keeps two clients in one
+  process apart, the counter keeps two orders in one millisecond apart.
 - **Signed requests carry the venue's time, not this machine's.** `ServerClock`
   existed, was tested, and was called by nothing: all ten venue clients stamped
   signatures from the local clock. A venue refuses a signed request whose
