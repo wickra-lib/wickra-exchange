@@ -20,6 +20,7 @@ use crate::clock::ServerClock;
 use crate::credentials::Credentials;
 use crate::error::{Error, Result};
 use crate::events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
+use crate::idempotency::ClientIdGenerator;
 use crate::normalize::{format_decimal, parse_decimal};
 use crate::options::{ExchangeOptions, MarginMode, MarketType, SelfTradePrevention};
 use crate::positions::{Position, PositionSide};
@@ -56,6 +57,12 @@ pub struct Bitget {
     market_type: MarketType,
     credentials: Option<Credentials>,
     now_ms: Box<dyn Fn() -> i64 + Send + Sync>,
+    /// Client order ids for orders the caller did not name.
+    ///
+    /// Seeded from the clock at construction and monotonic from there.
+    /// The previous fallback was the order's index within its batch, which
+    /// is unique inside one batch and repeats across every batch after it.
+    client_ids: ClientIdGenerator,
     /// Offset between this machine's clock and the venue's, applied to every
     /// signed timestamp. Zero until [`sync_time`](Self::sync_time) is called.
     clock: ServerClock,
@@ -106,6 +113,10 @@ impl Bitget {
             market_type: options.market_type,
             credentials,
             now_ms: Box::new(system_now_ms),
+            client_ids: ClientIdGenerator::with_seed(
+                "wbatch",
+                u64::try_from(system_now_ms()).unwrap_or(0),
+            ),
             clock: ServerClock::new(),
             connection: None,
             sub_messages: Vec::new(),
@@ -634,6 +645,20 @@ impl Bitget {
         let url = format!("{}{path}?{query}", self.rest_base);
         let response = self.http.execute(&HttpRequest::get(url))?;
         unwrap_envelope(&response.body)
+    }
+
+    /// The client order id to send for `request`: the caller's, or a generated
+    /// one.
+    ///
+    /// The generated half used to be the order's index within its batch, so the
+    /// first order of every batch was `wbatch-0`. Bitget deduplicates on this
+    /// id, so the second batch's first order looked like a repeat of the first
+    /// batch's.
+    fn batch_client_oid(&self, request: &OrderRequest) -> String {
+        request
+            .client_order_id
+            .clone()
+            .unwrap_or_else(|| self.client_ids.next_id())
     }
 
     /// Sign with the `ACCESS-*` headers: base64(HMAC-SHA256) over
@@ -1206,9 +1231,8 @@ impl Bitget {
         let wire = Self::wire_symbol(&requests[0].symbol);
         let order_list: Vec<serde_json::Value> = requests
             .iter()
-            .enumerate()
-            .map(|(i, r)| {
-                let coid = batch_client_oid(r, i);
+            .map(|r| {
+                let coid = self.batch_client_oid(r);
                 let mut o = serde_json::json!({
                     "side": side_str(r.side),
                     "orderType": order_type_str(r.order_type),
@@ -1253,9 +1277,8 @@ impl Bitget {
             .collect();
         Ok(requests
             .iter()
-            .enumerate()
-            .map(|(i, req)| {
-                let coid = batch_client_oid(req, i);
+            .map(|req| {
+                let coid = self.batch_client_oid(req);
                 if let Some(order_id) = ok_map.get(&coid) {
                     Ok(Order {
                         id: order_id.clone(),
@@ -1343,15 +1366,6 @@ impl AdvancedOrders for Bitget {
             message: "Bitget has no OCO order-list; use plan/trigger orders".to_string(),
         })
     }
-}
-
-/// The client order id used to align a batch element to its request: the
-/// caller's `clientOid` if set, else a synthetic index-based one.
-fn batch_client_oid(request: &OrderRequest, index: usize) -> String {
-    request
-        .client_order_id
-        .clone()
-        .unwrap_or_else(|| format!("wbatch-{index}"))
 }
 
 #[derive(Deserialize)]
@@ -1713,8 +1727,13 @@ mod tests {
         );
         let results = bitget
             .place_batch(&[
-                OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)),
-                OrderRequest::limit_buy(symbol(), dec!(1), dec!(101)),
+                // Named explicitly: this test is about aligning the venue's
+                // success/failure lists back onto the requests, not about which
+                // id the generator picks.
+                OrderRequest::limit_buy(symbol(), dec!(1), dec!(100))
+                    .with_client_order_id("wbatch-0"),
+                OrderRequest::limit_buy(symbol(), dec!(1), dec!(101))
+                    .with_client_order_id("wbatch-1"),
             ])
             .unwrap();
         assert_eq!(results[0].as_ref().unwrap().id, "o1");
@@ -1809,7 +1828,8 @@ mod tests {
             "failureList":[]}}"#,
         );
         let results = bitget
-            .place_batch(&[OrderRequest::limit_buy(symbol(), dec!(1), dec!(100))])
+            .place_batch(&[OrderRequest::limit_buy(symbol(), dec!(1), dec!(100))
+                .with_client_order_id("wbatch-0")])
             .unwrap();
         assert_eq!(results[0].as_ref().unwrap().id, "o1");
         let req = &mock.recorded_requests()[0];
@@ -2112,5 +2132,35 @@ mod tests {
             .map(|(_, value)| value.as_str())
             .expect("signed request carries ACCESS-TIMESTAMP");
         assert_eq!(header, "1004500", "the venue's time, not ours");
+    }
+
+    /// Unnamed batch orders get ids that are unique *across* batches, not only
+    /// within one.
+    ///
+    /// The generated id used to be the order's index in its batch, so the first
+    /// order of every batch was `wbatch-0`. Bitget deduplicates on the client
+    /// id, so the second batch's first order looked like a repeat of the first
+    /// batch's -- and the venue answered accordingly.
+    #[test]
+    fn batch_client_ids_do_not_repeat_across_batches() {
+        let (bitget, mock) = signed_client(1000);
+        let empty = r#"{"code":"00000","data":{"successList":[],"failureList":[]}}"#;
+        mock.push_json(200, empty);
+        mock.push_json(200, empty);
+
+        for _ in 0..2 {
+            let _ = bitget.place_batch(&[OrderRequest::limit_buy(symbol(), dec!(1), dec!(100))]);
+        }
+
+        let bodies: Vec<String> = mock
+            .recorded_requests()
+            .iter()
+            .filter_map(|request| request.body.clone())
+            .collect();
+        assert_eq!(bodies.len(), 2, "two batches were sent");
+        assert_ne!(
+            bodies[0], bodies[1],
+            "the second batch must not reuse the first batch's client id"
+        );
     }
 }

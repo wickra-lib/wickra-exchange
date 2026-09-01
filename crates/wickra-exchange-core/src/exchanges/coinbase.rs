@@ -13,6 +13,7 @@ use crate::clock::ServerClock;
 use crate::credentials::Credentials;
 use crate::error::{Error, Result};
 use crate::events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
+use crate::idempotency::ClientIdGenerator;
 use crate::normalize::{format_decimal, parse_decimal};
 use crate::options::ExchangeOptions;
 use crate::symbol::Symbol;
@@ -49,6 +50,15 @@ pub struct Coinbase {
     rest_base: String,
     credentials: Option<Credentials>,
     now_ms: Box<dyn Fn() -> i64 + Send + Sync>,
+    /// Client order ids for orders the caller did not name.
+    ///
+    /// Seeded from the clock at construction and monotonic from there: the
+    /// seed keeps two clients in one process apart, the counter keeps two
+    /// orders in one millisecond apart. The previous fallback was the
+    /// millisecond alone, so a second order placed inside the same
+    /// millisecond carried an id the venue had already seen and was refused
+    /// as a duplicate.
+    client_ids: ClientIdGenerator,
     /// Offset between this machine's clock and the venue's, applied to every
     /// signed timestamp. Zero until [`sync_time`](Self::sync_time) is called.
     clock: ServerClock,
@@ -86,6 +96,10 @@ impl Coinbase {
             rest_base: format!("https://{HOST}"),
             credentials,
             now_ms: Box::new(system_now_ms),
+            client_ids: ClientIdGenerator::with_seed(
+                "wkex",
+                u64::try_from(system_now_ms()).unwrap_or(0),
+            ),
             clock: ServerClock::new(),
             connection: None,
             sub_messages: Vec::new(),
@@ -321,7 +335,7 @@ impl Coinbase {
         let client_order_id = request
             .client_order_id
             .clone()
-            .unwrap_or_else(|| format!("wkex-{}", (self.now_ms)()));
+            .unwrap_or_else(|| self.client_ids.next_id());
         let base_size = format_decimal(request.quantity);
         let configuration = match request.order_type {
             OrderType::Market | OrderType::StopMarket => {

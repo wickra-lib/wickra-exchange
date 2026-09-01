@@ -17,6 +17,7 @@ use crate::clock::ServerClock;
 use crate::credentials::Credentials;
 use crate::error::{Error, Result};
 use crate::events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
+use crate::idempotency::ClientIdGenerator;
 use crate::normalize::{format_decimal, parse_decimal};
 use crate::options::{ExchangeOptions, MarginMode, MarketType, SelfTradePrevention};
 use crate::positions::{Position, PositionSide};
@@ -51,6 +52,15 @@ pub struct KuCoin {
     market_type: MarketType,
     credentials: Option<Credentials>,
     now_ms: Box<dyn Fn() -> i64 + Send + Sync>,
+    /// Client order ids for orders the caller did not name.
+    ///
+    /// Seeded from the clock at construction and monotonic from there: the
+    /// seed keeps two clients in one process apart, the counter keeps two
+    /// orders in one millisecond apart. The previous fallback was the
+    /// millisecond alone, so a second order placed inside the same
+    /// millisecond carried an id the venue had already seen and was refused
+    /// as a duplicate.
+    client_ids: ClientIdGenerator,
     /// Offset between this machine's clock and the venue's, applied to every
     /// signed timestamp. Zero until [`sync_time`](Self::sync_time) is called.
     clock: ServerClock,
@@ -110,6 +120,10 @@ impl KuCoin {
             market_type: options.market_type,
             credentials,
             now_ms: Box::new(system_now_ms),
+            client_ids: ClientIdGenerator::with_seed(
+                "wkex",
+                u64::try_from(system_now_ms()).unwrap_or(0),
+            ),
             clock: ServerClock::new(),
             connection: None,
             sub_messages: Vec::new(),
@@ -432,7 +446,7 @@ impl KuCoin {
         let client_oid = request
             .client_order_id
             .clone()
-            .unwrap_or_else(|| format!("wkex-{}", (self.now_ms)()));
+            .unwrap_or_else(|| self.client_ids.next_id());
         let symbol_wire = if self.is_futures() {
             Self::futures_symbol(&request.symbol)
         } else {
@@ -1091,12 +1105,11 @@ impl KuCoin {
         let wire = Self::wire_symbol(&requests[0].symbol);
         let order_list: Vec<serde_json::Value> = requests
             .iter()
-            .enumerate()
-            .map(|(i, r)| {
+            .map(|r| {
                 let coid = r
                     .client_order_id
                     .clone()
-                    .unwrap_or_else(|| format!("wkex-{i}"));
+                    .unwrap_or_else(|| self.client_ids.next_id());
                 let mut o = serde_json::json!({
                     "clientOid": coid,
                     "side": side_str(r.side),
@@ -1170,7 +1183,7 @@ impl KuCoin {
         let client_oid = request
             .client_order_id
             .clone()
-            .unwrap_or_else(|| format!("woco-{}", (self.now_ms)()));
+            .unwrap_or_else(|| self.client_ids.next_id());
         let stop_limit = request.stop_limit_price.unwrap_or(request.stop_price);
         let body = serde_json::json!({
             "symbol": Self::wire_symbol(&request.symbol),
@@ -1810,14 +1823,42 @@ mod tests {
         assert_eq!(header("KC-API-KEY-VERSION"), "2");
     }
 
+    /// An unnamed order still gets a client id, and two of them get *different*
+    /// ones.
+    ///
+    /// The generated id used to be the millisecond alone, so two orders placed
+    /// inside the same millisecond carried the same id -- and KuCoin
+    /// deduplicates on it, so the second was refused as a repeat of the first.
+    /// The assertion is on that property rather than on an exact string: the
+    /// value is seeded from the clock, and pinning it would only re-test the
+    /// seed.
     #[test]
-    fn place_order_generates_client_oid_when_absent() {
+    fn place_order_generates_a_unique_client_oid_when_absent() {
         let (kucoin, mock) = signed_client(1000);
         mock.push_json(200, r#"{"code":"200000","data":{"orderId":"1"}}"#);
-        let order = kucoin
+        mock.push_json(200, r#"{"code":"200000","data":{"orderId":"2"}}"#);
+
+        let first = kucoin
             .place_order(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)))
             .unwrap();
-        assert_eq!(order.client_order_id.as_deref(), Some("wkex-1000"));
+        let second = kucoin
+            .place_order(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)))
+            .unwrap();
+
+        let first_id = first.client_order_id.expect("an id was generated");
+        let second_id = second.client_order_id.expect("an id was generated");
+        // The id is not interpolated into the message. CodeQL traces any
+        // value out of a credentials-holding client as sensitive, and the
+        // rule is right in spirit even where this particular value is a
+        // counter: a test message is still output.
+        assert!(
+            first_id.starts_with("wkex-"),
+            "the generated id must carry the wkex- prefix"
+        );
+        assert_ne!(
+            first_id, second_id,
+            "two orders on a frozen clock must not share a client id"
+        );
     }
 
     #[test]
