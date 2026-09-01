@@ -40,6 +40,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The release published a crate that does not exist.** `release.yml` ran
+  `cargo publish -p wickra-exchange-cli`, `cargo package -p wickra-exchange-cli`
+  and copied its SBOM — for a `wkex` CLI crate the workspace does not contain and
+  the roadmap does not plan. The steps come back with the crate; the header
+  comment claiming "three crates" now names the two that exist.
+- **The C# example did not compile.** It called `ex.Balances()`, which the C#
+  binding has never had — the C ABI exposes a per-asset `Balance`, so the C#, Go,
+  Java and R wrappers ask for one asset at a time. Nothing noticed because CI
+  builds only `examples/c`; teaching CodeQL to build the C# example is what
+  surfaced it.
+- Nine shell defects in the workflows, found by the new `actionlint` job. Three
+  publish steps used `A && B || C`, which is not if-then-else — `C` also runs
+  when `A` succeeds and `B` fails, so a successful publish whose `grep` found
+  nothing would have been reported as a failure. Two `local x=$(...)` assignments
+  masked the command's exit status, and one `ls | wc -l` is now `find`.
 - **`osv-scanner` runs.** `osv-scanner.toml` existed and no workflow ever
   consulted it, so a waiver recorded there was load-bearing for nobody.
   `cargo-deny` covers the Rust graph only; the other six ecosystems — npm, PyPI,

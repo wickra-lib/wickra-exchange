@@ -387,7 +387,8 @@ jobs:
             # Windows (rtools bash): add the lib dir to PATH in msys form so the
             # ':' in the drive letter is not parsed as a PATH separator and msys
             # translates it to the Windows PATH the DLL loader searches.
-            export PATH="$(cygpath -u "$WKEX_LIB"):$PATH"
+            msys_lib=$(cygpath -u "$WKEX_LIB")
+            export PATH="$msys_lib:$PATH"
           else
             export LD_LIBRARY_PATH="$WKEX_LIB:$LD_LIBRARY_PATH"
             export DYLD_LIBRARY_PATH="$WKEX_LIB:$DYLD_LIBRARY_PATH"

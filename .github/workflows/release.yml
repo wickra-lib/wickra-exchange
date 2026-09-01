@@ -123,7 +123,11 @@ jobs:
           echo "every workflow that ran on this commit is green"
 
   # --------------------------------------------------------------------------
-  # crates.io: three crates in dependency order
+  # crates.io: the two published crates, in dependency order.
+  #
+  # A third, wickra-exchange-cli, was published, packaged and SBOM-ed here for
+  # a crate the workspace does not contain and the roadmap does not plan. The
+  # steps come back with the crate.
   # --------------------------------------------------------------------------
   cargo-publish:
     name: Publish to crates.io
@@ -142,9 +146,17 @@ jobs:
       # that as success so re-runs of the workflow do not fail.
       - name: Publish wickra-exchange-core (idempotent)
         run: |
-          out=$(cargo publish -p wickra-exchange-core --token "$CARGO_REGISTRY_TOKEN" 2>&1) && echo "$out" \
-            || (echo "$out" | grep -q "already uploaded\|already exists" && echo "skip: already published" \
-                || (echo "$out"; exit 1))
+          # `A && B || C` is not if-then-else: C also runs when A succeeds and B
+          # fails. Spelled out, so "already published" stays a skip and any other
+          # failure stays a failure.
+          if out=$(cargo publish -p wickra-exchange-core --token "$CARGO_REGISTRY_TOKEN" 2>&1); then
+            echo "$out"
+          elif echo "$out" | grep -q "already uploaded\|already exists"; then
+            echo "skip: already published"
+          else
+            echo "$out"
+            exit 1
+          fi
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
@@ -153,20 +165,17 @@ jobs:
 
       - name: Publish wickra-exchange (idempotent)
         run: |
-          out=$(cargo publish -p wickra-exchange --token "$CARGO_REGISTRY_TOKEN" 2>&1) && echo "$out" \
-            || (echo "$out" | grep -q "already uploaded\|already exists" && echo "skip: already published" \
-                || (echo "$out"; exit 1))
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-
-      - name: Wait for crates.io index to refresh
-        run: sleep 45
-
-      - name: Publish wickra-exchange-cli (idempotent)
-        run: |
-          out=$(cargo publish -p wickra-exchange-cli --token "$CARGO_REGISTRY_TOKEN" 2>&1) && echo "$out" \
-            || (echo "$out" | grep -q "already uploaded\|already exists" && echo "skip: already published" \
-                || (echo "$out"; exit 1))
+          # `A && B || C` is not if-then-else: C also runs when A succeeds and B
+          # fails. Spelled out, so "already published" stays a skip and any other
+          # failure stays a failure.
+          if out=$(cargo publish -p wickra-exchange --token "$CARGO_REGISTRY_TOKEN" 2>&1); then
+            echo "$out"
+          elif echo "$out" | grep -q "already uploaded\|already exists"; then
+            echo "skip: already published"
+          else
+            echo "$out"
+            exit 1
+          fi
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
@@ -175,7 +184,6 @@ jobs:
         run: |
           cargo package -p wickra-exchange-core
           cargo package -p wickra-exchange
-          cargo package -p wickra-exchange-cli
 
       - name: Upload .crate files
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -195,7 +203,6 @@ jobs:
           mkdir -p sboms
           cp crates/wickra-exchange-core/wickra-exchange-core.cdx.json sboms/
           cp crates/wickra-exchange/wickra-exchange.cdx.json sboms/
-          cp crates/wickra-exchange-cli/wickra-exchange-cli.cdx.json sboms/
           ls -lh sboms/
 
       - name: Upload SBOMs
@@ -402,7 +409,8 @@ jobs:
           fail=0
           publish_dir() {
             local dir=$1
-            local pkg=$(basename "$dir")
+            local pkg
+            pkg=$(basename "$dir")
             local pkgname="wickra-exchange-$pkg"
             local existing
             existing=$(npm view "$pkgname@$version" version 2>/dev/null)
@@ -863,7 +871,7 @@ jobs:
           find artifacts -type f -name "*.nupkg" -exec cp {} release-assets/ \;
           find artifacts -type f -name "*.jar" -exec cp {} release-assets/ \;
           ls -lh release-assets/
-          echo "asset-count=$(ls release-assets/ | wc -l)"
+          echo "asset-count=$(find release-assets/ -type f | wc -l)"
       - name: Create / update the draft GitHub Release with assets
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
