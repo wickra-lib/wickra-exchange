@@ -90,8 +90,10 @@ updates:
     # there. Its only remaining effect would be on *security* updates, which are
     # exempt from the limit and are the one thing that should still get through:
     # a security bump that breaks the 3.9 row is a visible problem, a suppressed
-    # advisory is not. Detection does not rest on Dependabot either -- osv-scanner
-    # runs in ci.yml across every ecosystem.
+    # advisory is not. Detection does not rest on Dependabot either: osv-scanner
+    # is pointed at both of these files explicitly in ci.yml -- it discovers
+    # lockfiles by filename and recognises neither of these, so the recursive
+    # walk had been skipping them.
 
   # Node binding npm dependencies.
   - package-ecosystem: npm

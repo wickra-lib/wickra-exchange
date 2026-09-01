@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- `GHSA-6w46-j5rx-g56g` (pytest tmpdir handling) is assessed and recorded in
+  `osv-scanner.toml`. The attack vector is local — a second user on the same
+  machine — and CI runners are single-user and ephemeral. It is also not fixable
+  on the row it is reported for: the finding is in the Python 3.9 lock, and every
+  pytest carrying the fix declares `requires-python >= 3.10`. Removed when the
+  support matrix drops 3.9, which is the real fix.
 - **`release.yml` refuses to publish from anything but a version tag.** A new
   `gate` job runs before every publishing job and fails unless the ref is
   `refs/tags/v*`. `workflow_dispatch` exists so a release whose publish step
@@ -70,6 +76,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`osv-scanner` was not scanning the CI Python lockfiles.** It discovers
+  lockfiles by filename, and neither `ci-dev-py3.txt` nor `ci-dev-py39.txt`
+  matches a pattern it recognises — the job's first run listed seven scanned
+  files and neither was among them. They are named after the interpreter they
+  target rather than after the format, which is the right name for a reader and
+  the wrong one for the scanner, so the format is now stated explicitly with
+  `--lockfile=requirements.txt:...` instead of renaming them. The claim in
+  `dependabot.yml` that osv-scanner covers these files is now true; it was not
+  when it was written.
 - Dependabot no longer proposes version updates for `.github/requirements`. The
   two lockfiles there are resolved against different interpreters — 3.9 and 3.11
   — and Dependabot cannot see that: it reads two requirements files in one
