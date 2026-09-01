@@ -82,6 +82,233 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo build -p wickra-exchange-node
 
+  # links.yml is the authoritative check and runs weekly; this is the early
+  # heads-up on the pull request that introduces a dead link. Non-blocking on
+  # purpose: external link rot is somebody else's outage, and a third-party site
+  # rate-limiting must not turn a green change red. links.yml's header has
+  # described this job since the repository was seeded -- it just did not exist.
+  links:
+    name: External links (non-blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 10 # backstop against a hung job, not a budget
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
+        with:
+          args: --config lychee.toml --no-progress --root-dir "${{ github.workspace }}" "*.md" "bindings/*/README.md"
+          fail: true
+
+  # Every example, compiled or parsed.
+  #
+  # Only examples/c was ever built (by the c-abi job, through ctest), so the
+  # other seven could rot with nothing to say so -- and one had:
+  # examples/csharp/Program.cs called `ex.Balances()`, a method the C# binding
+  # has never had, and it sat in the tree until CodeQL was taught to build it.
+  #
+  # Syntax-checking is not enough for that class of defect: `Balances()` is
+  # perfectly valid C# syntax. The compiled examples are therefore actually
+  # compiled against the binding in this tree, which is what makes a missing
+  # method fail. examples/rust is left out on purpose -- it is a workspace
+  # member and the `test` job already builds it.
+  examples-smoke:
+    name: Examples (build + parse)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30 # backstop against a hung job, not a budget
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/setup-rust
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "stable"
+          cache: false
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c # v6.0.0
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@465b7d8e732ca3921382b1674c59bada9cbf3399 # v2.13.0
+        with:
+          use-public-rspm: true
+
+      # Go and C# link the C ABI; Java loads it through FFM. One build serves all
+      # three.
+      - name: Build the C ABI library
+        run: cargo build -p wickra-exchange-c --release
+
+      - name: Node example — syntax check
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          count=0
+          for f in examples/node/*.js; do
+            echo "node --check $f"
+            node --check "$f"
+            count=$((count + 1))
+          done
+          echo "checked $count Node file(s)"
+
+      - name: Python example — byte-compile
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          count=0
+          for f in examples/python/*.py; do
+            echo "py_compile $f"
+            python -m py_compile "$f"
+            count=$((count + 1))
+          done
+          echo "compiled $count Python file(s)"
+
+      # R has no compiler, so parse() is the equivalent: it catches a syntax
+      # error but not a call to a function the package does not export. The
+      # binding surface itself is held to the trait contract by
+      # scripts/check_binding_surface.py in the binding-surface job.
+      - name: R example — parse
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          count=0
+          for f in examples/r/*.R; do
+            echo "parse $f"
+            Rscript -e "invisible(parse('$f'))"
+            count=$((count + 1))
+          done
+          echo "parsed $count R file(s)"
+
+      # The one that matters: this compiles against the binding project, so a
+      # method the binding does not have fails here rather than in a reader's
+      # editor.
+      - name: C# example — build
+        run: dotnet build examples/csharp/PaperTrade.csproj -c Release
+
+      # The example is written to be run from a module that requires the
+      # published Go module, which does not exist until a release. A throwaway
+      # module with a `replace` onto bindings/go compiles the same code against
+      # the tree.
+      - name: Go example — vet against the binding in this tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p bindings/go/lib/linux_amd64
+          cp target/release/libwickra_exchange.so bindings/go/lib/linux_amd64/
+          work=$(mktemp -d)
+          cp examples/go/*.go "$work/"
+          cd "$work"
+          # `go mod init`/`edit` rather than writing the file: inside a YAML
+          # block scalar a heredoc body keeps its indentation, and an indented
+          # go.mod is not a go.mod.
+          go mod init wickraexchangeexamples
+          go mod edit -require "github.com/wickra-lib/wickra-exchange-go@v0.0.0"
+          go mod edit -replace "github.com/wickra-lib/wickra-exchange-go=$GITHUB_WORKSPACE/bindings/go"
+          go mod tidy
+          go vet ./...
+          echo "go example vets against the binding in this tree"
+
+      # javac against the binding jar: same reasoning as C#. -DskipTests because
+      # compiling is the point, not exercising.
+      - name: Java example — compile against the binding jar
+        shell: bash
+        run: |
+          set -euo pipefail
+          mvn -B -q -f bindings/java package -DskipTests
+          jar=$(find bindings/java/target -maxdepth 1 -name '*.jar' \
+                ! -name '*-sources.jar' ! -name '*-javadoc.jar' | head -1)
+          if [ -z "$jar" ]; then
+            echo "::error::no binding jar was produced"
+            exit 1
+          fi
+          echo "compiling against $jar"
+          javac -cp "$jar" -d "$(mktemp -d)" examples/java/*.java
+          echo "java example compiles against the binding in this tree"
+
+  # The Linux wheels are the two artefacts CI never touched: the python job
+  # builds a wheel for the runner's own glibc, while release.yml builds
+  # manylinux and musllinux wheels inside containers -- and the first time
+  # anyone found out whether those build was the tag, which is irreversible.
+  #
+  # This repository is not exposed to the vendored-OpenSSL trap that makes the
+  # equivalent job in `wickra` slow: reqwest and tokio-tungstenite are pinned to
+  # rustls with default features off, so there is no system TLS to compile. What
+  # is worth proving is the other half, which `wickra`'s job does not: that the
+  # wheel a container produces actually installs and imports under that libc.
+  # Building a wheel and importing it are different claims.
+  python-wheel-container-smoke:
+    name: Python wheel (${{ matrix.manylinux }} smoke)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30 # backstop against a hung job, not a budget
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - manylinux: auto
+            image: quay.io/pypa/manylinux_2_28_x86_64
+            python: /opt/python/cp312-cp312/bin/python
+          - manylinux: musllinux_1_2
+            image: quay.io/pypa/musllinux_1_2_x86_64
+            python: /opt/python/cp312-cp312/bin/python
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Sync root README into bindings/python so the build matches release
+        run: cp README.md bindings/python/README.md
+
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          working-directory: bindings/python
+          target: x86_64
+          # Keep in sync with release.yml.
+          args: --release --strip --out dist
+          manylinux: ${{ matrix.manylinux }}
+
+      - name: Install and import the wheel under the target libc
+        env:
+          IMAGE: ${{ matrix.image }}
+          PY: ${{ matrix.python }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -lh bindings/python/dist/
+          # Run inside the same libc the wheel was built for: a musllinux wheel
+          # cannot be installed on the glibc runner, so importing it here would
+          # prove nothing.
+          docker run --rm -v "$PWD/bindings/python/dist:/dist:ro" "$IMAGE"             "$PY" -c "
+          import glob, subprocess, sys
+          wheels = glob.glob('/dist/*.whl')
+          assert wheels, 'no wheel was produced'
+          print('installing', wheels[0])
+          subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--no-index', wheels[0]])
+          import wickra_exchange as wx
+          ex = wx.Exchange.paper({'USDT': 100000.0})
+          assert ex.name() == 'paper', ex.name()
+          print('imported and constructed a paper exchange:', wx.__version__)
+          "
+
   binding-surface:
     name: Binding surface parity
     runs-on: ubuntu-latest
@@ -304,6 +531,24 @@ jobs:
       # the freshly built binary instead of a per-platform npm subpackage.
       - name: Build native module
         run: cd bindings/node && npx napi build --platform --release
+      # index.js and index.d.ts are generated by napi and committed, so consumers
+      # get types without a build step -- and nothing compared the committed
+      # pair with what napi produces. napi rewrites them only when somebody
+      # rebuilds, and a rebuild is not part of committing, so they drift
+      # silently. The build above has just regenerated them; if git sees a
+      # difference, the committed copies are stale. One OS is enough: the output
+      # is platform-independent.
+      - name: Check the committed loader is in sync with napi
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! git diff --quiet -- bindings/node/index.js bindings/node/index.d.ts; then
+            echo "::error::bindings/node/index.js or index.d.ts is out of sync -- run npm run build in bindings/node and commit the result"
+            git --no-pager diff -- bindings/node/index.js bindings/node/index.d.ts
+            exit 1
+          fi
+
       - name: Run Node tests
         run: cd bindings/node && node --test
 
@@ -487,6 +732,63 @@ jobs:
           fail_ci_if_error: true
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  semver:
+    name: Public API (cargo-semver-checks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30 # backstop: it builds rustdoc JSON for each crate and its baseline
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/setup-rust
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Install cargo-semver-checks
+        uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2.87.1
+        timeout-minutes: 10 # fail fast on a stuck download instead of hanging the job
+        with:
+          tool: cargo-semver-checks
+
+      # The published API is a promise, and the version number says what may
+      # change: a patch release must not move the public surface.
+      #
+      # `check-release` compares against the newest version already on
+      # crates.io, and neither crate has ever been published -- both return 404
+      # today. Running it now fails on the missing baseline, which says nothing
+      # about the code. So the baseline is looked up first and the check is
+      # skipped, loudly, until there is something to compare against; from the
+      # first release onwards it runs on its own without anyone remembering to
+      # enable it.
+      #
+      # Deliberately not `continue-on-error`: that would hide a real API break
+      # later, which is the one thing this job exists to catch.
+      #
+      # Crates are named explicitly rather than --workspace: the bench and the
+      # binding crates are `publish = false`, so they have no baseline and
+      # promise nothing.
+      - name: Check the published crates
+        shell: bash
+        run: |
+          set -euo pipefail
+          published=()
+          for crate in wickra-exchange-core wickra-exchange; do
+            code=$(curl -sS -o /dev/null -w "%{http_code}"               -H "User-Agent: wickra-exchange-ci"               "https://crates.io/api/v1/crates/$crate")
+            if [ "$code" = "200" ]; then
+              published+=("-p" "$crate")
+            else
+              echo "::notice::$crate is not on crates.io yet (HTTP $code); no baseline to compare against"
+            fi
+          done
+          if [ "${#published[@]}" -eq 0 ]; then
+            echo "no crate has been published yet -- nothing to compare. This job starts checking by itself once the first release lands."
+            exit 0
+          fi
+          cargo semver-checks check-release "${published[@]}"
 
   fuzz-smoke:
     name: Fuzz (smoke)
