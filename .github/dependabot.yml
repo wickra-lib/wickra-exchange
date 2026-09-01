@@ -64,7 +64,20 @@ updates:
       interval: monthly
       time: "06:00"
       timezone: "Etc/UTC"
-    open-pull-requests-limit: 10
+    # Version-update PRs disabled (0). The two lockfiles in this directory are
+    # resolved against *different* interpreters -- ci-dev-py39.txt with
+    # `uv pip compile --python-version 3.9`, ci-dev-py3.txt with 3.11 -- and
+    # Dependabot cannot see that. It reads two requirements files in one
+    # directory and bumps both to the same version.
+    #
+    # The first two PRs after this entry was added did exactly that: #163 and
+    # #164 each moved pytest 9 into the 3.9 row, and pytest 9 declares
+    # `requires-python >= 3.10`. `pip install --require-hashes` on 3.9 fails on
+    # the bound. wickra reached the same conclusion by the same route.
+    #
+    # Regeneration stays with scripts/update-lockfiles.sh, which passes each
+    # row's target Python to uv.
+    open-pull-requests-limit: 0
     cooldown:
       default-days: 7
     commit-message:
@@ -72,6 +85,13 @@ updates:
     groups:
       ci-python:
         patterns: ["*"]
+    # No `ignore` here, deliberately. The limit above already suppresses every
+    # version-update pull request for this ecosystem, so an ignore adds nothing
+    # there. Its only remaining effect would be on *security* updates, which are
+    # exempt from the limit and are the one thing that should still get through:
+    # a security bump that breaks the 3.9 row is a visible problem, a suppressed
+    # advisory is not. Detection does not rest on Dependabot either -- osv-scanner
+    # runs in ci.yml across every ecosystem.
 
   # Node binding npm dependencies.
   - package-ecosystem: npm
