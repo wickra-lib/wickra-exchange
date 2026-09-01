@@ -37,7 +37,7 @@ echo "==> Python (.github/requirements/*.txt via uv)"
 # everyone who regenerates a lockfile. Set WKEX_BOOTSTRAP_UV=1 to opt in; the
 # bootstrap then fetches one pinned release archive and refuses to use it unless
 # its checksum matches the one recorded here.
-UV_VERSION="0.12.7"
+UV_VERSION="0.12.9"
 uv_sha256() {
   case "$1" in
     x86_64-unknown-linux-gnu)  echo "788f18abea7c5f55d6216e4f5613fd89d4d59b631efeec117b2b07fe72f1da21" ;;

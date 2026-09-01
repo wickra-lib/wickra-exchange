@@ -8,7 +8,7 @@ inventory, trust boundaries and key-handling guarantees.
 ## Supported versions
 
 This project is pre-release. Security fixes target the `main` branch and the most
-recent published version once a release exists.
+recent published version once a release exists; the first of those will be `0.1.0`.
 
 | Version | Supported |
 |---------|-----------|
