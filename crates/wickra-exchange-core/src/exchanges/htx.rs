@@ -27,6 +27,7 @@
 //! no in-place amend and no OCO order-list, so `amend_order`/`place_oco` and STP
 //! are documented gaps.
 
+use crate::clock::ServerClock;
 use crate::credentials::Credentials;
 use crate::error::{Error, Result};
 use crate::events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
@@ -116,6 +117,9 @@ pub struct Htx {
     market_type: MarketType,
     credentials: Option<Credentials>,
     now_ms: Box<dyn Fn() -> i64 + Send + Sync>,
+    /// Offset between this machine's clock and the venue's, applied to every
+    /// signed timestamp. Zero until [`sync_time`](Self::sync_time) is called.
+    clock: ServerClock,
     connection: Option<Box<dyn WsConnection>>,
     sub_messages: Vec<String>,
     subscriptions: Vec<(String, Symbol)>,
@@ -144,6 +148,7 @@ impl fmt::Debug for Htx {
             .field("host", &self.host)
             .field("market_type", &self.market_type)
             .field("authenticated", &self.credentials.is_some())
+            .field("clock_offset_ms", &self.clock.offset_ms())
             .field("connection", &self.connection.is_some())
             .field("sub_messages", &self.sub_messages.len())
             .field("subscriptions", &self.subscriptions.len())
@@ -174,6 +179,7 @@ impl Htx {
             market_type: options.market_type,
             credentials,
             now_ms: Box::new(system_now_ms),
+            clock: ServerClock::new(),
             connection: None,
             sub_messages: Vec::new(),
             subscriptions: Vec::new(),
@@ -182,6 +188,40 @@ impl Htx {
             private_connection: None,
             user_data_active: false,
         }
+    }
+
+    /// The timestamp a signed request must carry: this machine's clock plus the
+    /// offset learned from the venue.
+    ///
+    /// A venue rejects a signed request whose timestamp falls outside its own
+    /// receive window, so a machine a few seconds off has every order refused --
+    /// with a message about the window rather than about the clock. Until
+    /// [`sync_time`](Self::sync_time) is called the offset is zero and this is
+    /// the local time, which is the previous behaviour.
+    fn signed_now_ms(&self) -> i64 {
+        self.clock.server_time_ms((self.now_ms)())
+    }
+
+    /// Learn the offset between this machine's clock and the venue's, from
+    /// `GET /v1/common/timestamp`.
+    ///
+    /// Explicit rather than automatic: it costs a request, and a client should
+    /// not make one the caller did not ask for. Call it once after connecting,
+    /// and again if the process runs long enough for drift to matter.
+    ///
+    /// Returns the new offset in milliseconds (`server - local`).
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the request fails or the response cannot be parsed.
+    pub fn sync_time(&mut self) -> Result<i64> {
+        let local_before = (self.now_ms)();
+        let value = self.get("/v1/common/timestamp", "")?;
+        let server_ms = value
+            .get("data")
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(|| Error::Deserialization("common/timestamp: no data".into()))?;
+        self.clock.sync(local_before, server_ms);
+        Ok(self.clock.offset_ms())
     }
 
     /// Whether this client targets HTX USDT-margined swaps (`api.hbdm.com`,
@@ -453,7 +493,7 @@ impl Htx {
         let creds = self.credentials.as_ref().ok_or(Error::InvalidCredentials(
             "user-data stream requires credentials",
         ))?;
-        let timestamp = iso8601_no_millis((self.now_ms)());
+        let timestamp = iso8601_no_millis(self.signed_now_ms());
         // The v2 WS auth signs the same canonical form as REST, over `/ws/v2`.
         let mut params = [
             ("accessKey", creds.api_key.as_str()),
@@ -922,7 +962,10 @@ impl Htx {
             ("AccessKeyId".to_string(), creds.api_key.clone()),
             ("SignatureMethod".to_string(), "HmacSHA256".to_string()),
             ("SignatureVersion".to_string(), "2".to_string()),
-            ("Timestamp".to_string(), iso8601_no_millis((self.now_ms)())),
+            (
+                "Timestamp".to_string(),
+                iso8601_no_millis(self.signed_now_ms()),
+            ),
         ];
         for (key, val) in extra {
             params.push(((*key).to_string(), (*val).to_string()));
@@ -2313,5 +2356,34 @@ mod tests {
         assert!(rendered.contains("authenticated: true"));
         assert!(!rendered.contains("SECRET"));
         assert!(!rendered.contains("APIKEY"));
+    }
+
+    /// The clock offset must reach the wire, not just the struct.
+    ///
+    /// A venue refuses a signed request whose timestamp is outside its own
+    /// receive window, so a machine a few seconds off has every order rejected
+    /// -- with a message about the window, not about the clock. This asserts the
+    /// whole path: sync, then a signed request carrying the adjusted time.
+    #[test]
+    fn sync_time_shifts_signed_timestamps() {
+        let (mut htx, http) = signed_client(1_000_000);
+
+        // Shape verified against the live public endpoint on 2026-09-01.
+        http.push_json(200, r#"{"status":"ok","data":1004500}"#);
+        let offset = htx.sync_time().expect("sync must succeed");
+        assert_eq!(offset, 4_500, "the venue is 4.5 s ahead of this machine");
+
+        http.push_json(200, r#"{"status":"ok","data":[]}"#);
+        let _ = htx.balances();
+
+        let requests = http.recorded_requests();
+        let signed = requests.last().expect("a signed request was recorded");
+        // HTX signs an ISO-8601 timestamp in the query; 1_004_500 ms is
+        // 1970-01-01T00:16:44.
+        assert!(
+            signed.url.contains("00%3A16%3A44") || signed.url.contains("00:16:44"),
+            "the signed query must carry the venue's time: {}",
+            signed.url
+        );
     }
 }

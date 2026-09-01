@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Two credentials were being printed by `Debug`.** The hand-written
+  implementations added in #160 redacted `credentials` but not
+  `binance.user_data_listen_key` or `kraken.ws_api_token` — a listen key grants
+  read access to an account's private order and balance stream, and the Kraken
+  token authenticates its WebSocket session. Both now report presence only, and
+  the per-venue `Debug` tests assert it.
 - `GHSA-6w46-j5rx-g56g` (pytest tmpdir handling) is assessed and recorded in
   `osv-scanner.toml`. The attack vector is local — a second user on the same
   machine — and CI runners are single-user and ephemeral. It is also not fixable
@@ -118,6 +124,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Signed requests carry the venue's time, not this machine's.** `ServerClock`
+  existed, was tested, and was called by nothing: all ten venue clients stamped
+  signatures from the local clock. A venue refuses a signed request whose
+  timestamp falls outside its receive window, so a machine a few seconds off had
+  every order rejected — with a message about the window rather than about the
+  clock. Each client gains `sync_time()`, which reads the venue's own time
+  endpoint, and every signed path uses the corrected value. The endpoint shapes
+  were read off the live public endpoints rather than taken from documentation:
+  Kraken reports seconds where everyone else reports milliseconds, and Bitget,
+  OKX and Coinbase return the number as a string.
+- **Kraken's nonce could repeat.** It was the wall clock in milliseconds, so two
+  signed calls inside one millisecond produced the same nonce and a clock that
+  stepped backwards produced a smaller one — both `Invalid nonce` from the
+  venue, and neither visible here. `NonceGenerator` now forces it strictly
+  upward whatever the clock does.
+- **Kraken's WebSocket token was never renewed.** `GetWebSocketsToken` returns
+  the token with `expires` (900 seconds) and that field was read past, so a
+  client placing orders over the WebSocket API for longer than fifteen minutes
+  kept sending one the venue had stopped accepting — `ensure_ws_api` would not
+  refetch, because the *connection* was still open. `TokenTtl` now tracks it and
+  the pair is replaced on expiry.
 - **`osv-scanner` was not scanning the CI Python lockfiles.** It discovers
   lockfiles by filename, and neither `ci-dev-py3.txt` nor `ci-dev-py39.txt`
   matches a pattern it recognises — the job's first run listed seven scanned

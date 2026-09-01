@@ -22,6 +22,7 @@
 // with underscores would obscure them rather than aid reading.
 #![allow(clippy::unreadable_literal)]
 
+use crate::clock::ServerClock;
 use crate::credentials::Credentials;
 use crate::error::{Error, Result};
 use crate::events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
@@ -63,6 +64,9 @@ pub struct Bybit {
     credentials: Option<Credentials>,
     recv_window_ms: u64,
     now_ms: Box<dyn Fn() -> i64 + Send + Sync>,
+    /// Offset between this machine's clock and the venue's, applied to every
+    /// signed timestamp. Zero until [`sync_time`](Self::sync_time) is called.
+    clock: ServerClock,
     connection: Option<Box<dyn WsConnection>>,
     sub_messages: Vec<String>,
     subscriptions: Vec<(String, Symbol)>,
@@ -92,6 +96,7 @@ impl fmt::Debug for Bybit {
             .field("category", &self.category)
             .field("testnet", &self.testnet)
             .field("authenticated", &self.credentials.is_some())
+            .field("clock_offset_ms", &self.clock.offset_ms())
             .field("recv_window_ms", &self.recv_window_ms)
             .field("connection", &self.connection.is_some())
             .field("sub_messages", &self.sub_messages.len())
@@ -122,6 +127,7 @@ impl Bybit {
             credentials,
             recv_window_ms: options.recv_window_ms,
             now_ms: Box::new(system_now_ms),
+            clock: ServerClock::new(),
             connection: None,
             sub_messages: Vec::new(),
             subscriptions: Vec::new(),
@@ -129,6 +135,46 @@ impl Bybit {
             user_data_active: false,
             ws_api_connection: None,
         }
+    }
+
+    /// The timestamp a signed request must carry: this machine's clock plus the
+    /// offset learned from the venue.
+    ///
+    /// A venue rejects a signed request whose timestamp falls outside its own
+    /// receive window, so a machine a few seconds off has every order refused --
+    /// with a message about the window rather than about the clock. Until
+    /// [`sync_time`](Self::sync_time) is called the offset is zero and this is
+    /// the local time, which is the previous behaviour.
+    fn signed_now_ms(&self) -> i64 {
+        self.clock.server_time_ms((self.now_ms)())
+    }
+
+    /// Learn the offset between this machine's clock and the venue's, from
+    /// `GET /v5/market/time`.
+    ///
+    /// Explicit rather than automatic: it costs a request, and a client should
+    /// not make one the caller did not ask for. Call it once after connecting,
+    /// and again if the process runs long enough for drift to matter.
+    ///
+    /// Returns the new offset in milliseconds (`server - local`).
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the request fails or the response cannot be parsed.
+    pub fn sync_time(&mut self) -> Result<i64> {
+        // `get` unwraps the envelope to its `result`, so the top-level `time`
+        // is not reachable here. `timeNano` is inside `result` and is a
+        // nanosecond string; `timeSecond` beside it would drop sub-second
+        // precision, which is the precision this offset exists to recover.
+        let local_before = (self.now_ms)();
+        let value = self.get("/v5/market/time", "")?;
+        let nanos: i64 = value
+            .get("timeNano")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| Error::Deserialization("market/time: no timeNano".into()))?
+            .parse()
+            .map_err(|_| Error::Deserialization("market/time: timeNano not an integer".into()))?;
+        self.clock.sync(local_before, nanos / 1_000_000);
+        Ok(self.clock.offset_ms())
     }
 
     /// Attach a WebSocket transport, enabling the streaming subscriptions.
@@ -366,7 +412,7 @@ impl Bybit {
             "user-data stream requires credentials",
         ))?;
         // Bybit signs `GET/realtime<expires>`; the auth is valid until `expires`.
-        let expires = (self.now_ms)() + i64::try_from(self.recv_window_ms).unwrap_or(5000);
+        let expires = self.signed_now_ms() + i64::try_from(self.recv_window_ms).unwrap_or(5000);
         let signature = hmac_sha256_hex(
             creds.api_secret.as_bytes(),
             format!("GET/realtime{expires}").as_bytes(),
@@ -537,7 +583,7 @@ impl Bybit {
         let creds = self.credentials.as_ref().ok_or(Error::InvalidCredentials(
             "WebSocket trade requires credentials",
         ))?;
-        let expires = (self.now_ms)() + i64::try_from(self.recv_window_ms).unwrap_or(5000);
+        let expires = self.signed_now_ms() + i64::try_from(self.recv_window_ms).unwrap_or(5000);
         let signature = hmac_sha256_hex(
             creds.api_secret.as_bytes(),
             format!("GET/realtime{expires}").as_bytes(),
@@ -693,7 +739,7 @@ impl Bybit {
         let creds = self.credentials.as_ref().ok_or(Error::InvalidCredentials(
             "signed endpoint requires credentials",
         ))?;
-        let timestamp = (self.now_ms)().to_string();
+        let timestamp = self.signed_now_ms().to_string();
         let recv_window = self.recv_window_ms.to_string();
         let payload = if body.is_empty() { query } else { body };
         let sign_input = format!("{timestamp}{}{recv_window}{payload}", creds.api_key);
@@ -2313,5 +2359,37 @@ mod tests {
         assert!(rendered.contains("authenticated: true"));
         assert!(!rendered.contains("SECRET"));
         assert!(!rendered.contains("APIKEY"));
+    }
+
+    /// The clock offset must reach the wire, not just the struct.
+    ///
+    /// A venue refuses a signed request whose timestamp is outside its own
+    /// receive window, so a machine a few seconds off has every order rejected
+    /// -- with a message about the window, not about the clock. This asserts the
+    /// whole path: sync, then a signed request carrying the adjusted time.
+    #[test]
+    fn sync_time_shifts_signed_timestamps() {
+        let (mut bybit, http) = signed_client(1_000_000);
+
+        // Shape verified against the live public endpoint on 2026-09-01.
+        http.push_json(200, r#"{"retCode":0,"retMsg":"OK","result":{"timeSecond":"1004","timeNano":"1004500000000"}}"#);
+        let offset = bybit.sync_time().expect("sync must succeed");
+        assert_eq!(offset, 4_500, "the venue is 4.5 s ahead of this machine");
+
+        http.push_json(
+            200,
+            r#"{"retCode":0,"retMsg":"OK","result":{"list":[{"coin":[]}]}}"#,
+        );
+        bybit.balances().expect("balances must succeed");
+
+        let requests = http.recorded_requests();
+        let signed = requests.last().expect("a signed request was recorded");
+        let header = signed
+            .headers
+            .iter()
+            .find(|(name, _)| name == "X-BAPI-TIMESTAMP")
+            .map(|(_, value)| value.as_str())
+            .expect("signed request carries X-BAPI-TIMESTAMP");
+        assert_eq!(header, "1004500", "the venue's time, not ours");
     }
 }

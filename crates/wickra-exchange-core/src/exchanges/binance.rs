@@ -27,6 +27,7 @@
 //! `{id, method, params}` frame and exchange it on a dedicated `ws-api`
 //! connection (`wss://ws-api.binance.com/ws-api/v3`, or `ws-fapi` on futures).
 
+use crate::clock::ServerClock;
 use crate::credentials::Credentials;
 use crate::error::{Error, Result};
 use crate::events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
@@ -76,6 +77,9 @@ pub struct Binance {
     sub_id: u64,
     sub_messages: Vec<String>,
     instruments: InstrumentCache,
+    /// Offset between this machine's clock and the venue's, applied to every
+    /// signed timestamp. Zero until [`sync_time`](Self::sync_time) is called.
+    clock: ServerClock,
     /// A dedicated connection to the WebSocket order API (`ws-api`), opened lazily
     /// on the first [`place_order_ws`](Self::place_order_ws) call.
     ws_api_connection: Option<Box<dyn WsConnection>>,
@@ -110,9 +114,13 @@ impl fmt::Debug for Binance {
             .field("sub_id", &self.sub_id)
             .field("sub_messages", &self.sub_messages.len())
             .field("instruments", &self.instruments)
+            .field("clock_offset_ms", &self.clock.offset_ms())
             .field("ws_api_connection", &self.ws_api_connection.is_some())
             .field("user_data_connection", &self.user_data_connection.is_some())
-            .field("user_data_listen_key", &self.user_data_listen_key)
+            // Presence, never the value: a listen key grants read access to
+            // the account's private order and balance stream, so it is
+            // credential material and must not reach a log line.
+            .field("user_data_listen_key", &self.user_data_listen_key.is_some())
             .field("user_data_active", &self.user_data_active)
             .finish_non_exhaustive()
     }
@@ -138,6 +146,7 @@ impl Binance {
             sub_id: 0,
             sub_messages: Vec::new(),
             instruments: InstrumentCache::new(),
+            clock: ServerClock::new(),
             ws_api_connection: None,
             user_data_connection: None,
             user_data_listen_key: None,
@@ -570,13 +579,50 @@ impl Binance {
         }
     }
 
+    /// The timestamp a signed request must carry: this machine's clock plus the
+    /// offset learned from the venue.
+    ///
+    /// Binance rejects a signed request whose `timestamp` falls outside
+    /// `recvWindow` of *its* clock, so a machine a few seconds off has every
+    /// order refused with a message about the receive window rather than about
+    /// the clock. Until [`sync_time`](Self::sync_time) is called the offset is
+    /// zero and this is the local time, which is the previous behaviour.
+    fn signed_now_ms(&self) -> i64 {
+        self.clock.server_time_ms((self.now_ms)())
+    }
+
+    /// Learn the offset between this machine's clock and the venue's.
+    ///
+    /// Explicit rather than automatic, for the same reason as
+    /// [`load_instruments`](Self::load_instruments): it costs a request, and a
+    /// client should not make one the caller did not ask for. Call it once after
+    /// connecting, and again if the process runs long enough for drift to
+    /// matter.
+    ///
+    /// Returns the new offset in milliseconds (`server - local`).
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the request fails or the response cannot be parsed.
+    pub fn sync_time(&mut self) -> Result<i64> {
+        let path = if self.is_futures() {
+            "/fapi/v1/time"
+        } else {
+            "/api/v3/time"
+        };
+        let local_before = (self.now_ms)();
+        let body = self.get(path, "")?;
+        let raw: RawServerTime = deserialize(&body)?;
+        self.clock.sync(local_before, raw.server_time);
+        Ok(self.clock.offset_ms())
+    }
+
     /// Sign `params` (HMAC-SHA256 over the query with `recvWindow` + `timestamp`)
     /// and issue the request with the API-key header.
     fn signed_request(&self, method: HttpMethod, path: &str, params: &str) -> Result<String> {
         let creds = self.credentials.as_ref().ok_or(Error::InvalidCredentials(
             "signed endpoint requires credentials",
         ))?;
-        let timestamp = (self.now_ms)();
+        let timestamp = self.signed_now_ms();
         let payload = if params.is_empty() {
             format!("recvWindow={}&timestamp={timestamp}", self.recv_window_ms)
         } else {
@@ -1007,7 +1053,7 @@ impl Binance {
         let creds = self.credentials.as_ref().ok_or(Error::InvalidCredentials(
             "signed endpoint requires credentials",
         ))?;
-        let id = (self.now_ms)();
+        let id = self.signed_now_ms();
         params.push(("apiKey".to_string(), creds.api_key.clone()));
         params.push(("timestamp".to_string(), id.to_string()));
         // Binance signs the request over the alphabetically-sorted params.
@@ -1650,6 +1696,14 @@ struct RawPosition {
     leverage: String,
     #[serde(rename = "marginType")]
     margin_type: String,
+}
+
+/// `GET /api/v3/time` (spot) / `/fapi/v1/time` (futures).
+/// Verified against the live endpoint: `{"serverTime":1788295956083}`.
+#[derive(Deserialize)]
+struct RawServerTime {
+    #[serde(rename = "serverTime")]
+    server_time: i64,
 }
 
 #[derive(Deserialize)]
@@ -2929,5 +2983,54 @@ mod tests {
         assert!(rendered.contains("authenticated: true"));
         assert!(!rendered.contains("SECRET"));
         assert!(!rendered.contains("APIKEY"));
+
+        // A listen key is credential material too: it grants read access
+        // to the account's private stream.
+        assert!(rendered.contains("user_data_listen_key: false"));
+        assert!(!rendered.contains("listen-key-value"));
+    }
+
+    /// The clock offset must reach the signature, not just the struct.
+    ///
+    /// Binance refuses a signed request whose `timestamp` is outside
+    /// `recvWindow` of its own clock, so a machine a few seconds off has every
+    /// order rejected -- with a message about the receive window, not about the
+    /// clock. This asserts the whole path: sync, then a signed request carrying
+    /// the adjusted time.
+    #[test]
+    fn sync_time_shifts_signed_timestamps() {
+        let (mut binance, http) = signed_client(1_000_000);
+
+        // Shape verified against the live endpoint on 2026-09-01:
+        // GET https://api.binance.com/api/v3/time -> {"serverTime":1788295956083}
+        http.push_json(200, r#"{"serverTime":1004500}"#);
+        let offset = binance.sync_time().expect("sync must succeed");
+        assert_eq!(offset, 4_500, "server is 4.5 s ahead of this machine");
+
+        http.push_json(200, r#"{"balances":[]}"#);
+        binance.balances().expect("balances must succeed");
+
+        let signed = &http.recorded_requests()[1];
+        assert!(
+            signed.url.contains("timestamp=1004500"),
+            "the signed request must carry the venue's time, not ours: {}",
+            signed.url
+        );
+        assert!(
+            !signed.url.contains("timestamp=1000000"),
+            "the local timestamp must not survive the offset: {}",
+            signed.url
+        );
+    }
+
+    /// Without a sync the behaviour is exactly what it was: local time.
+    #[test]
+    fn unsynced_clock_signs_with_local_time() {
+        let (binance, http) = signed_client(1_000_000);
+        http.push_json(200, r#"{"balances":[]}"#);
+        binance.balances().expect("balances must succeed");
+        assert!(http.recorded_requests()[0]
+            .url
+            .contains("timestamp=1000000"));
     }
 }
