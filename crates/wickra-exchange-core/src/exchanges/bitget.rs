@@ -1368,9 +1368,6 @@ impl AdvancedOrders for Bitget {
     }
 }
 
-/// The client order id used to align a batch element to its request: the
-/// caller's `clientOid` if set, else a synthetic index-based one.
-
 #[derive(Deserialize)]
 struct BatchOrdersResult {
     #[serde(rename = "successList", default)]
