@@ -54,9 +54,13 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["rustls-tls-webpki-roots", "connect"] }
 url = "2"
 # Request signing primitives (HMAC-SHA256/512, base64, hex).
+# base64 stays on the 0.22 line on purpose: reqwest pulls 0.22 in through
+# hyper-util/hyper-rustls, and declaring 0.23 here compiled a second copy of
+# the crate into every artefact. The Engine API this code uses is identical
+# across both lines.
 hmac = "0.13"
 sha2 = "0.11"
-base64 = "0.23"
+base64 = "0.22"
 hex = "0.4"
 # Test/dev.
 proptest = "1"
