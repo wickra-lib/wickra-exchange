@@ -124,6 +124,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `bindings/node/src/lib.rs` is excluded from CodeQL after all. It was left in
+  when the config was written, on the argument that it is hand-written here
+  rather than generated as in `wickra`. The first runs settled it: five
+  `rust/access-invalid-pointer` alerts, one per exported `#[napi]` class, each
+  anchored on a `pub struct` line — and the file contains zero `unsafe`. The
+  dereference is inside napi-derive's expansion, which CodeQL attributes back to
+  the macro's source span, so the rule cannot say anything true about this file
+  and the count grows with every class. Excluded by path rather than by
+  disabling the query, which would also blind `bindings/c/src`, where the real
+  raw-pointer code lives.
 - **Client order ids could repeat, and a repeated one is a refused order.**
   `ClientIdGenerator` existed and was called by nothing. Where the caller
   supplied no `client_order_id`, three sites derived one from the wall clock in

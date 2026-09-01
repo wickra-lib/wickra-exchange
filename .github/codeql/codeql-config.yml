@@ -9,21 +9,30 @@
 # is edited by hand, and a finding in either points at the generator rather than
 # at anything a reader can act on.
 #
-# Deliberately NOT excluded, unlike the wickra repository:
+# `bindings/node/src/lib.rs` was left in when this file was written, on the
+# argument that it is hand-written here rather than generated as in wickra, so
+# excluding it would drop real code to silence a few false positives. The first
+# runs settled that, and the argument does not survive them:
 #
-# - `bindings/node/src/lib.rs`. napi-derive expands every `#[napi]` into FFI glue
-#   that dereferences raw `napi_env` / `napi_value` handles, and CodeQL
-#   attributes that generated code back to the macro's source span -- so each
-#   exported class can raise one `rust/access-invalid-pointer` finding anchored
-#   on a struct identifier rather than on a pointer expression. wickra excludes
-#   the file for that reason, but there it is ~22,000 lines of generated
-#   delegation. Here it is hand-written and under a thousand lines, so excluding
-#   it would drop real code from analysis to silence a handful of false
-#   positives. If the first runs show the noise is real, add it then, with the
-#   count in the commit message.
-# - The C#, Java, Go and R bindings. This repository has no code generator, so
-#   there are no `.g.cs` or generated `org/wickra/*.java` files to exclude --
-#   every one of those files is hand-written and belongs in the database.
+#   * Five `rust/access-invalid-pointer` alerts, one per exported `#[napi]`
+#     class, each anchored on a `pub struct` line -- not on a pointer
+#     expression.
+#   * The file contains **zero** `unsafe`. The dereference the rule sees is
+#     inside napi-derive's expansion, which CodeQL attributes back to the
+#     macro's source span.
+#
+# So the rule cannot truthfully say anything about this file, and the count grows
+# by one with every class added. Excluding it drops nothing that rule could find.
+#
+# It is excluded by path rather than by disabling the query: `query-filters`
+# matches on id, tags and severity and cannot be scoped to a path, so switching
+# the rule off would also switch it off for `bindings/c/src`, which is where this
+# workspace's real raw-pointer code lives and where the rule earns its place.
+#
+# The C#, Java, Go and R bindings stay in: this repository has no code generator,
+# so there are no `.g.cs` or generated `org/wickra/*.java` files to exclude --
+# every one of those files is hand-written and belongs in the database.
 paths-ignore:
+  - bindings/node/src/lib.rs
   - bindings/node/index.js
   - bindings/node/index.d.ts
