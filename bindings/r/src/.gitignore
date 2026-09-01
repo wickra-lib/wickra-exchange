@@ -1,0 +1,8 @@
+# Build artifacts. The header and library come from WKEX_INC / WKEX_LIB at build
+# time (see Makevars), so nothing is staged into this directory.
+*.o
+*.so
+*.dll
+*.dll.a
+*.dylib
+symbols.rds

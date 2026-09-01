@@ -187,7 +187,7 @@ wickra-exchange/
 
 There is no `bindings/wasm/` — see the intro for why.
 
-## Building from source
+## Building everything from source
 
 ```bash
 # Rust core + tests + lints
@@ -221,6 +221,66 @@ Integration tests that hit a live exchange run only against **testnets**, are
 gated behind environment variables and are `#[ignore]` by default — they never
 touch mainnet with real keys. Fuzzing requires a nightly toolchain — see
 [`fuzz/`](fuzz/).
+
+## Testing
+
+Run the suites with the commands in
+[Building everything from source](#building-everything-from-source).
+
+- **`wickra-exchange-core`** — 441 unit tests. Every venue client is generic over
+  an injected transport, so its request-build, signing, parse and normalise path
+  is exercised offline against `MockHttpTransport` / `MockWsTransport`: queued
+  responses in, recorded requests out.
+- **`tests/conformance.rs`** — contracts every `Exchange` implementation must
+  satisfy, not one venue's behaviour: the order lifecycle (place a resting order
+  → query it → find it in open orders → cancel it) against `PaperExchange` and
+  `ReplayExchange`, and object-safety plus naming against all ten venue clients.
+- **`tests/proptest_invariants.rs`** — property tests over the shared machinery:
+  filter rounding stays on the step/tick grid, and decimal and symbol
+  parse/format round-trips.
+- **`tests/golden.rs`** — the recorded scenarios under [`golden/`](golden/).
+- **`fuzz/`** — five `cargo-fuzz` targets over everything a remote server can put
+  on the wire: JSON responses, WebSocket frames, order-book diffs, filter
+  rounding and credential/symbol parsing. Nothing may panic, because a panic
+  across the C ABI is undefined behaviour. CI runs each briefly on every push.
+- **Bindings** — `pytest` (Python), `node --test` (Node), `dotnet test` (C#),
+  `go test` (Go), JUnit (Java) and `testthat` (R), each covering construction,
+  the market-data and execution surface, derivatives and replay.
+- **Surface parity** — `scripts/check_binding_surface.py` reads the trait methods
+  out of `crates/wickra-exchange-core/src/traits.rs` and holds all seven bindings
+  to them. A method or constructor present in one binding and missing from
+  another fails CI; nothing else compares the bindings to each other.
+- **Examples** — every example is built or parsed on each push, the compiled ones
+  against the binding in this tree.
+
+### What the offline suites cannot tell you
+
+Every venue test above feeds the client a response the test itself wrote. That
+proves the parser handles the shape it was given; it cannot prove the shape is
+the one the venue actually sends. Live coverage is deliberately narrow and
+deliberately separate: `.github/workflows/testnet.yml` runs the `#[ignore]`
+integration tests nightly and on demand against public endpoints. They are
+`#[ignore]` by default and gated behind environment variables, so a normal
+`cargo test` never opens a socket and mainnet with real keys is never touched.
+
+## Benchmarks
+
+Connectivity throughput is dominated by the network, not the CPU, so the
+benchmarks measure the CPU-bound work done per request — the part that must not
+become the bottleneck under load — rather than round-trip latency, which is not
+reproducible and not ours to measure.
+
+```bash
+cargo bench -p wickra-exchange-bench
+```
+
+Four groups: request signing (HMAC-SHA256/512 and JWT construction), response
+parsing (recorded payloads into the typed structs), filter rounding (a price or
+quantity onto a venue's lot/tick/min-notional grid, in `Decimal`), and
+order-book diff application including sequence-gap detection.
+
+Measured figures, the methodology and the machine they were taken on are in
+[BENCHMARKS.md](BENCHMARKS.md).
 
 ## Requirements
 
