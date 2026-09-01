@@ -420,4 +420,22 @@ mod tests {
         let mut conn = ws.connect("wss://stream/empty").unwrap();
         assert_eq!(conn.recv().unwrap(), None);
     }
+
+    /// The mocks are public test scaffolding; their `Debug` is part of what a
+    /// failing assertion prints.
+    #[test]
+    fn mock_transports_render_debug() {
+        assert!(format!("{:?}", MockHttpTransport::new()).starts_with("MockHttpTransport"));
+        assert!(format!("{:?}", MockWsTransport::new()).starts_with("MockWsTransport"));
+
+        // `connect` hands back a `Box<dyn WsConnection>`, and the trait object
+        // has no Debug -- build the concrete mock directly, which the test
+        // module can do because it sits in this file.
+        let conn = MockWsConnection {
+            incoming: VecDeque::new(),
+            sent: Arc::new(Mutex::new(Vec::new())),
+            closed: false,
+        };
+        assert!(format!("{conn:?}").starts_with("MockWsConnection"));
+    }
 }

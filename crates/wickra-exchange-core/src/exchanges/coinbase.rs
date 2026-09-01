@@ -1044,4 +1044,20 @@ wHvqY4aizCFHQFTVNQCzDGy8/TOhRANCAAS69zNVQjOQ4RgxJVI8esP+jMfHLSTw\n\
     fn system_clock_is_sane() {
         assert!(system_now_ms() > 1_600_000_000_000);
     }
+
+    /// `Debug` reports connection state, never secret material. A client is
+    /// formatted into logs and error messages, so anything it prints is
+    /// somewhere a credential must not be.
+    #[test]
+    fn debug_reports_state_without_credentials() {
+        let (client, _http) = signed_client(1_700_000_000_000);
+        let rendered = format!("{client:?}");
+
+        assert!(rendered.starts_with("Coinbase {"));
+        assert!(rendered.contains("authenticated: true"));
+        // The PKCS#8 private key is the secret here.
+        assert!(!rendered.contains("BEGIN PRIVATE KEY"));
+        assert!(!rendered.contains("MIGHAgEAMBMGByqGSM49"));
+        assert!(!rendered.contains("organizations/x/apiKeys/y"));
+    }
 }

@@ -2300,4 +2300,18 @@ mod tests {
             .unwrap();
         assert_eq!(order.id, "1");
     }
+
+    /// `Debug` reports connection state, never secret material. A client is
+    /// formatted into logs and error messages, so anything it prints is
+    /// somewhere a credential must not be.
+    #[test]
+    fn debug_reports_state_without_credentials() {
+        let (client, _http) = signed_client(1_700_000_000_000);
+        let rendered = format!("{client:?}");
+
+        assert!(rendered.starts_with("Bybit {"));
+        assert!(rendered.contains("authenticated: true"));
+        assert!(!rendered.contains("SECRET"));
+        assert!(!rendered.contains("APIKEY"));
+    }
 }

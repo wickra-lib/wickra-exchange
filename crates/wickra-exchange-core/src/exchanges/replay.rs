@@ -310,4 +310,13 @@ mod tests {
             .unwrap();
         assert_eq!(btc.free, dec!(1));
     }
+
+    /// The derived `Debug` is part of the public surface: a replay client ends up
+    /// in test output and error messages.
+    #[test]
+    fn debug_renders() {
+        let replay = ReplayExchange::new(Vec::new());
+        let rendered = format!("{replay:?}");
+        assert!(rendered.starts_with("ReplayExchange {"));
+    }
 }

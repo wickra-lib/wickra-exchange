@@ -681,4 +681,12 @@ mod tests {
         assert_eq!(ex.maker_bps(), dec!(2));
         assert_eq!(ex.taker_bps(), dec!(7));
     }
+
+    /// The derived `Debug` is part of the public surface: a paper client ends up
+    /// in test output and error messages.
+    #[test]
+    fn debug_renders() {
+        let rendered = format!("{:?}", seeded());
+        assert!(rendered.starts_with("PaperExchange {"));
+    }
 }
