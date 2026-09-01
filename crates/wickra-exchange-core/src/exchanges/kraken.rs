@@ -31,6 +31,7 @@
 //! batch cancel (`/0/private/CancelOrderBatch`). Kraken has no OCO order-list (it
 //! uses conditional-close orders), so `place_oco` is a documented gap.
 
+use crate::clock::{NonceGenerator, ServerClock, TokenTtl};
 use crate::credentials::Credentials;
 use crate::error::{Error, Result};
 use crate::events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
@@ -72,6 +73,14 @@ pub struct Kraken {
     market_type: MarketType,
     credentials: Option<Credentials>,
     now_ms: Box<dyn Fn() -> i64 + Send + Sync>,
+    /// Offset between this machine's clock and the venue's, applied to every
+    /// signed timestamp. Zero until [`sync_time`](Self::sync_time) is called.
+    clock: ServerClock,
+    /// Kraken requires a strictly increasing nonce per API key. The wall
+    /// clock alone is not one: two signed calls inside the same millisecond
+    /// produce the same value, and a clock that steps backwards produces a
+    /// smaller one -- both are refused with `Invalid nonce`.
+    nonces: NonceGenerator,
     connection: Option<Box<dyn WsConnection>>,
     sub_messages: Vec<String>,
     /// Leverage applied on Kraken Futures (`maxLeverage` preference), recorded so
@@ -90,6 +99,15 @@ pub struct Kraken {
     /// call, together with the WebSocket token each request carries.
     ws_api_connection: Option<Box<dyn WsConnection>>,
     ws_api_token: Option<String>,
+    /// When the cached `ws_api_token` stops being accepted.
+    ///
+    /// `GetWebSocketsToken` returns the token together with an `expires`
+    /// (900 seconds). The token was cached and the expiry discarded, so a
+    /// client placing orders over the WebSocket API for longer than fifteen
+    /// minutes kept sending one the venue had stopped accepting -- and
+    /// `ensure_ws_api` would not refetch, because the *connection* was still
+    /// open.
+    ws_api_token_ttl: Option<TokenTtl>,
 }
 
 /// Hand-written: the client holds `Box<dyn HttpTransport>`, `Box<dyn WsTransport>`
@@ -104,13 +122,17 @@ impl fmt::Debug for Kraken {
             .field("rest_base", &self.rest_base)
             .field("market_type", &self.market_type)
             .field("authenticated", &self.credentials.is_some())
+            .field("clock_offset_ms", &self.clock.offset_ms())
             .field("connection", &self.connection.is_some())
             .field("sub_messages", &self.sub_messages.len())
             .field("leverage", &self.leverage)
             .field("private_connection", &self.private_connection.is_some())
             .field("user_data_active", &self.user_data_active)
             .field("ws_api_connection", &self.ws_api_connection.is_some())
-            .field("ws_api_token", &self.ws_api_token)
+            // Presence, never the value: this token authenticates the
+            // WebSocket session, so it is credential material and must not
+            // reach a log line.
+            .field("ws_api_token", &self.ws_api_token.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -129,6 +151,8 @@ impl Kraken {
             market_type: options.market_type,
             credentials,
             now_ms: Box::new(system_now_ms),
+            clock: ServerClock::new(),
+            nonces: NonceGenerator::new(0),
             connection: None,
             sub_messages: Vec::new(),
             leverage: Cell::new(1),
@@ -136,7 +160,49 @@ impl Kraken {
             user_data_active: false,
             ws_api_connection: None,
             ws_api_token: None,
+            ws_api_token_ttl: None,
         }
+    }
+
+    /// The timestamp a signed request must carry: this machine's clock plus the
+    /// offset learned from the venue.
+    fn signed_now_ms(&self) -> i64 {
+        self.clock.server_time_ms((self.now_ms)())
+    }
+
+    /// The next nonce for a signed request: strictly greater than the last one
+    /// this client issued, whatever the clock does.
+    ///
+    /// Kraken documents the nonce as an always-increasing unsigned integer and
+    /// refuses anything else. Milliseconds alone do not satisfy that -- two
+    /// signed calls inside one millisecond yield the same value -- so the
+    /// generator raises the candidate above the previous nonce when it has to.
+    fn next_nonce(&self) -> u64 {
+        let candidate = u64::try_from(self.signed_now_ms()).unwrap_or(0);
+        self.nonces.next(candidate)
+    }
+
+    /// Learn the offset between this machine's clock and the venue's, from
+    /// `GET /0/public/Time`.
+    ///
+    /// Explicit rather than automatic: it costs a request, and a client should
+    /// not make one the caller did not ask for.
+    ///
+    /// Returns the new offset in milliseconds (`server - local`).
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the request fails or the response cannot be parsed.
+    pub fn sync_time(&mut self) -> Result<i64> {
+        // Kraken is the one venue here that reports *seconds*:
+        // {"error":[],"result":{"unixtime":1788295967,"rfc1123":"..."}}
+        let local_before = (self.now_ms)();
+        let value = self.get("/0/public/Time", "")?;
+        let seconds = value
+            .get("unixtime")
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(|| Error::Deserialization("public/Time: no unixtime".into()))?;
+        self.clock.sync(local_before, seconds * 1000);
+        Ok(self.clock.offset_ms())
     }
 
     /// Whether this client targets Kraken Futures (`futures.kraken.com`) rather
@@ -571,9 +637,18 @@ impl Kraken {
     /// `GetWebSocketsToken` token over REST, connect `wss://ws-auth.kraken.com/v2`,
     /// and cache both.
     fn ensure_ws_api(&mut self) -> Result<()> {
-        if self.ws_api_connection.is_some() {
+        // An open connection is not enough: the token is sent with every order
+        // frame and expires on its own schedule, so a live connection can carry
+        // a dead token.
+        if self.ws_api_connection.is_some() && !self.ws_api_token_expired() {
             return Ok(());
         }
+        // Past the expiry the cached pair is worthless: drop both so the fetch
+        // below replaces them rather than layering a new token on a stale
+        // connection.
+        self.ws_api_connection = None;
+        self.ws_api_token = None;
+        self.ws_api_token_ttl = None;
         if self.is_futures() {
             return Err(Error::Exchange {
                 code: "unsupported".to_string(),
@@ -589,11 +664,29 @@ impl Kraken {
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| Error::Deserialization("missing WebSockets token".to_string()))?
             .to_string();
+        // `expires` is seconds and was previously read past. Kraken has returned
+        // 900 for as long as this endpoint has existed, but the response is the
+        // authority, not that constant.
+        let expires_s = result
+            .get("expires")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(900);
         let ws = self.ws.as_ref().ok_or(Error::NotConnected)?;
         let connection = ws.connect("wss://ws-auth.kraken.com/v2")?;
         self.ws_api_connection = Some(connection);
         self.ws_api_token = Some(token);
+        self.ws_api_token_ttl = Some(TokenTtl::new(self.signed_now_ms(), expires_s * 1000));
         Ok(())
+    }
+
+    /// Whether the cached WebSocket token has passed its expiry.
+    ///
+    /// A token with no recorded lifetime counts as expired: it predates this
+    /// tracking, and refetching one is cheaper than sending one the venue will
+    /// refuse.
+    fn ws_api_token_expired(&self) -> bool {
+        self.ws_api_token_ttl
+            .is_none_or(|ttl| ttl.is_expired(self.signed_now_ms()))
     }
 
     /// Send a token-authenticated order request frame and return its `result`,
@@ -848,7 +941,7 @@ impl Kraken {
         let creds = self.credentials.as_ref().ok_or(Error::InvalidCredentials(
             "signed endpoint requires credentials",
         ))?;
-        let nonce = (self.now_ms)().to_string();
+        let nonce = self.next_nonce().to_string();
         let mut form = vec![format!("nonce={nonce}")];
         for (key, val) in params {
             form.push(format!("{key}={val}"));
@@ -891,7 +984,7 @@ impl Kraken {
         let creds = self.credentials.as_ref().ok_or(Error::InvalidCredentials(
             "signed endpoint requires credentials",
         ))?;
-        let nonce = (self.now_ms)().to_string();
+        let nonce = self.next_nonce().to_string();
         let post_data = params
             .iter()
             .map(|(key, val)| format!("{key}={val}"))
@@ -2982,5 +3075,176 @@ mod tests {
         assert!(rendered.contains("authenticated: true"));
         assert!(!rendered.contains("c2VjcmV0"));
         assert!(!rendered.contains("APIKEY"));
+
+        // The WebSocket token authenticates the session; presence only.
+        assert!(rendered.contains("ws_api_token: false"));
+    }
+
+    /// Kraken refuses a nonce that does not strictly increase. The wall clock
+    /// alone is not one: two signed calls inside the same millisecond produced
+    /// the same value, and a clock that stepped backwards produced a smaller
+    /// one. Both were `Invalid nonce` from the venue, and neither was visible
+    /// here.
+    #[test]
+    fn nonce_is_monotonic_within_a_millisecond() {
+        // A frozen clock: every call reports the same millisecond.
+        let (kraken, http) = signed_client(1_000_000);
+        for _ in 0..3 {
+            http.push_json(200, r#"{"error":[],"result":{}}"#);
+            let _ = kraken.balances();
+        }
+
+        let nonces: Vec<i64> = http
+            .recorded_requests()
+            .iter()
+            .filter_map(|request| request.body.as_deref())
+            .filter_map(|body| {
+                body.strip_prefix("nonce=")
+                    .and_then(|rest| rest.split('&').next())
+                    .and_then(|value| value.parse().ok())
+            })
+            .collect();
+
+        assert_eq!(nonces.len(), 3, "three signed requests were recorded");
+        assert!(
+            nonces.windows(2).all(|pair| pair[1] > pair[0]),
+            "nonces must strictly increase even on a frozen clock: {nonces:?}"
+        );
+    }
+
+    /// The offset reaches the nonce, so a machine behind the venue does not
+    /// start from a timestamp the venue has already seen.
+    #[test]
+    fn sync_time_shifts_the_nonce() {
+        let (mut kraken, http) = signed_client(1_000_000);
+
+        // Shape verified against the live public endpoint on 2026-09-01:
+        // {"error":[],"result":{"unixtime":1788295967,"rfc1123":"..."}}
+        // Kraken is the one venue here that reports seconds.
+        http.push_json(200, r#"{"error":[],"result":{"unixtime":1004}}"#);
+        let offset = kraken.sync_time().expect("sync must succeed");
+        assert_eq!(offset, 4_000, "1004 s is 4 s ahead of 1_000_000 ms");
+
+        http.push_json(200, r#"{"error":[],"result":{}}"#);
+        let _ = kraken.balances();
+
+        let requests = http.recorded_requests();
+        let body = requests
+            .last()
+            .and_then(|request| request.body.as_deref())
+            .expect("the signed request carries a form body");
+        assert!(
+            body.starts_with("nonce=1004000"),
+            "the nonce must start from the venue's time: {body}"
+        );
+    }
+
+    /// The WebSocket token expires; a live connection does not make it valid.
+    ///
+    /// `GetWebSocketsToken` returns the token with an `expires` (900 seconds).
+    /// That field was read past: the token was cached and reused for as long as
+    /// the connection stayed open, so a client placing orders over the
+    /// WebSocket API for longer than fifteen minutes kept sending one the venue
+    /// had stopped accepting.
+    #[test]
+    fn expired_ws_token_is_refetched() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+
+        let clock = Arc::new(AtomicI64::new(1_000));
+        let http = Arc::new(MockHttpTransport::new());
+        let ws = Arc::new(MockWsTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::Spot);
+        let reader = Arc::clone(&clock);
+        let mut kraken = Kraken::with_credentials(
+            Box::new(ArcTransport(Arc::clone(&http))),
+            &opts,
+            Credentials::new("APIKEY", "c2VjcmV0"),
+        )
+        .with_ws(Box::new(ArcWs(Arc::clone(&ws))))
+        .with_clock(Box::new(move || reader.load(Ordering::Relaxed)));
+
+        let accepted = r#"{"method":"add_order","req_id":1000,"success":true,
+            "result":{"order_id":"O123"}}"#;
+
+        // First order: fetches "first" and uses it.
+        http.push_json(
+            200,
+            r#"{"error":[],"result":{"token":"first","expires":900}}"#,
+        );
+        ws.push_connection(vec![Ok(Some(accepted.to_string()))]);
+        kraken
+            .place_order_ws(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)))
+            .expect("first order");
+        assert!(ws.sent()[0].contains(r#""token":"first""#));
+
+        // Sixteen minutes later the token has expired, so the next order must
+        // fetch a new one rather than reuse it over the still-open connection.
+        clock.store(1_000 + 960_000, Ordering::Relaxed);
+        http.push_json(
+            200,
+            r#"{"error":[],"result":{"token":"second","expires":900}}"#,
+        );
+        ws.push_connection(vec![Ok(Some(accepted.to_string()))]);
+        kraken
+            .place_order_ws(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)))
+            .expect("second order");
+
+        let token_fetches = http
+            .recorded_requests()
+            .iter()
+            .filter(|request| request.url.contains("/0/private/GetWebSocketsToken"))
+            .count();
+        assert_eq!(token_fetches, 2, "the expired token was refetched");
+        assert!(
+            ws.sent().last().unwrap().contains(r#""token":"second""#),
+            "the new token is the one sent: {:?}",
+            ws.sent().last()
+        );
+    }
+
+    /// Inside the lifetime the token is reused: expiry tracking must not turn
+    /// every order into an extra REST call.
+    #[test]
+    fn unexpired_ws_token_is_reused() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+
+        let clock = Arc::new(AtomicI64::new(1_000));
+        let http = Arc::new(MockHttpTransport::new());
+        let ws = Arc::new(MockWsTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::Spot);
+        let reader = Arc::clone(&clock);
+        let mut kraken = Kraken::with_credentials(
+            Box::new(ArcTransport(Arc::clone(&http))),
+            &opts,
+            Credentials::new("APIKEY", "c2VjcmV0"),
+        )
+        .with_ws(Box::new(ArcWs(Arc::clone(&ws))))
+        .with_clock(Box::new(move || reader.load(Ordering::Relaxed)));
+
+        let accepted = r#"{"method":"add_order","req_id":1000,"success":true,
+            "result":{"order_id":"O123"}}"#;
+        http.push_json(
+            200,
+            r#"{"error":[],"result":{"token":"first","expires":900}}"#,
+        );
+        ws.push_connection(vec![
+            Ok(Some(accepted.to_string())),
+            Ok(Some(accepted.to_string())),
+        ]);
+
+        kraken
+            .place_order_ws(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)))
+            .expect("first order");
+        clock.store(1_000 + 60_000, Ordering::Relaxed); // one minute later
+        kraken
+            .place_order_ws(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)))
+            .expect("second order");
+
+        let token_fetches = http
+            .recorded_requests()
+            .iter()
+            .filter(|request| request.url.contains("/0/private/GetWebSocketsToken"))
+            .count();
+        assert_eq!(token_fetches, 1, "a live token is not refetched");
     }
 }

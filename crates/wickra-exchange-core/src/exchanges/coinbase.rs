@@ -9,6 +9,7 @@
 //! derived public key. Symbols are dash-form (`BTC-USD`); errors come back as an
 //! HTTP error status with an `{error, message}` body.
 
+use crate::clock::ServerClock;
 use crate::credentials::Credentials;
 use crate::error::{Error, Result};
 use crate::events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
@@ -48,6 +49,9 @@ pub struct Coinbase {
     rest_base: String,
     credentials: Option<Credentials>,
     now_ms: Box<dyn Fn() -> i64 + Send + Sync>,
+    /// Offset between this machine's clock and the venue's, applied to every
+    /// signed timestamp. Zero until [`sync_time`](Self::sync_time) is called.
+    clock: ServerClock,
     connection: Option<Box<dyn WsConnection>>,
     sub_messages: Vec<String>,
 }
@@ -63,6 +67,7 @@ impl fmt::Debug for Coinbase {
             .field("ws", &self.ws.is_some())
             .field("rest_base", &self.rest_base)
             .field("authenticated", &self.credentials.is_some())
+            .field("clock_offset_ms", &self.clock.offset_ms())
             .field("connection", &self.connection.is_some())
             .field("sub_messages", &self.sub_messages.len())
             .finish_non_exhaustive()
@@ -81,9 +86,52 @@ impl Coinbase {
             rest_base: format!("https://{HOST}"),
             credentials,
             now_ms: Box::new(system_now_ms),
+            clock: ServerClock::new(),
             connection: None,
             sub_messages: Vec::new(),
         }
+    }
+
+    /// The timestamp a signed request must carry: this machine's clock plus the
+    /// offset learned from the venue.
+    ///
+    /// A venue rejects a signed request whose timestamp falls outside its own
+    /// receive window, so a machine a few seconds off has every order refused --
+    /// with a message about the window rather than about the clock. Until
+    /// [`sync_time`](Self::sync_time) is called the offset is zero and this is
+    /// the local time, which is the previous behaviour.
+    fn signed_now_ms(&self) -> i64 {
+        self.clock.server_time_ms((self.now_ms)())
+    }
+
+    /// Learn the offset between this machine's clock and the venue's, from
+    /// `GET /api/v3/brokerage/time`.
+    ///
+    /// Explicit rather than automatic: it costs a request, and a client should
+    /// not make one the caller did not ask for. Call it once after connecting,
+    /// and again if the process runs long enough for drift to matter.
+    ///
+    /// Returns the new offset in milliseconds (`server - local`).
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the request fails or the response cannot be parsed.
+    pub fn sync_time(&mut self) -> Result<i64> {
+        // Every other endpoint on this client is signed; the time endpoint is
+        // public, so the request is built here rather than through signed_get.
+        let local_before = (self.now_ms)();
+        let url = format!("{}/api/v3/brokerage/time", self.rest_base);
+        let response = self.http.execute(&HttpRequest::get(url))?;
+        let value = parse_body(&response)?;
+        let server_ms: i64 = value
+            .get("epochMillis")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| Error::Deserialization("brokerage/time: no epochMillis".into()))?
+            .parse()
+            .map_err(|_| {
+                Error::Deserialization("brokerage/time: epochMillis not an integer".into())
+            })?;
+        self.clock.sync(local_before, server_ms);
+        Ok(self.clock.offset_ms())
     }
 
     /// Build a Coinbase client. Signed calls require credentials whose key name
@@ -426,7 +474,7 @@ impl Coinbase {
             ))?;
         let signing_key = SigningKey::from_pkcs8_pem(private_key)
             .map_err(|_| Error::InvalidCredentials("invalid EC private key"))?;
-        let now = (self.now_ms)() / 1000;
+        let now = self.signed_now_ms() / 1000;
         let nonce = format!("{:016x}", (self.now_ms)());
         let header = serde_json::json!({
             "alg": "ES256",
@@ -1059,5 +1107,46 @@ wHvqY4aizCFHQFTVNQCzDGy8/TOhRANCAAS69zNVQjOQ4RgxJVI8esP+jMfHLSTw\n\
         assert!(!rendered.contains("BEGIN PRIVATE KEY"));
         assert!(!rendered.contains("MIGHAgEAMBMGByqGSM49"));
         assert!(!rendered.contains("organizations/x/apiKeys/y"));
+    }
+
+    /// Coinbase carries the timestamp inside the JWT rather than in a header, so
+    /// the assertion decodes the token: `nbf` must be the venue's time.
+    #[test]
+    fn sync_time_shifts_the_jwt() {
+        let (mut coinbase, http) = signed_client(1_000_000);
+
+        // Shape verified against the live public endpoint on 2026-09-01:
+        // {"iso":"…","epochSeconds":"…","epochMillis":"1788295968224"}
+        http.push_json(200, r#"{"epochMillis":"1004500"}"#);
+        let offset = coinbase.sync_time().expect("sync must succeed");
+        assert_eq!(offset, 4_500, "the venue is 4.5 s ahead of this machine");
+
+        http.push_json(200, r#"{"accounts":[]}"#);
+        coinbase.balances().expect("balances must succeed");
+
+        let requests = http.recorded_requests();
+        let bearer = requests
+            .last()
+            .and_then(|request| {
+                request
+                    .headers
+                    .iter()
+                    .find(|(name, _)| name == "Authorization")
+            })
+            .map(|(_, value)| value.trim_start_matches("Bearer ").to_string())
+            .expect("the signed request carries a bearer token");
+
+        let payload = bearer.split('.').nth(1).expect("a JWT has three segments");
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload)
+            .expect("the payload is base64url");
+        let claims: serde_json::Value =
+            serde_json::from_slice(&decoded).expect("the payload is JSON");
+
+        assert_eq!(
+            claims["nbf"], 1004,
+            "the JWT must be stamped with the venue's time, not ours"
+        );
+        assert_eq!(claims["exp"], 1004 + 120, "the window moves with it");
     }
 }

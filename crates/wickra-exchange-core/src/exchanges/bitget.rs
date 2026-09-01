@@ -16,6 +16,7 @@
 //! per-order results. Bitget has no in-place amend and no OCO order-list — both
 //! documented gaps.
 
+use crate::clock::ServerClock;
 use crate::credentials::Credentials;
 use crate::error::{Error, Result};
 use crate::events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
@@ -55,6 +56,9 @@ pub struct Bitget {
     market_type: MarketType,
     credentials: Option<Credentials>,
     now_ms: Box<dyn Fn() -> i64 + Send + Sync>,
+    /// Offset between this machine's clock and the venue's, applied to every
+    /// signed timestamp. Zero until [`sync_time`](Self::sync_time) is called.
+    clock: ServerClock,
     connection: Option<Box<dyn WsConnection>>,
     sub_messages: Vec<String>,
     subscriptions: Vec<(String, Symbol)>,
@@ -79,6 +83,7 @@ impl fmt::Debug for Bitget {
             .field("rest_base", &self.rest_base)
             .field("market_type", &self.market_type)
             .field("authenticated", &self.credentials.is_some())
+            .field("clock_offset_ms", &self.clock.offset_ms())
             .field("connection", &self.connection.is_some())
             .field("sub_messages", &self.sub_messages.len())
             .field("subscriptions", &self.subscriptions.len())
@@ -101,12 +106,49 @@ impl Bitget {
             market_type: options.market_type,
             credentials,
             now_ms: Box::new(system_now_ms),
+            clock: ServerClock::new(),
             connection: None,
             sub_messages: Vec::new(),
             subscriptions: Vec::new(),
             private_connection: None,
             user_data_active: false,
         }
+    }
+
+    /// The timestamp a signed request must carry: this machine's clock plus the
+    /// offset learned from the venue.
+    ///
+    /// A venue rejects a signed request whose timestamp falls outside its own
+    /// receive window, so a machine a few seconds off has every order refused --
+    /// with a message about the window rather than about the clock. Until
+    /// [`sync_time`](Self::sync_time) is called the offset is zero and this is
+    /// the local time, which is the previous behaviour.
+    fn signed_now_ms(&self) -> i64 {
+        self.clock.server_time_ms((self.now_ms)())
+    }
+
+    /// Learn the offset between this machine's clock and the venue's, from
+    /// `GET /api/v2/public/time`.
+    ///
+    /// Explicit rather than automatic: it costs a request, and a client should
+    /// not make one the caller did not ask for. Call it once after connecting,
+    /// and again if the process runs long enough for drift to matter.
+    ///
+    /// Returns the new offset in milliseconds (`server - local`).
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the request fails or the response cannot be parsed.
+    pub fn sync_time(&mut self) -> Result<i64> {
+        let local_before = (self.now_ms)();
+        let value = self.get("/api/v2/public/time", "")?;
+        let server_ms: i64 = value
+            .get("serverTime")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| Error::Deserialization("public/time: no serverTime".into()))?
+            .parse()
+            .map_err(|_| Error::Deserialization("public/time: serverTime not an integer".into()))?;
+        self.clock.sync(local_before, server_ms);
+        Ok(self.clock.offset_ms())
     }
 
     /// Whether this client targets a USDⓈ-M futures market (Bitget's `mix`
@@ -356,7 +398,7 @@ impl Bitget {
             .as_deref()
             .ok_or(Error::InvalidCredentials("Bitget requires a passphrase"))?;
         // Bitget WS login signs `<timestamp>GET/user/verify`, timestamp in seconds.
-        let timestamp = (self.now_ms)() / 1000;
+        let timestamp = self.signed_now_ms() / 1000;
         let sign = hmac_sha256_base64(
             creds.api_secret.as_bytes(),
             format!("{timestamp}GET/user/verify").as_bytes(),
@@ -610,7 +652,7 @@ impl Bitget {
             .passphrase
             .as_deref()
             .ok_or(Error::InvalidCredentials("Bitget requires a passphrase"))?;
-        let timestamp = (self.now_ms)().to_string();
+        let timestamp = self.signed_now_ms().to_string();
         let request_path = if query.is_empty() {
             path.to_string()
         } else {
@@ -2038,5 +2080,37 @@ mod tests {
         assert!(rendered.contains("authenticated: true"));
         assert!(!rendered.contains("SECRET"));
         assert!(!rendered.contains("APIKEY"));
+    }
+
+    /// The clock offset must reach the wire, not just the struct.
+    ///
+    /// A venue refuses a signed request whose timestamp is outside its own
+    /// receive window, so a machine a few seconds off has every order rejected
+    /// -- with a message about the window, not about the clock. This asserts the
+    /// whole path: sync, then a signed request carrying the adjusted time.
+    #[test]
+    fn sync_time_shifts_signed_timestamps() {
+        let (mut bitget, http) = signed_client(1_000_000);
+
+        // Shape verified against the live public endpoint on 2026-09-01.
+        http.push_json(
+            200,
+            r#"{"code":"00000","msg":"success","data":{"serverTime":"1004500"}}"#,
+        );
+        let offset = bitget.sync_time().expect("sync must succeed");
+        assert_eq!(offset, 4_500, "the venue is 4.5 s ahead of this machine");
+
+        http.push_json(200, r#"{"code":"00000","data":[]}"#);
+        bitget.balances().expect("balances must succeed");
+
+        let requests = http.recorded_requests();
+        let signed = requests.last().expect("a signed request was recorded");
+        let header = signed
+            .headers
+            .iter()
+            .find(|(name, _)| name == "ACCESS-TIMESTAMP")
+            .map(|(_, value)| value.as_str())
+            .expect("signed request carries ACCESS-TIMESTAMP");
+        assert_eq!(header, "1004500", "the venue's time, not ours");
     }
 }
