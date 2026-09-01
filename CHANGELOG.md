@@ -55,7 +55,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when `A` succeeds and `B` fails, so a successful publish whose `grep` found
   nothing would have been reported as a failure. Two `local x=$(...)` assignments
   masked the command's exit status, and one `ls | wc -l` is now `find`.
-- **`osv-scanner` runs.** `osv-scanner.toml` existed and no workflow ever
+- **`osv-scanner` runs**, and its first run found something `cargo-deny` does
+  not: RUSTSEC-2026-0235 in `rkyv`, an *optional* `rust_decimal` feature this
+  workspace does not enable. Cargo.lock records optional dependencies whether or
+  not their feature is on, so the crate is in the lockfile while never being
+  compiled — `cargo tree -i rkyv --target all` prints nothing. cargo-deny is
+  silent because it resolves the real graph; OSV-Scanner reads the lockfile.
+  Recorded as a waiver in `osv-scanner.toml` with that reasoning, to be revisited
+  when `rust_decimal` moves the optional dependency to the 0.8 line. `osv-scanner.toml` existed and no workflow ever
   consulted it, so a waiver recorded there was load-bearing for nobody.
   `cargo-deny` covers the Rust graph only; the other six ecosystems — npm, PyPI,
   Maven, NuGet, Go modules, R — had no vulnerability scanning in CI at all. It
