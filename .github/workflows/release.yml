@@ -136,7 +136,7 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-rust
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
 
       # Idempotent publishing: if the version is already on crates.io we treat
       # that as success so re-runs of the workflow do not fail.
@@ -185,7 +185,7 @@ jobs:
 
       # CycloneDX SBOM per published crate.
       - name: Install cargo-cyclonedx
-        uses: taiki-e/install-action@3d7d7cd5ac7f994c1892ae0c06165095b9139094 # v2.85.1
+        uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2.86.7
         with:
           tool: cargo-cyclonedx
 
@@ -314,7 +314,7 @@ jobs:
       - uses: ./.github/actions/setup-rust
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       # npm install (not ci): the per-platform optionalDependencies are not yet
       # published, so they are absent from the lock and npm ci would reject it.
       - name: Install Node deps
@@ -500,7 +500,7 @@ jobs:
       - uses: ./.github/actions/setup-rust
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - name: Build the C ABI library (cdylib + staticlib)
         run: cargo build -p wickra-exchange-c --release --target ${{ matrix.target }}
       - name: Package header + libraries
@@ -646,7 +646,7 @@ jobs:
             echo "staged ${PLAT[$target]}:"; ls -l "$dest"
           done
       - name: Set up JDK 25 + Maven Central credentials + GPG
-        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
+        uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c # v6.0.0
         with:
           distribution: temurin
           java-version: "25"
@@ -970,7 +970,7 @@ jobs:
           path: artifacts/java
       - name: Attest build provenance
         id: attest
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
             artifacts/c-abi/*.tar.gz
