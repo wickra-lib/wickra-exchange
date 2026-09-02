@@ -30,6 +30,7 @@ use crate::transport::{HttpMethod, HttpRequest, HttpTransport, WsConnection, WsT
 use crate::types::{
     Balance, OcoRequest, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker,
 };
+use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -1388,7 +1389,7 @@ fn parse_ku_position(raw: &RawKuPosition) -> Option<Result<Position>> {
     } else {
         PositionSide::Long
     };
-    let dec = |value: f64| Decimal::from_f64_retain(value).unwrap_or_default();
+    let dec = |value: f64| Decimal::from_f64(value).unwrap_or_default();
     Some(Ok(Position {
         symbol: symbol_from_futures(&raw.symbol),
         side,

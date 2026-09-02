@@ -170,6 +170,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A price crossed every binding as the binary double, not the number typed.**
+  `types.rs` opens by saying prices and quantities are `Decimal` and never
+  `f64`, "because exchanges reject mis-rounded values, and float drift loses
+  money". Four bindings then converted back with `Decimal::from_f64_retain`,
+  which keeps the *binary* expansion of the double rather than the decimal the
+  caller wrote:
+
+  | asked for | sent to the venue |
+  | --- | --- |
+  | `20000.15` | `20000.150000000001455191522832` |
+  | `1.005` | `1.0049999999999998934185896356` |
+  | `0.1` | `0.1000000000000000055511151231` |
+
+  A price filter rejects that, and a tick check rounds it away from what was
+  meant. `Decimal::from_f64` reads the number the caller wrote. Sixteen
+  conversion sites in the C ABI, one each in the Python, Node and WASM entry
+  helpers, and one in the KuCoin client, where a position size arriving as a
+  JSON number was expanded the same way.
+  Each binding gained a test pinning the exact strings, verified against the
+  previous behaviour: reverting the C ABI conversion fails with
+  `left: "20000.150000000001455191522832", right: "20000.15"`. The non-finite
+  guards are unchanged — `from_f64` returns `None` for NaN and infinity exactly
+  as before, and NaN keeps its separate meaning of "market order" on the C ABI's
+  price argument.
+
 - **No binding could reach a futures market.** Every binding built its exchange
   client with `MarketType::Spot` hardcoded, so no caller in Python, Node, C,
   C++, C#, Go, Java or R could place a futures order, read a futures book, or

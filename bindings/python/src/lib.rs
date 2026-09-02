@@ -19,6 +19,7 @@ use std::fmt;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 
@@ -44,7 +45,7 @@ fn parse_symbol(market: &str) -> PyResult<Symbol> {
 
 /// Convert a Python float to an exact [`Decimal`].
 fn to_decimal(value: f64) -> PyResult<Decimal> {
-    Decimal::from_f64_retain(value)
+    Decimal::from_f64(value)
         .ok_or_else(|| PyValueError::new_err(format!("{value} is not a finite number")))
 }
 
@@ -971,4 +972,32 @@ fn _wickra_exchange(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyUserData>()?;
     module.add_class::<PyWsExecution>()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_price_arrives_as_the_number_the_caller_typed() {
+        // This binding takes prices and quantities as floats, so the
+        // conversion back is the whole of the fidelity. It used to be
+        // `from_f64_retain`, which keeps the *binary* expansion of the double:
+        // a caller asking for 20000.15 sent "20000.150000000001455191522832"
+        // to the venue, which a price filter rejects and a tick check rounds
+        // away from.
+        for (typed, expected) in [
+            (20000.15_f64, "20000.15"),
+            (0.1, "0.1"),
+            (1.005, "1.005"),
+            (0.000_000_01, "0.00000001"),
+        ] {
+            assert_eq!(
+                wickra_exchange::format_decimal(to_decimal(typed).unwrap()),
+                expected
+            );
+        }
+        assert!(to_decimal(f64::NAN).is_err());
+        assert!(to_decimal(f64::INFINITY).is_err());
+    }
 }
