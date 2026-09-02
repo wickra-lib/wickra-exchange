@@ -456,6 +456,9 @@ impl Bybit {
     /// Returns an [`Error`] if the order is invalid, credentials are missing, or
     /// the venue rejects it.
     pub fn place_order(&self, request: &OrderRequest) -> Result<Order> {
+        if request.order_type.is_trigger() {
+            return Err(Error::unsupported_trigger("Bybit"));
+        }
         request.validate()?;
         let time_in_force = if request.post_only {
             "PostOnly"
@@ -525,6 +528,9 @@ impl Bybit {
     /// Returns [`Error::NotConnected`] without a WebSocket transport, or another
     /// [`Error`] if the order is invalid or rejected.
     pub fn place_order_ws(&mut self, request: &OrderRequest) -> Result<Order> {
+        if request.order_type.is_trigger() {
+            return Err(Error::unsupported_trigger("Bybit"));
+        }
         request.validate()?;
         let time_in_force = if request.post_only {
             "PostOnly"
@@ -1417,6 +1423,9 @@ impl Bybit {
     /// # Errors
     /// Returns an [`Error`] if the batch request itself fails.
     pub fn place_batch(&self, requests: &[OrderRequest]) -> Result<Vec<Result<Order>>> {
+        if requests.iter().any(|r| r.order_type.is_trigger()) {
+            return Err(Error::unsupported_trigger("Bybit"));
+        }
         let items: Vec<serde_json::Value> = requests
             .iter()
             .map(|r| {
@@ -1970,6 +1979,40 @@ mod tests {
         )
         .with_clock(Box::new(move || now_ms));
         (bybit, mock)
+    }
+
+    #[test]
+    fn post_only_and_reduce_only_reach_every_order_path() {
+        // Three paths build an order body; each spells post-only as the
+        // `PostOnly` time-in-force and reduce-only as its own flag.
+        let (bybit, mock) = signed_client(1000);
+        mock.push_json(
+            200,
+            r#"{"retCode":0,"result":{"orderId":"a","orderLinkId":""}}"#,
+        );
+        bybit
+            .place_order(
+                &OrderRequest::limit_buy(symbol(), dec!(1), dec!(100))
+                    .post_only()
+                    .reduce_only(),
+            )
+            .unwrap();
+        let body = mock.recorded_requests()[0].body.clone().unwrap();
+        assert!(body.contains(r#""timeInForce":"PostOnly""#));
+        assert!(body.contains(r#""reduceOnly":true"#));
+
+        mock.push_json(
+            200,
+            r#"{"retCode":0,"result":{"list":[{"orderId":"o1","orderLinkId":""}]}}"#,
+        );
+        bybit
+            .place_batch(&[OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)).reduce_only()])
+            .unwrap();
+        assert!(mock.recorded_requests()[1]
+            .body
+            .as_deref()
+            .unwrap()
+            .contains(r#""reduceOnly":true"#));
     }
 
     #[test]

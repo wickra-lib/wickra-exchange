@@ -91,6 +91,21 @@ pub enum Error {
 }
 
 impl Error {
+    /// A trigger order on a venue path that cannot carry the trigger price.
+    ///
+    /// Placing it anyway is not a smaller version of the order the caller
+    /// asked for -- a stop-loss with no trigger executes at once, at the price
+    /// it was meant to protect against. So the paths that cannot express the
+    /// trigger refuse, and this is the refusal.
+    pub(crate) fn unsupported_trigger(venue: &str) -> Self {
+        Error::Exchange {
+            code: "unsupported".to_string(),
+            message: format!(
+                "{venue}: trigger (stop) orders are not implemented on this path;                  sending one without its trigger price would execute immediately                  instead of resting"
+            ),
+        }
+    }
+
     /// Whether retrying the operation could plausibly succeed: transient
     /// transport failures, timeouts and rate limits. Permanent failures
     /// (invalid order, auth, insufficient balance, …) return `false`.

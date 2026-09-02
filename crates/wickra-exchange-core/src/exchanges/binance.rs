@@ -954,6 +954,9 @@ impl Binance {
         if let Some(price) = request.price {
             params.push(("price".to_string(), format_decimal(price)));
         }
+        if let Some(stop) = request.stop_price {
+            params.push(("stopPrice".to_string(), format_decimal(stop)));
+        }
         if matches!(type_str, "LIMIT" | "STOP_LOSS_LIMIT" | "TAKE_PROFIT_LIMIT") {
             params.push((
                 "timeInForce".to_string(),
@@ -1239,6 +1242,9 @@ fn batch_order_json(request: &OrderRequest, position_mode: PositionMode) -> Stri
     }
     if request.order_type.requires_price() {
         obj["timeInForce"] = serde_json::json!(tif_str(request.time_in_force));
+    }
+    if let Some(stop) = request.stop_price {
+        obj["stopPrice"] = serde_json::json!(format_decimal(stop));
     }
     if let Some(id) = &request.client_order_id {
         obj["newClientOrderId"] = serde_json::json!(id);
@@ -2093,6 +2099,44 @@ mod tests {
         )
         .with_clock(Box::new(move || now_ms));
         (binance, mock)
+    }
+
+    #[test]
+    fn the_trigger_price_reaches_all_three_order_paths() {
+        // Binance is the one venue that carries a trigger rather than refusing
+        // it, and it has three ways to send an order. The REST path already had
+        // this; the batch entry and the ws-api frame were dropping `stopPrice`.
+        let stop = OrderRequest {
+            order_type: OrderType::StopMarket,
+            stop_price: Some(dec!(19000)),
+            ..OrderRequest::market_sell(symbol(), dec!(1))
+        };
+
+        let (rest, mock) = signed_futures_client(1000);
+        mock.push_json(200, ORDER_JSON);
+        rest.place_order(&stop).unwrap();
+        assert!(mock.recorded_requests()[0].url.contains("stopPrice=19000"));
+
+        let batch = batch_order_json(&stop, PositionMode::OneWay);
+        assert!(batch.contains(r#""stopPrice":"19000""#));
+
+        let ws = Arc::new(MockWsTransport::new());
+        let http = Arc::new(MockHttpTransport::new());
+        let mut ws_client = Binance::with_credentials(
+            Box::new(ArcTransport(http)),
+            &ExchangeOptions::mainnet(MarketType::UsdMFutures),
+            Credentials::new("APIKEY", "SECRET"),
+        )
+        .with_ws(Box::new(ArcWs(Arc::clone(&ws))))
+        .with_clock(Box::new(|| 1000));
+        ws.push_connection(vec![Ok(Some(
+            r#"{"id":"1","status":200,"result":{"symbol":"BTCUSDT","orderId":7,
+            "clientOrderId":"","status":"NEW","type":"STOP_LOSS","side":"SELL",
+            "origQty":"1","executedQty":"0","price":"0"}}"#
+                .to_string(),
+        ))]);
+        ws_client.place_order_ws(&stop).unwrap();
+        assert!(ws.sent()[0].contains("stopPrice"));
     }
 
     #[test]

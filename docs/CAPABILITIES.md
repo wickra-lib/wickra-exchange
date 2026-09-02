@@ -24,10 +24,30 @@ legitimately differ per venue, and — for derivatives and advanced orders — t
    surface is subscription-only). `WsExecution::place_order_ws` /
    `cancel_order_ws` return a documented `Error::Exchange` pointing to REST.
 
-All order types are common across venues: market, limit, stop-market,
-stop-limit; time-in-force GTC / IOC / FOK; `reduce_only` and `post_only` flags.
-Per-symbol filters (lot step, price tick, min-notional) are enforced through
-`InstrumentFilters` before an order is sent.
+Market and limit orders are common across venues, with time-in-force
+GTC / IOC / FOK and the `reduce_only` and `post_only` flags. Per-symbol filters
+(lot step, price tick, min-notional) are enforced through `InstrumentFilters`
+before an order is sent.
+
+**Trigger (stop) orders are the exception, and only Binance carries them.**
+`OrderType::StopMarket` and `StopLimit` rest until the market reaches
+`stop_price`, which every venue expresses through a different field and several
+through a separate endpoint entirely. Only the Binance client sends the trigger
+(`stopPrice`, on all three of its order paths). **Every other venue refuses the
+order** with `Error::Exchange` code `unsupported`, rather than dropping the
+trigger and placing the plain order underneath it — a stop-loss without its
+trigger executes at once, at the price it existed to protect against.
+
+| Venue | trigger orders |
+|-------|----------------|
+| Binance | ✅ `stopPrice` on REST, batch and the WebSocket API |
+| every other venue | refused (`Error::Exchange`, code `unsupported`) |
+| `PaperExchange` | refused (`Error::InvalidOrder`) |
+
+`tests/conformance.rs` holds all ten clients to that contract: a trigger order
+is either sent with its trigger price or refused, never flattened into an
+immediate one. A venue that gains native trigger orders later moves from one
+branch to the other without the test changing.
 
 > **Full read/execution surface in every binding.** The complete `MarketData`
 > surface (`ticker`, `klines`, `order_book`, `subscribe_trades` /

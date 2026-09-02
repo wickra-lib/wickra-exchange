@@ -475,6 +475,9 @@ impl Okx {
     /// Returns [`Error::NotConnected`] without a WebSocket transport, or another
     /// [`Error`] if the order is invalid or the venue rejects it.
     pub fn place_order_ws(&mut self, request: &OrderRequest) -> Result<Order> {
+        if request.order_type.is_trigger() {
+            return Err(Error::unsupported_trigger("OKX"));
+        }
         request.validate()?;
         let ord_type = if request.post_only && request.order_type == OrderType::Limit {
             "post_only"
@@ -596,6 +599,9 @@ impl Okx {
     /// Returns an [`Error`] if the order is invalid, credentials are missing, or
     /// the venue rejects it.
     pub fn place_order(&self, request: &OrderRequest) -> Result<Order> {
+        if request.order_type.is_trigger() {
+            return Err(Error::unsupported_trigger("OKX"));
+        }
         request.validate()?;
         let ord_type = if request.post_only && request.order_type == OrderType::Limit {
             "post_only"
@@ -1453,6 +1459,9 @@ impl Okx {
     /// # Errors
     /// Returns an [`Error`] if the batch request itself fails.
     pub fn place_batch(&self, requests: &[OrderRequest]) -> Result<Vec<Result<Order>>> {
+        if requests.iter().any(|r| r.order_type.is_trigger()) {
+            return Err(Error::unsupported_trigger("OKX"));
+        }
         let items: Vec<serde_json::Value> =
             requests.iter().map(|r| self.batch_order_json(r)).collect();
         let body = serde_json::Value::Array(items).to_string();
@@ -1881,6 +1890,45 @@ mod tests {
         )
         .with_clock(Box::new(move || now_ms));
         (okx, mock)
+    }
+
+    #[test]
+    fn post_only_and_client_ids_reach_the_batch_and_bracket_paths() {
+        let (okx, mock) = signed_client(1000);
+        mock.push_json(200, OKX_ORDER_OK);
+        okx.place_order(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)).post_only())
+            .unwrap();
+        assert!(mock.recorded_requests()[0]
+            .body
+            .as_deref()
+            .unwrap()
+            .contains(r#""ordType":"post_only""#));
+
+        mock.push_json(200, OKX_ORDER_OK);
+        okx.place_batch(&[
+            OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)).with_client_order_id("mine")
+        ])
+        .unwrap();
+        assert!(mock.recorded_requests()[1]
+            .body
+            .as_deref()
+            .unwrap()
+            .contains(r#""clOrdId":"mine""#));
+
+        mock.push_json(
+            200,
+            r#"{"code":"0","data":[{"algoId":"algo1","sCode":"0","sMsg":""}]}"#,
+        );
+        okx.place_oco(
+            &OcoRequest::new(symbol(), OrderSide::Sell, dec!(1), dec!(110), dec!(95))
+                .with_client_order_id("bracket"),
+        )
+        .unwrap();
+        assert!(mock.recorded_requests()[2]
+            .body
+            .as_deref()
+            .unwrap()
+            .contains(r#""algoClOrdId":"bracket""#));
     }
 
     #[test]

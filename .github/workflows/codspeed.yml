@@ -95,31 +95,44 @@ jobs:
       # of whatever machine produced a number. A diagnostic must never fail the
       # job, hence the fallback and the trailing `|| true`.
       #
-      # It earned itself on the next occurrence, which took one run and had the
-      # opposite answer: that time it *was* the machine. `apply_delta` came back
-      # at exactly 453.6 ns against exactly 399.4 ns -- the same pair as above,
-      # to the decimal -- on a pull request whose only non-comment Rust change
-      # was one name removed from a re-export list and one `pub` narrowed to
-      # `pub(crate)` on a test-only mock. The base was measured on the newest
-      # main commit this time, so the fallback that explained the first
-      # occurrence was ruled out. What differed was the CPU:
+      # It earned itself on the next two occurrences, and the second corrected
+      # the first. Both reported `apply_delta` at the same pair of figures --
+      # 399.4 ns for the base against 453.6 and then 455 for the head -- on
+      # pull requests whose generated code for that function is identical.
       #
-      #   base (main)     AMD EPYC 7763 64-Core, family 25 model 1   399.4 ns
-      #   head (the PR)   AMD EPYC 9V74 80-Core, family 25 model 17  453.6 ns
+      # The first of the two was read as a difference in the machine, because
+      # the base and head had run on different CPUs and everything else matched.
+      # That reading was wrong, and this is what disproves it: on the second
+      # occurrence the CPUs were the other way round and the figures did not
+      # move with them.
       #
-      # Same kernel, same rustc, same LLVM. `simulation` mode counts
-      # instructions, but the nanosecond figure CodSpeed reports is modelled
-      # from them, and the model is fitted to the host's cache geometry --
-      # which differs between Milan and Genoa. GitHub's ubuntu-latest pool
-      # holds both, so the reported figure is bimodal per runner while the
-      # instruction stream is unchanged.
+      #   occurrence   base                head                figures
+      #   #186         EPYC 7763  399.4    EPYC 9V74  453.6    base low
+      #   #190         EPYC 9V74  399.4    EPYC 7763  455      base low
       #
-      # There is no fix available here: a standard runner cannot be pinned to a
-      # CPU generation, and a threshold wide enough to swallow 12% would swallow
-      # a real 12% regression too. So this check is read, not obeyed: when it
-      # fires, compare the two CPU lines below before looking at the diff. If
-      # they differ and the diff cannot reach the benchmarked function, it is
-      # this, and the two figures will be that same pair again.
+      # One EPYC 7763 run produced 399.4 and another produced 455. So the CPU is
+      # not the variable, and the note that said it was has been removed rather
+      # than left standing.
+      #
+      # Nor is it simply "head runs measure high": #187 and #189 reported no
+      # change at all, and #189 shared #190's base commit exactly.
+      #
+      # What is established, by the same method as the first incident and now
+      # for the second: the code does not move. Building both revisions with
+      # `--emit=asm` and comparing the two functions the benchmark executes,
+      # `apply_delta` and `apply_level` are byte-identical between main and the
+      # pull request's head once basic-block label numbering is normalised.
+      #
+      # So the figure moves while the instruction stream does not, and the cause
+      # is not yet known. That is the honest state of it. When this fires:
+      # compare the recorded CPU lines, check the report's footnote for a base
+      # commit older than main's head (`No successful run was found on main`),
+      # and diff the emitted assembly for the named function. If the code is
+      # identical, the number is not about this pull request -- and the two
+      # figures will be that same pair again.
+      #
+      # A threshold is still not the answer: one wide enough to swallow 12%
+      # would swallow a real 12% regression too.
       - name: Record the measurement environment
         # `github.ref` reaches the shell through the environment, not through
         # template expansion: on a push it carries a branch name, and a branch

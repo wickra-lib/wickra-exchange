@@ -474,6 +474,9 @@ impl Bitget {
     /// Returns an [`Error`] if the order is invalid, credentials are missing, or
     /// the venue rejects it.
     pub fn place_order(&self, request: &OrderRequest) -> Result<Order> {
+        if request.order_type.is_trigger() {
+            return Err(Error::unsupported_trigger("Bitget"));
+        }
         request.validate()?;
         let force = if request.post_only {
             "post_only"
@@ -1259,6 +1262,9 @@ impl Bitget {
     /// Returns an [`Error`] if the batch request itself fails, or if called on a
     /// futures client (mix batch is a documented follow-up).
     pub fn place_batch(&self, requests: &[OrderRequest]) -> Result<Vec<Result<Order>>> {
+        if requests.iter().any(|r| r.order_type.is_trigger()) {
+            return Err(Error::unsupported_trigger("Bitget"));
+        }
         if requests.is_empty() {
             return Ok(Vec::new());
         }
@@ -1784,6 +1790,23 @@ mod tests {
         )
         .with_clock(Box::new(move || now_ms));
         (bitget, mock)
+    }
+
+    #[test]
+    fn post_only_maps_to_the_post_only_order_type() {
+        let (bitget, mock) = signed_client(1000);
+        mock.push_json(
+            200,
+            r#"{"code":"00000","data":{"orderId":"1","clientOid":""}}"#,
+        );
+        bitget
+            .place_order(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)).post_only())
+            .unwrap();
+        assert!(mock.recorded_requests()[0]
+            .body
+            .as_deref()
+            .unwrap()
+            .contains("post_only"));
     }
 
     #[test]

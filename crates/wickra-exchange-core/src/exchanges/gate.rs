@@ -470,6 +470,9 @@ impl Gate {
     /// order API covers spot), [`Error::NotConnected`] without a WebSocket
     /// transport, or another [`Error`] if the order is invalid or rejected.
     pub fn place_order_ws(&mut self, request: &OrderRequest) -> Result<Order> {
+        if request.order_type.is_trigger() {
+            return Err(Error::unsupported_trigger("Gate.io"));
+        }
         request.validate()?;
         if self.is_futures() {
             return Err(Error::Exchange {
@@ -618,6 +621,9 @@ impl Gate {
     /// Returns an [`Error`] if the order is invalid, credentials are missing, or
     /// the venue rejects it.
     pub fn place_order(&self, request: &OrderRequest) -> Result<Order> {
+        if request.order_type.is_trigger() {
+            return Err(Error::unsupported_trigger("Gate.io"));
+        }
         request.validate()?;
         if self.is_futures() {
             return self.place_futures_order(request);
@@ -1590,6 +1596,9 @@ impl Gate {
     /// # Errors
     /// Returns an [`Error`] if the batch request itself fails.
     pub fn place_batch(&self, requests: &[OrderRequest]) -> Result<Vec<Result<Order>>> {
+        if requests.iter().any(|r| r.order_type.is_trigger()) {
+            return Err(Error::unsupported_trigger("Gate.io"));
+        }
         let items: Vec<serde_json::Value> = requests
             .iter()
             .map(|r| {
@@ -2123,6 +2132,17 @@ mod tests {
         let open = reqs[1].body.as_deref().unwrap();
         assert!(open.contains(r#""size":2"#));
         assert!(!open.contains("auto_size"));
+
+        // The other close: a buy that reduces is closing the short side.
+        mock.push_json(200, GATE_FUTURES_FILL);
+        hedged
+            .place_order(&OrderRequest::market_buy(symbol(), dec!(2)).reduce_only())
+            .unwrap();
+        assert!(mock.recorded_requests()[2]
+            .body
+            .as_deref()
+            .unwrap()
+            .contains(r#""auto_size":"close_short""#));
 
         // One-way is untouched: reduce_only, real size, no auto_size.
         let (one_way, one_way_mock) = signed_futures_client(1_000_000);

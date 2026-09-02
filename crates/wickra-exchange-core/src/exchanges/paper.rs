@@ -325,10 +325,7 @@ impl MarketData for PaperExchange {
 impl Execution for PaperExchange {
     fn place_order(&mut self, request: &OrderRequest) -> Result<Order> {
         request.validate()?;
-        if matches!(
-            request.order_type,
-            OrderType::StopMarket | OrderType::StopLimit
-        ) {
+        if request.order_type.is_trigger() {
             return Err(Error::InvalidOrder(
                 "paper exchange supports only market and limit orders",
             ));

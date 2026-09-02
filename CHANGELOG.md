@@ -150,6 +150,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A stop-loss was placed as an order that executed immediately.** The most
+  severe of the defects in this run, and the simplest: `OrderRequest::validate`
+  *requires* a `stop_price` on a `StopMarket`/`StopLimit` — so the library
+  accepted the order and asserted the trigger was there — and then every venue's
+  `order_type_str` mapped `StopMarket` down to `"market"` and `StopLimit` to
+  `"limit"` and sent no trigger at all. A stop-loss at 19 000 with the market at
+  20 000 went out as a market sell and filled at 20 000: exactly the loss it
+  existed to prevent.
+  Counting the order-building paths in the crate: **one of thirty-one** sent a
+  trigger price, `Binance::place_order`. The other thirty dropped it, including
+  Binance's own batch and WebSocket paths. (The `stop_price` references in the
+  OKX and KuCoin clients are `OcoRequest`, a different type on the bracket path,
+  which was never affected.)
+  Binance now carries `stopPrice` on all three of its order paths — the REST
+  mapping mirrored into the batch entry and the ws-api frame. **Every other
+  venue refuses a trigger order** with `Error::Exchange` code `unsupported`,
+  rather than placing the immediate order underneath it. Implementing trigger
+  orders natively on nine venues means nine different endpoints and parameter
+  sets; refusing is correct today, and each venue can move to carrying them one
+  at a time. `PaperExchange` already refused, and had done so from the start.
+  `tests/conformance.rs` now holds all ten clients to the contract — a trigger
+  order is either sent with its trigger or refused, never flattened — so a venue
+  added without either is caught, and one that gains native support later moves
+  between branches without the test changing.
+  `docs/CAPABILITIES.md` claimed "all order types are common across venues:
+  market, limit, stop-market, stop-limit". It now says which one is not.
+  Codecov caught the first draft leaving the new guards untested on the batch
+  and WebSocket paths — the two places the earlier `reduce_only` drop had hidden
+  in as well. The conformance contract now drives all three order paths, and the
+  per-venue suites gained the cases whose branches were never entered: Binance's
+  trigger price on the batch entry and the ws-api frame, Gate's `close_short`
+  half of dual mode, and post-only and client-id handling on Bybit, OKX and
+  Bitget.
+
 - **A hedged account got orders that named no side.** `position_mode` was the
   last field on `ExchangeOptions` that nothing read. On a hedged account a
   symbol holds a long and a short position at once, so every order has to name
@@ -209,23 +243,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the previous behaviour.
   `position_mode` remains the one field nothing reads; it is a separate fix.
 
-- **The CodSpeed comparison is bimodal per runner CPU, and now says so.** The
-  job reported `apply_delta` at 453.6 ns against a 399.4 ns base on this
-  release's documentation branch — the same pair as the earlier incident, to the
-  decimal, on a pull request whose only non-comment Rust change was one name
-  removed from a re-export list and one `pub` narrowed to `pub(crate)` on a
-  test-only mock. The base-commit fallback that explained the first occurrence
-  was ruled out: the base was measured on the newest `main` commit. The
-  diagnostic step added last time then answered it in one run — the base ran on
-  an AMD EPYC 7763 (family 25 model 1) and the head on an EPYC 9V74 (family 25
-  model 17), with the same kernel, rustc and LLVM on both. `simulation` mode
-  counts instructions, but the nanosecond figure is modelled from them against
-  the host's cache geometry, and Milan and Genoa do not share one; GitHub's
-  `ubuntu-latest` pool holds both. No fix is available — a standard runner
-  cannot be pinned to a CPU generation, and a threshold wide enough to swallow
-  12% would swallow a real 12% regression. The workflow comment now says to
-  compare the two recorded CPU lines before the diff, and names the figures the
-  artefact reproduces at.
+- **The CodSpeed artefact is not the runner CPU, and the entry that said it was
+  is corrected here.** The previous entry read the `apply_delta` figure as
+  bimodal per CPU: base on an EPYC 7763 at 399.4 ns, head on an EPYC 9V74 at
+  453.6 ns, everything else equal. The next occurrence had the CPUs the other
+  way round — base on the 9V74 at 399.4, head on the 7763 at 455 — so one EPYC
+  7763 run produced each of the two figures and the machine explains neither.
+  Nor is it "head runs measure high": two pull requests in between reported no
+  change at all, one of them against the same base commit.
+  What *is* established, by the method the first incident introduced: the code
+  does not move. Built with `--emit=asm` on both revisions, `apply_delta` and
+  `apply_level` — the two functions the benchmark executes — are byte-identical
+  between `main` and the pull request's head once basic-block label numbering is
+  normalised. The figure moves while the instruction stream does not, and the
+  cause is not known. The workflow comment now says that, and says how to check
+  the next one: compare the recorded CPUs, look for the report's footnote naming
+  a base commit older than `main`'s head, and diff the emitted assembly for the
+  function named. No threshold was added, for the same reason as before — one
+  wide enough to swallow 12% would swallow a real 12% regression.
 
 - **A public type nobody could name, and three doc links to nothing.**
   `MockWsConnection` was exported from the crate root, but `connect` hands it
