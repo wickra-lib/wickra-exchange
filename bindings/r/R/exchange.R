@@ -77,12 +77,29 @@ wkex_replay_trades <- function(market, tape, balances, maker_bps = 0, taker_bps 
 #' @param api_key,api_secret API credentials.
 #' @param passphrase,private_key Optional extra credentials (NULL if unused).
 #' @param testnet Use the venue testnet.
+#' @param market Which market of the venue: "spot" (default) or
+#'   "usdm_futures". A venue is several APIs behind one name, and this is the
+#'   choice between them. Coin-margined and margin are not offered: no client
+#'   routes them consistently, and Binance treats coin-margined as spot.
+#' @param margin_mode "cross" (default) or "isolated". Two venues carry it on
+#'   every order, so it belongs here rather than in a later call.
+#' @param position_mode "one_way" (default) or "hedge". On a hedged account
+#'   every order names the side of the account it acts on.
 #' @return A `wickra_exchange` object.
 #' @export
 wkex_connect <- function(name, api_key, api_secret,
-                         passphrase = NULL, private_key = NULL, testnet = FALSE) {
+                         passphrase = NULL, private_key = NULL, testnet = FALSE,
+                         market = "spot", margin_mode = "cross",
+                         position_mode = "one_way") {
+  markets <- c(spot = 0L, usdm_futures = 1L)
+  margins <- c(cross = 0L, isolated = 1L)
+  positions <- c(one_way = 0L, hedge = 1L)
+  market_code <- markets[[match.arg(market, names(markets))]]
+  margin_code <- margins[[match.arg(margin_mode, names(margins))]]
+  position_code <- positions[[match.arg(position_mode, names(positions))]]
   handle <- .Call(C_wkex_connect, name, api_key, api_secret,
-                  passphrase, private_key, as.logical(testnet))
+                  passphrase, private_key, as.logical(testnet),
+                  market_code, margin_code, position_code)
   structure(list(handle = handle), class = "wickra_exchange")
 }
 

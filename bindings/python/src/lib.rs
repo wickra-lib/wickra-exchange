@@ -26,7 +26,8 @@ use wickra_exchange::{
     connect, connect_advanced, connect_derivatives, connect_user_data, connect_ws_execution,
     AdvancedOrders, BookLevel, Credentials, Derivatives, Event, Exchange, ExchangeOptions,
     MarginMode, MarketType, OcoRequest, Order, OrderRequest, OrderSide, OrderStatus, PaperExchange,
-    Position, PositionSide, ReplayExchange, Symbol, Ticker, TradePrint, WsExecution, WsUserData,
+    Position, PositionMode, PositionSide, ReplayExchange, Symbol, Ticker, TradePrint, WsExecution,
+    WsUserData,
 };
 
 /// Parse a `"BASE/QUOTE"` market string into a [`Symbol`].
@@ -110,6 +111,52 @@ fn position_dict<'py>(py: Python<'py>, position: &Position) -> PyResult<Bound<'p
         },
     )?;
     Ok(dict)
+}
+
+/// Parse a market string into the [`MarketType`] a client routes to.
+///
+/// `connect` was fixed at spot, so no Python caller could reach a futures
+/// market on the exchange handle. Only spot and USDⓈ-margined futures are
+/// offered: no client routes coin-margined or margin consistently -- Binance
+/// treats coin-margined as spot -- and a name that does not describe where the
+/// order goes is the defect this argument exists to end.
+fn market_type_from_str(market: &str) -> PyResult<MarketType> {
+    match market {
+        "spot" => Ok(MarketType::Spot),
+        "usdm_futures" => Ok(MarketType::UsdMFutures),
+        other => Err(PyValueError::new_err(format!(
+            "market must be 'spot' or 'usdm_futures', got {other:?}"
+        ))),
+    }
+}
+
+/// Parse a position-mode string (`"one_way"` / `"hedge"`).
+fn position_mode_from_str(mode: &str) -> PyResult<PositionMode> {
+    match mode {
+        "one_way" => Ok(PositionMode::OneWay),
+        "hedge" => Ok(PositionMode::Hedge),
+        other => Err(PyValueError::new_err(format!(
+            "position_mode must be 'one_way' or 'hedge', got {other:?}"
+        ))),
+    }
+}
+
+/// Options for a live connection from the string arguments the constructors take.
+fn live_options(
+    testnet: bool,
+    market: &str,
+    margin_mode: &str,
+    position_mode: &str,
+) -> PyResult<ExchangeOptions> {
+    let market = market_type_from_str(market)?;
+    let mut options = if testnet {
+        ExchangeOptions::testnet(market)
+    } else {
+        ExchangeOptions::mainnet(market)
+    };
+    options.margin_mode = margin_mode_from_str(margin_mode)?;
+    options.position_mode = position_mode_from_str(position_mode)?;
+    Ok(options)
 }
 
 /// Parse a margin-mode string (`"cross"` / `"isolated"`).
@@ -351,13 +398,16 @@ impl PyExchange {
     /// A live client for `name` (see the crate README for the ten supported
     /// venues), authenticated with `credentials`.
     #[staticmethod]
-    #[pyo3(signature = (name, credentials, testnet=false))]
-    fn connect(name: &str, credentials: &PyCredentials, testnet: bool) -> PyResult<Self> {
-        let options = if testnet {
-            ExchangeOptions::testnet(MarketType::Spot)
-        } else {
-            ExchangeOptions::mainnet(MarketType::Spot)
-        };
+    #[pyo3(signature = (name, credentials, testnet=false, market="spot", margin_mode="cross", position_mode="one_way"))]
+    fn connect(
+        name: &str,
+        credentials: &PyCredentials,
+        testnet: bool,
+        market: &str,
+        margin_mode: &str,
+        position_mode: &str,
+    ) -> PyResult<Self> {
+        let options = live_options(testnet, market, margin_mode, position_mode)?;
         let live = connect(name, credentials.inner.clone(), &options)
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok(Self {
@@ -588,13 +638,15 @@ impl fmt::Debug for PyDerivatives {
 impl PyDerivatives {
     /// Connect a USDⓈ-M futures client for `name`. Raises for a spot-only venue.
     #[staticmethod]
-    #[pyo3(signature = (name, credentials, testnet=false))]
-    fn connect(name: &str, credentials: &PyCredentials, testnet: bool) -> PyResult<Self> {
-        let options = if testnet {
-            ExchangeOptions::testnet(MarketType::UsdMFutures)
-        } else {
-            ExchangeOptions::mainnet(MarketType::UsdMFutures)
-        };
+    #[pyo3(signature = (name, credentials, testnet=false, margin_mode="cross", position_mode="one_way"))]
+    fn connect(
+        name: &str,
+        credentials: &PyCredentials,
+        testnet: bool,
+        margin_mode: &str,
+        position_mode: &str,
+    ) -> PyResult<Self> {
+        let options = live_options(testnet, "usdm_futures", margin_mode, position_mode)?;
         let inner = connect_derivatives(name, credentials.inner.clone(), &options)
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok(Self { inner })

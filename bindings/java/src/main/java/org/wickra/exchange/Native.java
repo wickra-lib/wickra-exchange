@@ -25,6 +25,12 @@ final class Native {
 
     static final int STR_CAP = 64;
 
+    static final int MARKET_SPOT = 0;
+    static final int MARKET_USDM_FUTURES = 1;
+
+    static final int POSITION_ONE_WAY = 0;
+    static final int POSITION_HEDGE = 1;
+
     static final int MARGIN_CROSS = 0;
     static final int MARGIN_ISOLATED = 1;
     static final int POSITION_LONG = 0;
@@ -99,7 +105,8 @@ final class Native {
     static final MethodHandle REPLAY_NEW = handle("wickra_replay_new",
             FunctionDescriptor.of(C_PTR, C_PTR, C_PTR, C_SIZE, C_PTR, C_PTR, C_SIZE, C_DOUBLE, C_DOUBLE, C_DOUBLE));
     static final MethodHandle CONNECT = handle("wickra_connect",
-            FunctionDescriptor.of(C_PTR, C_PTR, C_PTR, C_PTR, C_PTR, C_PTR, C_BOOL));
+            FunctionDescriptor.of(C_PTR, C_PTR, C_PTR, C_PTR, C_PTR, C_PTR, C_BOOL,
+                    C_INT, C_INT, C_INT));
     static final MethodHandle FREE = handle("wickra_exchange_free",
             FunctionDescriptor.ofVoid(C_PTR));
     static final MethodHandle NAME = handle("wickra_exchange_name",
@@ -134,7 +141,8 @@ final class Native {
             FunctionDescriptor.of(C_INT, C_PTR, C_PTR, C_PTR, C_SIZE));
 
     static final MethodHandle CONNECT_DERIVATIVES = handle("wickra_connect_derivatives",
-            FunctionDescriptor.of(C_PTR, C_PTR, C_PTR, C_PTR, C_PTR, C_PTR, C_BOOL));
+            FunctionDescriptor.of(C_PTR, C_PTR, C_PTR, C_PTR, C_PTR, C_PTR, C_BOOL,
+                    C_INT, C_INT));
     static final MethodHandle DERIVATIVES_FREE = handle("wickra_derivatives_free",
             FunctionDescriptor.ofVoid(C_PTR));
     static final MethodHandle DERIVATIVES_POSITION = handle("wickra_derivatives_position",
@@ -149,7 +157,8 @@ final class Native {
             FunctionDescriptor.of(C_INT, C_PTR, C_PTR, C_PTR));
 
     static final MethodHandle CONNECT_ADVANCED = handle("wickra_connect_advanced",
-            FunctionDescriptor.of(C_PTR, C_PTR, C_PTR, C_PTR, C_PTR, C_PTR, C_BOOL, C_BOOL));
+            FunctionDescriptor.of(C_PTR, C_PTR, C_PTR, C_PTR, C_PTR, C_PTR, C_BOOL, C_BOOL,
+                    C_INT, C_INT));
     static final MethodHandle ADVANCED_FREE = handle("wickra_advanced_free",
             FunctionDescriptor.ofVoid(C_PTR));
     static final MethodHandle ADVANCED_AMEND_ORDER = handle("wickra_advanced_amend_order",
@@ -162,7 +171,8 @@ final class Native {
             FunctionDescriptor.of(C_INT, C_PTR, C_PTR, C_PTR, C_PTR, C_PTR, C_SIZE, C_PTR, C_PTR, C_SIZE));
 
     static final MethodHandle CONNECT_USER_DATA = handle("wickra_connect_user_data",
-            FunctionDescriptor.of(C_PTR, C_PTR, C_PTR, C_PTR, C_PTR, C_PTR, C_BOOL, C_BOOL));
+            FunctionDescriptor.of(C_PTR, C_PTR, C_PTR, C_PTR, C_PTR, C_PTR, C_BOOL, C_BOOL,
+                    C_INT, C_INT));
     static final MethodHandle USER_DATA_FREE = handle("wickra_user_data_free",
             FunctionDescriptor.ofVoid(C_PTR));
     static final MethodHandle USER_DATA_SUBSCRIBE = handle("wickra_user_data_subscribe",
@@ -173,7 +183,8 @@ final class Native {
             FunctionDescriptor.of(C_INT, C_PTR, C_PTR, C_SIZE));
 
     static final MethodHandle CONNECT_WS_EXECUTION = handle("wickra_connect_ws_execution",
-            FunctionDescriptor.of(C_PTR, C_PTR, C_PTR, C_PTR, C_PTR, C_PTR, C_BOOL, C_BOOL));
+            FunctionDescriptor.of(C_PTR, C_PTR, C_PTR, C_PTR, C_PTR, C_PTR, C_BOOL, C_BOOL,
+                    C_INT, C_INT));
     static final MethodHandle WS_EXECUTION_FREE = handle("wickra_ws_execution_free",
             FunctionDescriptor.ofVoid(C_PTR));
     static final MethodHandle WS_PLACE_ORDER = handle("wickra_ws_place_order",

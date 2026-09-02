@@ -150,6 +150,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **No binding could reach a futures market.** Every binding built its exchange
+  client with `MarketType::Spot` hardcoded, so no caller in Python, Node, C,
+  C++, C#, Go, Java or R could place a futures order, read a futures book, or
+  cancel a futures order. The `Exchange` surface was complete in all of them and
+  half of it pointed at the wrong API.
+  It went unnoticed because `check_binding_surface.py` counts **verbs**, not
+  reachable **configurations**: `place_order` was present everywhere, and the
+  derivatives, advanced-orders, user-data and ws-execution constructors each
+  chose their own market, so nothing looked missing from the outside.
+  Every exchange constructor now takes the market, and the two per-order modes
+  with it — six venues between them carry `margin_mode` or the position side on
+  the order itself, so neither can be set after the first order. The C ABI's
+  five connect entry points gained the codes, and the Go, C#, Java and R
+  wrappers pass them; Python and Node take them as optional arguments, Go as an
+  `Options` struct through a new `ConnectWith`, C# as optional parameters, Java
+  as an overload, and R as defaulted arguments — so no existing call site
+  changes.
+  **Only spot and USDⓈ-margined futures are offered.** `MarketType` also has
+  `CoinMFutures` and `Margin`, and no client routes either consistently: Binance
+  treats coin-margined as spot outright, five venues route it to their USDT
+  futures path, and only Bybit maps it to a genuine inverse category; `Margin`
+  is routed nowhere. Offering them would hand a caller a name that does not
+  describe where the order goes — the defect this parameter exists to end — so
+  an unrouted market is refused rather than silently downgraded to spot.
+
 - **Every WebSocket order dropped a flag its own REST path sends.** Smaller than
   the trigger defect above and the same shape: the request carried a field, the
   REST body honoured it, and the WebSocket frame on the same client left it out.

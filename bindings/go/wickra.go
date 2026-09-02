@@ -161,8 +161,47 @@ func ReplayTrades(market string, tape []float64, balances map[string]float64, ma
 	return wrap(handle, "replay")
 }
 
-// Connect opens a live client for name, authenticated with API keys.
+// Market selects which of a venue's markets a client trades.
+type Market int32
+
+// The markets this binding offers. Spot is the zero value, so a zero Options
+// keeps the previous behaviour. Coin-margined and margin are deliberately
+// absent: no client routes them consistently, and Binance treats coin-margined
+// as spot outright.
+const (
+	MarketSpot        Market = C.WICKRA_MARKET_SPOT
+	MarketUSDMFutures Market = C.WICKRA_MARKET_USDM_FUTURES
+)
+
+// PositionMode is one net position per symbol, or a long and a short at once.
+// Two venues carry the margin mode on every order and four carry the position
+// side, so both have to be set before the first order rather than after it.
+type PositionMode int32
+
+const (
+	PositionOneWay PositionMode = C.WICKRA_POSITION_ONE_WAY
+	PositionHedge  PositionMode = C.WICKRA_POSITION_HEDGE
+)
+
+// Options configures a live client beyond its name and credentials. The zero
+// value is mainnet spot with cross margin in one-way mode, which is what
+// Connect used to be fixed at.
+type Options struct {
+	Testnet      bool
+	Market       Market
+	MarginMode   MarginMode
+	PositionMode PositionMode
+}
+
+// Connect opens a live client for name on the spot market, authenticated with
+// API keys. Use ConnectWith to reach a futures market or to set the margin and
+// position modes.
 func Connect(name, apiKey, apiSecret, passphrase, privateKey string, testnet bool) (*Exchange, error) {
+	return ConnectWith(name, apiKey, apiSecret, passphrase, privateKey, Options{Testnet: testnet})
+}
+
+// ConnectWith opens a live client for name with the given options.
+func ConnectWith(name, apiKey, apiSecret, passphrase, privateKey string, opts Options) (*Exchange, error) {
 	cName := C.CString(name)
 	cKey := C.CString(apiKey)
 	cSecret := C.CString(apiSecret)
@@ -178,7 +217,8 @@ func Connect(name, apiKey, apiSecret, passphrase, privateKey string, testnet boo
 		cPriv = C.CString(privateKey)
 		defer C.free(unsafe.Pointer(cPriv))
 	}
-	handle := C.wickra_connect(cName, cKey, cSecret, cPass, cPriv, C.bool(testnet))
+	handle := C.wickra_connect(cName, cKey, cSecret, cPass, cPriv, C.bool(opts.Testnet),
+		C.int32_t(opts.Market), C.int32_t(opts.MarginMode), C.int32_t(opts.PositionMode))
 	return wrap(handle, name)
 }
 
@@ -560,7 +600,8 @@ func ConnectDerivatives(name, apiKey, apiSecret, passphrase, privateKey string, 
 		cPriv = C.CString(privateKey)
 		defer C.free(unsafe.Pointer(cPriv))
 	}
-	handle := C.wickra_connect_derivatives(cName, cKey, cSecret, cPass, cPriv, C.bool(testnet))
+	handle := C.wickra_connect_derivatives(cName, cKey, cSecret, cPass, cPriv, C.bool(testnet),
+		C.int32_t(MarginCross), C.int32_t(PositionOneWay))
 	if handle == nil {
 		return nil, fmt.Errorf("wickra: failed to connect derivatives client for %s", name)
 	}
@@ -670,7 +711,8 @@ func ConnectAdvanced(name, apiKey, apiSecret, passphrase, privateKey string, tes
 		cPriv = C.CString(privateKey)
 		defer C.free(unsafe.Pointer(cPriv))
 	}
-	handle := C.wickra_connect_advanced(cName, cKey, cSecret, cPass, cPriv, C.bool(testnet), C.bool(futures))
+	handle := C.wickra_connect_advanced(cName, cKey, cSecret, cPass, cPriv, C.bool(testnet),
+		C.bool(futures), C.int32_t(MarginCross), C.int32_t(PositionOneWay))
 	if handle == nil {
 		return nil, fmt.Errorf("wickra: failed to connect advanced-orders client for %s", name)
 	}
@@ -842,7 +884,8 @@ func ConnectUserData(name, apiKey, apiSecret, passphrase, privateKey string, tes
 		cPriv = C.CString(privateKey)
 		defer C.free(unsafe.Pointer(cPriv))
 	}
-	handle := C.wickra_connect_user_data(cName, cKey, cSecret, cPass, cPriv, C.bool(testnet), C.bool(futures))
+	handle := C.wickra_connect_user_data(cName, cKey, cSecret, cPass, cPriv, C.bool(testnet),
+		C.bool(futures), C.int32_t(MarginCross), C.int32_t(PositionOneWay))
 	if handle == nil {
 		return nil, fmt.Errorf("wickra: failed to connect user-data client for %s", name)
 	}
@@ -916,7 +959,8 @@ func ConnectWsExecution(name, apiKey, apiSecret, passphrase, privateKey string, 
 		cPriv = C.CString(privateKey)
 		defer C.free(unsafe.Pointer(cPriv))
 	}
-	handle := C.wickra_connect_ws_execution(cName, cKey, cSecret, cPass, cPriv, C.bool(testnet), C.bool(futures))
+	handle := C.wickra_connect_ws_execution(cName, cKey, cSecret, cPass, cPriv, C.bool(testnet),
+		C.bool(futures), C.int32_t(MarginCross), C.int32_t(PositionOneWay))
 	if handle == nil {
 		return nil, fmt.Errorf("wickra: failed to connect ws-execution client for %s", name)
 	}

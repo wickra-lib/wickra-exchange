@@ -25,6 +25,12 @@ internal static unsafe class Native
     public const int EventSubscribed = 4;
     public const int EventOther = 5;
 
+    public const int MarketSpot = 0;
+    public const int MarketUsdMFutures = 1;
+
+    public const int PositionOneWay = 0;
+    public const int PositionHedge = 1;
+
     public const int MarginCross = 0;
     public const int MarginIsolated = 1;
 
@@ -72,7 +78,7 @@ internal static unsafe class Native
     [DllImport(Lib)]
     public static extern nint wickra_connect(
         byte* name, byte* apiKey, byte* apiSecret, byte* passphrase, byte* privateKey,
-        [MarshalAs(UnmanagedType.U1)] bool testnet);
+        [MarshalAs(UnmanagedType.U1)] bool testnet, int marketType, int marginMode, int positionMode);
 
     [DllImport(Lib)]
     public static extern void wickra_exchange_free(nint handle);
@@ -173,7 +179,7 @@ internal static unsafe class Native
     [DllImport(Lib)]
     public static extern nint wickra_connect_derivatives(
         byte* name, byte* apiKey, byte* apiSecret, byte* passphrase, byte* privateKey,
-        [MarshalAs(UnmanagedType.U1)] bool testnet);
+        [MarshalAs(UnmanagedType.U1)] bool testnet, int marginMode, int positionMode);
 
     [DllImport(Lib)]
     public static extern void wickra_derivatives_free(nint handle);
@@ -196,7 +202,8 @@ internal static unsafe class Native
     [DllImport(Lib)]
     public static extern nint wickra_connect_advanced(
         byte* name, byte* apiKey, byte* apiSecret, byte* passphrase, byte* privateKey,
-        [MarshalAs(UnmanagedType.U1)] bool testnet, [MarshalAs(UnmanagedType.U1)] bool futures);
+        [MarshalAs(UnmanagedType.U1)] bool testnet, [MarshalAs(UnmanagedType.U1)] bool futures,
+        int marginMode, int positionMode);
 
     [DllImport(Lib)]
     public static extern void wickra_advanced_free(nint handle);
@@ -221,7 +228,8 @@ internal static unsafe class Native
     [DllImport(Lib)]
     public static extern nint wickra_connect_user_data(
         byte* name, byte* apiKey, byte* apiSecret, byte* passphrase, byte* privateKey,
-        [MarshalAs(UnmanagedType.U1)] bool testnet, [MarshalAs(UnmanagedType.U1)] bool futures);
+        [MarshalAs(UnmanagedType.U1)] bool testnet, [MarshalAs(UnmanagedType.U1)] bool futures,
+        int marginMode, int positionMode);
 
     [DllImport(Lib)]
     public static extern void wickra_user_data_free(nint handle);
@@ -238,7 +246,8 @@ internal static unsafe class Native
     [DllImport(Lib)]
     public static extern nint wickra_connect_ws_execution(
         byte* name, byte* apiKey, byte* apiSecret, byte* passphrase, byte* privateKey,
-        [MarshalAs(UnmanagedType.U1)] bool testnet, [MarshalAs(UnmanagedType.U1)] bool futures);
+        [MarshalAs(UnmanagedType.U1)] bool testnet, [MarshalAs(UnmanagedType.U1)] bool futures,
+        int marginMode, int positionMode);
 
     [DllImport(Lib)]
     public static extern void wickra_ws_execution_free(nint handle);

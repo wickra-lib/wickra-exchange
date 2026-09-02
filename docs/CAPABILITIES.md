@@ -61,6 +61,29 @@ branch to the other without the test changing.
 > run time. (The C-ABI `order_book` projects the bid/ask levels; the venue
 > sequence id stays on the native Rust/Python/Node path.)
 >
+> **What that check does not cover, and what it cost.** It reads the canonical
+> verb set and holds every binding to it — so it counts *verbs*, not reachable
+> *configurations*. Every binding carried `place_order`, and every binding built
+> its exchange client with `MarketType::Spot` hardcoded. The full surface was
+> present and half the markets were unreachable: no caller in Python, Node, C,
+> C++, C#, Go, Java or R could place a futures order, read a futures book, or
+> cancel a futures order. The derivatives, advanced-orders, user-data and
+> ws-execution constructors each chose their own market, which is why nothing
+> looked missing. Every binding's exchange constructor now takes the market, and
+> the two per-order modes with it — `margin_mode` and `position_mode` are
+> carried on the order by six venues between them, so neither can be set after
+> the first order is placed.
+>
+> Only **spot** and **USDⓈ-margined futures** are offered. `MarketType` also has
+> `CoinMFutures` and `Margin`, and no client routes either consistently: Binance
+> treats coin-margined as spot outright (its `is_futures` is USDⓈ-only and its
+> base URL falls through to the spot host), five venues route it to their USDT
+> futures path, and only Bybit maps it to a genuine inverse category. `Margin`
+> is routed nowhere. A binding that offered them would hand a caller a name that
+> does not describe where the order goes, which is the defect the parameter
+> exists to end — so they are refused, loudly, rather than silently downgraded
+> to spot.
+>
 > The **WASM** binding is deliberately outside this claim. It targets
 > `wasm32-unknown-unknown`, which has no sockets, so it carries the offline
 > paper and replay simulators and no live venue client at all — see

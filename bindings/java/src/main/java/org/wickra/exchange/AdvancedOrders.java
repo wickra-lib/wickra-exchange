@@ -37,7 +37,8 @@ public final class AdvancedOrders implements AutoCloseable {
             MemorySegment priv = privateKey == null ? MemorySegment.NULL : arena.allocateFrom(privateKey);
             MemorySegment h = (MemorySegment) Native.CONNECT_ADVANCED.invokeExact(
                     arena.allocateFrom(name), arena.allocateFrom(apiKey), arena.allocateFrom(apiSecret),
-                    pass, priv, (byte) (testnet ? 1 : 0), (byte) (futures ? 1 : 0));
+                    pass, priv, (byte) (testnet ? 1 : 0), (byte) (futures ? 1 : 0),
+                    Native.MARGIN_CROSS, Native.POSITION_ONE_WAY);
             if (h == null || h.equals(MemorySegment.NULL)) {
                 throw new RuntimeException("failed to connect advanced-orders client for " + name);
             }

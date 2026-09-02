@@ -24,8 +24,8 @@ use wickra_exchange::{
     connect, connect_advanced, connect_derivatives, connect_user_data, connect_ws_execution,
     AdvancedOrders, BookLevel, Candle, Credentials, Derivatives, Error, Event, Exchange,
     ExchangeOptions, MarginMode, MarketType, OcoRequest, Order, OrderRequest, OrderSide,
-    OrderStatus, PaperExchange, Position, PositionSide, ReplayExchange, Symbol, Ticker, TradePrint,
-    WsExecution, WsUserData,
+    OrderStatus, PaperExchange, Position, PositionMode, PositionSide, ReplayExchange, Symbol,
+    Ticker, TradePrint, WsExecution, WsUserData,
 };
 
 /// Success.
@@ -49,6 +49,26 @@ pub const WICKRA_ERR_OTHER: i32 = -7;
 pub const WICKRA_SIDE_BUY: i32 = 0;
 /// Order side: sell.
 pub const WICKRA_SIDE_SELL: i32 = 1;
+
+/// Market: spot.
+pub const WICKRA_MARKET_SPOT: i32 = 0;
+/// Market: USDⓈ-margined linear perpetual / futures.
+pub const WICKRA_MARKET_USDM_FUTURES: i32 = 1;
+
+// `MarketType` also has `CoinMFutures` and `Margin`, and this ABI deliberately
+// does not offer them. No client routes them consistently: Binance treats
+// coin-margined as spot outright -- its `is_futures` is USDⓈ-only and its base
+// URL falls through to the spot host -- five venues route it to their USDT
+// futures path, and only Bybit maps it to a genuine inverse category. `Margin`
+// is routed nowhere. Exposing either would hand a caller a name that does not
+// describe where the order goes, which is the class of defect this parameter
+// exists to end. The numbering follows `MarketType` so the codes need no
+// renumbering if the routing is completed later.
+
+/// Position mode: one net position per symbol.
+pub const WICKRA_POSITION_ONE_WAY: i32 = 0;
+/// Position mode: separate long and short positions per symbol.
+pub const WICKRA_POSITION_HEDGE: i32 = 1;
 
 /// Margin mode: cross (margin shared across positions).
 pub const WICKRA_MARGIN_CROSS: i32 = 0;
@@ -367,6 +387,48 @@ fn fill_order(dst: &mut WickraOrder, order: &Order) {
     dst.average_price = order.average_price.map_or(f64::NAN, to_float);
 }
 
+/// The market for a code, or `None` for one this ABI does not offer.
+///
+/// A refused code returns a null handle rather than quietly falling back to
+/// spot: a caller who asked for a futures market and silently got a spot client
+/// would place spot orders believing they were futures.
+fn market_type_from_code(code: i32) -> Option<MarketType> {
+    match code {
+        WICKRA_MARKET_SPOT => Some(MarketType::Spot),
+        WICKRA_MARKET_USDM_FUTURES => Some(MarketType::UsdMFutures),
+        _ => None,
+    }
+}
+
+/// The position mode for a code, defaulting to one-way.
+fn position_mode_from_code(code: i32) -> PositionMode {
+    if code == WICKRA_POSITION_HEDGE {
+        PositionMode::Hedge
+    } else {
+        PositionMode::OneWay
+    }
+}
+
+/// Options for a live connection, from the three configuration codes every
+/// connect entry point now takes.
+fn live_options(
+    testnet: bool,
+    market_type: i32,
+    margin_mode: i32,
+    position_mode: i32,
+) -> Option<ExchangeOptions> {
+    let market = market_type_from_code(market_type)?;
+    let margin = margin_mode_from_code(margin_mode)?;
+    let mut options = if testnet {
+        ExchangeOptions::testnet(market)
+    } else {
+        ExchangeOptions::mainnet(market)
+    };
+    options.margin_mode = margin;
+    options.position_mode = position_mode_from_code(position_mode);
+    Some(options)
+}
+
 fn margin_mode_from_code(code: i32) -> Option<MarginMode> {
     match code {
         WICKRA_MARGIN_CROSS => Some(MarginMode::Cross),
@@ -608,6 +670,9 @@ pub unsafe extern "C" fn wickra_connect(
     passphrase: *const c_char,
     private_key: *const c_char,
     testnet: bool,
+    market_type: i32,
+    margin_mode: i32,
+    position_mode: i32,
 ) -> *mut WickraExchange {
     let (Some(name), Some(api_key), Some(api_secret)) =
         (unsafe { (opt_str(name), opt_str(api_key), opt_str(api_secret)) })
@@ -621,10 +686,8 @@ pub unsafe extern "C" fn wickra_connect(
     if let Some(private_key) = unsafe { opt_str(private_key) } {
         credentials = credentials.with_private_key(private_key);
     }
-    let options = if testnet {
-        ExchangeOptions::testnet(MarketType::Spot)
-    } else {
-        ExchangeOptions::mainnet(MarketType::Spot)
+    let Some(options) = live_options(testnet, market_type, margin_mode, position_mode) else {
+        return core::ptr::null_mut();
     };
     match connect(name, credentials, &options) {
         Ok(live) => Box::into_raw(Box::new(WickraExchange {
@@ -1177,6 +1240,8 @@ pub unsafe extern "C" fn wickra_connect_derivatives(
     passphrase: *const c_char,
     private_key: *const c_char,
     testnet: bool,
+    margin_mode: i32,
+    position_mode: i32,
 ) -> *mut WickraDerivatives {
     let (Some(name), Some(api_key), Some(api_secret)) =
         (unsafe { (opt_str(name), opt_str(api_key), opt_str(api_secret)) })
@@ -1190,10 +1255,13 @@ pub unsafe extern "C" fn wickra_connect_derivatives(
     if let Some(private_key) = unsafe { opt_str(private_key) } {
         credentials = credentials.with_private_key(private_key);
     }
-    let options = if testnet {
-        ExchangeOptions::testnet(MarketType::UsdMFutures)
-    } else {
-        ExchangeOptions::mainnet(MarketType::UsdMFutures)
+    let Some(options) = live_options(
+        testnet,
+        WICKRA_MARKET_USDM_FUTURES,
+        margin_mode,
+        position_mode,
+    ) else {
+        return core::ptr::null_mut();
     };
     match connect_derivatives(name, credentials, &options) {
         Ok(inner) => Box::into_raw(Box::new(WickraDerivatives { inner })),
@@ -1394,6 +1462,8 @@ pub unsafe extern "C" fn wickra_connect_advanced(
     private_key: *const c_char,
     testnet: bool,
     futures: bool,
+    margin_mode: i32,
+    position_mode: i32,
 ) -> *mut WickraAdvanced {
     let (Some(name), Some(api_key), Some(api_secret)) =
         (unsafe { (opt_str(name), opt_str(api_key), opt_str(api_secret)) })
@@ -1407,15 +1477,13 @@ pub unsafe extern "C" fn wickra_connect_advanced(
     if let Some(private_key) = unsafe { opt_str(private_key) } {
         credentials = credentials.with_private_key(private_key);
     }
-    let market_type = if futures {
-        MarketType::UsdMFutures
+    let market = if futures {
+        WICKRA_MARKET_USDM_FUTURES
     } else {
-        MarketType::Spot
+        WICKRA_MARKET_SPOT
     };
-    let options = if testnet {
-        ExchangeOptions::testnet(market_type)
-    } else {
-        ExchangeOptions::mainnet(market_type)
+    let Some(options) = live_options(testnet, market, margin_mode, position_mode) else {
+        return core::ptr::null_mut();
     };
     match connect_advanced(name, credentials, &options) {
         Ok(inner) => Box::into_raw(Box::new(WickraAdvanced { inner })),
@@ -1662,6 +1730,8 @@ pub unsafe extern "C" fn wickra_connect_user_data(
     private_key: *const c_char,
     testnet: bool,
     futures: bool,
+    margin_mode: i32,
+    position_mode: i32,
 ) -> *mut WickraUserData {
     let (Some(name), Some(api_key), Some(api_secret)) =
         (unsafe { (opt_str(name), opt_str(api_key), opt_str(api_secret)) })
@@ -1675,15 +1745,13 @@ pub unsafe extern "C" fn wickra_connect_user_data(
     if let Some(private_key) = unsafe { opt_str(private_key) } {
         credentials = credentials.with_private_key(private_key);
     }
-    let market_type = if futures {
-        MarketType::UsdMFutures
+    let market = if futures {
+        WICKRA_MARKET_USDM_FUTURES
     } else {
-        MarketType::Spot
+        WICKRA_MARKET_SPOT
     };
-    let options = if testnet {
-        ExchangeOptions::testnet(market_type)
-    } else {
-        ExchangeOptions::mainnet(market_type)
+    let Some(options) = live_options(testnet, market, margin_mode, position_mode) else {
+        return core::ptr::null_mut();
     };
     match connect_user_data(name, credentials, &options) {
         Ok(inner) => Box::into_raw(Box::new(WickraUserData { inner })),
@@ -1779,6 +1847,8 @@ pub unsafe extern "C" fn wickra_connect_ws_execution(
     private_key: *const c_char,
     testnet: bool,
     futures: bool,
+    margin_mode: i32,
+    position_mode: i32,
 ) -> *mut WickraWsExecution {
     let (Some(name), Some(api_key), Some(api_secret)) =
         (unsafe { (opt_str(name), opt_str(api_key), opt_str(api_secret)) })
@@ -1792,15 +1862,13 @@ pub unsafe extern "C" fn wickra_connect_ws_execution(
     if let Some(private_key) = unsafe { opt_str(private_key) } {
         credentials = credentials.with_private_key(private_key);
     }
-    let market_type = if futures {
-        MarketType::UsdMFutures
+    let market = if futures {
+        WICKRA_MARKET_USDM_FUTURES
     } else {
-        MarketType::Spot
+        WICKRA_MARKET_SPOT
     };
-    let options = if testnet {
-        ExchangeOptions::testnet(market_type)
-    } else {
-        ExchangeOptions::mainnet(market_type)
+    let Some(options) = live_options(testnet, market, margin_mode, position_mode) else {
+        return core::ptr::null_mut();
     };
     match connect_ws_execution(name, credentials, &options) {
         Ok(inner) => Box::into_raw(Box::new(WickraWsExecution { inner })),
@@ -2320,6 +2388,8 @@ mod tests {
                 core::ptr::null(),
                 core::ptr::null(),
                 false,
+                WICKRA_MARGIN_CROSS,
+                WICKRA_POSITION_ONE_WAY,
             )
         };
         assert!(handle.is_null(), "coinbase has no derivatives market");
@@ -2347,6 +2417,44 @@ mod tests {
     }
 
     #[test]
+    fn every_market_is_reachable_and_the_modes_are_carried() {
+        // `wickra_connect` used to build `MarketType::Spot` and nothing else,
+        // so no caller over this ABI -- C, C++, Go, C#, Java or R -- could
+        // place a futures order, read a futures book, or cancel a futures
+        // order. The three codes are what fixes that, and this pins the mapping
+        // rather than the socket: construction is offline.
+        for (code, expected) in [
+            (WICKRA_MARKET_SPOT, MarketType::Spot),
+            (WICKRA_MARKET_USDM_FUTURES, MarketType::UsdMFutures),
+        ] {
+            let options = live_options(false, code, WICKRA_MARGIN_CROSS, WICKRA_POSITION_ONE_WAY)
+                .expect("a market this ABI offers");
+            assert_eq!(options.market_type, expected);
+        }
+
+        // A code this ABI does not offer is refused rather than falling back to
+        // spot. Silently downgrading a futures request to spot is precisely the
+        // defect the parameter exists to end, so it must not be the failure
+        // mode of the parameter itself.
+        assert!(live_options(false, 2, WICKRA_MARGIN_CROSS, WICKRA_POSITION_ONE_WAY).is_none());
+        assert!(live_options(false, 99, WICKRA_MARGIN_CROSS, WICKRA_POSITION_ONE_WAY).is_none());
+
+        // Both modes reach the client: two venues carry the margin mode on
+        // every order and four carry the position side, so neither can be set
+        // after the first order.
+        let hedged = live_options(
+            true,
+            WICKRA_MARKET_USDM_FUTURES,
+            WICKRA_MARGIN_ISOLATED,
+            WICKRA_POSITION_HEDGE,
+        )
+        .expect("usdm futures with isolated margin in hedge mode");
+        assert!(hedged.testnet);
+        assert_eq!(hedged.margin_mode, MarginMode::Isolated);
+        assert_eq!(hedged.position_mode, PositionMode::Hedge);
+    }
+
+    #[test]
     fn derivatives_bad_margin_mode_is_invalid_arg() {
         // Construction is offline (no socket until an RPC is issued), so a live
         // handle can be built and the argument validation exercised without a
@@ -2360,6 +2468,8 @@ mod tests {
                 core::ptr::null(),
                 core::ptr::null(),
                 false,
+                WICKRA_MARGIN_CROSS,
+                WICKRA_POSITION_ONE_WAY,
             )
         };
         assert!(!handle.is_null());
@@ -2383,6 +2493,8 @@ mod tests {
                 core::ptr::null(),
                 false,
                 false,
+                WICKRA_MARGIN_CROSS,
+                WICKRA_POSITION_ONE_WAY,
             )
         };
         assert!(handle.is_null(), "upbit has no advanced-order surface");
@@ -2399,6 +2511,8 @@ mod tests {
                 core::ptr::null(),
                 false,
                 false,
+                WICKRA_MARGIN_CROSS,
+                WICKRA_POSITION_ONE_WAY,
             )
         }
     }
@@ -2414,6 +2528,8 @@ mod tests {
                 core::ptr::null(),
                 false,
                 false,
+                WICKRA_MARGIN_CROSS,
+                WICKRA_POSITION_ONE_WAY,
             )
         }
     }
@@ -2553,6 +2669,8 @@ mod tests {
                 core::ptr::null(),
                 false,
                 false,
+                WICKRA_MARGIN_CROSS,
+                WICKRA_POSITION_ONE_WAY,
             )
         };
         assert!(!handle.is_null());
@@ -2584,6 +2702,8 @@ mod tests {
                 core::ptr::null(),
                 core::ptr::null(),
                 false,
+                WICKRA_MARGIN_CROSS,
+                WICKRA_POSITION_ONE_WAY,
             )
         }
     }
@@ -2599,6 +2719,8 @@ mod tests {
                 core::ptr::null(),
                 false,
                 false,
+                WICKRA_MARGIN_CROSS,
+                WICKRA_POSITION_ONE_WAY,
             )
         }
     }
