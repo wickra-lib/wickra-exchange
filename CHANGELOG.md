@@ -40,20 +40,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **The CodSpeed job now records the machine it measured on.** Every
-  `pull_request` run has reported `apply_delta` at 453.6 ns and every `push`
-  run at 399.4 ns — across four branches and two unrelated diffs, one of which
-  merged, after which `main` went on reporting 399.4 while carrying the very
-  code the branch had "regressed" on. A second branch that added a WASM binding
-  and touched neither `orderbook.rs` nor the bench crate produced the same
-  453.6. The figure tracks the trigger, not the source, and the generated
-  assembly for `apply_delta` and its one callee is identical between the two
-  once basic-block labels are normalised. CodSpeed reports "Different runtime
-  environments detected" without naming the dimension, and the job logged
-  nothing that would let anyone check; it now prints the CPU model, kernel and
-  toolchain, so the next pair of runs either shows the difference or rules the
-  hardware out. Left failing rather than silenced: a threshold wide enough to
-  hide a constant 12% offset would hide a real 12% regression too.
+- **The CodSpeed job now records the machine it measured on.** The job spent an
+  evening failing every pull request with the same figure: `apply_delta` at
+  453.6 ns against a 399.4 ns base, on five runs across two branches whose diffs
+  had nothing in common — the second touched neither `orderbook.rs` nor the
+  bench crate — while `main` went on reporting 399.4 although it already carried
+  the code the first branch had "regressed" on. It was never a real regression,
+  and that part is settled rather than assumed: built with `--emit=asm`, the two
+  functions the benchmark executes are identical between the revisions,
+  `apply_delta` modulo basic-block label numbering and `apply_level` but for the
+  names of anonymous panic constants. The offset then disappeared on its own
+  once `main` was measured again on a later commit, and base and head have
+  agreed since. So the cause lay in the comparison rather than the source, but
+  which part of it is not established — CodSpeed reported "Different runtime
+  environments detected" without naming the dimension, and separately fell back
+  to an unexpected base commit. The job now logs the CPU, kernel and toolchain
+  of whatever machine produced a number, so a recurrence is diagnosable instead
+  of re-derived from scratch. No threshold was added: one wide enough to hide a
+  constant 12% offset would hide a real 12% regression too.
 
 - `@napi-rs/cli` 3.7.4 → 3.8.6, with the regenerated `bindings/node/index.js`.
   The new CLI emits a different native loader — it chains load errors instead of
