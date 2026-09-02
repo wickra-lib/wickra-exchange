@@ -503,6 +503,9 @@ impl Gate {
             };
             req_param["text"] = serde_json::json!(text);
         }
+        if let Some(act) = stp_act_str(request.stp) {
+            req_param["stp_act"] = serde_json::json!(act);
+        }
         let result = self.ws_api_request("spot.order_place", &req_param)?;
         let raw: RawOrder =
             serde_json::from_value(result).map_err(|e| Error::Deserialization(e.to_string()))?;
@@ -1856,6 +1859,33 @@ mod tests {
         assert_eq!(signed_subs, 4);
         assert_eq!(ws.connected_urls().len(), 2);
         assert_eq!(ws.connected_urls()[1], "wss://api.gateio.ws/ws/v4/");
+    }
+
+    #[test]
+    fn the_websocket_frame_carries_the_stp_policy() {
+        // `stp_act` is on the REST spot body and was missing from this frame,
+        // which otherwise uses the same field names.
+        let (mut gate, ws) = signed_ws_client(1_700_000_000_000);
+        ws.push_connection(vec![
+            Ok(Some(
+                r#"{"request_id":"login","header":{"status":"200","channel":"spot.login",
+                "event":"api"},"data":{"result":{"api_key":"APIKEY"}}}"#
+                    .to_string(),
+            )),
+            Ok(Some(
+                r#"{"request_id":"b","header":{"status":"200","channel":"spot.order_place",
+                "event":"api"},"data":{"result":{"id":"55","text":"","currency_pair":"BTC_USDT",
+                "side":"buy","type":"limit","status":"open","amount":"1","left":"1","price":"100",
+                "avg_deal_price":"0"}}}"#
+                    .to_string(),
+            )),
+        ]);
+        gate.place_order_ws(
+            &OrderRequest::limit_buy(symbol(), dec!(1), dec!(100))
+                .with_stp(SelfTradePrevention::ExpireTaker),
+        )
+        .unwrap();
+        assert!(ws.sent()[1].contains(r#""stp_act":"cn""#));
     }
 
     #[test]

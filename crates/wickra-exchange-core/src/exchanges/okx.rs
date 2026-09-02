@@ -499,6 +499,11 @@ impl Okx {
         }
         if let Some(pos_side) = self.pos_side(request) {
             arg["posSide"] = serde_json::json!(pos_side);
+        } else if request.reduce_only {
+            arg["reduceOnly"] = serde_json::json!(true);
+        }
+        if let Some(mode) = stp_mode_str(request.stp) {
+            arg["stpMode"] = serde_json::json!(mode);
         }
         let data = self.ws_order_request("order", &arg)?;
         let list: Vec<PlaceResult> = parse_json(data)?;
@@ -2460,6 +2465,29 @@ mod tests {
             .unwrap();
 
         assert!(ws.sent()[1].contains(r#""tdMode":"isolated""#));
+    }
+
+    #[test]
+    fn the_websocket_frame_carries_reduce_only_and_the_stp_policy() {
+        // Both are honoured on the REST body and were dropped from this frame,
+        // which uses the same key spellings.
+        let (mut okx, ws) = signed_ws_client(1_700_000_000_000);
+        ws.push_connection(vec![
+            Ok(Some(r#"{"event":"login","code":"0"}"#.to_string())),
+            Ok(Some(
+                r#"{"id":"1700000000","op":"order","code":"0","msg":"","data":[{"ordId":"55",
+                "clOrdId":"","sCode":"0","sMsg":""}]}"#
+                    .to_string(),
+            )),
+        ]);
+        okx.place_order_ws(
+            &OrderRequest::limit_buy(symbol(), dec!(1), dec!(100))
+                .reduce_only()
+                .with_stp(SelfTradePrevention::ExpireTaker),
+        )
+        .unwrap();
+        assert!(ws.sent()[1].contains(r#""reduceOnly":true"#));
+        assert!(ws.sent()[1].contains(r#""stpMode":"cancel_taker""#));
     }
 
     #[test]

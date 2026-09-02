@@ -610,6 +610,18 @@ impl Kraken {
             return Err(Error::unsupported_trigger("Kraken"));
         }
         self.ensure_one_way()?;
+        // The REST spot body spells post-only as `oflags=post`; this frame is
+        // the v2 WebSocket protocol, which names every other field differently
+        // (`order_qty`, `limit_price`, `cl_ord_id`), so the REST spelling does
+        // not carry over. Sending the order without it would place a limit that
+        // may take liquidity -- the one thing post-only exists to prevent.
+        if request.post_only {
+            return Err(Error::Exchange {
+                code: "unsupported".to_string(),
+                message: "Kraken: post-only is not wired on the v2 WebSocket order                           API; place post-only orders over REST (/0/private/AddOrder)"
+                    .to_string(),
+            });
+        }
         request.validate()?;
         let mut params = serde_json::Map::new();
         params.insert(
@@ -2365,6 +2377,24 @@ mod tests {
         .with_ws(Box::new(ArcWs(Arc::clone(&ws))))
         .with_clock(Box::new(move || now_ms));
         (kraken, http, ws)
+    }
+
+    #[test]
+    fn the_websocket_path_refuses_post_only_rather_than_dropping_it() {
+        // The REST spot body spells post-only as `oflags=post`; this frame is
+        // the v2 protocol, which names every other field differently, so the
+        // REST spelling proves nothing about it. Sending the order without the
+        // flag would place a limit that may take liquidity.
+        let (mut kraken, _http, _ws) = signed_ws_client(1000);
+        let err = kraken
+            .place_order_ws(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)).post_only())
+            .unwrap_err();
+        assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
+
+        // Without the flag the same client reaches the connection instead.
+        let (mut plain, _http2, ws2) = signed_ws_client(1000);
+        let _ = plain.place_order_ws(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)));
+        let _ = ws2;
     }
 
     fn signed_futures_ws_client(now_ms: i64) -> (Kraken, Arc<MockWsTransport>) {
