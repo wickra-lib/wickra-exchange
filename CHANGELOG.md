@@ -236,23 +236,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the previous behaviour.
   `position_mode` remains the one field nothing reads; it is a separate fix.
 
-- **The CodSpeed comparison is bimodal per runner CPU, and now says so.** The
-  job reported `apply_delta` at 453.6 ns against a 399.4 ns base on this
-  release's documentation branch — the same pair as the earlier incident, to the
-  decimal, on a pull request whose only non-comment Rust change was one name
-  removed from a re-export list and one `pub` narrowed to `pub(crate)` on a
-  test-only mock. The base-commit fallback that explained the first occurrence
-  was ruled out: the base was measured on the newest `main` commit. The
-  diagnostic step added last time then answered it in one run — the base ran on
-  an AMD EPYC 7763 (family 25 model 1) and the head on an EPYC 9V74 (family 25
-  model 17), with the same kernel, rustc and LLVM on both. `simulation` mode
-  counts instructions, but the nanosecond figure is modelled from them against
-  the host's cache geometry, and Milan and Genoa do not share one; GitHub's
-  `ubuntu-latest` pool holds both. No fix is available — a standard runner
-  cannot be pinned to a CPU generation, and a threshold wide enough to swallow
-  12% would swallow a real 12% regression. The workflow comment now says to
-  compare the two recorded CPU lines before the diff, and names the figures the
-  artefact reproduces at.
+- **The CodSpeed artefact is not the runner CPU, and the entry that said it was
+  is corrected here.** The previous entry read the `apply_delta` figure as
+  bimodal per CPU: base on an EPYC 7763 at 399.4 ns, head on an EPYC 9V74 at
+  453.6 ns, everything else equal. The next occurrence had the CPUs the other
+  way round — base on the 9V74 at 399.4, head on the 7763 at 455 — so one EPYC
+  7763 run produced each of the two figures and the machine explains neither.
+  Nor is it "head runs measure high": two pull requests in between reported no
+  change at all, one of them against the same base commit.
+  What *is* established, by the method the first incident introduced: the code
+  does not move. Built with `--emit=asm` on both revisions, `apply_delta` and
+  `apply_level` — the two functions the benchmark executes — are byte-identical
+  between `main` and the pull request's head once basic-block label numbering is
+  normalised. The figure moves while the instruction stream does not, and the
+  cause is not known. The workflow comment now says that, and says how to check
+  the next one: compare the recorded CPUs, look for the report's footnote naming
+  a base commit older than `main`'s head, and diff the emitted assembly for the
+  function named. No threshold was added, for the same reason as before — one
+  wide enough to swallow 12% would swallow a real 12% regression.
 
 - **A public type nobody could name, and three doc links to nothing.**
   `MockWsConnection` was exported from the crate root, but `connect` hands it
