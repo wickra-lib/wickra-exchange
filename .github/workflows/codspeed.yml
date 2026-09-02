@@ -66,8 +66,15 @@ jobs:
       # rules one explanation out. A diagnostic must never fail the job, hence
       # the fallback and the trailing `|| true`.
       - name: Record the measurement environment
+        # `github.ref` reaches the shell through the environment, not through
+        # template expansion: on a push it carries a branch name, and a branch
+        # name is attacker-controllable text that `${{ }}` would paste straight
+        # into the script (zizmor template-injection).
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
         run: |
-          echo "event=${{ github.event_name }} ref=${{ github.ref }}"
+          echo "event=${EVENT_NAME} ref=${REF}"
           echo "runner=${RUNNER_NAME:-?} arch=${RUNNER_ARCH:-?} os=${RUNNER_OS:-?}"
           echo "--- cpu ---"
           lscpu 2>/dev/null | grep -E 'Model name|CPU family|Model:|Stepping|CPU MHz' \
