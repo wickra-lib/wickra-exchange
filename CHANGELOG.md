@@ -194,6 +194,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   guards are unchanged — `from_f64` returns `None` for NaN and infinity exactly
   as before, and NaN keeps its separate meaning of "market order" on the C ABI's
   price argument.
+  The WASM test asserts only the conversions and says why: that binding reports
+  errors as a `JsValue`, and constructing one outside a wasm runtime aborts the
+  process inside wasm-bindgen rather than failing a test. The abort is also what
+  made the first draft look green locally — an aborting test never prints
+  `test result: FAILED`, so a run checked by grepping for that string reports
+  success. Checked by exit status since.
 
 - **No binding could reach a futures market.** Every binding built its exchange
   client with `MarketType::Spot` hardcoded, so no caller in Python, Node, C,

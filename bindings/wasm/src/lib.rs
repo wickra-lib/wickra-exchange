@@ -497,7 +497,10 @@ mod tests {
                 expected
             );
         }
-        assert!(to_decimal(f64::NAN).is_err());
-        assert!(to_decimal(f64::INFINITY).is_err());
+        // The non-finite guard is not asserted here. This binding reports
+        // errors as a `JsValue`, and constructing one outside a wasm runtime
+        // aborts the process inside wasm-bindgen rather than failing a test.
+        // The same guard is asserted natively in the C ABI, Python and Node
+        // suites, which run on the host.
     }
 }
