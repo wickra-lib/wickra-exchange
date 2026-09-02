@@ -202,6 +202,24 @@ impl OrderRequest {
         self
     }
 
+    /// Turn this into a trigger order that rests until the market reaches
+    /// `stop_price`: a market order becomes a [`OrderType::StopMarket`], a limit
+    /// order a [`OrderType::StopLimit`].
+    ///
+    /// A stop price is what makes an order a trigger order, so setting one
+    /// promotes the type rather than leaving a `stop_price` that the type says
+    /// to ignore. Without this the only way to build a stop was a struct
+    /// literal, which is why no binding could place one.
+    #[must_use]
+    pub fn with_stop_price(mut self, stop_price: Decimal) -> Self {
+        self.order_type = match self.order_type {
+            OrderType::Market | OrderType::StopMarket => OrderType::StopMarket,
+            OrderType::Limit | OrderType::StopLimit => OrderType::StopLimit,
+        };
+        self.stop_price = Some(stop_price);
+        self
+    }
+
     /// Set the self-trade-prevention policy.
     #[must_use]
     pub fn with_stp(mut self, stp: SelfTradePrevention) -> Self {
@@ -569,5 +587,29 @@ mod tests {
             bad_slp.validate().unwrap_err(),
             Error::InvalidOrder("stop limit price must be positive")
         );
+    }
+
+    /// A stop price promotes the order type, because a trigger price on an order
+    /// the type says is not a trigger order would be ignored by every venue.
+    #[test]
+    fn with_stop_price_promotes_the_order_type() {
+        let symbol = Symbol::new("BTC", "USDT");
+        let stop_market =
+            OrderRequest::market_sell(symbol.clone(), dec!(1)).with_stop_price(dec!(19000));
+        assert_eq!(stop_market.order_type, OrderType::StopMarket);
+        assert_eq!(stop_market.stop_price, Some(dec!(19000)));
+        assert!(stop_market.validate().is_ok());
+
+        let stop_limit = OrderRequest::limit_sell(symbol.clone(), dec!(1), dec!(18900))
+            .with_stop_price(dec!(19000));
+        assert_eq!(stop_limit.order_type, OrderType::StopLimit);
+        assert!(stop_limit.validate().is_ok());
+
+        // Applying it twice is the same order, not a further promotion.
+        let twice = OrderRequest::market_sell(symbol, dec!(1))
+            .with_stop_price(dec!(19000))
+            .with_stop_price(dec!(18500));
+        assert_eq!(twice.order_type, OrderType::StopMarket);
+        assert_eq!(twice.stop_price, Some(dec!(18500)));
     }
 }
