@@ -13,6 +13,7 @@
 //! `/api/v5/trade/order-algo` (`ordType=oco`) — OKX models an OCO as one algo
 //! order, so `place_oco` returns a single order carrying the `algoId`.
 
+use crate::clock::ServerClock;
 use crate::credentials::Credentials;
 use crate::error::{Error, Result};
 use crate::events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
@@ -82,6 +83,9 @@ pub struct Okx {
     testnet: bool,
     credentials: Option<Credentials>,
     now_ms: Box<dyn Fn() -> i64 + Send + Sync>,
+    /// Offset between this machine's clock and OKX's, applied to every signed
+    /// timestamp. Zero until [`sync_time`](Self::sync_time) is called.
+    clock: ServerClock,
     connection: Option<Box<dyn WsConnection>>,
     sub_messages: Vec<String>,
     subscriptions: Vec<(String, Symbol)>,
@@ -137,6 +141,7 @@ impl Okx {
             testnet: options.testnet,
             credentials,
             now_ms: Box::new(system_now_ms),
+            clock: ServerClock::new(),
             connection: None,
             sub_messages: Vec::new(),
             subscriptions: Vec::new(),
@@ -167,6 +172,38 @@ impl Okx {
     pub fn with_clock(mut self, now_ms: Box<dyn Fn() -> i64 + Send + Sync>) -> Self {
         self.now_ms = now_ms;
         self
+    }
+
+    /// Learn the offset between this machine's clock and OKX's, from
+    /// `GET /api/v5/public/time`.
+    ///
+    /// Explicit rather than automatic: it costs a request, and a client should
+    /// not make one the caller did not ask for. Call it once after connecting,
+    /// and again if the process runs long enough for drift to matter.
+    ///
+    /// OKX stamps every signed request with `OK-ACCESS-TIMESTAMP` and refuses
+    /// one whose time is too far from its own, so a machine a few seconds off
+    /// has every signed call rejected -- with a message about the timestamp
+    /// rather than about the clock.
+    ///
+    /// Returns the new offset in milliseconds (`server - local`).
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the request fails or the response cannot be parsed.
+    pub fn sync_time(&mut self) -> Result<i64> {
+        let local_before = (self.now_ms)();
+        let value = self.get("/api/v5/public/time", "")?;
+        // The envelope's `data` is an array of one object, and OKX reports the
+        // millisecond timestamp as a string.
+        let server_ms: i64 = value
+            .get(0)
+            .and_then(|entry| entry.get("ts"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| Error::Deserialization("public/time: no ts".into()))?
+            .parse()
+            .map_err(|_| Error::Deserialization("public/time: ts not an integer".into()))?;
+        self.clock.sync(local_before, server_ms);
+        Ok(self.clock.offset_ms())
     }
 
     /// Attach a WebSocket transport.
@@ -704,7 +741,7 @@ impl Okx {
             .passphrase
             .as_deref()
             .ok_or(Error::InvalidCredentials("OKX requires a passphrase"))?;
-        let timestamp = iso8601_from_ms((self.now_ms)());
+        let timestamp = iso8601_from_ms(self.clock.server_time_ms((self.now_ms)()));
         let request_path = if query.is_empty() {
             path.to_string()
         } else {
@@ -2243,5 +2280,51 @@ mod tests {
         let err = okx.ticker(&symbol()).unwrap_err();
         let wait = std::time::Duration::from_millis(2500);
         assert!(matches!(err, Error::RateLimited { retry_after: Some(d) } if d == wait));
+    }
+
+    /// `sync_time` reads OKX's clock, and every later signature carries the
+    /// corrected time rather than this machine's.
+    ///
+    /// OKX stamps `OK-ACCESS-TIMESTAMP` on every signed request and refuses one
+    /// whose time is too far from its own. Before this, the client signed with
+    /// the local clock alone: a machine a few seconds off had every signed call
+    /// rejected, with a message about the timestamp rather than about the clock.
+    #[test]
+    fn sync_time_corrects_the_signed_timestamp() {
+        let (mut okx, mock) = signed_client(1_000);
+        // OKX reports the millisecond timestamp as a string, inside the
+        // envelope's one-element `data` array.
+        mock.push_json(200, r#"{"code":"0","msg":"","data":[{"ts":"4000"}]}"#);
+
+        let offset = okx.sync_time().unwrap();
+        assert_eq!(offset, 3_000, "server 4000 - local 1000");
+
+        mock.push_json(
+            200,
+            r#"{"code":"0","msg":"","data":[{"ordId":"1","clOrdId":"","sCode":"0","sMsg":""}]}"#,
+        );
+        okx.place_order(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)))
+            .unwrap();
+
+        let request = &mock.recorded_requests()[1];
+        let timestamp = request
+            .headers
+            .iter()
+            .find(|(name, _)| name == "OK-ACCESS-TIMESTAMP")
+            .map(|(_, value)| value.as_str())
+            .unwrap();
+        // 1000 local + 3000 offset = 4000ms after the epoch.
+        assert_eq!(timestamp, "1970-01-01T00:00:04.000Z");
+    }
+
+    /// A malformed time response is reported, not silently treated as zero drift.
+    #[test]
+    fn sync_time_rejects_a_response_without_a_timestamp() {
+        let (mut okx, mock) = signed_client(1_000);
+        mock.push_json(200, r#"{"code":"0","msg":"","data":[{}]}"#);
+        assert!(matches!(
+            okx.sync_time().unwrap_err(),
+            Error::Deserialization(_)
+        ));
     }
 }
