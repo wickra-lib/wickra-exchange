@@ -51,6 +51,32 @@ jobs:
         with:
           tool: cargo-codspeed
 
+      # Every `pull_request` run of this job has reported `apply_delta` at
+      # 453.6 ns and every `push` run at 399.4 ns -- across four branches and
+      # two unrelated diffs, one of which then merged, after which main kept
+      # reporting 399.4 while carrying the very code the branch had
+      # "regressed" on. The number tracks the trigger, not the source: the
+      # generated assembly for `apply_delta` and its one callee is identical
+      # between the two, modulo basic-block label numbering.
+      #
+      # CodSpeed reports "Different runtime environments detected" but does not
+      # say which dimension differs, and this job recorded nothing that would
+      # let a reader check. Now it does. If the two contexts land on different
+      # CPU models, the answer is in the log of both runs; if they do not, that
+      # rules one explanation out. A diagnostic must never fail the job, hence
+      # the fallback and the trailing `|| true`.
+      - name: Record the measurement environment
+        run: |
+          echo "event=${{ github.event_name }} ref=${{ github.ref }}"
+          echo "runner=${RUNNER_NAME:-?} arch=${RUNNER_ARCH:-?} os=${RUNNER_OS:-?}"
+          echo "--- cpu ---"
+          lscpu 2>/dev/null | grep -E 'Model name|CPU family|Model:|Stepping|CPU MHz' \
+            || grep -E 'model name|cpu family|stepping' /proc/cpuinfo | sort -u \
+            || true
+          echo "--- kernel / toolchain ---"
+          uname -srm
+          rustc --version --verbose
+
       # The bench crate depends on codspeed-criterion-compat aliased to
       # `criterion`. Without that alias these steps succeed and report nothing,
       # which is the failure mode worth naming: a green job that measured

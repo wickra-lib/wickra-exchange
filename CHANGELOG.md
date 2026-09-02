@@ -40,6 +40,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The CodSpeed job now records the machine it measured on.** Every
+  `pull_request` run has reported `apply_delta` at 453.6 ns and every `push`
+  run at 399.4 ns — across four branches and two unrelated diffs, one of which
+  merged, after which `main` went on reporting 399.4 while carrying the very
+  code the branch had "regressed" on. A second branch that added a WASM binding
+  and touched neither `orderbook.rs` nor the bench crate produced the same
+  453.6. The figure tracks the trigger, not the source, and the generated
+  assembly for `apply_delta` and its one callee is identical between the two
+  once basic-block labels are normalised. CodSpeed reports "Different runtime
+  environments detected" without naming the dimension, and the job logged
+  nothing that would let anyone check; it now prints the CPU model, kernel and
+  toolchain, so the next pair of runs either shows the difference or rules the
+  hardware out. Left failing rather than silenced: a threshold wide enough to
+  hide a constant 12% offset would hide a real 12% regression too.
+
 - `@napi-rs/cli` 3.7.4 → 3.8.6, with the regenerated `bindings/node/index.js`.
   The new CLI emits a different native loader — it chains load errors instead of
   discarding all but the last — so the committed file had to move with it. The
