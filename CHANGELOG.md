@@ -40,6 +40,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`wickra-core` moved from the `0.9` line to `1.0`.** The pin admitted only
+  0.9.x while crates.io serves 1.0.4, so the lockfile sat a major version
+  behind and no `cargo update` could have reached across the boundary. The 1.0
+  API needed nothing from this repository: the workspace compiles as it stood,
+  and the suite and clippy pass untouched. Repositories that consume this one
+  by git rev can now raise their own `wickra-core` pin without resolving two
+  incompatible cores into a single graph.
+
 - **The CodSpeed job now records the machine it measured on.** The job spent an
   evening failing every pull request with the same figure: `apply_delta` at
   453.6 ns against a 399.4 ns base, on five runs across two branches whose diffs
