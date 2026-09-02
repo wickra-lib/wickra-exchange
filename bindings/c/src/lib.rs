@@ -2244,6 +2244,31 @@ mod tests {
     /// The full-request call places the same order the narrow one does when no
     /// extra field is set, and carries the fields the narrow one has nowhere to
     /// put when they are.
+    /// The layout of [`WickraOrderRequest`], pinned.
+    ///
+    /// The Java binding addresses this struct by hand-written byte offsets and
+    /// the C# one by field order, so a field inserted in the middle would move
+    /// what those bindings read without any of them failing to compile. This is
+    /// the test that fails instead.
+    #[test]
+    fn the_request_layout_is_what_the_bindings_assume() {
+        use core::mem::{align_of, offset_of, size_of};
+
+        assert_eq!(size_of::<WickraOrderRequest>(), 64);
+        assert_eq!(align_of::<WickraOrderRequest>(), 8);
+        assert_eq!(offset_of!(WickraOrderRequest, market), 0);
+        assert_eq!(offset_of!(WickraOrderRequest, side), 8);
+        assert_eq!(offset_of!(WickraOrderRequest, order_type), 12);
+        assert_eq!(offset_of!(WickraOrderRequest, quantity), 16);
+        assert_eq!(offset_of!(WickraOrderRequest, price), 24);
+        assert_eq!(offset_of!(WickraOrderRequest, stop_price), 32);
+        assert_eq!(offset_of!(WickraOrderRequest, time_in_force), 40);
+        assert_eq!(offset_of!(WickraOrderRequest, client_order_id), 48);
+        assert_eq!(offset_of!(WickraOrderRequest, reduce_only), 56);
+        assert_eq!(offset_of!(WickraOrderRequest, post_only), 57);
+        assert_eq!(offset_of!(WickraOrderRequest, stp), 60);
+    }
+
     #[test]
     fn place_order_carries_every_field_across_the_abi() {
         let market = cstr("BTC/USDT");

@@ -17,6 +17,20 @@ final class Native {
     static final int SIDE_BUY = 0;
     static final int SIDE_SELL = 1;
 
+    static final int ORDER_MARKET = 0;
+    static final int ORDER_LIMIT = 1;
+    static final int ORDER_STOP_MARKET = 2;
+    static final int ORDER_STOP_LIMIT = 3;
+
+    static final int TIF_GTC = 0;
+    static final int TIF_IOC = 1;
+    static final int TIF_FOK = 2;
+
+    static final int STP_NONE = 0;
+    static final int STP_EXPIRE_MAKER = 1;
+    static final int STP_EXPIRE_TAKER = 2;
+    static final int STP_EXPIRE_BOTH = 3;
+
     static final int STATUS_NEW = 0;
     static final int STATUS_FILLED = 2;
 
@@ -48,6 +62,22 @@ final class Native {
     static final long P_MARGIN_MODE = 112;
 
     // WickraOrder field offsets (repr(C), 8-aligned; total 104 bytes).
+    // WickraOrderRequest. The offsets are pinned by a Rust test
+    // (`the_request_layout_is_what_the_bindings_assume`), because nothing here
+    // would fail to compile if a field moved.
+    static final long REQUEST_SIZE = 64;
+    static final long R_MARKET = 0;
+    static final long R_SIDE = 8;
+    static final long R_ORDER_TYPE = 12;
+    static final long R_QUANTITY = 16;
+    static final long R_PRICE = 24;
+    static final long R_STOP_PRICE = 32;
+    static final long R_TIME_IN_FORCE = 40;
+    static final long R_CLIENT_ORDER_ID = 48;
+    static final long R_REDUCE_ONLY = 56;
+    static final long R_POST_ONLY = 57;
+    static final long R_STP = 60;
+
     static final long ORDER_SIZE = 104;
     static final long O_ID = 0;
     static final long O_SIDE = 64;
@@ -117,6 +147,8 @@ final class Native {
             FunctionDescriptor.of(C_INT, C_PTR, C_PTR, C_INT, C_DOUBLE, C_PTR));
     static final MethodHandle PLACE_LIMIT = handle("wickra_exchange_place_limit",
             FunctionDescriptor.of(C_INT, C_PTR, C_PTR, C_INT, C_DOUBLE, C_DOUBLE, C_PTR));
+    static final MethodHandle PLACE_ORDER = handle("wickra_exchange_place_order",
+            FunctionDescriptor.of(C_INT, C_PTR, C_PTR, C_PTR));
     static final MethodHandle CANCEL = handle("wickra_exchange_cancel",
             FunctionDescriptor.of(C_INT, C_PTR, C_PTR, C_PTR));
     static final MethodHandle BALANCE = handle("wickra_exchange_balance",

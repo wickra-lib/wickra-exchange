@@ -210,6 +210,45 @@ SEXP wkex_place(SEXP ext, SEXP market, SEXP side, SEXP quantity, SEXP price) {
     return order_to_list(&order);
 }
 
+/* Place a full order: every field WickraOrderRequest carries.
+ *
+ * wkex_place can say only market, side, quantity and price, which is all an
+ * order could ever be from R. The trigger price that makes a stop-loss a
+ * stop-loss, the time-in-force that says an order must not rest, post-only,
+ * reduce-only, self-trade prevention and the client order id all had no way
+ * through. An R NA is "unset" and becomes the NaN the ABI reads as absent; a
+ * NULL or NA client order id becomes a null pointer.
+ */
+SEXP wkex_place_order(SEXP ext, SEXP market, SEXP side, SEXP order_type, SEXP quantity,
+                      SEXP price, SEXP stop_price, SEXP time_in_force, SEXP client_order_id,
+                      SEXP reduce_only, SEXP post_only, SEXP stp) {
+    WickraOrder order;
+    double p = Rf_asReal(price);
+    double sp = Rf_asReal(stop_price);
+    const char *coid = NULL;
+    if (client_order_id != R_NilValue && STRING_ELT(client_order_id, 0) != NA_STRING) {
+        coid = CHAR(STRING_ELT(client_order_id, 0));
+    }
+    WickraOrderRequest request = {
+        CHAR(STRING_ELT(market, 0)),
+        Rf_asInteger(side),
+        Rf_asInteger(order_type),
+        Rf_asReal(quantity),
+        ISNA(p) ? NAN : p,
+        ISNA(sp) ? NAN : sp,
+        Rf_asInteger(time_in_force),
+        coid,
+        (bool)Rf_asLogical(reduce_only),
+        (bool)Rf_asLogical(post_only),
+        Rf_asInteger(stp),
+    };
+    int rc = wickra_exchange_place_order(handle_of(ext), &request, &order);
+    if (rc != WICKRA_OK) {
+        Rf_error("wickra: order failed with code %d", rc);
+    }
+    return order_to_list(&order);
+}
+
 SEXP wkex_cancel(SEXP ext, SEXP market, SEXP order_id) {
     int rc = wickra_exchange_cancel(handle_of(ext),
                                     CHAR(STRING_ELT(market, 0)),
@@ -673,6 +712,7 @@ static const R_CallMethodDef CallEntries[] = {
     {"wkex_replay_new", (DL_FUNC)&wkex_replay_new, 7},
     {"wkex_name", (DL_FUNC)&wkex_name, 1},
     {"wkex_set_price", (DL_FUNC)&wkex_set_price, 3},
+    {"wkex_place_order", (DL_FUNC)&wkex_place_order, 12},
     {"wkex_place", (DL_FUNC)&wkex_place, 5},
     {"wkex_cancel", (DL_FUNC)&wkex_cancel, 3},
     {"wkex_balance", (DL_FUNC)&wkex_balance, 2},

@@ -237,4 +237,51 @@ run_golden_case <- function(name) {
 run_golden_case("sma_cross")
 run_golden_case("sma_cross_with_costs")
 
+## ---------------------------------------------------------------- place_order
+##
+## wkex_place_market() and wkex_place_limit() take a market, a side, a quantity
+## and a price, which is all an order could ever be from R. The trigger price,
+## the time-in-force, post-only, reduce-only, self-trade prevention and the
+## client order id all existed in the Rust core and had no way through.
+
+ex <- wkex_paper(c(USDT = 100000, BTC = 5), maker_bps = 1, taker_bps = 5, slippage_bps = 10)
+wkex_set_price(ex, "BTC/USDT", 20000)
+
+## A plain request places the same order the narrow call does.
+order <- wkex_place_order(ex, "BTC/USDT", "buy", 1)
+stopifnot(order$status == "filled")
+stopifnot(abs(order$average_price - 20020) < 1e-6)
+
+## A resting order carries the flags that decide what it is.
+resting <- wkex_place_order(
+  ex, "BTC/USDT", "buy", 1,
+  price = 19000, time_in_force = "gtc",
+  client_order_id = "retry-safe-1", post_only = TRUE, stp = "expire_maker"
+)
+stopifnot(resting$status == "new")
+
+## A trigger order reaches the venue with its trigger. The paper backend refuses
+## triggers, and that refusal is the proof it arrived: a request with the field
+## dropped would have been placed as a plain market sell instead, at the price
+## the stop existed to protect against.
+stopifnot(inherits(
+  try(wkex_place_order(ex, "BTC/USDT", "sell", 1, stop_price = 19000), silent = TRUE),
+  "try-error"
+))
+
+## The order type is derived from which prices are set, so a caller never names
+## one that contradicts the prices given.
+stopifnot(wickraexchange:::.wkex_order_type(NA_real_, NA_real_) == 0L)
+stopifnot(wickraexchange:::.wkex_order_type(19000, NA_real_) == 1L)
+stopifnot(wickraexchange:::.wkex_order_type(NA_real_, 19000) == 2L)
+stopifnot(wickraexchange:::.wkex_order_type(18900, 19000) == 3L)
+
+## An unknown time-in-force is an error, not a silent fall back to "gtc": a
+## resting order where the caller asked for one that must not rest is the defect
+## the core stopped shipping, and a lenient parse here would put it back.
+stopifnot(inherits(try(wickraexchange:::.wkex_tif("gtd"), silent = TRUE), "try-error"))
+stopifnot(inherits(try(wickraexchange:::.wkex_stp("cancel_maker"), silent = TRUE), "try-error"))
+stopifnot(wickraexchange:::.wkex_tif("IOC") == 1L)
+stopifnot(wickraexchange:::.wkex_stp("EXPIRE_BOTH") == 3L)
+
 cat("wickra.exchange R tests passed\n")

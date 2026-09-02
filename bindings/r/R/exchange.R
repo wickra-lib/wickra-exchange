@@ -10,6 +10,41 @@
   stop("side must be 'buy' or 'sell'")
 }
 
+# The order type is derived from which prices are set, so a caller never names
+# it and cannot name one that contradicts the prices given. A stop price
+# promotes the order into its trigger form, matching the Rust builder.
+.wkex_order_type <- function(price, stop_price) {
+  limit <- !is.na(price)
+  if (!is.na(stop_price)) {
+    return(if (limit) 3L else 2L)
+  }
+  if (limit) 1L else 0L
+}
+
+# An unknown value is an error rather than a silent fall back to the default: a
+# time-in-force that quietly becomes "gtc" places a resting order where the
+# caller asked for one that must not rest.
+.wkex_tif <- function(tif) {
+  code <- switch(tolower(tif), gtc = 0L, ioc = 1L, fok = 2L, NULL)
+  if (is.null(code)) {
+    stop(sprintf("wickra: unknown time-in-force %s; expected gtc, ioc or fok", dQuote(tif)))
+  }
+  code
+}
+
+.wkex_stp <- function(stp) {
+  code <- switch(tolower(stp),
+    none = 0L, expire_maker = 1L, expire_taker = 2L, expire_both = 3L, NULL
+  )
+  if (is.null(code)) {
+    stop(sprintf(
+      "wickra: unknown self-trade-prevention policy %s; expected none, expire_maker, expire_taker or expire_both",
+      dQuote(stp)
+    ))
+  }
+  code
+}
+
 .wkex_status <- c("new", "partially_filled", "filled", "canceled", "rejected", "expired")
 .wkex_kind <- c("trade", "ticker", "order_update", "balance_update", "subscribed", "other")
 
@@ -146,6 +181,50 @@ wkex_place_market <- function(ex, market, side, quantity) {
 #' @export
 wkex_place_limit <- function(ex, market, side, quantity, price) {
   .wkex_order(.Call(C_wkex_place, ex$handle, market, .wkex_side(side), as.numeric(quantity), as.numeric(price)))
+}
+
+#' Place a full order.
+#'
+#' `wkex_place_market()` and `wkex_place_limit()` take a market, a side, a
+#' quantity and a price, which is all an order could ever be from R. This is the
+#' call that can also carry the trigger price that makes a stop-loss a
+#' stop-loss, the time-in-force that says an order must not rest, post-only,
+#' reduce-only, self-trade prevention, and the client order id that makes a
+#' retried placement idempotent.
+#'
+#' The order type is derived rather than named: a `price` makes it a limit
+#' order, a `stop_price` promotes it into its trigger form.
+#'
+#' A field the venue cannot express refuses the order rather than weakening it,
+#' which surfaces here as an error rather than as a differently-shaped order
+#' reaching the exchange.
+#'
+#' @param ex A `wickra_exchange` object.
+#' @param market Market string.
+#' @param side "buy" or "sell".
+#' @param quantity Order quantity.
+#' @param price Limit price, or `NA` for a market order.
+#' @param stop_price Trigger price, or `NA` for a non-trigger order.
+#' @param time_in_force "gtc" (the default), "ioc" or "fok".
+#' @param client_order_id An id of your choosing, or `NULL`.
+#' @param reduce_only Close-only: the order may not increase a position.
+#' @param post_only Maker-only: cancelled rather than crossing the spread.
+#' @param stp "none" (the default), "expire_maker", "expire_taker" or
+#'   "expire_both".
+#' @return The resulting order as a list.
+#' @export
+wkex_place_order <- function(ex, market, side, quantity,
+                             price = NA_real_, stop_price = NA_real_,
+                             time_in_force = "gtc", client_order_id = NULL,
+                             reduce_only = FALSE, post_only = FALSE,
+                             stp = "none") {
+  .wkex_order(.Call(
+    C_wkex_place_order, ex$handle, market, .wkex_side(side),
+    .wkex_order_type(price, stop_price), as.numeric(quantity),
+    as.numeric(price), as.numeric(stop_price),
+    .wkex_tif(time_in_force), client_order_id,
+    isTRUE(reduce_only), isTRUE(post_only), .wkex_stp(stp)
+  ))
 }
 
 #' Cancel an open order by venue id.

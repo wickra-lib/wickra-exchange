@@ -11,6 +11,20 @@ internal static unsafe class Native
     public const int SideBuy = 0;
     public const int SideSell = 1;
 
+    public const int OrderMarket = 0;
+    public const int OrderLimit = 1;
+    public const int OrderStopMarket = 2;
+    public const int OrderStopLimit = 3;
+
+    public const int TifGtc = 0;
+    public const int TifIoc = 1;
+    public const int TifFok = 2;
+
+    public const int StpNone = 0;
+    public const int StpExpireMaker = 1;
+    public const int StpExpireTaker = 2;
+    public const int StpExpireBoth = 3;
+
     public const int StatusNew = 0;
     public const int StatusPartiallyFilled = 1;
     public const int StatusFilled = 2;
@@ -49,6 +63,39 @@ internal static unsafe class Native
         public double FilledQuantity;
         public double Price;
         public double AveragePrice;
+    }
+
+    /// <summary>
+    /// A full order, as the caller wants it placed.
+    /// </summary>
+    /// <remarks>
+    /// <c>place_market</c> and <c>place_limit</c> take a market, a side, a
+    /// quantity and a price, which is all an order could ever be from this
+    /// binding. Everything else the library supports -- the trigger price that
+    /// makes a stop-loss a stop-loss, the time-in-force that says an order must
+    /// not rest, post-only, reduce-only, self-trade prevention, and the client
+    /// order id that makes a retry idempotent -- had no way through.
+    /// <para>
+    /// <c>Price</c> and <c>StopPrice</c> are <c>NaN</c> when unset, matching how
+    /// <see cref="Order"/> reports an absent price; <c>ClientOrderId</c> is null.
+    /// </para>
+    /// </remarks>
+    [StructLayout(LayoutKind.Sequential)]
+    public struct OrderRequest
+    {
+        public byte* Market;
+        public int Side;
+        public int OrderType;
+        public double Quantity;
+        public double Price;
+        public double StopPrice;
+        public int TimeInForce;
+        public byte* ClientOrderId;
+        [MarshalAs(UnmanagedType.U1)]
+        public bool ReduceOnly;
+        [MarshalAs(UnmanagedType.U1)]
+        public bool PostOnly;
+        public int Stp;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -96,6 +143,10 @@ internal static unsafe class Native
     [DllImport(Lib)]
     public static extern int wickra_exchange_place_limit(
         nint handle, byte* market, int side, double quantity, double price, Order* outOrder);
+
+    [DllImport(Lib)]
+    public static extern int wickra_exchange_place_order(
+        nint handle, OrderRequest* request, Order* outOrder);
 
     [DllImport(Lib)]
     public static extern int wickra_exchange_cancel(nint handle, byte* market, byte* orderId);

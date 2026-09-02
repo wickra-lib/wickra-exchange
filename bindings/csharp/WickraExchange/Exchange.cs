@@ -27,6 +27,79 @@ public enum OrderStatus
     Expired = Native.StatusExpired,
 }
 
+/// <summary>What kind of order this is: whether it takes the market now, rests
+/// at a price, or waits for a trigger.</summary>
+public enum OrderType
+{
+    /// <summary>Takes the best available price now.</summary>
+    Market = Native.OrderMarket,
+    /// <summary>Rests at the limit price until filled or cancelled.</summary>
+    Limit = Native.OrderLimit,
+    /// <summary>Rests until the market reaches the stop price, then takes the market.</summary>
+    StopMarket = Native.OrderStopMarket,
+    /// <summary>Rests until the market reaches the stop price, then rests at the limit price.</summary>
+    StopLimit = Native.OrderStopLimit,
+}
+
+/// <summary>How long an order may live.</summary>
+public enum TimeInForce
+{
+    /// <summary>Rest until cancelled.</summary>
+    Gtc = Native.TifGtc,
+    /// <summary>Fill what is possible now, cancel the rest.</summary>
+    Ioc = Native.TifIoc,
+    /// <summary>Fill entirely now or not at all.</summary>
+    Fok = Native.TifFok,
+}
+
+/// <summary>Which side to cancel when an order would match the account's own
+/// resting order.</summary>
+public enum SelfTradePrevention
+{
+    /// <summary>Let the account trade against itself.</summary>
+    None = Native.StpNone,
+    /// <summary>Cancel the resting order.</summary>
+    ExpireMaker = Native.StpExpireMaker,
+    /// <summary>Cancel the incoming order.</summary>
+    ExpireTaker = Native.StpExpireTaker,
+    /// <summary>Cancel both.</summary>
+    ExpireBoth = Native.StpExpireBoth,
+}
+
+/// <summary>A full order, as the caller wants it placed.</summary>
+/// <remarks>
+/// <see cref="Exchange.PlaceMarket"/> and <see cref="Exchange.PlaceLimit"/> take
+/// a market, a side, a quantity and a price, which is all an order could ever be
+/// from this binding. Everything else the library supports had no way through:
+/// the trigger price that makes a stop-loss a stop-loss, the time-in-force that
+/// says an order must not rest, post-only, reduce-only, self-trade prevention,
+/// and the client order id that makes a retried placement idempotent.
+/// </remarks>
+public sealed record OrderRequest(string Market, Side Side, OrderType Type, double Quantity)
+{
+    /// <summary>Limit price. Null for a market order.</summary>
+    public double? Price { get; init; }
+
+    /// <summary>Trigger price the order rests for. Null for a non-trigger order.</summary>
+    public double? StopPrice { get; init; }
+
+    /// <summary>How long the order may live. Defaults to good-til-cancelled.</summary>
+    public TimeInForce TimeInForce { get; init; } = TimeInForce.Gtc;
+
+    /// <summary>An id of the caller's choosing, so a retried placement is
+    /// recognised by the venue as the same order rather than placed twice.</summary>
+    public string? ClientOrderId { get; init; }
+
+    /// <summary>Close-only: the order may not increase a position.</summary>
+    public bool ReduceOnly { get; init; }
+
+    /// <summary>Maker-only: the order is cancelled rather than crossing the spread.</summary>
+    public bool PostOnly { get; init; }
+
+    /// <summary>Self-trade-prevention policy.</summary>
+    public SelfTradePrevention Stp { get; init; } = SelfTradePrevention.None;
+}
+
 /// <summary>The kind of a stream event.</summary>
 public enum EventKind
 {
@@ -216,6 +289,45 @@ public sealed unsafe class Exchange : IDisposable
         fixed (byte* mp = m)
         {
             Check(Native.wickra_exchange_place_limit(_handle, mp, (int)side, quantity, price, &order));
+        }
+        return ReadOrder(order);
+    }
+
+    /// <summary>
+    /// Place a full order: every field the library supports, not just a market,
+    /// a side, a quantity and a price.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="PlaceMarket"/> and <see cref="PlaceLimit"/> remain as the
+    /// shortest spelling of the common case. This is the one that can place a
+    /// stop-loss, an immediate-or-cancel, a post-only or an idempotent retry.
+    /// A field the venue cannot express refuses the order rather than weakening
+    /// it, which arrives here as an exception rather than as a
+    /// differently-shaped order reaching the exchange.
+    /// </remarks>
+    public OrderInfo PlaceOrder(OrderRequest request)
+    {
+        var m = Utf8(request.Market);
+        var c = request.ClientOrderId is null ? null : Utf8(request.ClientOrderId);
+        Native.Order order;
+        fixed (byte* mp = m)
+        fixed (byte* cp = c)
+        {
+            var native = new Native.OrderRequest
+            {
+                Market = mp,
+                Side = (int)request.Side,
+                OrderType = (int)request.Type,
+                Quantity = request.Quantity,
+                Price = request.Price ?? double.NaN,
+                StopPrice = request.StopPrice ?? double.NaN,
+                TimeInForce = (int)request.TimeInForce,
+                ClientOrderId = cp,
+                ReduceOnly = request.ReduceOnly,
+                PostOnly = request.PostOnly,
+                Stp = (int)request.Stp,
+            };
+            Check(Native.wickra_exchange_place_order(_handle, &native, &order));
         }
         return ReadOrder(order);
     }
