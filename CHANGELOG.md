@@ -79,6 +79,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Golden-fixture parity in every binding.** The committed replay tapes in
+  `golden/` were driven by the Rust suite alone. Each binding had a replay test
+  that proved a tape reaches a fill, and none of them checked the numbers — a
+  lost decimal, a dropped fee or slippage applied to the wrong side would still
+  produce a fill and still pass. Python, Node, Go, C#, Java, R and the C ABI now
+  each drive the same two fixtures through the same fixed SMA strategy and
+  assert the fill price and both balances the Rust suite pins
+  (`102.0 / 1 BTC / 99898.0 USDT` frictionless, `102.102 / 1 / 99897.846949`
+  with fees and slippage).
+  - The strategy is reimplemented in each language rather than imported, so what
+    is under test is the replay-to-paper-fill pipeline and not two libraries
+    agreeing on a three-value mean.
+  - C, Java and R read the fixtures with a small field reader written for that
+    one committed shape. C ships no dependency at all, Java's only test
+    dependency is JUnit, and the R package declares none; taking a JSON parser
+    on so a test can read four numbers and one array would be a poor trade.
+
+### Fixed
+
+- **The C examples asserted nothing on Windows.** They double as the C-side test
+  suite, and CI builds them with `--config Release` — which on a multi-config
+  generator defines `NDEBUG` and compiles every `assert` in them away. The
+  Windows runs were therefore green regardless of what the library did, while
+  the Linux and macOS runs (single-config, no `NDEBUG`) really checked. All
+  three now `#undef NDEBUG` before including the assert header.
+
 - **A WASM binding, `bindings/wasm`, carrying the offline simulators.** The
   README previously said there would be none, on the argument that
   authenticated trading needs raw sockets and secret keys a browser forbids.
