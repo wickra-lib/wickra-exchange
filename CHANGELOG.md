@@ -126,6 +126,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`docs/CAPABILITIES.md` claimed a test that does not exist.** It said "a
+  per-binding completeness test pins the canonical verb set so a dropped method
+  fails CI". There is no such test in five of the seven bindings — only Python
+  and Node assert the surface at run time. What actually guards it is
+  `scripts/check_binding_surface.py`, which reads the verb set out of
+  `traits.rs`, holds every binding's source to it, and runs in CI as its own
+  job. The paragraph now says that, and names the WASM binding as deliberately
+  outside the claim: it has no sockets and therefore no live client, so "full
+  execution surface in every binding" was never meant to include it.
+
 - **The R package could only be installed inside this repository's CI.** Its
   `Makevars` took the C ABI header and library from `WKEX_INC` / `WKEX_LIB`,
   environment variables that only this workflow sets, and baked no rpath — so
