@@ -51,6 +51,17 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+      # rustdoc is the third linter and nothing was running it: three public
+      # doc links resolved to private items and had gone unnoticed, because a
+      # broken intra-doc link is a warning and warnings were not read.
+      #
+      # The two published crates, not --workspace: the C binding's lib is also
+      # named `wickra_exchange`, so documenting both at once collides on the
+      # output path. These are the crates whose rustdoc is published anyway.
+      - run: cargo doc -p wickra-exchange-core -p wickra-exchange --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
   msrv:
     name: MSRV workspace (1.86)
     runs-on: ubuntu-latest

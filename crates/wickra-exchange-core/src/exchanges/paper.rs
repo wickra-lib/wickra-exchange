@@ -50,7 +50,7 @@ fn bps_fraction(bps: Decimal) -> Decimal {
 }
 
 /// A deterministic, network-free exchange that simulates fills through an
-/// internal portfolio. See the [module docs](self) for the fill model.
+/// internal portfolio. The fill model is documented on the methods below.
 #[derive(Debug)]
 pub struct PaperExchange {
     market_type: MarketType,

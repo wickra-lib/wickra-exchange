@@ -142,6 +142,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A public type nobody could name, and three doc links to nothing.**
+  `MockWsConnection` was exported from the crate root, but `connect` hands it
+  back as a `Box<dyn WsConnection>`, its fields are private and it has no
+  constructor — so no caller could name or build one. It is `pub(crate)` now,
+  which is what `unreachable_pub` says it always was.
+  Separately, three intra-doc links in public documentation resolved to private
+  items: `PaperExchange` and `ReplayExchange` each pointed at `[module docs]
+  (self)` in a private module, and Kraken's `subscribe_user_data` pointed at a
+  private method. All three are prose now. They survived because **nothing ran
+  rustdoc**: a broken intra-doc link is a warning, and the workspace's three
+  linters were two. `cargo doc` with `RUSTDOCFLAGS: -D warnings` now runs in the
+  lint job, over the two published crates rather than `--workspace` — the C
+  binding's lib is also named `wickra_exchange` and the two collide on the
+  output path.
+
 - **`Health` and `redact` were public, tested and undocumented.** Both are
   exported from the crate root, and neither appeared anywhere outside the source
   — `Health` had zero references in the entire repository apart from its own

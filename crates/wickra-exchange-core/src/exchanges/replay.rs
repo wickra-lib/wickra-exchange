@@ -22,7 +22,7 @@ use crate::types::{Balance, Order, OrderRequest, Ticker};
 use wickra_core::Candle;
 
 /// A network-free exchange that replays a recorded feed and fills against it.
-/// See the [module docs](self) for the model.
+/// The replay model is documented on the methods below.
 #[derive(Debug)]
 pub struct ReplayExchange {
     frames: Vec<Event>,
