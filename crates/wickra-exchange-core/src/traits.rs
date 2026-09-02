@@ -15,6 +15,7 @@
 
 use crate::error::Result;
 use crate::events::{Event, OrderBookSnapshot};
+use crate::feeds::{DerivativesChannel, LongShortRatio, OpenInterest};
 use crate::options::MarginMode;
 use crate::positions::Position;
 use crate::symbol::Symbol;
@@ -215,6 +216,48 @@ pub trait WsUserData: MarketData {
     fn keepalive_user_data(&mut self) -> Result<()> {
         Ok(())
     }
+}
+
+/// The derivatives microstructure channels, for a futures client.
+///
+/// [`MarketData`] carries what every market has: trades, depth, a ticker. A
+/// perpetual market publishes more -- what it costs to hold a position, what the
+/// contract is marked against, and who is being liquidated -- and those figures
+/// are the input the perpetual-futures indicator family consumes.
+///
+/// The split between subscribing and reading is the venues' own, not a design
+/// choice: funding, mark/index and liquidations are pushed over the WebSocket,
+/// while open interest and long/short positioning are published on a cadence
+/// over REST and pushed by nobody. Presenting the polled two as subscriptions
+/// would have made this trait look symmetric and the data arrive never.
+///
+/// A venue that does not publish a channel refuses it rather than subscribing to
+/// nothing, so a caller learns at the call instead of waiting on a stream that
+/// will never carry it.
+pub trait DerivativesStream: MarketData {
+    /// Subscribe to a pushed derivatives channel. Frames arrive through
+    /// [`poll_events`](MarketData::poll_events) as
+    /// [`Event::Derivatives`](crate::events::Event::Derivatives).
+    ///
+    /// # Errors
+    /// Returns an [`Error`](crate::Error) if the venue does not publish the
+    /// channel, the client is not a futures client, or the subscription fails.
+    fn subscribe_derivatives(&mut self, symbol: &Symbol, channel: DerivativesChannel)
+        -> Result<()>;
+
+    /// Read the current open interest. Polled, not pushed.
+    ///
+    /// # Errors
+    /// Returns an [`Error`](crate::Error) if the venue does not publish it or
+    /// the request fails.
+    fn open_interest(&mut self, symbol: &Symbol) -> Result<OpenInterest>;
+
+    /// Read the current long/short positioning ratio. Polled, not pushed.
+    ///
+    /// # Errors
+    /// Returns an [`Error`](crate::Error) if the venue does not publish it or
+    /// the request fails.
+    fn long_short_ratio(&mut self, symbol: &Symbol) -> Result<LongShortRatio>;
 }
 
 /// Order placement and cancellation over a venue's WebSocket API (`ws-api`),

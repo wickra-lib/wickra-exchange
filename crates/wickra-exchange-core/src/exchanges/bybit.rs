@@ -26,13 +26,18 @@ use crate::clock::ServerClock;
 use crate::credentials::Credentials;
 use crate::error::{Error, Result};
 use crate::events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
+use crate::feeds::{
+    DerivativesChannel, DerivativesFeed, FundingRate, Liquidation, LongShortRatio, MarkIndex,
+    OpenInterest,
+};
 use crate::normalize::{format_decimal, parse_decimal};
 use crate::options::{ExchangeOptions, MarginMode, MarketType, PositionMode, SelfTradePrevention};
 use crate::positions::{Position, PositionSide};
 use crate::signing::hmac_sha256_hex;
 use crate::symbol::Symbol;
 use crate::traits::{
-    AdvancedOrders, Derivatives, Exchange, Execution, MarketData, WsExecution, WsUserData,
+    AdvancedOrders, Derivatives, DerivativesStream, Exchange, Execution, MarketData, WsExecution,
+    WsUserData,
 };
 use crate::transport::{HttpMethod, HttpRequest, HttpTransport, WsConnection, WsTransport};
 use crate::types::{
@@ -73,6 +78,11 @@ pub struct Bybit {
     connection: Option<Box<dyn WsConnection>>,
     sub_messages: Vec<String>,
     subscriptions: Vec<(String, Symbol)>,
+    /// Which derivatives channels were subscribed, per wire symbol. Bybit
+    /// carries funding, mark and index on the same `tickers` stream that
+    /// feeds the ordinary ticker, so the frame alone cannot say which prints
+    /// the caller wants out of it.
+    derivatives_channels: Vec<(String, DerivativesChannel)>,
     /// The private user-data connection, opened by
     /// [`subscribe_user_data`](Self::subscribe_user_data) and drained by
     /// [`poll_events`](Self::poll_events) alongside the public stream.
@@ -135,6 +145,7 @@ impl Bybit {
             connection: None,
             sub_messages: Vec::new(),
             subscriptions: Vec::new(),
+            derivatives_channels: Vec::new(),
             private_connection: None,
             user_data_active: false,
             ws_api_connection: None,
@@ -209,6 +220,12 @@ impl Bybit {
     pub fn with_clock(mut self, now_ms: Box<dyn Fn() -> i64 + Send + Sync>) -> Self {
         self.now_ms = now_ms;
         self
+    }
+
+    /// Whether this client targets a futures category. Funding, mark/index and
+    /// liquidations exist only there.
+    fn is_futures(&self) -> bool {
+        self.category != "spot"
     }
 
     /// The Bybit product category this client targets (`spot`/`linear`/`inverse`).
@@ -323,6 +340,121 @@ impl Bybit {
         self.subscribe(symbol, &topic)
     }
 
+    /// Subscribe to a pushed derivatives channel.
+    ///
+    /// Bybit publishes funding, mark and index on the **same `tickers` stream**
+    /// that carries the ordinary ticker -- one topic answering four questions --
+    /// so both channels resolve to it and the parser emits whichever the caller
+    /// subscribed to. Liquidations are `allLiquidation`, which reports the taker
+    /// side of the forced order rather than the side of the position that was
+    /// closed; that is the side this crate's [`Liquidation`] carries, so it maps
+    /// straight through.
+    ///
+    /// These streams exist only on the linear (futures) venue.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] on a spot client, or if the subscription fails.
+    pub fn subscribe_derivatives(
+        &mut self,
+        symbol: &Symbol,
+        channel: DerivativesChannel,
+    ) -> Result<()> {
+        if !self.is_futures() {
+            return Err(Error::unsupported_field(
+                "Bybit",
+                "a derivatives channel on a spot client",
+                "funding, mark/index and liquidations exist only on the linear venue",
+            ));
+        }
+        let wire = Self::wire_symbol(symbol);
+        let topic = match channel {
+            DerivativesChannel::Funding | DerivativesChannel::MarkIndex => {
+                format!("tickers.{wire}")
+            }
+            DerivativesChannel::Liquidations => format!("allLiquidation.{wire}"),
+        };
+        self.derivatives_channels.push((wire, channel));
+        self.subscribe(symbol, &topic)
+    }
+
+    /// The current open interest (`GET /v5/market/open-interest`), most recent
+    /// point.
+    ///
+    /// Bybit does push open interest, on the `tickers` stream -- but only as one
+    /// field among many, and only when it changes. Reading it is what gives a
+    /// caller a figure at a known moment rather than whenever the venue last
+    /// happened to include it.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] on a spot client, if the request fails, or if the
+    /// venue returns no data point.
+    pub fn open_interest(&self, symbol: &Symbol) -> Result<OpenInterest> {
+        if !self.is_futures() {
+            return Err(Error::unsupported_field(
+                "Bybit",
+                "open interest on a spot client",
+                "open interest is a futures figure",
+            ));
+        }
+        let query = format!(
+            "category=linear&symbol={}&intervalTime=5min&limit=1",
+            Self::wire_symbol(symbol)
+        );
+        let value = self.get("/v5/market/open-interest", &query)?;
+        let result = parse_result::<serde_json::Value>(value)?;
+        let point = result
+            .get("list")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|list| list.first())
+            .ok_or_else(|| Error::NotFound("no open-interest data point".to_string()))?;
+        Ok(OpenInterest {
+            symbol: symbol.clone(),
+            open_interest: parse_decimal(field_str(point, "openInterest")?)?,
+            timestamp: field_str(point, "timestamp")
+                .ok()
+                .and_then(|t| t.parse().ok())
+                .unwrap_or(0),
+        })
+    }
+
+    /// The current long/short account ratio (`GET /v5/market/account-ratio`),
+    /// most recent point.
+    ///
+    /// Reported as account proportions summing to one, carried through as given.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] on a spot client, if the request fails, or if the
+    /// venue returns no data point.
+    pub fn long_short_ratio(&self, symbol: &Symbol) -> Result<LongShortRatio> {
+        if !self.is_futures() {
+            return Err(Error::unsupported_field(
+                "Bybit",
+                "long/short positioning on a spot client",
+                "positioning is a futures figure",
+            ));
+        }
+        let query = format!(
+            "category=linear&symbol={}&period=5min&limit=1",
+            Self::wire_symbol(symbol)
+        );
+        let value = self.get("/v5/market/account-ratio", &query)?;
+        let result = parse_result::<serde_json::Value>(value)?;
+        let point = result
+            .get("list")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|list| list.first())
+            .ok_or_else(|| Error::NotFound("no long/short data point".to_string()))?;
+        Ok(LongShortRatio {
+            symbol: symbol.clone(),
+            long_size: parse_decimal(field_str(point, "buyRatio")?)?,
+            short_size: parse_decimal(field_str(point, "sellRatio")?)?,
+            timestamp: field_str(point, "timestamp")
+                .ok()
+                .and_then(|t| t.parse().ok())
+                .unwrap_or(0),
+        })
+    }
+
     /// Open the connection if needed, send an `op:subscribe` for `topic`, and
     /// register the symbol for wire-name resolution.
     fn subscribe(&mut self, symbol: &Symbol, topic: &str) -> Result<()> {
@@ -356,12 +488,17 @@ impl Bybit {
                 .cloned()
                 .unwrap_or_else(|| Symbol::new(wire, ""))
         };
+        let channels = self.derivatives_channels.clone();
         let mut events = Vec::new();
         if let Some(connection) = self.connection.as_mut() {
             while let Ok(Some(frame)) = connection.recv() {
                 if let Ok(mut parsed) = parse_ws_message(&frame, &resolve) {
                     events.append(&mut parsed);
                 }
+                // Parsed separately: a `tickers` frame is both an ordinary
+                // ticker and, on the linear venue, a funding and mark/index
+                // print. One frame, up to three subscriptions.
+                events.extend(parse_derivatives_frame(&frame, &resolve, &channels));
             }
         }
         // Drain the private user-data stream (order/wallet topics), if open.
@@ -919,6 +1056,124 @@ fn unwrap_envelope(body: &str) -> Result<serde_json::Value> {
         return Err(map_error(envelope.ret_code, &envelope.ret_msg));
     }
     Ok(envelope.result)
+}
+
+/// Pull `topic` and `data` out of a raw frame and hand them to
+/// [`parse_derivatives_message`]. A frame that is not JSON, or carries no topic,
+/// yields nothing.
+fn parse_derivatives_frame(
+    text: &str,
+    resolve: &impl Fn(&str) -> Symbol,
+    channels: &[(String, DerivativesChannel)],
+) -> Vec<Event> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return Vec::new();
+    };
+    let Some(topic) = value.get("topic").and_then(serde_json::Value::as_str) else {
+        return Vec::new();
+    };
+    let Some(data) = value.get("data") else {
+        return Vec::new();
+    };
+    parse_derivatives_message(topic, data, resolve, channels)
+}
+
+/// Parse one Bybit WebSocket frame into the derivatives events the caller
+/// subscribed to.
+///
+/// Bybit's `tickers` frames are *deltas*: after the first snapshot only the
+/// fields that changed are present. So a funding print is emitted only when the
+/// frame actually carries a rate, and a mark/index print only when it carries
+/// both prices. Filling a missing field with the last seen value would report a
+/// figure as current that the venue did not just publish, and filling it with
+/// zero would report a funding rate of zero, which is a number a strategy acts
+/// on.
+fn parse_derivatives_message(
+    topic: &str,
+    data: &serde_json::Value,
+    resolve: &impl Fn(&str) -> Symbol,
+    channels: &[(String, DerivativesChannel)],
+) -> Vec<Event> {
+    let subscribed = |wire: &str, channel: DerivativesChannel| {
+        channels.iter().any(|(w, c)| w == wire && *c == channel)
+    };
+    let mut out = Vec::new();
+    if topic.starts_with("tickers.") {
+        let Ok(wire) = field_str(data, "symbol") else {
+            return out;
+        };
+        let symbol = resolve(wire);
+        let timestamp = data
+            .get("ts")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+        // A missing field is an empty string here, which does not parse -- so an
+        // absent price is absent rather than zero.
+        let mark = parse_decimal(opt_str(data, "markPrice")).ok();
+        if subscribed(wire, DerivativesChannel::Funding) {
+            if let (Some(rate), Some(mark_price)) =
+                (parse_decimal(opt_str(data, "fundingRate")).ok(), mark)
+            {
+                out.push(Event::Derivatives(DerivativesFeed::Funding(FundingRate {
+                    symbol: symbol.clone(),
+                    rate,
+                    mark_price,
+                    timestamp,
+                })));
+            }
+        }
+        if subscribed(wire, DerivativesChannel::MarkIndex) {
+            if let (Some(mark_price), Some(index_price)) =
+                (mark, parse_decimal(opt_str(data, "indexPrice")).ok())
+            {
+                out.push(Event::Derivatives(DerivativesFeed::MarkIndex(MarkIndex {
+                    symbol,
+                    mark_price,
+                    index_price,
+                    timestamp,
+                })));
+            }
+        }
+    } else if topic.starts_with("allLiquidation.") {
+        let Some(prints) = data.as_array() else {
+            return out;
+        };
+        for print in prints {
+            let Ok(wire) = field_str(print, "s") else {
+                continue;
+            };
+            if !subscribed(wire, DerivativesChannel::Liquidations) {
+                continue;
+            }
+            // `S` on `allLiquidation` is the taker side of the forced order --
+            // the side hitting the book -- which is what `Liquidation` carries.
+            // The older `liquidation` topic reported the *position* side, the
+            // opposite; reading one as the other inverts every liquidation-flow
+            // figure computed downstream.
+            let Ok(side) = parse_side(field_str(print, "S").unwrap_or("")) else {
+                continue;
+            };
+            let (Ok(price), Ok(quantity)) = (
+                field_str(print, "p").and_then(parse_decimal),
+                field_str(print, "v").and_then(parse_decimal),
+            ) else {
+                continue;
+            };
+            out.push(Event::Derivatives(DerivativesFeed::Liquidation(
+                Liquidation {
+                    symbol: resolve(wire),
+                    side,
+                    price,
+                    quantity,
+                    timestamp: print
+                        .get("T")
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or(0),
+                },
+            )));
+        }
+    }
+    out
 }
 
 fn parse_result<T: for<'de> Deserialize<'de>>(value: serde_json::Value) -> Result<T> {
@@ -1568,6 +1823,22 @@ impl WsUserData for Bybit {
     }
 }
 
+impl DerivativesStream for Bybit {
+    fn subscribe_derivatives(
+        &mut self,
+        symbol: &Symbol,
+        channel: DerivativesChannel,
+    ) -> Result<()> {
+        Bybit::subscribe_derivatives(self, symbol, channel)
+    }
+    fn open_interest(&mut self, symbol: &Symbol) -> Result<OpenInterest> {
+        Bybit::open_interest(self, symbol)
+    }
+    fn long_short_ratio(&mut self, symbol: &Symbol) -> Result<LongShortRatio> {
+        Bybit::long_short_ratio(self, symbol)
+    }
+}
+
 impl WsExecution for Bybit {
     fn place_order_ws(&mut self, request: &OrderRequest) -> Result<Order> {
         Bybit::place_order_ws(self, request)
@@ -1897,6 +2168,135 @@ mod tests {
         let body = reqs[0].body.as_ref().unwrap();
         assert!(body.contains(r#""orderId":"1""#));
         assert!(body.contains(r#""orderId":"2""#));
+    }
+
+    /// Bybit's `tickers` frames are deltas: after the first snapshot only the
+    /// changed fields are present. A funding print is emitted only when the
+    /// frame actually carries a rate. Carrying the last seen value forward would
+    /// report a stale figure as current, and defaulting to zero would report a
+    /// funding rate of zero -- a number a strategy acts on.
+    #[test]
+    fn a_delta_ticker_frame_prints_only_what_it_carries() {
+        let resolve = |_: &str| symbol();
+        let both = [
+            ("BTCUSDT".to_string(), DerivativesChannel::Funding),
+            ("BTCUSDT".to_string(), DerivativesChannel::MarkIndex),
+        ];
+
+        let full: serde_json::Value = serde_json::from_str(
+            r#"{"symbol":"BTCUSDT","markPrice":"20000.5","indexPrice":"19998.25","fundingRate":"0.0001","ts":1700000000000}"#,
+        )
+        .unwrap();
+        let events = parse_derivatives_message("tickers.BTCUSDT", &full, &resolve, &both);
+        assert_eq!(events.len(), 2);
+
+        // A delta with only the mark price: no funding print, because there is
+        // no rate in it.
+        let delta: serde_json::Value =
+            serde_json::from_str(r#"{"symbol":"BTCUSDT","markPrice":"20001.0"}"#).unwrap();
+        let events = parse_derivatives_message("tickers.BTCUSDT", &delta, &resolve, &both);
+        assert!(events.is_empty());
+
+        // A delta with a rate and a mark, but no index: funding only.
+        let delta: serde_json::Value = serde_json::from_str(
+            r#"{"symbol":"BTCUSDT","markPrice":"20001.0","fundingRate":"0.0002"}"#,
+        )
+        .unwrap();
+        let events = parse_derivatives_message("tickers.BTCUSDT", &delta, &resolve, &both);
+        assert_eq!(events.len(), 1);
+        let Event::Derivatives(DerivativesFeed::Funding(funding)) = &events[0] else {
+            panic!("expected a funding print");
+        };
+        assert_eq!(funding.rate, dec!(0.0002));
+    }
+
+    /// The same frame prints nothing for a client that subscribed to neither
+    /// channel: the `tickers` topic also feeds the ordinary ticker, so a client
+    /// watching prices must not start receiving funding prints it never asked
+    /// for.
+    #[test]
+    fn a_ticker_subscription_alone_yields_no_derivatives_prints() {
+        let resolve = |_: &str| symbol();
+        let full: serde_json::Value = serde_json::from_str(
+            r#"{"symbol":"BTCUSDT","markPrice":"20000.5","indexPrice":"19998.25","fundingRate":"0.0001"}"#,
+        )
+        .unwrap();
+        assert!(parse_derivatives_message("tickers.BTCUSDT", &full, &resolve, &[]).is_empty());
+    }
+
+    /// `allLiquidation` reports the taker side of the forced order -- the side
+    /// hitting the book -- which is what `Liquidation` carries. The older
+    /// `liquidation` topic reported the position side, the opposite one.
+    #[test]
+    fn all_liquidation_carries_the_side_hitting_the_book() {
+        let resolve = |_: &str| symbol();
+        let data: serde_json::Value = serde_json::from_str(
+            r#"[{"T":1700000000123,"s":"BTCUSDT","S":"Sell","v":"2.5","p":"19000"}]"#,
+        )
+        .unwrap();
+        let events = parse_derivatives_message(
+            "allLiquidation.BTCUSDT",
+            &data,
+            &resolve,
+            &[("BTCUSDT".to_string(), DerivativesChannel::Liquidations)],
+        );
+        assert_eq!(events.len(), 1);
+        let Event::Derivatives(DerivativesFeed::Liquidation(liq)) = &events[0] else {
+            panic!("expected a liquidation print");
+        };
+        assert_eq!(liq.side, OrderSide::Sell);
+        assert_eq!(liq.price, dec!(19000));
+        assert_eq!(liq.quantity, dec!(2.5));
+        assert_eq!(liq.timestamp, 1_700_000_000_123);
+
+        assert!(
+            parse_derivatives_message("allLiquidation.BTCUSDT", &data, &resolve, &[]).is_empty()
+        );
+    }
+
+    /// A spot client refuses the derivatives channels rather than subscribing to
+    /// a topic that will never carry a frame.
+    #[test]
+    fn a_spot_client_refuses_the_derivatives_channels() {
+        let (mut spot, _mock) = signed_client(1000);
+        let err = DerivativesStream::subscribe_derivatives(
+            &mut spot,
+            &symbol(),
+            DerivativesChannel::Funding,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
+        let err = DerivativesStream::open_interest(&mut spot, &symbol()).unwrap_err();
+        assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
+        let err = DerivativesStream::long_short_ratio(&mut spot, &symbol()).unwrap_err();
+        assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
+    }
+
+    /// The polled figures are read over REST, and an empty series is reported
+    /// rather than read as a zero.
+    #[test]
+    fn the_polled_figures_are_read_over_rest() {
+        let (futures, mock) = signed_futures_client(1000);
+        mock.push_json(
+            200,
+            r#"{"retCode":0,"retMsg":"OK","result":{"list":[{"openInterest":"12345.67","timestamp":"1700000000000"}]}}"#,
+        );
+        let oi = Bybit::open_interest(&futures, &symbol()).unwrap();
+        assert_eq!(oi.open_interest, dec!(12345.67));
+        assert_eq!(oi.timestamp, 1_700_000_000_000);
+
+        let (futures, mock) = signed_futures_client(1000);
+        mock.push_json(
+            200,
+            r#"{"retCode":0,"retMsg":"OK","result":{"list":[{"buyRatio":"0.6","sellRatio":"0.4","timestamp":"1700000000000"}]}}"#,
+        );
+        let ratio = Bybit::long_short_ratio(&futures, &symbol()).unwrap();
+        assert_eq!(ratio.long_size, dec!(0.6));
+        assert_eq!(ratio.short_size, dec!(0.4));
+
+        let (futures, mock) = signed_futures_client(1000);
+        mock.push_json(200, r#"{"retCode":0,"retMsg":"OK","result":{"list":[]}}"#);
+        assert!(Bybit::open_interest(&futures, &symbol()).is_err());
     }
 
     #[test]
