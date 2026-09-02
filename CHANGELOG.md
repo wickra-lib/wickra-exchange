@@ -142,6 +142,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`ExchangeOptions.margin_mode` was read by nothing, and two venues carry the
+  mode on every order.** Of the eight fields on `ExchangeOptions`, six are read
+  — `market_type`, `testnet` and `recv_window_ms` by the clients, and `timeout`,
+  `user_agent` and `proxy` by `ReqwestHttpTransport`. `margin_mode` was read by
+  nothing at all, and on OKX and Bitget that is not cosmetic: the mode travels
+  on the order, and the value on the order is the one that applies.
+  - **OKX** derived `tdMode` from the market type alone, so every non-spot order
+    went out as `cross` — on all four sites that build one (REST, WebSocket,
+    batch, and the OCO algo order). It is now a function of the market *and* the
+    configured margin mode: spot stays `cash`, and futures follow the option.
+  - **Bitget** wrote `"marginMode": "crossed"` as a literal in both futures order
+    paths, single and batch.
+  - `set_margin_mode` on both venues changed the account setting and left the
+    per-order value stale, so the very next order overrode what had just been
+    set. Both now update the client's mode as well; both signatures became
+    `&mut self` to do it, matching the `Derivatives` trait they implement.
+  A caller who asked for isolated margin got cross: the whole account balance
+  behind a position that was meant to be capped, with nothing said. It survived
+  because `ExchangeOptions::mainnet` defaults to `Cross` and no test had ever
+  constructed one with `Isolated` — seven new tests do, and each fails against
+  the previous behaviour.
+  `position_mode` remains the one field nothing reads; it is a separate fix.
+
 - **The CodSpeed comparison is bimodal per runner CPU, and now says so.** The
   job reported `apply_delta` at 453.6 ns against a 399.4 ns base on this
   release's documentation branch — the same pair as the earlier incident, to the

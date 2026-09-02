@@ -49,12 +49,23 @@ fn system_now_ms() -> i64 {
         .as_millis() as i64
 }
 
+/// Bitget's wire word for a margin mode. Cross is `crossed`, not `cross`.
+fn margin_wire(mode: MarginMode) -> &'static str {
+    match mode {
+        MarginMode::Cross => "crossed",
+        MarginMode::Isolated => "isolated",
+    }
+}
+
 /// A Bitget client over injected transports.
 pub struct Bitget {
     http: Box<dyn HttpTransport>,
     ws: Option<Box<dyn WsTransport>>,
     rest_base: String,
     market_type: MarketType,
+    /// The margin mode every futures order carries, kept in step by
+    /// [`set_margin_mode`](Self::set_margin_mode).
+    margin_mode: MarginMode,
     credentials: Option<Credentials>,
     now_ms: Box<dyn Fn() -> i64 + Send + Sync>,
     /// Client order ids for orders the caller did not name.
@@ -111,6 +122,7 @@ impl Bitget {
             ws: None,
             rest_base: "https://api.bitget.com".to_string(),
             market_type: options.market_type,
+            margin_mode: options.margin_mode,
             credentials,
             now_ms: Box::new(system_now_ms),
             client_ids: ClientIdGenerator::with_seed(
@@ -471,7 +483,7 @@ impl Bitget {
         }
         let path = if self.is_futures() {
             body["productType"] = serde_json::json!("USDT-FUTURES");
-            body["marginMode"] = serde_json::json!("crossed");
+            body["marginMode"] = serde_json::json!(margin_wire(self.margin_mode));
             body["marginCoin"] = serde_json::json!("USDT");
             if request.reduce_only {
                 body["reduceOnly"] = serde_json::json!("YES");
@@ -1176,11 +1188,8 @@ impl Bitget {
     ///
     /// # Errors
     /// Returns an [`Error`] if the change is rejected or the request fails.
-    pub fn set_margin_mode(&self, symbol: &Symbol, mode: MarginMode) -> Result<()> {
-        let margin = match mode {
-            MarginMode::Cross => "crossed",
-            MarginMode::Isolated => "isolated",
-        };
+    pub fn set_margin_mode(&mut self, symbol: &Symbol, mode: MarginMode) -> Result<()> {
+        let margin = margin_wire(mode);
         let body = serde_json::json!({
             "symbol": Self::wire_symbol(symbol),
             "productType": "USDT-FUTURES",
@@ -1193,6 +1202,10 @@ impl Bitget {
             "",
             &body.to_string(),
         )?;
+        // Every futures order carries `marginMode`, so the account-level change
+        // above is only half of it: without this the next order still says
+        // `crossed` and overrides what was just set.
+        self.margin_mode = mode;
         Ok(())
     }
 
@@ -1252,7 +1265,7 @@ impl Bitget {
                 serde_json::json!({
                     "symbol": wire,
                     "productType": "USDT-FUTURES",
-                    "marginMode": "crossed",
+                    "marginMode": margin_wire(self.margin_mode),
                     "marginCoin": "USDT",
                     "orderList": order_list,
                 }),
@@ -1714,6 +1727,96 @@ mod tests {
             .as_ref()
             .unwrap()
             .contains(r#""stpMode":"cancel_both""#));
+    }
+
+    fn isolated_futures_client(now_ms: i64) -> (Bitget, Arc<MockHttpTransport>) {
+        let mock = Arc::new(MockHttpTransport::new());
+        let mut opts = ExchangeOptions::mainnet(crate::MarketType::UsdMFutures);
+        opts.margin_mode = MarginMode::Isolated;
+        let bitget = Bitget::with_credentials(
+            Box::new(ArcTransport(Arc::clone(&mock))),
+            &opts,
+            Credentials::new("APIKEY", "SECRET").with_passphrase("PASS"),
+        )
+        .with_clock(Box::new(move || now_ms));
+        (bitget, mock)
+    }
+
+    #[test]
+    fn configured_margin_mode_reaches_every_futures_order() {
+        // Both futures order paths used to send `crossed` literally, so a client
+        // configured for isolated margin traded cross -- silently, with the whole
+        // account balance behind the position.
+        let (isolated, mock) = isolated_futures_client(1000);
+        mock.push_json(
+            200,
+            r#"{"code":"00000","data":{"orderId":"1","clientOid":""}}"#,
+        );
+        isolated
+            .place_order(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)))
+            .unwrap();
+        mock.push_json(
+            200,
+            r#"{"code":"00000","data":{
+            "successList":[{"orderId":"o1","clientOid":"b-0"}],"failureList":[]}}"#,
+        );
+        isolated
+            .place_batch(&[
+                OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)).with_client_order_id("b-0")
+            ])
+            .unwrap();
+
+        let reqs = mock.recorded_requests();
+        assert!(reqs[0]
+            .body
+            .as_deref()
+            .unwrap()
+            .contains(r#""marginMode":"isolated""#));
+        assert!(reqs[1]
+            .body
+            .as_deref()
+            .unwrap()
+            .contains(r#""marginMode":"isolated""#));
+
+        // The default is still cross, spelled the way Bitget spells it.
+        let (cross, cross_mock) = signed_futures_client(1000);
+        cross_mock.push_json(
+            200,
+            r#"{"code":"00000","data":{"orderId":"1","clientOid":""}}"#,
+        );
+        cross
+            .place_order(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)))
+            .unwrap();
+        let cross_reqs = cross_mock.recorded_requests();
+        assert!(cross_reqs[0]
+            .body
+            .as_deref()
+            .unwrap()
+            .contains(r#""marginMode":"crossed""#));
+    }
+
+    #[test]
+    fn set_margin_mode_changes_what_later_orders_carry() {
+        // The account-level call is only half of it: the order carries the mode
+        // too, and a stale one overrides what was just set.
+        let (mut bitget, mock) = signed_futures_client(1000);
+        mock.push_json(200, r#"{"code":"00000","data":{}}"#);
+        mock.push_json(
+            200,
+            r#"{"code":"00000","data":{"orderId":"1","clientOid":""}}"#,
+        );
+
+        Derivatives::set_margin_mode(&mut bitget, &symbol(), MarginMode::Isolated).unwrap();
+        bitget
+            .place_order(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)))
+            .unwrap();
+
+        let reqs = mock.recorded_requests();
+        assert!(reqs[1]
+            .body
+            .as_deref()
+            .unwrap()
+            .contains(r#""marginMode":"isolated""#));
     }
 
     #[test]
