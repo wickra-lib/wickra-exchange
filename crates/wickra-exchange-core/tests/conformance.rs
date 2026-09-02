@@ -13,8 +13,32 @@ use wickra_exchange_core::{
     AdvancedOrders, Binance, Bitget, Bybit, Coinbase, Credentials, Error, Event, Exchange,
     ExchangeOptions, Gate, HttpRequest, HttpResponse, HttpTransport, Htx, Kraken, KuCoin,
     MarketData, MarketType, MockHttpTransport, Okx, OrderRequest, OrderStatus, OrderType,
-    PaperExchange, ReplayExchange, Result, Symbol, TradePrint, Upbit, WsExecution, WsUserData,
+    PaperExchange, ReplayExchange, Result, SelfTradePrevention, Symbol, TimeInForce, TradePrint,
+    Upbit, WsExecution, WsUserData,
 };
+
+/// An EC private key, so the Coinbase client can sign the ES256 JWT its order
+/// path builds. A client that cannot sign never reaches the wire, and a contract
+/// about what goes out cannot be tested on one.
+const EC_KEY: &str = "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgZZ/YugITtxORUz74
+wHvqY4aizCFHQFTVNQCzDGy8/TOhRANCAAS69zNVQjOQ4RgxJVI8esP+jMfHLSTw
+2iVqo0qWlda/1D2jN4O3zcv4juQF5iE4pU5qPkeECTgsKSIYwZaMVMyO
+-----END PRIVATE KEY-----
+";
+
+/// Every spelling that proves post-only reached the wire, across all ten venues.
+const POST_ONLY_SPELLINGS: &[&str] = &[
+    "post_only",
+    "postonly",
+    "limit_maker",
+    "limit-maker",
+    "oflags=post",
+    "\"poc\"",
+];
+
+/// Every spelling that proves an immediate-or-cancel reached the wire.
+const IOC_SPELLINGS: &[&str] = &["ioc"];
 
 /// Share one [`MockHttpTransport`] between the test and the client that owns it,
 /// so the requests a client built can be read back after the call.
@@ -334,4 +358,429 @@ fn the_batch_and_websocket_paths_refuse_triggers_too() {
     ws!("OKX", Okx);
     ws!("Gate.io", Gate);
     ws!("Kraken", Kraken);
+}
+
+/// Every field the caller set on an order either reaches the venue or refuses
+/// the order. None of them may be dropped on the way.
+///
+/// This is [`a_trigger_order_is_either_carried_or_refused_but_never_flattened`]
+/// widened from one field to the class it belongs to. The trigger contract was
+/// written for `stop_price` after nine clients were found flattening it, but the
+/// same shape of defect sat on the rest of the request and no test looked: seven
+/// of the ten clients never sent `time_in_force` at all, so an `Ioc` -- "fill
+/// what you can now, cancel the rest" -- was placed as the resting `Gtc` the
+/// caller had asked it never to be, and four dropped the self-trade-prevention
+/// policy the same way.
+///
+/// A field a venue genuinely cannot express is a legitimate answer; sending the
+/// order anyway is not, because an order missing a field the caller set is a
+/// different order, not a smaller one. So the assertion is again "carried, or
+/// refused" -- a venue that gains a field later moves from one branch to the
+/// other without this test changing, and a venue added without either is caught.
+#[test]
+fn every_order_field_is_either_carried_or_refused_but_never_dropped() {
+    /// One field under test: how to set it on a request, and every spelling that
+    /// proves it reached the wire. Matching is case-insensitive, so `IOC`,
+    /// `ioc` and `Ioc` are one entry.
+    struct Field {
+        name: &'static str,
+        apply: fn(OrderRequest) -> OrderRequest,
+        spellings: &'static [&'static str],
+    }
+
+    const FIELDS: &[Field] = &[
+        Field {
+            name: "time_in_force = Ioc",
+            apply: |r| r.with_time_in_force(TimeInForce::Ioc),
+            spellings: &["ioc"],
+        },
+        Field {
+            name: "time_in_force = Fok",
+            apply: |r| r.with_time_in_force(TimeInForce::Fok),
+            spellings: &["fok"],
+        },
+        Field {
+            name: "post_only",
+            apply: OrderRequest::post_only,
+            spellings: &[
+                "post_only",
+                "postonly",
+                "limit_maker",
+                "limit-maker",
+                "oflags=post",
+                "\"poc\"",
+            ],
+        },
+        Field {
+            name: "stp",
+            apply: |r| r.with_stp(SelfTradePrevention::ExpireMaker),
+            spellings: &[
+                "stpmode",
+                "smptype",
+                "selftradeprevention",
+                "stp_act",
+                "\"stp\"",
+            ],
+        },
+    ];
+
+    fn assert_contract(
+        venue: &str,
+        field: &Field,
+        outcome: &Result<wickra_exchange_core::Order>,
+        sent: &[String],
+    ) {
+        let refused = matches!(outcome, Err(Error::Exchange { code, .. }) if code == "unsupported");
+        if refused {
+            assert!(
+                sent.is_empty(),
+                "{venue}/{}: refused, yet sent a request anyway",
+                field.name
+            );
+            return;
+        }
+        assert!(
+            !sent.is_empty(),
+            "{venue}/{}: neither refused the field nor sent an order",
+            field.name
+        );
+        let wire = sent.join(" ").to_lowercase();
+        let carried = field
+            .spellings
+            .iter()
+            .any(|spelling| wire.contains(spelling));
+        assert!(
+            carried,
+            "{venue}/{}: order went out without the field; the venue will place \
+             a different order than the caller asked for.\nwire: {wire}",
+            field.name
+        );
+    }
+
+    let market = market();
+    let creds = || {
+        Credentials::new("APIKEY", "c2VjcmV0")
+            .with_passphrase("PASS")
+            .with_private_key(EC_KEY)
+    };
+    let options = ExchangeOptions::mainnet(MarketType::Spot);
+
+    macro_rules! check {
+        ($name:literal, $venue:ident) => {{
+            for field in FIELDS {
+                let mock = Arc::new(MockHttpTransport::new());
+                // Enough replies, and enough shape, for the clients that fetch
+                // something before they can build an order (HTX resolves its
+                // spot account id first) to reach the order call at all. What
+                // came back is irrelevant; what went out is the contract.
+                for _ in 0..3 {
+                    mock.push_json(
+                        200,
+                        r#"{"status":"ok","code":"0","data":[{"id":42,"type":"spot","state":"working"}]}"#,
+                    );
+                }
+                let client = $venue::with_credentials(
+                    Box::new(ArcTransport(Arc::clone(&mock))),
+                    &options,
+                    creds(),
+                );
+                // A limit order, so that the time-in-force is meaningful: a
+                // market order is immediate by construction and several venues
+                // legitimately have no separate spelling for it.
+                let request =
+                    (field.apply)(OrderRequest::limit_buy(market.clone(), dec!(1), dec!(100)));
+                let outcome = client.place_order(&request);
+                // The order request is the last one out; anything before it is
+                // the client fetching what it needed to build the order.
+                let sent: Vec<String> = mock
+                    .recorded_requests()
+                    .last()
+                    .map(|r| format!("{} {}", r.url, r.body.clone().unwrap_or_default()))
+                    .into_iter()
+                    .collect();
+                assert_contract($name, field, &outcome, &sent);
+            }
+        }};
+    }
+
+    check!("Binance", Binance);
+    check!("Bybit", Bybit);
+    check!("OKX", Okx);
+    check!("Bitget", Bitget);
+    check!("KuCoin", KuCoin);
+    check!("Gate.io", Gate);
+    check!("HTX", Htx);
+    check!("Kraken", Kraken);
+    check!("Coinbase", Coinbase);
+    check!("Upbit", Upbit);
+}
+
+/// The same field contract on the batch path.
+///
+/// A batch builder is a second, hand-written copy of the order builder, and the
+/// two drift: PR #189 found Bitget's batch dropping `reduce_only` while its
+/// single-order path carried it, and this audit found the same shape on six
+/// more venues -- Gate's batch dropped `time_in_force`, `post_only` **and** the
+/// STP policy that its own `place_order` sends. A caller does not expect an
+/// order to mean something different because it travelled in a batch.
+#[test]
+fn the_batch_path_carries_every_field_too() {
+    struct Field {
+        name: &'static str,
+        apply: fn(OrderRequest) -> OrderRequest,
+        spellings: &'static [&'static str],
+    }
+
+    const FIELDS: &[Field] = &[
+        Field {
+            name: "time_in_force = Ioc",
+            apply: |r| r.with_time_in_force(TimeInForce::Ioc),
+            spellings: &["ioc"],
+        },
+        Field {
+            name: "post_only",
+            apply: OrderRequest::post_only,
+            spellings: &[
+                "post_only",
+                "postonly",
+                "limit_maker",
+                "limit-maker",
+                "oflags%5d=post",
+                "oflags]=post",
+                "\"poc\"",
+            ],
+        },
+        Field {
+            name: "stp",
+            apply: |r| r.with_stp(SelfTradePrevention::ExpireMaker),
+            spellings: &[
+                "stpmode",
+                "smptype",
+                "selftradeprevention",
+                "stp_act",
+                "\"stp\"",
+            ],
+        },
+    ];
+
+    let market = market();
+    let creds = || {
+        Credentials::new("APIKEY", "c2VjcmV0")
+            .with_passphrase("PASS")
+            .with_private_key(EC_KEY)
+    };
+    let options = ExchangeOptions::mainnet(MarketType::Spot);
+
+    macro_rules! check {
+        ($name:literal, $venue:ident) => {{
+            for field in FIELDS {
+                let mock = Arc::new(MockHttpTransport::new());
+                for _ in 0..3 {
+                    mock.push_json(
+                        200,
+                        r#"{"status":"ok","code":"0","data":[{"id":42,"type":"spot","state":"working"}]}"#,
+                    );
+                }
+                let mut client = $venue::with_credentials(
+                    Box::new(ArcTransport(Arc::clone(&mock))),
+                    &options,
+                    creds(),
+                );
+                let request =
+                    (field.apply)(OrderRequest::limit_buy(market.clone(), dec!(1), dec!(100)));
+                let outcome = AdvancedOrders::place_batch(&mut client, &[request]);
+                let refused = matches!(
+                    &outcome,
+                    Err(Error::Exchange { code, .. }) if code == "unsupported"
+                );
+                let sent: Vec<String> = mock
+                    .recorded_requests()
+                    .last()
+                    .map(|r| format!("{} {}", r.url, r.body.clone().unwrap_or_default()))
+                    .into_iter()
+                    .collect();
+                if refused {
+                    assert!(
+                        sent.is_empty(),
+                        "{}/{}: batch refused, yet sent a request anyway",
+                        $name,
+                        field.name
+                    );
+                    continue;
+                }
+                assert!(
+                    !sent.is_empty(),
+                    "{}/{}: batch neither refused the field nor sent an order",
+                    $name,
+                    field.name
+                );
+                let wire = sent.join(" ").to_lowercase();
+                assert!(
+                    field.spellings.iter().any(|s| wire.contains(s)),
+                    "{}/{}: batch went out without the field, while the \
+                     single-order path carries it.\nwire: {wire}",
+                    $name,
+                    field.name
+                );
+            }
+        }};
+    }
+
+    check!("Binance", Binance);
+    check!("Bybit", Bybit);
+    check!("OKX", Okx);
+    check!("Bitget", Bitget);
+    check!("KuCoin", KuCoin);
+    check!("Gate.io", Gate);
+    check!("HTX", Htx);
+    check!("Kraken", Kraken);
+}
+
+/// Two fields that a venue spells in *one* slot are refused together, never
+/// resolved by dropping one.
+///
+/// Several venues carry post-only and the time-in-force in a single field:
+/// Bybit's `timeInForce` takes `PostOnly` beside `IOC`, Bitget's `force` and
+/// Gate's `time_in_force` take `post_only`/`poc` the same way, OKX and HTX fold
+/// both into the order *type*, and Binance's post-only type accepts no
+/// time-in-force at all. Asking for both is asking for two things in one slot.
+///
+/// Those builders used to answer by picking one and discarding the other in
+/// silence -- `post_only` won, and an `Ioc` vanished -- which placed a resting
+/// order where the caller had asked for one that must not rest. Where a venue
+/// has room for both (Kraken spells post-only in `oflags`, KuCoin in its own
+/// `postOnly` field) the order goes out carrying both; where it does not, the
+/// order is refused.
+#[test]
+fn two_fields_in_one_venue_slot_are_refused_together_not_silently_resolved() {
+    let market = market();
+    let creds = || {
+        Credentials::new("APIKEY", "c2VjcmV0")
+            .with_passphrase("PASS")
+            .with_private_key(EC_KEY)
+    };
+    let options = ExchangeOptions::mainnet(MarketType::Spot);
+
+    macro_rules! check {
+        ($name:literal, $venue:ident) => {{
+            let mock = Arc::new(MockHttpTransport::new());
+            for _ in 0..3 {
+                mock.push_json(
+                    200,
+                    r#"{"status":"ok","code":"0","data":[{"id":42,"type":"spot","state":"working"}]}"#,
+                );
+            }
+            let client = $venue::with_credentials(
+                Box::new(ArcTransport(Arc::clone(&mock))),
+                &options,
+                creds(),
+            );
+            let request = OrderRequest::limit_buy(market.clone(), dec!(1), dec!(100))
+                .post_only()
+                .with_time_in_force(TimeInForce::Ioc);
+            let outcome = client.place_order(&request);
+            let sent: Vec<String> = mock
+                .recorded_requests()
+                .last()
+                .map(|r| format!("{} {}", r.url, r.body.clone().unwrap_or_default()))
+                .into_iter()
+                .collect();
+            if matches!(&outcome, Err(Error::Exchange { code, .. }) if code == "unsupported") {
+                assert!(
+                    sent.is_empty(),
+                    concat!($name, ": refused the pair, yet sent a request anyway")
+                );
+            } else {
+                let wire = sent.join(" ").to_lowercase();
+                assert!(
+                    POST_ONLY_SPELLINGS.iter().any(|s| wire.contains(s))
+                        && IOC_SPELLINGS.iter().any(|s| wire.contains(s)),
+                    "{}: accepted post_only + Ioc but sent only one of them.\nwire: {wire}",
+                    $name
+                );
+            }
+        }};
+    }
+
+    check!("Binance", Binance);
+    check!("Bybit", Bybit);
+    check!("OKX", Okx);
+    check!("Bitget", Bitget);
+    check!("KuCoin", KuCoin);
+    check!("Gate.io", Gate);
+    check!("HTX", Htx);
+    check!("Kraken", Kraken);
+    check!("Coinbase", Coinbase);
+    check!("Upbit", Upbit);
+}
+
+/// A market order that asks for fill-or-kill is refused wherever the venue's
+/// market order has no such spelling.
+///
+/// A market order is immediate by construction, so GTC (the request default)
+/// and IOC both describe what it already does and need no field. FOK does not:
+/// "fill all of it now or none of it" is a different instruction, and most
+/// venues express it only on a limit order -- Gate's futures market order *is*
+/// a zero-price IOC, HTX's is `optimal_5`, Coinbase's is `market_market_ioc`.
+/// Placing the order without the FOK would let a partial fill stand where the
+/// caller asked for all-or-nothing.
+#[test]
+fn a_market_order_asking_for_fill_or_kill_is_refused_where_it_cannot_be_said() {
+    let market = market();
+    let creds = || {
+        Credentials::new("APIKEY", "c2VjcmV0")
+            .with_passphrase("PASS")
+            .with_private_key(EC_KEY)
+    };
+    let options = ExchangeOptions::mainnet(MarketType::Spot);
+
+    macro_rules! check {
+        ($name:literal, $venue:ident) => {{
+            let mock = Arc::new(MockHttpTransport::new());
+            for _ in 0..3 {
+                mock.push_json(
+                    200,
+                    r#"{"status":"ok","code":"0","data":[{"id":42,"type":"spot","state":"working"}]}"#,
+                );
+            }
+            let client = $venue::with_credentials(
+                Box::new(ArcTransport(Arc::clone(&mock))),
+                &options,
+                creds(),
+            );
+            let request = OrderRequest::market_buy(market.clone(), dec!(1))
+                .with_time_in_force(TimeInForce::Fok);
+            let outcome = client.place_order(&request);
+            let sent: Vec<String> = mock
+                .recorded_requests()
+                .last()
+                .map(|r| format!("{} {}", r.url, r.body.clone().unwrap_or_default()))
+                .into_iter()
+                .collect();
+            if matches!(&outcome, Err(Error::Exchange { code, .. }) if code == "unsupported") {
+                assert!(
+                    sent.is_empty(),
+                    concat!($name, ": refused the FOK, yet sent a request anyway")
+                );
+            } else {
+                let wire = sent.join(" ").to_lowercase();
+                assert!(
+                    wire.contains("fok"),
+                    "{}: accepted a FOK market order but sent no fill-or-kill.\nwire: {wire}",
+                    $name
+                );
+            }
+        }};
+    }
+
+    check!("Binance", Binance);
+    check!("Bybit", Bybit);
+    check!("OKX", Okx);
+    check!("Bitget", Bitget);
+    check!("KuCoin", KuCoin);
+    check!("Gate.io", Gate);
+    check!("HTX", Htx);
+    check!("Kraken", Kraken);
+    check!("Coinbase", Coinbase);
+    check!("Upbit", Upbit);
 }

@@ -106,6 +106,24 @@ impl Error {
         }
     }
 
+    /// An order field the caller set that this venue path cannot express.
+    ///
+    /// The same reasoning as [`Error::unsupported_trigger`], generalised to the
+    /// rest of the request. A field the caller set is part of what the order
+    /// *is*: an `Ioc` that is sent as a `Gtc` rests in the book the caller
+    /// asked it never to rest in, and a `post_only` that is dropped can take
+    /// liquidity at the taker fee. Sending the order without the field is not
+    /// a smaller version of it, so the paths that cannot express a field refuse
+    /// instead of quietly weakening the order.
+    pub(crate) fn unsupported_field(venue: &str, field: &str, detail: &str) -> Self {
+        Error::Exchange {
+            code: "unsupported".to_string(),
+            message: format!(
+                "{venue}: {field} cannot be expressed on this order path ({detail});                  sending the order without it would place a different order than requested"
+            ),
+        }
+    }
+
     /// Whether retrying the operation could plausibly succeed: transient
     /// transport failures, timeouts and rate limits. Permanent failures
     /// (invalid order, auth, insufficient balance, …) return `false`.

@@ -460,11 +460,7 @@ impl Bybit {
             return Err(Error::unsupported_trigger("Bybit"));
         }
         request.validate()?;
-        let time_in_force = if request.post_only {
-            "PostOnly"
-        } else {
-            tif_str(request.time_in_force)
-        };
+        let time_in_force = tif_for(request)?;
         let mut body = serde_json::json!({
             "category": self.category,
             "symbol": Self::wire_symbol(&request.symbol),
@@ -532,11 +528,7 @@ impl Bybit {
             return Err(Error::unsupported_trigger("Bybit"));
         }
         request.validate()?;
-        let time_in_force = if request.post_only {
-            "PostOnly"
-        } else {
-            tif_str(request.time_in_force)
-        };
+        let time_in_force = tif_for(request)?;
         let mut arg = serde_json::json!({
             "category": self.category,
             "symbol": Self::wire_symbol(&request.symbol),
@@ -944,6 +936,22 @@ fn order_type_str(order_type: OrderType) -> &'static str {
     match order_type {
         OrderType::Market | OrderType::StopMarket => "Market",
         OrderType::Limit | OrderType::StopLimit => "Limit",
+    }
+}
+
+/// The Bybit `timeInForce` value for a request. `PostOnly` is one of the values
+/// that field takes, alongside `GTC`/`IOC`/`FOK`, so setting both asks for two
+/// things in one slot: that is refused rather than resolved by dropping the
+/// time-in-force, which is what these builders used to do silently.
+fn tif_for(request: &OrderRequest) -> Result<&'static str> {
+    match (request.post_only, request.time_in_force) {
+        (true, TimeInForce::Gtc) => Ok("PostOnly"),
+        (true, _) => Err(Error::unsupported_field(
+            "Bybit",
+            "post_only together with a non-GTC time-in-force",
+            "`PostOnly` is one of the values Bybit's `timeInForce` field takes",
+        )),
+        (false, tif) => Ok(tif_str(tif)),
     }
 }
 
@@ -1429,16 +1437,23 @@ impl Bybit {
         if requests.iter().any(|r| r.order_type.is_trigger()) {
             return Err(Error::unsupported_trigger("Bybit"));
         }
+        // Resolved before the batch is built, so a request the venue cannot
+        // express refuses the whole call rather than being sent weakened.
+        let tifs = requests.iter().map(tif_for).collect::<Result<Vec<_>>>()?;
         let items: Vec<serde_json::Value> = requests
             .iter()
-            .map(|r| {
+            .zip(&tifs)
+            .map(|(r, tif)| {
                 let mut o = serde_json::json!({
                     "symbol": Self::wire_symbol(&r.symbol),
                     "side": side_str(r.side),
                     "orderType": order_type_str(r.order_type),
                     "qty": format_decimal(r.quantity),
-                    "timeInForce": tif_str(r.time_in_force),
+                    "timeInForce": tif,
                 });
+                if let Some(smp) = smp_str(r.stp) {
+                    o["smpType"] = serde_json::json!(smp);
+                }
                 if let Some(price) = r.price {
                     o["price"] = serde_json::json!(format_decimal(price));
                 }

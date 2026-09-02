@@ -478,11 +478,7 @@ impl Bitget {
             return Err(Error::unsupported_trigger("Bitget"));
         }
         request.validate()?;
-        let force = if request.post_only {
-            "post_only"
-        } else {
-            force_str(request.time_in_force)
-        };
+        let force = force_for(request)?;
         let mut body = serde_json::json!({
             "symbol": Self::wire_symbol(&request.symbol),
             "side": side_str(request.side),
@@ -790,6 +786,22 @@ fn order_type_str(order_type: OrderType) -> &'static str {
     match order_type {
         OrderType::Market | OrderType::StopMarket => "market",
         OrderType::Limit | OrderType::StopLimit => "limit",
+    }
+}
+
+/// The Bitget `force` value for a request. `post_only` is one of the values that
+/// field takes, alongside `gtc`/`ioc`/`fok`, so setting both asks for two things
+/// in one slot: that is refused rather than resolved by dropping the
+/// time-in-force, which is what this builder used to do silently.
+fn force_for(request: &OrderRequest) -> Result<&'static str> {
+    match (request.post_only, request.time_in_force) {
+        (true, TimeInForce::Gtc) => Ok("post_only"),
+        (true, _) => Err(Error::unsupported_field(
+            "Bitget",
+            "post_only together with a non-GTC time-in-force",
+            "`post_only` is one of the values Bitget's `force` field takes",
+        )),
+        (false, tif) => Ok(force_str(tif)),
     }
 }
 
@@ -1269,17 +1281,24 @@ impl Bitget {
             return Ok(Vec::new());
         }
         let wire = Self::wire_symbol(&requests[0].symbol);
+        // Resolved before the batch is built, so a request the venue cannot
+        // express refuses the whole call rather than being sent weakened.
+        let forces = requests.iter().map(force_for).collect::<Result<Vec<_>>>()?;
         let order_list: Vec<serde_json::Value> = requests
             .iter()
-            .map(|r| {
+            .zip(&forces)
+            .map(|(r, force)| {
                 let coid = self.batch_client_oid(r);
                 let mut o = serde_json::json!({
                     "side": side_str(r.side),
                     "orderType": order_type_str(r.order_type),
-                    "force": force_str(r.time_in_force),
+                    "force": force,
                     "size": format_decimal(r.quantity),
                     "clientOid": coid,
                 });
+                if let Some(mode) = stp_mode_str(r.stp) {
+                    o["stpMode"] = serde_json::json!(mode);
+                }
                 if let Some(price) = r.price {
                     o["price"] = serde_json::json!(format_decimal(price));
                 }

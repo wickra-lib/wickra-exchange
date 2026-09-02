@@ -36,7 +36,7 @@ use crate::credentials::Credentials;
 use crate::error::{Error, Result};
 use crate::events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
 use crate::normalize::{format_decimal, parse_decimal};
-use crate::options::{ExchangeOptions, MarginMode, MarketType, PositionMode};
+use crate::options::{ExchangeOptions, MarginMode, MarketType, PositionMode, SelfTradePrevention};
 use crate::positions::{Position, PositionSide};
 use crate::signing::{hmac_sha512_base64_with_b64_secret, sha256};
 use crate::symbol::Symbol;
@@ -46,6 +46,7 @@ use crate::traits::{
 use crate::transport::{HttpMethod, HttpRequest, HttpTransport, WsConnection, WsTransport};
 use crate::types::{
     Balance, OcoRequest, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker,
+    TimeInForce,
 };
 use rust_decimal::Decimal;
 use std::cell::Cell;
@@ -615,6 +616,7 @@ impl Kraken {
         // (`order_qty`, `limit_price`, `cl_ord_id`), so the REST spelling does
         // not carry over. Sending the order without it would place a limit that
         // may take liquidity -- the one thing post-only exists to prevent.
+        ensure_no_stp(request)?;
         if request.post_only {
             return Err(Error::Exchange {
                 code: "unsupported".to_string(),
@@ -639,6 +641,12 @@ impl Kraken {
         );
         if let Some(price) = request.price {
             params.insert("limit_price".to_string(), json_number(price));
+        }
+        if let Some(tif) = tif_str(request.time_in_force)? {
+            params.insert(
+                "time_in_force".to_string(),
+                serde_json::json!(tif.to_lowercase()),
+            );
         }
         if let Some(id) = &request.client_order_id {
             params.insert("cl_ord_id".to_string(), serde_json::json!(id.clone()));
@@ -791,6 +799,7 @@ impl Kraken {
         }
         self.ensure_one_way()?;
         request.validate()?;
+        ensure_no_stp(request)?;
         if self.is_futures() {
             return self.place_futures_order(request);
         }
@@ -806,6 +815,9 @@ impl Kraken {
         }
         if request.post_only {
             params.push(("oflags", "post".to_string()));
+        }
+        if let Some(tif) = tif_str(request.time_in_force)? {
+            params.push(("timeinforce", tif.to_string()));
         }
         if let Some(id) = &request.client_order_id {
             params.push(("cl_ord_id", id.clone()));
@@ -1080,10 +1092,29 @@ impl Kraken {
     /// (`mkt`/`lmt`/`post`), `symbol`, `side`, `size`, optional `limitPrice`, and
     /// `reduceOnly`.
     fn place_futures_order(&self, request: &OrderRequest) -> Result<Order> {
-        let order_type = match (request.order_type, request.post_only) {
-            (OrderType::Market | OrderType::StopMarket, _) => "mkt",
-            (OrderType::Limit | OrderType::StopLimit, true) => "post",
-            (OrderType::Limit | OrderType::StopLimit, false) => "lmt",
+        ensure_no_stp(request)?;
+        // Kraken Futures carries post-only and IOC *inside* `orderType`, so the
+        // two cannot both be spelled on one order, and there is no fill-or-kill
+        // at all -- both are refused rather than dropped down to a plain limit.
+        let order_type = match (request.order_type, request.time_in_force, request.post_only) {
+            (_, TimeInForce::Fok, _) => {
+                return Err(Error::unsupported_field(
+                    "Kraken",
+                    "a FOK time-in-force",
+                    "Kraken Futures orderType is mkt, lmt, post or ioc",
+                ))
+            }
+            (OrderType::Limit | OrderType::StopLimit, TimeInForce::Ioc, true) => {
+                return Err(Error::unsupported_field(
+                    "Kraken",
+                    "post_only together with an IOC time-in-force",
+                    "both are Kraken Futures order types and only one is sent",
+                ))
+            }
+            (OrderType::Market | OrderType::StopMarket, _, _) => "mkt",
+            (OrderType::Limit | OrderType::StopLimit, TimeInForce::Ioc, false) => "ioc",
+            (OrderType::Limit | OrderType::StopLimit, TimeInForce::Gtc, true) => "post",
+            (OrderType::Limit | OrderType::StopLimit, TimeInForce::Gtc, false) => "lmt",
         };
         let mut params: Vec<(&str, String)> = vec![
             ("orderType", order_type.to_string()),
@@ -1665,6 +1696,36 @@ fn side_str(side: OrderSide) -> &'static str {
     }
 }
 
+/// Kraken's order APIs -- spot `AddOrder`, the v2 WebSocket `add_order` and
+/// Kraken Futures `sendorder` alike -- carry no self-trade-prevention field, so
+/// a policy the caller set cannot be honoured and the order is refused rather
+/// than placed without the protection it was given.
+fn ensure_no_stp(request: &OrderRequest) -> Result<()> {
+    if request.stp == SelfTradePrevention::None {
+        return Ok(());
+    }
+    Err(Error::unsupported_field(
+        "Kraken",
+        "a self-trade-prevention policy",
+        "Kraken's order APIs carry no STP field",
+    ))
+}
+
+/// The Kraken `timeinforce` value for a spot order. Kraken spells GTC, IOC and
+/// GTD; it has **no** fill-or-kill, so a FOK is refused rather than sent as the
+/// resting GTC it is not. `Gtc` is Kraken's default and is left off the wire.
+fn tif_str(tif: TimeInForce) -> Result<Option<&'static str>> {
+    match tif {
+        TimeInForce::Gtc => Ok(None),
+        TimeInForce::Ioc => Ok(Some("IOC")),
+        TimeInForce::Fok => Err(Error::unsupported_field(
+            "Kraken",
+            "a FOK time-in-force",
+            "Kraken's timeinforce is GTC, IOC or GTD",
+        )),
+    }
+}
+
 fn order_type_str(order_type: OrderType) -> &'static str {
     match order_type {
         OrderType::Market | OrderType::StopMarket => "market",
@@ -2179,6 +2240,7 @@ impl Kraken {
         }
         for request in requests {
             request.validate()?;
+            ensure_no_stp(request)?;
         }
         // Kraken's `AddOrderBatch` carries one shared `pair` plus an indexed
         // `orders[i][…]` array — a form shape the flat helper cannot express.
@@ -2202,6 +2264,9 @@ impl Kraken {
             }
             if request.post_only {
                 params.push((format!("orders[{index}][oflags]"), "post".to_string()));
+            }
+            if let Some(tif) = tif_str(request.time_in_force)? {
+                params.push((format!("orders[{index}][timeinforce]"), tif.to_string()));
             }
             if let Some(id) = &request.client_order_id {
                 params.push((format!("orders[{index}][cl_ord_id]"), id.clone()));

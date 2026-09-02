@@ -36,6 +36,7 @@ use crate::transport::{
 };
 use crate::types::{
     Balance, OcoRequest, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker,
+    TimeInForce,
 };
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
@@ -492,8 +493,8 @@ impl Gate {
         if let Some(price) = request.price {
             req_param["price"] = serde_json::json!(format_decimal(price));
         }
-        if request.post_only {
-            req_param["time_in_force"] = serde_json::json!("poc");
+        if let Some(tif) = tif_str(request)? {
+            req_param["time_in_force"] = serde_json::json!(tif);
         }
         if let Some(id) = &request.client_order_id {
             let text = if id.starts_with("t-") {
@@ -640,8 +641,8 @@ impl Gate {
         if let Some(price) = request.price {
             body["price"] = serde_json::json!(format_decimal(price));
         }
-        if request.post_only {
-            body["time_in_force"] = serde_json::json!("poc");
+        if let Some(tif) = tif_str(request)? {
+            body["time_in_force"] = serde_json::json!(tif);
         }
         if let Some(id) = &request.client_order_id {
             let text = if id.starts_with("t-") {
@@ -788,6 +789,16 @@ impl Gate {
         };
         match request.order_type {
             OrderType::Market | OrderType::StopMarket => {
+                // A Gate futures market order is a zero-price IOC; the venue has
+                // no other spelling for it, so a caller asking for FOK is asking
+                // for an order this path cannot place.
+                if request.time_in_force == TimeInForce::Fok {
+                    return Err(Error::unsupported_field(
+                        "Gate.io",
+                        "a FOK time-in-force on a futures market order",
+                        "the futures market order is a zero-price IOC",
+                    ));
+                }
                 body["price"] = serde_json::json!("0");
                 body["tif"] = serde_json::json!("ioc");
             }
@@ -796,8 +807,8 @@ impl Gate {
                     .price
                     .ok_or(Error::InvalidOrder("limit order requires a price"))?;
                 body["price"] = serde_json::json!(format_decimal(price));
-                if request.post_only {
-                    body["tif"] = serde_json::json!("poc");
+                if let Some(tif) = tif_str(request)? {
+                    body["tif"] = serde_json::json!(tif);
                 }
             }
         }
@@ -988,6 +999,28 @@ fn stp_act_str(stp: SelfTradePrevention) -> Option<&'static str> {
         SelfTradePrevention::ExpireMaker => Some("co"),
         SelfTradePrevention::ExpireTaker => Some("cn"),
         SelfTradePrevention::ExpireBoth => Some("cb"),
+    }
+}
+
+/// Gate spells time-in-force and post-only through one field (`time_in_force`
+/// on spot, `tif` on futures), because `poc` *is* a post-only GTC. That makes
+/// the two settings able to conflict, so a post-only IOC/FOK is refused rather
+/// than silently resolved in one direction or the other.
+///
+/// `Gtc` is the request default and Gate's own default, so it is left off the
+/// wire; `Ioc` and `Fok` are what a dropped field would change, and they are
+/// always sent.
+fn tif_str(request: &OrderRequest) -> Result<Option<&'static str>> {
+    match (request.post_only, request.time_in_force) {
+        (true, TimeInForce::Gtc) => Ok(Some("poc")),
+        (true, _) => Err(Error::unsupported_field(
+            "Gate.io",
+            "post_only together with a non-GTC time-in-force",
+            "`poc` is Gate's post-only and is itself a time-in-force",
+        )),
+        (false, TimeInForce::Gtc) => Ok(None),
+        (false, TimeInForce::Ioc) => Ok(Some("ioc")),
+        (false, TimeInForce::Fok) => Ok(Some("fok")),
     }
 }
 
@@ -1602,9 +1635,13 @@ impl Gate {
         if requests.iter().any(|r| r.order_type.is_trigger()) {
             return Err(Error::unsupported_trigger("Gate.io"));
         }
+        // Resolved before the batch is built, so a request the venue cannot
+        // express refuses the whole call rather than being sent weakened.
+        let tifs = requests.iter().map(tif_str).collect::<Result<Vec<_>>>()?;
         let items: Vec<serde_json::Value> = requests
             .iter()
-            .map(|r| {
+            .zip(&tifs)
+            .map(|(r, tif)| {
                 let mut o = serde_json::json!({
                     "currency_pair": Self::wire_symbol(&r.symbol),
                     "side": side_str(r.side),
@@ -1614,6 +1651,9 @@ impl Gate {
                 if let Some(price) = r.price {
                     o["price"] = serde_json::json!(format_decimal(price));
                 }
+                if let Some(tif) = tif {
+                    o["time_in_force"] = serde_json::json!(*tif);
+                }
                 if let Some(id) = &r.client_order_id {
                     let text = if id.starts_with("t-") {
                         id.clone()
@@ -1621,6 +1661,9 @@ impl Gate {
                         format!("t-{id}")
                     };
                     o["text"] = serde_json::json!(text);
+                }
+                if let Some(act) = stp_act_str(r.stp) {
+                    o["stp_act"] = serde_json::json!(act);
                 }
                 o
             })
