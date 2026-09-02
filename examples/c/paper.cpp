@@ -7,6 +7,13 @@
 // than freed by hand at the end: every `assert` below is an early exit, and a
 // hand-written free after them is not reached when one fires.
 
+/* These programs double as the C-side test suite: ctest runs them and a failed
+ * expectation must fail the build. CI builds with `--config Release`, and on a
+ * multi-config generator that defines NDEBUG -- which turns every assert below
+ * into nothing at all, so the Windows runs were asserting no expectation while
+ * reporting success. Undefining it before <assert.h> keeps the checks live in
+ * every configuration. */
+#undef NDEBUG
 #include <cassert>
 #include <cmath>
 #include <cstring>

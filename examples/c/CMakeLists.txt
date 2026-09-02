@@ -37,12 +37,22 @@ add_executable(paper paper.cpp)
 target_include_directories(paper PRIVATE "${WICKRA_EXCHANGE_INCLUDE}")
 target_link_libraries(paper PRIVATE "${WICKRA_EXCHANGE_LIB}")
 
+# The golden-parity test reads the committed fixtures in <repo>/golden, so it
+# runs from the repository root rather than the build tree (see the WORKING_
+# DIRECTORY on its test below).
+add_executable(golden_test golden_test.c)
+target_include_directories(golden_test PRIVATE "${WICKRA_EXCHANGE_INCLUDE}")
+target_link_libraries(golden_test PRIVATE "${WICKRA_EXCHANGE_LIB}")
+if(NOT WIN32)
+    target_link_libraries(golden_test PRIVATE m)
+endif()
+
 # On Windows the runtime DLL must sit next to the executable (there is no
 # rpath); without it the loader pops a modal "DLL not found" dialog that hangs
 # ctest. Copy it next to each example after build. (Unix resolves the .so/.dylib
 # via the linker's embedded path, so this is Windows-only.)
 if(WIN32)
-    foreach(example replay paper)
+    foreach(example replay paper golden_test)
         add_custom_command(TARGET ${example} POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "${WICKRA_EXCHANGE_LIB_DIR}/wickra_exchange.dll"
@@ -54,5 +64,7 @@ endif()
 enable_testing()
 add_test(NAME replay COMMAND replay)
 add_test(NAME paper COMMAND paper)
+add_test(NAME golden COMMAND golden_test
+         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../..")
 # A missing runtime dependency must fail fast, never block the runner for hours.
-set_tests_properties(replay paper PROPERTIES TIMEOUT 60)
+set_tests_properties(replay paper golden PROPERTIES TIMEOUT 60)
