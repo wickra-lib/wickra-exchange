@@ -32,7 +32,7 @@ use crate::credentials::Credentials;
 use crate::error::{Error, Result};
 use crate::events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
 use crate::normalize::{format_decimal, parse_decimal};
-use crate::options::{ExchangeOptions, MarginMode, MarketType};
+use crate::options::{ExchangeOptions, MarginMode, MarketType, SelfTradePrevention};
 use crate::positions::{Position, PositionSide};
 use crate::signing::hmac_sha256_base64;
 use crate::symbol::Symbol;
@@ -42,6 +42,7 @@ use crate::traits::{
 use crate::transport::{HttpMethod, HttpRequest, HttpTransport, WsConnection, WsTransport};
 use crate::types::{
     Balance, OcoRequest, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker,
+    TimeInForce,
 };
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
@@ -572,12 +573,11 @@ impl Htx {
         if self.is_futures() {
             return self.place_futures_order(request);
         }
+        // Resolved before the account lookup, so a request this venue cannot
+        // express costs no round-trip and leaves nothing on the wire.
+        ensure_no_stp(request)?;
+        let order_kind = format!("{}-{}", side_str(request.side), order_kind_str(request)?);
         let account_id = self.account_id()?;
-        let order_kind = format!(
-            "{}-{}",
-            side_str(request.side),
-            order_type_str(request.order_type)
-        );
         let mut body = serde_json::json!({
             "account-id": account_id,
             "symbol": Self::wire_symbol(&request.symbol),
@@ -781,13 +781,23 @@ impl Htx {
         });
         match request.order_type {
             OrderType::Market | OrderType::StopMarket => {
+                // `optimal_5` sweeps the best five levels and cancels the rest,
+                // which is the venue's market order and already IOC-shaped;
+                // there is no fill-or-kill spelling for it.
+                if request.time_in_force == TimeInForce::Fok {
+                    return Err(Error::unsupported_field(
+                        "HTX",
+                        "a FOK time-in-force on a futures market order",
+                        "the futures market order is `optimal_5`, which is IOC-shaped",
+                    ));
+                }
                 body["order_price_type"] = serde_json::json!("optimal_5");
             }
             OrderType::Limit | OrderType::StopLimit => {
                 let price = request
                     .price
                     .ok_or(Error::InvalidOrder("limit order requires a price"))?;
-                body["order_price_type"] = serde_json::json!("limit");
+                body["order_price_type"] = serde_json::json!(futures_price_type(request)?);
                 body["price"] = serde_json::json!(format_decimal(price));
             }
         }
@@ -1053,6 +1063,70 @@ fn side_str(side: OrderSide) -> &'static str {
         OrderSide::Buy => "buy",
         OrderSide::Sell => "sell",
     }
+}
+
+/// HTX spells the spot order kind, its time-in-force and post-only as one
+/// `<side>-<kind>` string (`buy-limit`, `buy-ioc`, `buy-limit-maker`,
+/// `buy-limit-fok`), so those three settings share a single slot and a
+/// combination needing two of them is refused rather than resolved by dropping
+/// one. There is no market fill-or-kill, so that is refused too.
+fn order_kind_str(request: &OrderRequest) -> Result<&'static str> {
+    match (request.order_type, request.time_in_force, request.post_only) {
+        (OrderType::Market | OrderType::StopMarket, TimeInForce::Fok, _) => {
+            Err(Error::unsupported_field(
+                "HTX",
+                "a FOK time-in-force on a market order",
+                "HTX has no `<side>-market-fok` order kind",
+            ))
+        }
+        (OrderType::Market | OrderType::StopMarket, _, true) => Err(Error::unsupported_field(
+            "HTX",
+            "post_only on a market order",
+            "HTX's post-only is the `limit-maker` order kind",
+        )),
+        (OrderType::Market | OrderType::StopMarket, _, false)
+        | (OrderType::Limit | OrderType::StopLimit, TimeInForce::Gtc, false) => {
+            Ok(order_type_str(request.order_type))
+        }
+        (OrderType::Limit | OrderType::StopLimit, TimeInForce::Gtc, true) => Ok("limit-maker"),
+        (OrderType::Limit | OrderType::StopLimit, _, true) => Err(Error::unsupported_field(
+            "HTX",
+            "post_only together with a non-GTC time-in-force",
+            "both live in the one `<side>-<kind>` slot",
+        )),
+        (OrderType::Limit | OrderType::StopLimit, TimeInForce::Ioc, false) => Ok("ioc"),
+        (OrderType::Limit | OrderType::StopLimit, TimeInForce::Fok, false) => Ok("limit-fok"),
+    }
+}
+
+/// The HTX swap `order_price_type`. Post-only and IOC/FOK are values of that one
+/// field, so they cannot both be spelled and a conflict is refused.
+fn futures_price_type(request: &OrderRequest) -> Result<&'static str> {
+    match (request.time_in_force, request.post_only) {
+        (TimeInForce::Gtc, false) => Ok("limit"),
+        (TimeInForce::Gtc, true) => Ok("post_only"),
+        (TimeInForce::Ioc, false) => Ok("ioc"),
+        (TimeInForce::Fok, false) => Ok("fok"),
+        (_, true) => Err(Error::unsupported_field(
+            "HTX",
+            "post_only together with a non-GTC time-in-force",
+            "both are values of the one `order_price_type` field",
+        )),
+    }
+}
+
+/// HTX's spot order API carries no self-trade-prevention field, so a policy the
+/// caller set cannot be honoured and the order is refused instead of placed
+/// without it.
+fn ensure_no_stp(request: &OrderRequest) -> Result<()> {
+    if request.stp == SelfTradePrevention::None {
+        return Ok(());
+    }
+    Err(Error::unsupported_field(
+        "HTX",
+        "a self-trade-prevention policy",
+        "HTX's spot order API carries no STP field",
+    ))
 }
 
 fn order_type_str(order_type: OrderType) -> &'static str {
@@ -1553,11 +1627,22 @@ impl Htx {
                 message: "HTX batch-orders is a spot endpoint".to_string(),
             });
         }
+        // Resolved up front, so a request this endpoint cannot express refuses
+        // the whole batch rather than travelling with a field dropped -- and
+        // before the account lookup, so nothing reaches the wire either.
+        for r in requests {
+            ensure_no_stp(r)?;
+        }
+        let kinds = requests
+            .iter()
+            .map(order_kind_str)
+            .collect::<Result<Vec<_>>>()?;
         let account_id = self.account_id()?;
         let items: Vec<serde_json::Value> = requests
             .iter()
-            .map(|r| {
-                let order_kind = format!("{}-{}", side_str(r.side), order_type_str(r.order_type));
+            .zip(&kinds)
+            .map(|(r, kind)| {
+                let order_kind = format!("{}-{}", side_str(r.side), kind);
                 let mut o = serde_json::json!({
                     "account-id": account_id,
                     "symbol": Self::wire_symbol(&r.symbol),
@@ -2117,6 +2202,63 @@ mod tests {
                 .unwrap_err(),
             Error::Exchange { .. }
         ));
+    }
+
+    /// The swap `order_price_type` carries the time-in-force and post-only in one
+    /// field, and the futures market order is `optimal_5` -- IOC-shaped, with no
+    /// fill-or-kill spelling.
+    #[test]
+    fn futures_orders_carry_the_time_in_force_or_refuse_it() {
+        let (htx, mock) = signed_futures_client(1000);
+        mock.push_json(200, "{}");
+        let ioc = OrderRequest::limit_buy(symbol(), dec!(1), dec!(100))
+            .with_time_in_force(TimeInForce::Ioc);
+        let _ = htx.place_order(&ioc);
+        let body = mock.recorded_requests()[0].body.clone().unwrap_or_default();
+        assert!(body.contains(r#""order_price_type":"ioc""#));
+
+        let (htx, mock) = signed_futures_client(1000);
+        mock.push_json(200, "{}");
+        let fok = OrderRequest::limit_buy(symbol(), dec!(1), dec!(100))
+            .with_time_in_force(TimeInForce::Fok);
+        let _ = htx.place_order(&fok);
+        let body = mock.recorded_requests()[0].body.clone().unwrap_or_default();
+        assert!(body.contains(r#""order_price_type":"fok""#));
+
+        let (htx, mock) = signed_futures_client(1000);
+        mock.push_json(200, "{}");
+        let poc = OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)).post_only();
+        let _ = htx.place_order(&poc);
+        let body = mock.recorded_requests()[0].body.clone().unwrap_or_default();
+        assert!(body.contains(r#""order_price_type":"post_only""#));
+
+        // Post-only and a non-GTC time-in-force are both values of that one
+        // field, so asking for both is refused rather than half-honoured.
+        let (htx, mock) = signed_futures_client(1000);
+        let both = OrderRequest::limit_buy(symbol(), dec!(1), dec!(100))
+            .post_only()
+            .with_time_in_force(TimeInForce::Ioc);
+        let err = htx.place_order(&both).unwrap_err();
+        assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
+        assert!(mock.recorded_requests().is_empty());
+
+        let (htx, mock) = signed_futures_client(1000);
+        let market_fok =
+            OrderRequest::market_buy(symbol(), dec!(1)).with_time_in_force(TimeInForce::Fok);
+        let err = htx.place_order(&market_fok).unwrap_err();
+        assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
+        assert!(mock.recorded_requests().is_empty());
+    }
+
+    /// Post-only is the `limit-maker` order kind on spot, so it cannot ride on a
+    /// market order.
+    #[test]
+    fn spot_refuses_post_only_on_a_market_order() {
+        let (htx, mock) = signed_client(1000);
+        let request = OrderRequest::market_buy(symbol(), dec!(1)).post_only();
+        let err = htx.place_order(&request).unwrap_err();
+        assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
+        assert!(mock.recorded_requests().is_empty());
     }
 
     #[test]

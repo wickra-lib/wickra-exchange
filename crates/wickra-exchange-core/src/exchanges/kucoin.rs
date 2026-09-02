@@ -29,6 +29,7 @@ use crate::traits::{
 use crate::transport::{HttpMethod, HttpRequest, HttpTransport, WsConnection, WsTransport};
 use crate::types::{
     Balance, OcoRequest, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker,
+    TimeInForce,
 };
 use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
@@ -497,6 +498,9 @@ impl KuCoin {
         if request.post_only {
             body["postOnly"] = serde_json::json!(true);
         }
+        if let Some(tif) = tif_str(request.time_in_force) {
+            body["timeInForce"] = serde_json::json!(tif);
+        }
         if let Some(stp) = stp_flag(request.stp) {
             body["stp"] = serde_json::json!(stp);
         }
@@ -696,6 +700,17 @@ fn order_type_str(order_type: OrderType) -> &'static str {
 
 /// The KuCoin `stp` flag for a self-trade-prevention policy, or `None` to omit.
 /// KuCoin cancels the oldest (`CO`), newest (`CN`) or both (`CB`) order.
+/// The KuCoin `timeInForce` value. KuCoin carries it as its own field beside
+/// `postOnly`, so the two never conflict; `Gtc` is KuCoin's default and is left
+/// off the wire.
+fn tif_str(tif: TimeInForce) -> Option<&'static str> {
+    match tif {
+        TimeInForce::Gtc => None,
+        TimeInForce::Ioc => Some("IOC"),
+        TimeInForce::Fok => Some("FOK"),
+    }
+}
+
 fn stp_flag(stp: SelfTradePrevention) -> Option<&'static str> {
     match stp {
         SelfTradePrevention::None => None,
@@ -1155,6 +1170,15 @@ impl KuCoin {
                 });
                 if let Some(price) = r.price {
                     o["price"] = serde_json::json!(format_decimal(price));
+                }
+                if r.post_only {
+                    o["postOnly"] = serde_json::json!(true);
+                }
+                if let Some(tif) = tif_str(r.time_in_force) {
+                    o["timeInForce"] = serde_json::json!(tif);
+                }
+                if let Some(stp) = stp_flag(r.stp) {
+                    o["stp"] = serde_json::json!(stp);
                 }
                 o
             })

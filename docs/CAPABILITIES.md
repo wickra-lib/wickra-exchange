@@ -24,10 +24,53 @@ legitimately differ per venue, and — for derivatives and advanced orders — t
    surface is subscription-only). `WsExecution::place_order_ws` /
    `cancel_order_ws` return a documented `Error::Exchange` pointing to REST.
 
-Market and limit orders are common across venues, with time-in-force
-GTC / IOC / FOK and the `reduce_only` and `post_only` flags. Per-symbol filters
-(lot step, price tick, min-notional) are enforced through `InstrumentFilters`
-before an order is sent.
+Market and limit orders are common across venues, and per-symbol filters (lot
+step, price tick, min-notional) are enforced through `InstrumentFilters` before
+an order is sent.
+
+### Order fields
+
+The rest of the request is **not** uniform, and this table says exactly where it
+differs. Every field is either sent to the venue or the order is refused with
+`Error::Exchange` code `unsupported`; none is ever dropped on the way, because an
+order missing a field the caller set is a different order, not a smaller one.
+
+| Venue    | GTC | IOC | FOK | `post_only` | `stp` | `reduce_only` |
+|----------|:---:|:---:|:---:|:-----------:|:-----:|:-------------:|
+| Binance  | ✅  | ✅¹ | ✅¹ | `LIMIT_MAKER`² | `selfTradePreventionMode` | futures only³ |
+| Bybit    | ✅  | ✅  | ✅  | `PostOnly`⁴ | `smpType` | ✅ |
+| OKX      | ✅  | ✅⁵ | ✅⁵ | `post_only`⁵ | `stpMode` | ✅ |
+| Bitget   | ✅  | ✅  | ✅  | `post_only`⁴ | `stpMode` | ✅ |
+| KuCoin   | ✅  | ✅  | ✅  | `postOnly` | `stp` | futures only |
+| Gate.io  | ✅  | ✅  | ✅  | `poc`⁴ | `stp_act` | futures only |
+| HTX      | ✅  | ✅⁶ | ✅¹ ⁶ | `limit-maker`⁶ | — refused | futures only |
+| Kraken   | ✅  | ✅  | — refused⁷ | `oflags=post` | — refused | futures only |
+| Coinbase | ✅  | — refused⁸ | ✅¹ | `post_only` | — refused⁹ | — (spot only) |
+| Upbit    | ✅  | ✅¹ | ✅¹ | — refused | — refused | — (spot only) |
+
+1. On a limit order. A market order is immediate by construction, so GTC and IOC
+   describe what it already does and need no field — but FOK is a different
+   instruction ("all of it now, or none"), and where the venue has no market
+   fill-or-kill the order is refused rather than left able to fill partially.
+2. `LIMIT_MAKER` is Binance's post-only type and accepts no `timeInForce` at all,
+   so post-only together with IOC/FOK is refused.
+3. Spot holds balances, not positions, and rejects `reduceOnly` outright (-1104).
+4. The venue spells post-only as a *value* of its time-in-force field, so the two
+   share one slot: post-only together with a non-GTC time-in-force is refused.
+5. OKX carries all three inside `ordType` (`ioc`, `fok`, `post_only` are order
+   types, not modifiers), so any two of them at once are refused.
+6. HTX folds the kind, the time-in-force and post-only into one `<side>-<kind>`
+   string (`buy-ioc`, `buy-limit-fok`, `buy-limit-maker`).
+7. Kraken's `timeinforce` is GTC, IOC or GTD — it has no fill-or-kill.
+8. Coinbase's limit configurations are `limit_limit_gtc`, `_gtd` and `_fok`;
+   there is no `limit_limit_ioc`.
+9. Coinbase sets self-trade prevention per portfolio, not per order.
+
+`tests/conformance.rs` holds every client to that table without naming it: four
+contracts assert that each field is *carried or refused* on the single-order
+path, on the batch path, when two fields land in one venue slot, and when a
+market order asks for fill-or-kill. A venue that gains a field later moves from
+one column to the other without those tests changing.
 
 **Trigger (stop) orders are the exception, and only Binance carries them.**
 `OrderType::StopMarket` and `StopLimit` rest until the market reaches

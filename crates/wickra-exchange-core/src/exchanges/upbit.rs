@@ -12,14 +12,16 @@ use crate::credentials::Credentials;
 use crate::error::{Error, Result};
 use crate::events::{BookLevel, Event, OrderBookSnapshot, TradePrint};
 use crate::normalize::{format_decimal, parse_decimal};
-use crate::options::ExchangeOptions;
+use crate::options::{ExchangeOptions, SelfTradePrevention};
 use crate::signing::{hmac_sha512_bytes, sha512_hex};
 use crate::symbol::Symbol;
 use crate::traits::{Exchange, Execution, MarketData};
 use crate::transport::{
     HttpMethod, HttpRequest, HttpResponse, HttpTransport, WsConnection, WsTransport,
 };
-use crate::types::{Balance, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker};
+use crate::types::{
+    Balance, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker, TimeInForce,
+};
 use base64::Engine;
 use rust_decimal::Decimal;
 use std::fmt;
@@ -287,6 +289,12 @@ impl Upbit {
         if let Some(price) = request.price {
             params.push(("price", format_decimal(price)));
         }
+        if let Some(tif) = tif_str(request)? {
+            params.push(("time_in_force", tif.to_string()));
+        }
+        if let Some(id) = &request.client_order_id {
+            params.push(("identifier", id.clone()));
+        }
         let value = self.signed_request(HttpMethod::Post, "/v1/orders", &params)?;
         order_from_value(request.symbol.clone(), &value)
     }
@@ -495,6 +503,55 @@ fn side_str(side: OrderSide) -> &'static str {
     match side {
         OrderSide::Buy => "bid",
         OrderSide::Sell => "ask",
+    }
+}
+
+/// Upbit is a spot-only venue whose order API carries `market`, `side`,
+/// `ord_type`, `volume`, `price` and `time_in_force` -- and nothing else. The
+/// flags it has no field for are refused rather than dropped, so an order that
+/// reaches the venue is the order that was asked for.
+///
+/// `time_in_force` is `ioc` or `fok`, and only on a limit order; a market buy
+/// (`price`) or market sell (`market`) is already immediate-or-cancel and has no
+/// fill-or-kill spelling.
+fn tif_str(request: &OrderRequest) -> Result<Option<&'static str>> {
+    if request.post_only {
+        return Err(Error::unsupported_field(
+            "Upbit",
+            "post_only",
+            "Upbit's order API carries no post-only flag",
+        ));
+    }
+    if request.stp != SelfTradePrevention::None {
+        return Err(Error::unsupported_field(
+            "Upbit",
+            "a self-trade-prevention policy",
+            "Upbit's order API carries no STP field",
+        ));
+    }
+    if request.reduce_only {
+        return Err(Error::unsupported_field(
+            "Upbit",
+            "reduce_only",
+            "Upbit is spot-only and has no positions to reduce",
+        ));
+    }
+    match (request.order_type, request.time_in_force) {
+        // A market order is immediate-or-cancel by construction, so GTC (the
+        // default) and IOC both ask for what it already does and need no field;
+        // a FOK asks for something it cannot be.
+        (_, TimeInForce::Gtc) | (OrderType::Market | OrderType::StopMarket, TimeInForce::Ioc) => {
+            Ok(None)
+        }
+        (OrderType::Limit | OrderType::StopLimit, TimeInForce::Ioc) => Ok(Some("ioc")),
+        (OrderType::Limit | OrderType::StopLimit, TimeInForce::Fok) => Ok(Some("fok")),
+        (OrderType::Market | OrderType::StopMarket, TimeInForce::Fok) => {
+            Err(Error::unsupported_field(
+                "Upbit",
+                "a FOK time-in-force on a market order",
+                "Upbit accepts time_in_force only on a limit order",
+            ))
+        }
     }
 }
 
@@ -780,6 +837,27 @@ mod tests {
         )
         .with_clock(Box::new(move || now_ms));
         (upbit, mock)
+    }
+
+    /// Upbit is spot-only and its order API carries no reduce-only flag, so a
+    /// caller asking to reduce a position is asking for something this venue has
+    /// no concept of. The client order id it *does* carry, as `identifier`.
+    #[test]
+    fn spot_only_fields_are_refused_and_the_client_id_is_carried() {
+        let (upbit, mock) = signed_client(1000);
+        let reduce = OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)).reduce_only();
+        let err = upbit.place_order(&reduce).unwrap_err();
+        assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
+        assert!(mock.recorded_requests().is_empty());
+
+        let (upbit, mock) = signed_client(1000);
+        mock.push_json(200, "{}");
+        let identified =
+            OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)).with_client_order_id("abc-123");
+        let _ = upbit.place_order(&identified);
+        let url = mock.recorded_requests()[0].url.clone();
+        let body = mock.recorded_requests()[0].body.clone().unwrap_or_default();
+        assert!(url.contains("identifier=abc-123") || body.contains("abc-123"));
     }
 
     #[test]

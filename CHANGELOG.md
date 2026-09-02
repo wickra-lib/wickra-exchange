@@ -170,6 +170,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Seven of the ten clients never sent `time_in_force`.** `OrderRequest` has
+  carried GTC / IOC / FOK since the first release and `docs/CAPABILITIES.md`
+  promised all three across every venue, but only Binance, Bitget and Bybit put
+  the field on the wire. Coinbase, HTX, Kraken, KuCoin, OKX and Upbit dropped it
+  entirely, and Gate sent only its post-only spelling. An `Ioc` — "fill what you
+  can now, cancel the rest" — was therefore placed as the resting `Gtc` the
+  caller had asked it never to be, leaving an open order where none was wanted.
+
+  Every client now spells the field the way its venue does: Kraken's
+  `timeinforce`, KuCoin's `timeInForce`, Upbit's `time_in_force`, Gate's
+  `ioc`/`fok` beside the existing `poc`, OKX's `ordType`, HTX's `<side>-<kind>`
+  string and swap `order_price_type`, and Coinbase's `order_configuration` key.
+
+  Where a venue genuinely cannot say it, the order is now **refused** rather
+  than weakened: Kraken has no fill-or-kill, Coinbase has no `limit_limit_ioc`,
+  and a market order has no FOK spelling on most venues (Binance rejects
+  `timeInForce` on `MARKET` outright with -1106).
+
+- **The same silence on `stp` and `post_only`.** Coinbase, HTX, Kraken and Upbit
+  dropped the self-trade-prevention policy; those four now refuse it, since none
+  of their order APIs carries the field. Where a venue spells post-only as a
+  *value* of its time-in-force slot — Bybit's `PostOnly`, Bitget's `post_only`,
+  Gate's `poc`, and the order types OKX, HTX and Binance use — asking for both
+  used to resolve silently in post-only's favour and discard the time-in-force.
+  That pair is now refused.
+
+- **Every batch builder was weaker than the single-order path beside it.** PR
+  #189 found Bitget's batch dropping `reduce_only`; the same drift sat on six
+  more venues. Gate's batch lost `time_in_force`, `post_only`, `stp` **and**
+  `reduce_only` while its own `place_order` sent them; Bitget, Bybit, KuCoin,
+  OKX, Kraken and HTX lost `post_only` and `stp`. An order no longer means
+  something different because it travelled in a batch.
+
+- **Binance sent `reduceOnly=true` on spot orders.** The flag had no
+  `is_futures()` guard, and spot rejects the unknown parameter with -1104. Spot
+  holds balances rather than positions, so the request is now refused instead.
+
+- **The field-fidelity contract now covers the class, not one field.**
+  `tests/conformance.rs` held all ten clients to "a trigger order is carried or
+  refused, never flattened" — the lesson of PR #190, applied to `stop_price`
+  alone. Four new contracts widen it to the whole request: each field is carried
+  or refused on the single-order path, on the batch path, when two fields land in
+  one venue slot, and when a market order asks for fill-or-kill. `docs/CAPABILITIES.md`
+  now carries the resulting per-venue table instead of a blanket promise.
+
 - **A price crossed every binding as the binary double, not the number typed.**
   `types.rs` opens by saying prices and quantities are `Decimal` and never
   `f64`, "because exchanges reject mis-rounded values, and float drift loses

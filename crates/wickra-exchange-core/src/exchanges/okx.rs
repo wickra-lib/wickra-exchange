@@ -28,6 +28,7 @@ use crate::traits::{
 use crate::transport::{HttpMethod, HttpRequest, HttpTransport, WsConnection, WsTransport};
 use crate::types::{
     Balance, OcoRequest, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker,
+    TimeInForce,
 };
 use rust_decimal::Decimal;
 use serde::Deserialize;
@@ -479,11 +480,7 @@ impl Okx {
             return Err(Error::unsupported_trigger("OKX"));
         }
         request.validate()?;
-        let ord_type = if request.post_only && request.order_type == OrderType::Limit {
-            "post_only"
-        } else {
-            ord_type_str(request.order_type)
-        };
+        let ord_type = ord_type_for(request)?;
         let mut arg = serde_json::json!({
             "instId": self.inst_id(&request.symbol),
             "tdMode": self.td_mode,
@@ -608,11 +605,7 @@ impl Okx {
             return Err(Error::unsupported_trigger("OKX"));
         }
         request.validate()?;
-        let ord_type = if request.post_only && request.order_type == OrderType::Limit {
-            "post_only"
-        } else {
-            ord_type_str(request.order_type)
-        };
+        let ord_type = ord_type_for(request)?;
         let mut body = serde_json::json!({
             "instId": self.inst_id(&request.symbol),
             "tdMode": self.td_mode,
@@ -894,6 +887,43 @@ fn side_str(side: OrderSide) -> &'static str {
     match side {
         OrderSide::Buy => "buy",
         OrderSide::Sell => "sell",
+    }
+}
+
+/// OKX carries time-in-force *inside* `ordType` -- `ioc`, `fok` and `post_only`
+/// are order types, not modifiers -- so the type, the time-in-force and
+/// `post_only` all resolve to one string, and a combination that would need two
+/// of those slots at once is refused rather than resolved by dropping one.
+///
+/// `Gtc` is the request default and OKX's own default for `limit`, so it maps
+/// to the plain type; `Ioc` and `Fok` are what a dropped field would change.
+fn ord_type_for(request: &OrderRequest) -> Result<&'static str> {
+    let post_only = request.post_only;
+    match (request.order_type, request.time_in_force, post_only) {
+        (OrderType::Market | OrderType::StopMarket, TimeInForce::Fok, _) => {
+            Err(Error::unsupported_field(
+                "OKX",
+                "a FOK time-in-force on a market order",
+                "OKX spells FOK as an order type of its own, which excludes `market`",
+            ))
+        }
+        (OrderType::Market | OrderType::StopMarket, _, true) => Err(Error::unsupported_field(
+            "OKX",
+            "post_only on a market order",
+            "`post_only` is an OKX order type, which excludes `market`",
+        )),
+        (OrderType::Market | OrderType::StopMarket, _, false)
+        | (OrderType::Limit | OrderType::StopLimit, TimeInForce::Gtc, false) => {
+            Ok(ord_type_str(request.order_type))
+        }
+        (OrderType::Limit | OrderType::StopLimit, TimeInForce::Gtc, true) => Ok("post_only"),
+        (OrderType::Limit | OrderType::StopLimit, _, true) => Err(Error::unsupported_field(
+            "OKX",
+            "post_only together with a non-GTC time-in-force",
+            "both are OKX order types and only one `ordType` is sent",
+        )),
+        (OrderType::Limit | OrderType::StopLimit, TimeInForce::Ioc, false) => Ok("ioc"),
+        (OrderType::Limit | OrderType::StopLimit, TimeInForce::Fok, false) => Ok("fok"),
     }
 }
 
@@ -1436,12 +1466,12 @@ impl Okx {
     }
 
     /// The JSON for one order in a batch (`/api/v5/trade/batch-orders`).
-    fn batch_order_json(&self, request: &OrderRequest) -> serde_json::Value {
+    fn batch_order_json(&self, request: &OrderRequest) -> Result<serde_json::Value> {
         let mut o = serde_json::json!({
             "instId": self.inst_id(&request.symbol),
             "tdMode": self.td_mode,
             "side": side_str(request.side),
-            "ordType": ord_type_str(request.order_type),
+            "ordType": ord_type_for(request)?,
             "sz": format_decimal(request.quantity),
         });
         if let Some(price) = request.price {
@@ -1455,7 +1485,10 @@ impl Okx {
         } else if request.reduce_only {
             o["reduceOnly"] = serde_json::json!(true);
         }
-        o
+        if let Some(mode) = stp_mode_str(request.stp) {
+            o["stpMode"] = serde_json::json!(mode);
+        }
+        Ok(o)
     }
 
     /// Place several orders in one request (`/api/v5/trade/batch-orders`). Each
@@ -1467,8 +1500,10 @@ impl Okx {
         if requests.iter().any(|r| r.order_type.is_trigger()) {
             return Err(Error::unsupported_trigger("OKX"));
         }
-        let items: Vec<serde_json::Value> =
-            requests.iter().map(|r| self.batch_order_json(r)).collect();
+        let items: Vec<serde_json::Value> = requests
+            .iter()
+            .map(|r| self.batch_order_json(r))
+            .collect::<Result<Vec<_>>>()?;
         let body = serde_json::Value::Array(items).to_string();
         let data =
             self.signed_request(HttpMethod::Post, "/api/v5/trade/batch-orders", "", &body)?;
@@ -1775,6 +1810,17 @@ mod tests {
         let body = reqs[0].body.as_ref().unwrap();
         assert!(body.contains(r#""newSz":"2""#));
         assert!(body.contains(r#""newPx":"101""#));
+    }
+
+    /// `post_only` is an OKX order *type*, so it cannot ride on a market order:
+    /// the two would need the one `ordType` slot at once.
+    #[test]
+    fn a_market_order_cannot_also_be_post_only() {
+        let (okx, mock) = signed_client(1000);
+        let request = OrderRequest::market_buy(symbol(), dec!(1)).post_only();
+        let err = okx.place_order(&request).unwrap_err();
+        assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
+        assert!(mock.recorded_requests().is_empty());
     }
 
     #[test]

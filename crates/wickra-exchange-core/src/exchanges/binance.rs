@@ -212,19 +212,29 @@ impl Binance {
     ///
     /// Only a hedged *futures* client takes the second branch. Spot is
     /// untouched, and so is one-way futures.
-    fn position_params(&self, request: &OrderRequest) -> String {
+    fn position_params(&self, request: &OrderRequest) -> Result<String> {
         if self.is_futures() && self.position_mode == PositionMode::Hedge {
             let side = match PositionSide::for_order(request.side, request.reduce_only) {
                 PositionSide::Long => "LONG",
                 PositionSide::Short => "SHORT",
             };
-            return format!("&positionSide={side}");
+            return Ok(format!("&positionSide={side}"));
         }
-        if request.reduce_only {
-            "&reduceOnly=true".to_string()
-        } else {
-            String::new()
+        if !request.reduce_only {
+            return Ok(String::new());
         }
+        // Spot has no positions to reduce and rejects the parameter outright
+        // (-1104, "not all sent parameters were read"). Sending the order
+        // without it would place an opening order where a closing one was
+        // asked for, so the spot path refuses instead.
+        if !self.is_futures() {
+            return Err(Error::unsupported_field(
+                "Binance",
+                "reduce_only on a spot order",
+                "spot holds balances, not positions, and rejects the parameter",
+            ));
+        }
+        Ok("&reduceOnly=true".to_string())
     }
 
     /// The single-order endpoint (place/cancel/query) for this market.
@@ -477,11 +487,7 @@ impl Binance {
                 .filters
                 .validate(request.quantity, request.price)?;
         }
-        let type_str = if request.post_only && request.order_type == OrderType::Limit {
-            "LIMIT_MAKER"
-        } else {
-            order_type_str(request.order_type)
-        };
+        let type_str = type_for(request)?;
         let mut params = format!(
             "symbol={}&side={}&type={type_str}&quantity={}",
             Self::wire_symbol(&request.symbol),
@@ -504,7 +510,7 @@ impl Binance {
             params.push_str("&newClientOrderId=");
             params.push_str(id);
         }
-        params.push_str(&self.position_params(request));
+        params.push_str(&self.position_params(request)?);
         if let Some(mode) = stp_str(request.stp) {
             params.push_str("&selfTradePreventionMode=");
             params.push_str(mode);
@@ -844,7 +850,7 @@ impl Binance {
             let items = requests
                 .iter()
                 .map(|request| batch_order_json(request, self.position_mode))
-                .collect::<Vec<_>>()
+                .collect::<Result<Vec<_>>>()?
                 .join(",");
             let params = format!("batchOrders={}", percent_encode(&format!("[{items}]")));
             let body = self.signed_request(HttpMethod::Post, "/fapi/v1/batchOrders", &params)?;
@@ -940,11 +946,7 @@ impl Binance {
     /// another [`Error`] if the order is invalid or rejected.
     pub fn place_order_ws(&mut self, request: &OrderRequest) -> Result<Order> {
         request.validate()?;
-        let type_str = if request.post_only && request.order_type == OrderType::Limit {
-            "LIMIT_MAKER"
-        } else {
-            order_type_str(request.order_type)
-        };
+        let type_str = type_for(request)?;
         let mut params = vec![
             ("symbol".to_string(), Self::wire_symbol(&request.symbol)),
             ("side".to_string(), side_str(request.side).to_string()),
@@ -1233,18 +1235,24 @@ fn percent_encode(s: &str) -> String {
 }
 
 /// One element of a futures `batchOrders` JSON array.
-fn batch_order_json(request: &OrderRequest, position_mode: PositionMode) -> String {
+fn batch_order_json(request: &OrderRequest, position_mode: PositionMode) -> Result<String> {
+    let type_str = type_for(request)?;
     let mut obj = serde_json::json!({
         "symbol": Binance::wire_symbol(&request.symbol),
         "side": side_str(request.side),
-        "type": order_type_str(request.order_type),
+        "type": type_str,
         "quantity": format_decimal(request.quantity),
     });
     if let Some(price) = request.price {
         obj["price"] = serde_json::json!(format_decimal(price));
     }
-    if request.order_type.requires_price() {
+    // `LIMIT_MAKER` takes no time-in-force; `type_for` has already refused a
+    // post-only order that asked for one.
+    if request.order_type.requires_price() && type_str != "LIMIT_MAKER" {
         obj["timeInForce"] = serde_json::json!(tif_str(request.time_in_force));
+    }
+    if let Some(mode) = stp_str(request.stp) {
+        obj["selfTradePreventionMode"] = serde_json::json!(mode);
     }
     if let Some(stop) = request.stop_price {
         obj["stopPrice"] = serde_json::json!(format_decimal(stop));
@@ -1266,7 +1274,7 @@ fn batch_order_json(request: &OrderRequest, position_mode: PositionMode) -> Stri
     } else if request.reduce_only {
         obj["reduceOnly"] = serde_json::json!("true");
     }
-    obj.to_string()
+    Ok(obj.to_string())
 }
 
 /// A batch-order response element is either a placed order or a `{code, msg}`
@@ -1334,6 +1342,36 @@ fn order_type_str(order_type: OrderType) -> &'static str {
         OrderType::StopMarket => "STOP_LOSS",
         OrderType::StopLimit => "STOP_LOSS_LIMIT",
     }
+}
+
+/// The Binance order `type` for a request. `LIMIT_MAKER` is how Binance spells
+/// post-only, and it accepts no `timeInForce` at all -- so a post-only order
+/// carrying an IOC or FOK is refused rather than sent as the `LIMIT_MAKER` whose
+/// time-in-force silently went missing.
+fn type_for(request: &OrderRequest) -> Result<&'static str> {
+    // Only the limit-shaped types take a `timeInForce`; `MARKET` rejects the
+    // parameter (-1106). A market order is immediate anyway, so GTC (the
+    // default) and IOC describe what it already does -- but FOK is a different
+    // instruction, and letting it through would leave a partial fill standing
+    // where the caller asked for all-or-nothing.
+    if !request.order_type.requires_price() && request.time_in_force == TimeInForce::Fok {
+        return Err(Error::unsupported_field(
+            "Binance",
+            "a FOK time-in-force on a market order",
+            "Binance accepts timeInForce only on the limit order types",
+        ));
+    }
+    if request.post_only && request.order_type == OrderType::Limit {
+        if request.time_in_force != TimeInForce::Gtc {
+            return Err(Error::unsupported_field(
+                "Binance",
+                "post_only together with a non-GTC time-in-force",
+                "`LIMIT_MAKER` is Binance's post-only type and accepts no timeInForce",
+            ));
+        }
+        return Ok("LIMIT_MAKER");
+    }
+    Ok(order_type_str(request.order_type))
 }
 
 fn tif_str(tif: TimeInForce) -> &'static str {
@@ -2149,7 +2187,7 @@ mod tests {
         rest.place_order(&stop).unwrap();
         assert!(mock.recorded_requests()[0].url.contains("stopPrice=19000"));
 
-        let batch = batch_order_json(&stop, PositionMode::OneWay);
+        let batch = batch_order_json(&stop, PositionMode::OneWay).unwrap();
         assert!(batch.contains(r#""stopPrice":"19000""#));
 
         let ws = Arc::new(MockWsTransport::new());
@@ -2214,16 +2252,29 @@ mod tests {
         let json = batch_order_json(
             &OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)),
             PositionMode::Hedge,
-        );
+        )
+        .unwrap();
         assert!(json.contains(r#""positionSide":"LONG""#));
         assert!(!json.contains("reduceOnly"));
 
         let one_way = batch_order_json(
             &OrderRequest::limit_sell(symbol(), dec!(1), dec!(100)).reduce_only(),
             PositionMode::OneWay,
-        );
+        )
+        .unwrap();
         assert!(one_way.contains(r#""reduceOnly":"true""#));
         assert!(!one_way.contains("positionSide"));
+    }
+
+    /// Spot holds balances, not positions, and Binance rejects `reduceOnly`
+    /// there outright (-1104). The client used to append it anyway.
+    #[test]
+    fn a_spot_order_refuses_reduce_only() {
+        let (binance, mock) = signed_client(1000);
+        let request = OrderRequest::limit_sell(symbol(), dec!(1), dec!(100)).reduce_only();
+        let err = binance.place_order(&request).unwrap_err();
+        assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
+        assert!(mock.recorded_requests().is_empty());
     }
 
     #[test]

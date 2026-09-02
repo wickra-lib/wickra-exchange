@@ -15,13 +15,15 @@ use crate::error::{Error, Result};
 use crate::events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
 use crate::idempotency::ClientIdGenerator;
 use crate::normalize::{format_decimal, parse_decimal};
-use crate::options::ExchangeOptions;
+use crate::options::{ExchangeOptions, SelfTradePrevention};
 use crate::symbol::Symbol;
 use crate::traits::{Exchange, Execution, MarketData};
 use crate::transport::{
     HttpMethod, HttpRequest, HttpResponse, HttpTransport, WsConnection, WsTransport,
 };
-use crate::types::{Balance, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker};
+use crate::types::{
+    Balance, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker, TimeInForce,
+};
 use base64::Engine;
 use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 use p256::pkcs8::DecodePrivateKey;
@@ -330,6 +332,20 @@ impl Coinbase {
     /// # Errors
     /// Returns an [`Error`] if the order is invalid, credentials are missing, or
     /// the venue rejects it.
+    /// Coinbase Advanced Trade sets self-trade prevention per *portfolio*, not
+    /// per order, so a policy the caller set cannot be honoured on this request
+    /// and the order is refused instead of placed without it.
+    fn ensure_no_stp_inner(request: &OrderRequest) -> Result<()> {
+        if request.stp == SelfTradePrevention::None {
+            return Ok(());
+        }
+        Err(Error::unsupported_field(
+            "Coinbase",
+            "a per-order self-trade-prevention policy",
+            "Coinbase sets self-trade prevention per portfolio",
+        ))
+    }
+
     pub fn place_order(&self, request: &OrderRequest) -> Result<Order> {
         if request.order_type.is_trigger() {
             return Err(Error::unsupported_trigger("Coinbase"));
@@ -340,19 +356,59 @@ impl Coinbase {
             .clone()
             .unwrap_or_else(|| self.client_ids.next_id());
         let base_size = format_decimal(request.quantity);
-        let configuration = match request.order_type {
-            OrderType::Market | OrderType::StopMarket => {
+        Self::ensure_no_stp_inner(request)?;
+        // Coinbase names the time-in-force inside the `order_configuration` key
+        // itself -- `market_market_ioc`, `limit_limit_gtc`, `limit_limit_fok` --
+        // so the key is chosen from the order type and the time-in-force
+        // together, and a pairing the venue has no key for is refused.
+        let configuration = match (request.order_type, request.time_in_force) {
+            (OrderType::Market | OrderType::StopMarket, TimeInForce::Fok) => {
+                return Err(Error::unsupported_field(
+                    "Coinbase",
+                    "a FOK time-in-force on a market order",
+                    "Coinbase's market configuration is `market_market_ioc`",
+                ))
+            }
+            (OrderType::Market | OrderType::StopMarket, _) => {
+                if request.post_only {
+                    return Err(Error::unsupported_field(
+                        "Coinbase",
+                        "post_only on a market order",
+                        "`post_only` belongs to the limit configurations",
+                    ));
+                }
                 serde_json::json!({ "market_market_ioc": { "base_size": base_size } })
             }
-            OrderType::Limit | OrderType::StopLimit => {
+            (OrderType::Limit | OrderType::StopLimit, TimeInForce::Ioc) => {
+                return Err(Error::unsupported_field(
+                    "Coinbase",
+                    "an IOC time-in-force on a limit order",
+                    "Coinbase's limit configurations are GTC, GTD and FOK",
+                ))
+            }
+            (OrderType::Limit | OrderType::StopLimit, tif) => {
                 let price = request
                     .price
                     .ok_or(Error::InvalidOrder("limit order requires a price"))?;
-                serde_json::json!({ "limit_limit_gtc": {
-                    "base_size": base_size,
-                    "limit_price": format_decimal(price),
-                    "post_only": request.post_only,
-                }})
+                if tif == TimeInForce::Fok {
+                    if request.post_only {
+                        return Err(Error::unsupported_field(
+                            "Coinbase",
+                            "post_only together with a FOK time-in-force",
+                            "`limit_limit_fok` carries no post-only flag",
+                        ));
+                    }
+                    serde_json::json!({ "limit_limit_fok": {
+                        "base_size": base_size,
+                        "limit_price": format_decimal(price),
+                    }})
+                } else {
+                    serde_json::json!({ "limit_limit_gtc": {
+                        "base_size": base_size,
+                        "limit_price": format_decimal(price),
+                        "post_only": request.post_only,
+                    }})
+                }
             }
         };
         let body = serde_json::json!({
@@ -937,6 +993,26 @@ wHvqY4aizCFHQFTVNQCzDGy8/TOhRANCAAS69zNVQjOQ4RgxJVI8esP+jMfHLSTw\n\
         assert!(verifying_key
             .verify(signing_input.as_bytes(), &signature)
             .is_ok());
+    }
+
+    /// Coinbase names the time-in-force in the `order_configuration` key, and
+    /// `limit_limit_fok` carries no post-only flag; `post_only` belongs to the
+    /// limit configurations, so it cannot ride on a market order either.
+    #[test]
+    fn configurations_that_cannot_hold_both_settings_are_refused() {
+        let (coinbase, mock) = signed_client(1000);
+        let market_post_only = OrderRequest::market_buy(symbol(), dec!(1)).post_only();
+        let err = coinbase.place_order(&market_post_only).unwrap_err();
+        assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
+        assert!(mock.recorded_requests().is_empty());
+
+        let (coinbase, mock) = signed_client(1000);
+        let fok_post_only = OrderRequest::limit_buy(symbol(), dec!(1), dec!(100))
+            .post_only()
+            .with_time_in_force(TimeInForce::Fok);
+        let err = coinbase.place_order(&fok_post_only).unwrap_err();
+        assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
+        assert!(mock.recorded_requests().is_empty());
     }
 
     #[test]
