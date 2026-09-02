@@ -151,22 +151,36 @@ jobs:
       # is not the CPU (three models, same numbers) and not the code (assembly
       # byte-identical); it is the environment the simulation runs in.
       #
-      # Third, and it settles the question as far as this repository can: the
-      # next run on that same branch reported no regression at all. The commit
-      # between them touched only this comment -- not one line the benchmark
-      # executes -- so the code under measurement was identical across a red run
-      # and a green one. Whatever varies, it is not in this repository.
+      # Third, and it settles the question as far as this repository can: on
+      # #197 the same branch was measured three times, and the verdict flipped
+      # without the measured code changing at all.
       #
-      # That is the honest state of it, and it now comes with a cheaper first
-      # step. When this fires: check whether the report carries the "different
-      # runtime environments" note, and if the diff does not touch the benchmarked
-      # path, re-run the job before investigating further -- the figure has
-      # resolved itself on a re-run with unchanged code. If it persists, then
-      # compare the recorded CPU lines, check the footnote for a base commit
-      # older than main's head (`No successful run was found on main`), and diff
-      # the emitted assembly for the named function. If the code is identical,
-      # the number is not about this pull request -- and the two figures will be
-      # that same pair again.
+      #   303ec6d   regression, 399.4 -> 453.6
+      #   82ac998   no change            <- commit touched only this comment
+      #   ba5c855   regression, 399.4 -> 453.6 again
+      #
+      # The two commits between those runs edited this comment and nothing else,
+      # so not one line the benchmark executes differed across a red run, a green
+      # run and a red run. The figure is bimodal over repeated runs of identical
+      # code: when it is wrong it is wrong by exactly the same amount, to the
+      # tenth of a nanosecond, every time.
+      #
+      # That is as far as this repository can take it. Whatever varies is in how
+      # the two sides of the comparison are measured, not in what is measured --
+      # which is also what the vendor's own "different runtime environments" note
+      # says on each red run.
+      #
+      # So a re-run is a coin toss, not a fix, and this comment does not tell you
+      # to keep flipping until it lands green: a green run bought that way says
+      # nothing the red one did not. What to do when this fires: confirm the diff
+      # does not touch the benchmarked path, confirm the report carries the
+      # "different runtime environments" note, and confirm the pair of figures is
+      # that same 399.4/453.6. Those three together are the signature of this
+      # phenomenon and not of a regression. If any of them differs -- a different
+      # pair, a missing note, a diff that does touch `orderbook.rs` -- then treat
+      # it as real: compare the recorded CPU lines, check the footnote for a base
+      # commit older than main's head (`No successful run was found on main`),
+      # and diff the emitted assembly for the named function.
       #
       # A threshold is still not the answer: one wide enough to swallow 12%
       # would swallow a real 12% regression too.
