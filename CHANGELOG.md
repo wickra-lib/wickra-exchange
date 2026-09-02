@@ -126,6 +126,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The R package could only be installed inside this repository's CI.** Its
+  `Makevars` took the C ABI header and library from `WKEX_INC` / `WKEX_LIB`,
+  environment variables that only this workflow sets, and baked no rpath — so
+  the native library also had to be on the loader path at run time. Anyone
+  running `install.packages()` got a compiler error about a missing header. It
+  now ships `configure` / `configure.win`, which fetch the
+  `wickra-exchange-c-<triple>.tar.gz` release asset for the package's version
+  and stage it into `src/`, plus `install.libs.R`, which bundles the library
+  beside the compiled object where the baked rpath (`$ORIGIN` /
+  `@loader_path`, or the same directory on Windows) resolves it.
+  `WKEX_INC` / `WKEX_LIB` still work as the local-build override.
+  - The CI job no longer exports `LD_LIBRARY_PATH` / `DYLD_LIBRARY_PATH` /
+    `PATH` before running the R suite. With them set, the job passed whether or
+    not the package was self-contained; without them it passes only if it is,
+    which is the property a user actually depends on.
+  - `configure` refuses the Emscripten target with a message rather than
+    failing further in. Unlike the indicator library, this one is a network
+    client: the C ABI is built on tokio, reqwest and tokio-tungstenite, and
+    `wasm32-unknown-emscripten` has no sockets for them. The offline simulators
+    are published separately as the `wickra-exchange-wasm` npm package.
+  - This is the prerequisite for the r-universe registry entry, which is the
+    last open item in the repository blueprint. It stays deferred until the
+    first release exists, because `configure` downloads a release asset and
+    registering before then would only produce a red build.
+
 - **The CodSpeed gate was comparing against the wrong commit, and the path
   filter on `main` was why.** CodSpeed measures a pull request against a
   measurement of `main`; when the newest `main` commit has none it falls back to

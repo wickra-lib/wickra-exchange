@@ -1,10 +1,17 @@
-# Keep compiled artifacts out of the R source tarball built by `R CMD build`.
-# The package links the C ABI out-of-tree (WKEX_INC / WKEX_LIB), so only the
-# glue objects and any locally built shared library live under src/ — none of
-# them belong in a distributable source package; they are produced at install.
+# Keep everything configure stages or the compiler produces out of the R source
+# tarball built by `R CMD build`. The package is source-distributed: configure
+# fetches the C ABI at install time (or takes it from WKEX_INC / WKEX_LIB), so
+# none of these belong in the distributable.
+^src/wickra_exchange\.h$
+^src/wickra_exchange\.dll$
+^src/wickra_exchange\.def$
+^src/libwickra_exchange\.dll\.a$
+^src/libwickra_exchange\.(so|dylib)$
+^src/wickra-exchange-c\.tar\.gz$
+^src/wickra-exchange-c$
+^src/Makevars$
 ^src/.*\.o$
-^src/.*\.so$
-^src/.*\.dll$
-^src/.*\.dylib$
+^src/wickraexchange\.(dll|so|dylib)$
 ^src/symbols\.rds$
+^src/dlltool\.log$
 ^\.gitignore$

@@ -1,8 +1,16 @@
-# Build artifacts. The header and library come from WKEX_INC / WKEX_LIB at build
-# time (see Makevars), so nothing is staged into this directory.
+# Everything configure stages, and everything the compiler produces. The C ABI
+# header and library are fetched from the matching GitHub release at install
+# time, or taken from WKEX_INC / WKEX_LIB for a local build, so nothing under
+# src/ except the glue source and the Makevars templates is committed.
 *.o
 *.so
 *.dll
 *.dll.a
 *.dylib
 symbols.rds
+dlltool.log
+Makevars
+wickra_exchange.h
+wickra_exchange.def
+wickra-exchange-c.tar.gz
+wickra-exchange-c/

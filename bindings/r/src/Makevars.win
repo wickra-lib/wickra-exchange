@@ -1,4 +1,6 @@
-# On Windows the C ABI DLL is linked directly (mingw resolves the import stubs
-# from wickra_exchange.dll); the loader finds it via PATH at run time.
-PKG_CPPFLAGS = -I$(WKEX_INC)
-PKG_LIBS = -L$(WKEX_LIB) -l:wickra_exchange.dll
+# Link the import library built by configure.win, which references the staged
+# wickra_exchange.dll. The C ABI header is staged into src/ by configure.win, so
+# the include path is the source directory itself. install.libs.R bundles the
+# DLL next to the package object, where the loader finds it.
+PKG_CPPFLAGS = -I.
+PKG_LIBS = libwickra_exchange.dll.a
