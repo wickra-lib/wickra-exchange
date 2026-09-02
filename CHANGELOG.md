@@ -150,6 +150,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A hedged account got orders that named no side.** `position_mode` was the
+  last field on `ExchangeOptions` that nothing read. On a hedged account a
+  symbol holds a long and a short position at once, so every order has to name
+  the one it acts on — under a different field name per venue, and on two of
+  them *instead of* `reduce_only` rather than alongside it. None was sent, so a
+  caller who configured `Hedge` had every futures order rejected (Binance
+  `-4061`) or applied to the wrong side.
+  - **Binance** now sends `positionSide` and drops `reduceOnly`, which the venue
+    refuses in the same order (`-1106`), on all three futures order paths: REST,
+    the native batch endpoint, and the ws-fapi WebSocket API.
+  - **Bybit** sends `positionIdx` (1 = buy side, 2 = sell side) on the REST,
+    WebSocket and batch paths; `0` is one-way and is the venue default, so it is
+    left off rather than sent.
+  - **OKX** sends `posSide` and drops `reduceOnly` on all four order paths,
+    including the OCO algo order — a bracket protects a position that is
+    already open, so it acts on the side its own side closes.
+  - **Bitget** sends `tradeSide` (`open`/`close`) instead of `reduceOnly`.
+  - **Gate.io** closes with `auto_size` (`close_long`/`close_short`) and `size`
+    0, which is how its dual mode names a side; opening is unchanged, because
+    the sign of `size` already says which side grows.
+  - **HTX** needed no branch and gets none: its swap orders already carry
+    `direction` **and** `offset`, which is the hedged encoding, and the venue
+    takes the same shape in one-way mode.
+  - **KuCoin Futures and Kraken Futures** hold one net position per contract and
+    have no hedge mode. A futures order from a client configured `Hedge` now
+    returns `Error::Exchange` instead of moving the net position — the same
+    treatment `set_margin_mode(Isolated)` already gets on those two venues.
+  The side is derived rather than asked for: buying opens the long side or
+  closes the short one, and `reduce_only` separates the two. That mapping is
+  `PositionSide::for_order`, written once and applied identically everywhere.
+
+- **Bitget's batched orders lost their `reduce_only`.** Found while wiring the
+  above: the batch entry builder set side, type, force, size, client id and
+  price, and nothing else — so an order batched with `reduce_only` was sent as
+  an opening one. It now carries the position half like the single-order path.
+
 - **`ExchangeOptions.margin_mode` was read by nothing, and two venues carry the
   mode on every order.** Of the eight fields on `ExchangeOptions`, six are read
   — `market_type`, `testnet` and `recv_window_ms` by the clients, and `timeout`,

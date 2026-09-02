@@ -24,7 +24,7 @@ use crate::credentials::Credentials;
 use crate::error::{Error, Result};
 use crate::events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
 use crate::normalize::{format_decimal, parse_decimal};
-use crate::options::{ExchangeOptions, MarginMode, MarketType, SelfTradePrevention};
+use crate::options::{ExchangeOptions, MarginMode, MarketType, PositionMode, SelfTradePrevention};
 use crate::positions::{Position, PositionSide};
 use crate::signing::{hmac_sha512_hex, sha512_hex};
 use crate::symbol::Symbol;
@@ -58,6 +58,9 @@ pub struct Gate {
     ws: Option<Box<dyn WsTransport>>,
     rest_base: String,
     market_type: MarketType,
+    /// One-way or hedge. Gate calls hedge "dual mode", and a dual-mode close is
+    /// expressed with `auto_size` rather than with `reduce_only`.
+    position_mode: PositionMode,
     credentials: Option<Credentials>,
     now_ms: Box<dyn Fn() -> i64 + Send + Sync>,
     /// Offset between this machine's clock and the venue's, applied to every
@@ -118,6 +121,7 @@ impl Gate {
             ws: None,
             rest_base: "https://api.gateio.ws".to_string(),
             market_type: options.market_type,
+            position_mode: options.position_mode,
             credentials,
             now_ms: Box::new(system_now_ms),
             clock: ServerClock::new(),
@@ -749,11 +753,30 @@ impl Gate {
             OrderSide::Buy => magnitude,
             OrderSide::Sell => -magnitude,
         };
-        let mut body = serde_json::json!({
-            "contract": contract,
-            "size": size,
-            "reduce_only": request.reduce_only,
-        });
+        let mut body = if self.position_mode == PositionMode::Hedge && request.reduce_only {
+            // In dual mode a close names the side it closes and carries no size
+            // of its own: Gate reads `auto_size` and requires `size` to be 0.
+            // `reduce_only` alone is the one-way spelling and does not say which
+            // of the two open sides is meant.
+            let auto_size = match PositionSide::for_order(request.side, true) {
+                PositionSide::Long => "close_long",
+                PositionSide::Short => "close_short",
+            };
+            serde_json::json!({
+                "contract": contract,
+                "size": 0,
+                "auto_size": auto_size,
+                "reduce_only": true,
+            })
+        } else {
+            // Opening in dual mode needs nothing extra: the sign of `size`
+            // already says which side grows.
+            serde_json::json!({
+                "contract": contract,
+                "size": size,
+                "reduce_only": request.reduce_only,
+            })
+        };
         match request.order_type {
             OrderType::Market | OrderType::StopMarket => {
                 body["price"] = serde_json::json!("0");
@@ -2059,6 +2082,58 @@ mod tests {
         assert_eq!(book.last_update_id, 77);
         assert_eq!(book.bids[0], BookLevel::new(dec!(100), dec!(1)));
         assert_eq!(book.asks[0], BookLevel::new(dec!(101), dec!(2)));
+    }
+
+    fn hedged_futures_client(now_ms: i64) -> (Gate, Arc<MockHttpTransport>) {
+        let mock = Arc::new(MockHttpTransport::new());
+        let mut opts = ExchangeOptions::mainnet(crate::MarketType::UsdMFutures);
+        opts.position_mode = crate::PositionMode::Hedge;
+        let gate = Gate::with_credentials(
+            Box::new(ArcTransport(Arc::clone(&mock))),
+            &opts,
+            Credentials::new("APIKEY", "SECRET"),
+        )
+        .with_clock(Box::new(move || now_ms));
+        (gate, mock)
+    }
+
+    const GATE_FUTURES_FILL: &str = r#"{"id":88,"size":2,"left":0,"price":"0",
+        "fill_price":"20000","status":"finished","finish_as":"filled","text":""}"#;
+
+    #[test]
+    fn dual_mode_closes_with_auto_size_and_opens_by_sign() {
+        // Gate calls hedge "dual mode". A close there names the side and sends
+        // no size of its own; `reduce_only` alone does not say which of the two
+        // open sides is meant. Opening is unchanged: the sign of `size` says it.
+        let (hedged, mock) = hedged_futures_client(1_000_000);
+        for _ in 0..2 {
+            mock.push_json(200, GATE_FUTURES_FILL);
+        }
+        hedged
+            .place_order(&OrderRequest::market_sell(symbol(), dec!(2)).reduce_only())
+            .unwrap();
+        hedged
+            .place_order(&OrderRequest::market_buy(symbol(), dec!(2)))
+            .unwrap();
+
+        let reqs = mock.recorded_requests();
+        let close = reqs[0].body.as_deref().unwrap();
+        assert!(close.contains(r#""auto_size":"close_long""#));
+        assert!(close.contains(r#""size":0"#));
+        let open = reqs[1].body.as_deref().unwrap();
+        assert!(open.contains(r#""size":2"#));
+        assert!(!open.contains("auto_size"));
+
+        // One-way is untouched: reduce_only, real size, no auto_size.
+        let (one_way, one_way_mock) = signed_futures_client(1_000_000);
+        one_way_mock.push_json(200, GATE_FUTURES_FILL);
+        one_way
+            .place_order(&OrderRequest::market_sell(symbol(), dec!(2)).reduce_only())
+            .unwrap();
+        let body = one_way_mock.recorded_requests()[0].body.clone().unwrap();
+        assert!(body.contains(r#""reduce_only":true"#));
+        assert!(body.contains(r#""size":-2"#));
+        assert!(!body.contains("auto_size"));
     }
 
     #[test]

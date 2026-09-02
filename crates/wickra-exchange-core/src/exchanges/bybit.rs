@@ -27,7 +27,7 @@ use crate::credentials::Credentials;
 use crate::error::{Error, Result};
 use crate::events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
 use crate::normalize::{format_decimal, parse_decimal};
-use crate::options::{ExchangeOptions, MarginMode, MarketType, SelfTradePrevention};
+use crate::options::{ExchangeOptions, MarginMode, MarketType, PositionMode, SelfTradePrevention};
 use crate::positions::{Position, PositionSide};
 use crate::signing::hmac_sha256_hex;
 use crate::symbol::Symbol;
@@ -60,6 +60,9 @@ pub struct Bybit {
     ws: Option<Box<dyn WsTransport>>,
     rest_base: String,
     category: &'static str,
+    /// One-way or hedge. Bybit names the side with `positionIdx`, which is only
+    /// meaningful on a derivatives category.
+    position_mode: PositionMode,
     testnet: bool,
     credentials: Option<Credentials>,
     recv_window_ms: u64,
@@ -123,6 +126,7 @@ impl Bybit {
                 "https://api.bybit.com".to_string()
             },
             category: category(options.market_type),
+            position_mode: options.position_mode,
             testnet: options.testnet,
             credentials,
             recv_window_ms: options.recv_window_ms,
@@ -475,6 +479,9 @@ impl Bybit {
         if request.reduce_only {
             body["reduceOnly"] = serde_json::json!(true);
         }
+        if let Some(idx) = self.position_idx(request) {
+            body["positionIdx"] = serde_json::json!(idx);
+        }
         if let Some(smp) = smp_str(request.stp) {
             body["smpType"] = serde_json::json!(smp);
         }
@@ -540,6 +547,9 @@ impl Bybit {
         }
         if request.reduce_only {
             arg["reduceOnly"] = serde_json::json!(true);
+        }
+        if let Some(idx) = self.position_idx(request) {
+            arg["positionIdx"] = serde_json::json!(idx);
         }
         let data = self.ws_trade_request("order.create", &arg)?;
         let created: CreateResult =
@@ -765,6 +775,26 @@ impl Bybit {
 }
 
 /// The Bybit product category for a market type.
+impl Bybit {
+    /// Bybit's `positionIdx`, or `None` when the order does not need one.
+    ///
+    /// `0` is one-way and is also the venue default, so it is left off rather
+    /// than sent. In hedge mode the buy side of the account is `1` and the sell
+    /// side is `2`, and an order has to say which it acts on. Spot has no
+    /// position index at all.
+    fn position_idx(&self, request: &OrderRequest) -> Option<u8> {
+        if self.category == "spot" || self.position_mode == PositionMode::OneWay {
+            return None;
+        }
+        Some(
+            match PositionSide::for_order(request.side, request.reduce_only) {
+                PositionSide::Long => 1,
+                PositionSide::Short => 2,
+            },
+        )
+    }
+}
+
 fn category(market_type: MarketType) -> &'static str {
     match market_type {
         MarketType::Spot | MarketType::Margin => "spot",
@@ -1406,6 +1436,9 @@ impl Bybit {
                 if r.reduce_only {
                     o["reduceOnly"] = serde_json::json!(true);
                 }
+                if let Some(idx) = self.position_idx(r) {
+                    o["positionIdx"] = serde_json::json!(idx);
+                }
                 o
             })
             .collect();
@@ -1924,6 +1957,64 @@ mod tests {
             .find(|(k, _)| k == name)
             .map(|(_, v)| v.as_str())
             .unwrap()
+    }
+
+    fn hedged_futures_client(now_ms: i64) -> (Bybit, Arc<MockHttpTransport>) {
+        let mock = Arc::new(MockHttpTransport::new());
+        let mut opts = ExchangeOptions::mainnet(MarketType::UsdMFutures);
+        opts.position_mode = PositionMode::Hedge;
+        let bybit = Bybit::with_credentials(
+            Box::new(ArcTransport(Arc::clone(&mock))),
+            &opts,
+            Credentials::new("APIKEY", "SECRET"),
+        )
+        .with_clock(Box::new(move || now_ms));
+        (bybit, mock)
+    }
+
+    #[test]
+    fn hedge_mode_sends_the_position_index() {
+        // positionIdx 1 is the buy side of a hedged account, 2 the sell side.
+        // 0 is one-way and is the venue default, so it is left off entirely.
+        let (hedged, mock) = hedged_futures_client(1000);
+        for _ in 0..2 {
+            mock.push_json(
+                200,
+                r#"{"retCode":0,"result":{"orderId":"a","orderLinkId":""}}"#,
+            );
+        }
+        hedged
+            .place_order(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)))
+            .unwrap();
+        hedged
+            .place_order(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)).reduce_only())
+            .unwrap();
+        let reqs = mock.recorded_requests();
+        assert!(reqs[0]
+            .body
+            .as_deref()
+            .unwrap()
+            .contains(r#""positionIdx":1"#));
+        // A buy that reduces is closing the short side.
+        assert!(reqs[1]
+            .body
+            .as_deref()
+            .unwrap()
+            .contains(r#""positionIdx":2"#));
+
+        // Spot never carries one, whatever the mode says.
+        let (spot, spot_mock) = signed_client(1000);
+        spot_mock.push_json(
+            200,
+            r#"{"retCode":0,"result":{"orderId":"a","orderLinkId":""}}"#,
+        );
+        spot.place_order(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)))
+            .unwrap();
+        assert!(!spot_mock.recorded_requests()[0]
+            .body
+            .as_deref()
+            .unwrap()
+            .contains("positionIdx"));
     }
 
     #[test]
