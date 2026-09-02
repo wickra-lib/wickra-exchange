@@ -1,0 +1,117 @@
+#!/bin/sh
+# Resolve the wickra-exchange C ABI (header + shared library) for the Unix build.
+#
+# Until this existed the package built only where something had already set
+# WKEX_INC and WKEX_LIB -- which is to say, only in this repository's CI. A user
+# running install.packages() got a compiler error about a missing header.
+#
+# Self-contained by default: download the prebuilt wickra-exchange-c-<triple>.tar.gz
+# release asset matching this package's version and stage the shared library into
+# src/, so the compiled object links against it and bundles it (via
+# install.libs.R), found post-install through an rpath ($ORIGIN on Linux,
+# @loader_path on macOS). Set WKEX_INC + WKEX_LIB to build against a locally
+# built C ABI instead (the dev override; e.g. `cargo build -p wickra-exchange-c
+# --release`). Download and extraction use base R, which is always present at
+# build time, so there is no curl/wget system dependency.
+set -e
+
+inc=""
+lib=""
+
+# A freshly-cut GitHub release can briefly return 404 while its assets propagate
+# across the CDN, and a transient network blip should not fail the build either.
+# Retry base R's download.file with a backoff (~2 min total) rather than giving
+# up on the first miss.
+wkex_download() {
+  _url="$1"
+  _dest="$2"
+  _attempt=1
+  while [ "${_attempt}" -le 6 ]; do
+    if "${R_HOME}/bin/Rscript" -e "download.file('${_url}', '${_dest}', mode = 'wb', quiet = TRUE)"; then
+      return 0
+    fi
+    echo "wickra-exchange: download attempt ${_attempt}/6 failed (${_url}); the release asset may still be propagating -- retrying in 20s..."
+    sleep 20
+    _attempt=$((_attempt + 1))
+  done
+  echo "wickra-exchange: failed to download ${_url} after 6 attempts"
+  return 1
+}
+
+# WebAssembly (r-universe's webR target) is not supported and says so rather
+# than failing further in with a link error. Unlike the indicator library, this
+# one is a network client: the C ABI is built on tokio, reqwest and
+# tokio-tungstenite, and wasm32-unknown-emscripten has no sockets for them. A
+# build here could only produce something that compiles and then cannot connect.
+if [ "$(uname -s)" = "Emscripten" ]; then
+  echo "wickra-exchange: no WebAssembly build -- this package is a network client and wasm has no sockets."
+  echo "wickra-exchange: the offline paper/replay simulators are published separately as the wickra-exchange-wasm npm package."
+  exit 1
+fi
+
+if [ -n "${WKEX_INC}" ] && [ -n "${WKEX_LIB}" ]; then
+  echo "wickra-exchange: using the C ABI from WKEX_INC / WKEX_LIB (dev override)"
+  inc="${WKEX_INC}"
+  lib="${WKEX_LIB}"
+else
+  version=$(sed -n 's/^Version:[[:space:]]*//p' DESCRIPTION)
+  os=$(uname -s)
+  arch=$(uname -m)
+  case "${os}" in
+    Linux)
+      case "${arch}" in
+        x86_64) triple="x86_64-unknown-linux-gnu" ;;
+        aarch64 | arm64) triple="aarch64-unknown-linux-gnu" ;;
+        *) echo "wickra-exchange: unsupported Linux arch '${arch}' -- set WKEX_INC/WKEX_LIB"; exit 1 ;;
+      esac
+      ;;
+    Darwin)
+      case "${arch}" in
+        x86_64) triple="x86_64-apple-darwin" ;;
+        arm64 | aarch64) triple="aarch64-apple-darwin" ;;
+        *) echo "wickra-exchange: unsupported macOS arch '${arch}' -- set WKEX_INC/WKEX_LIB"; exit 1 ;;
+      esac
+      ;;
+    *)
+      echo "wickra-exchange: unsupported OS '${os}' -- set WKEX_INC/WKEX_LIB"
+      exit 1
+      ;;
+  esac
+  url="https://github.com/wickra-lib/wickra-exchange/releases/download/v${version}/wickra-exchange-c-${triple}.tar.gz"
+  echo "wickra-exchange: downloading the C ABI ${triple} for v${version}"
+  wkex_download "${url}" "src/wickra-exchange-c.tar.gz" || exit 1
+  "${R_HOME}/bin/Rscript" -e "untar('src/wickra-exchange-c.tar.gz', exdir = 'src/wickra-exchange-c')"
+  inc="src/wickra-exchange-c/wickra-exchange-c-${triple}/include"
+  lib="src/wickra-exchange-c/wickra-exchange-c-${triple}/lib"
+fi
+
+# Stage the header and the platform shared library into src/ so the package
+# object links with -L. -lwickra_exchange and install.libs.R bundles the lib.
+cp "${inc}/wickra_exchange.h" src/wickra_exchange.h
+staged=""
+for f in libwickra_exchange.so libwickra_exchange.dylib; do
+  if [ -f "${lib}/${f}" ]; then
+    cp "${lib}/${f}" "src/${f}"
+    staged="${f}"
+  fi
+done
+if [ -z "${staged}" ]; then
+  echo "wickra-exchange: no libwickra_exchange.so/.dylib found under ${lib}"
+  exit 1
+fi
+
+# rpath so the bundled library is found next to the package object after install.
+case "$(uname -s)" in
+  Darwin)
+    rpath="-Wl,-rpath,@loader_path"
+    # Normalise the dylib id to @rpath so @loader_path resolution applies.
+    install_name_tool -id "@rpath/${staged}" "src/${staged}" 2>/dev/null || true
+    ;;
+  *)
+    rpath="-Wl,-rpath,'\$\$ORIGIN'"
+    ;;
+esac
+
+sed "s|@WKEX_RPATH@|${rpath}|" src/Makevars.in > src/Makevars
+echo "wickra-exchange: configured (bundled ${staged})"
+exit 0

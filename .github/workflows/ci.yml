@@ -737,23 +737,20 @@ jobs:
           use-public-rspm: true
       - name: Install and test the R binding
         shell: bash
-        # github.workspace is a backslash path on Windows; Makevars(.win) (sh) and
-        # mingw need forward slashes. The Makevars do not bake an rpath, so the
-        # native library must be on the loader path at run time: LD_LIBRARY_PATH
-        # (Linux), DYLD_LIBRARY_PATH (macOS) and PATH (Windows).
+        # github.workspace is a backslash path on Windows; configure(.win) (sh)
+        # and mingw need forward slashes.
+        #
+        # Nothing is added to the loader path on purpose. configure stages the
+        # C ABI into src/ and install.libs.R bundles it beside the package
+        # object, resolved by the rpath configure bakes ($ORIGIN /
+        # @loader_path) or, on Windows, by the DLL sitting in the same
+        # directory. This job previously exported LD_LIBRARY_PATH /
+        # DYLD_LIBRARY_PATH / PATH, which made it pass whether or not the
+        # package was self-contained. Without them it passes only if it is,
+        # which is the property a user installing this package depends on.
         run: |
           export WKEX_INC="${WKEX_INC//\\//}"
           export WKEX_LIB="${WKEX_LIB//\\//}"
-          if command -v cygpath >/dev/null 2>&1; then
-            # Windows (rtools bash): add the lib dir to PATH in msys form so the
-            # ':' in the drive letter is not parsed as a PATH separator and msys
-            # translates it to the Windows PATH the DLL loader searches.
-            msys_lib=$(cygpath -u "$WKEX_LIB")
-            export PATH="$msys_lib:$PATH"
-          else
-            export LD_LIBRARY_PATH="$WKEX_LIB:$LD_LIBRARY_PATH"
-            export DYLD_LIBRARY_PATH="$WKEX_LIB:$DYLD_LIBRARY_PATH"
-          fi
           R CMD INSTALL bindings/r
           Rscript bindings/r/tests/run_tests.R
 
