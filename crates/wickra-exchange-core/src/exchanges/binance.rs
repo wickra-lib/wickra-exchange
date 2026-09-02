@@ -2266,6 +2266,17 @@ mod tests {
         assert!(!one_way.contains("positionSide"));
     }
 
+    /// Spot holds balances, not positions, and Binance rejects `reduceOnly`
+    /// there outright (-1104). The client used to append it anyway.
+    #[test]
+    fn a_spot_order_refuses_reduce_only() {
+        let (binance, mock) = signed_client(1000);
+        let request = OrderRequest::limit_sell(symbol(), dec!(1), dec!(100)).reduce_only();
+        let err = binance.place_order(&request).unwrap_err();
+        assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
+        assert!(mock.recorded_requests().is_empty());
+    }
+
     #[test]
     fn stp_mode_appends_param() {
         let (binance, mock) = signed_client(1000);

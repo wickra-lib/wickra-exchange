@@ -2997,6 +2997,65 @@ mod tests {
         ));
     }
 
+    /// Kraken Futures carries post-only and IOC inside `orderType`, and has no
+    /// fill-or-kill anywhere; its APIs carry no STP field either.
+    #[test]
+    fn futures_orders_carry_the_time_in_force_or_refuse_it() {
+        let (kraken, mock) = signed_futures_client(1000);
+        mock.push_json(200, "{}");
+        let ioc = OrderRequest::limit_buy(symbol(), dec!(1), dec!(100))
+            .with_time_in_force(TimeInForce::Ioc);
+        let _ = kraken.place_order(&ioc);
+        let body = mock.recorded_requests()[0].body.clone().unwrap_or_default();
+        assert!(body.contains("orderType=ioc"));
+
+        let (kraken, mock) = signed_futures_client(1000);
+        let both = OrderRequest::limit_buy(symbol(), dec!(1), dec!(100))
+            .post_only()
+            .with_time_in_force(TimeInForce::Ioc);
+        let err = kraken.place_order(&both).unwrap_err();
+        assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
+        assert!(mock.recorded_requests().is_empty());
+
+        let (kraken, mock) = signed_futures_client(1000);
+        let fok = OrderRequest::limit_buy(symbol(), dec!(1), dec!(100))
+            .with_time_in_force(TimeInForce::Fok);
+        let err = kraken.place_order(&fok).unwrap_err();
+        assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
+        assert!(mock.recorded_requests().is_empty());
+
+        let (kraken, mock) = signed_futures_client(1000);
+        let stp = OrderRequest::limit_buy(symbol(), dec!(1), dec!(100))
+            .with_stp(SelfTradePrevention::ExpireMaker);
+        let err = kraken.place_order(&stp).unwrap_err();
+        assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
+        assert!(mock.recorded_requests().is_empty());
+    }
+
+    /// The batch and WebSocket paths honour the same two limits.
+    #[test]
+    fn the_batch_and_websocket_paths_refuse_what_kraken_cannot_say() {
+        let (mut kraken, mock) = signed_client(1000);
+        let stp = OrderRequest::limit_buy(symbol(), dec!(1), dec!(100))
+            .with_stp(SelfTradePrevention::ExpireMaker);
+        let err = AdvancedOrders::place_batch(&mut kraken, &[stp]).unwrap_err();
+        assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
+        assert!(mock.recorded_requests().is_empty());
+
+        let (mut kraken, mock) = signed_client(1000);
+        let fok = OrderRequest::limit_buy(symbol(), dec!(1), dec!(100))
+            .with_time_in_force(TimeInForce::Fok);
+        let err = AdvancedOrders::place_batch(&mut kraken, &[fok]).unwrap_err();
+        assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
+        assert!(mock.recorded_requests().is_empty());
+
+        let (mut kraken, _mock) = signed_client(1000);
+        let ws_stp = OrderRequest::limit_buy(symbol(), dec!(1), dec!(100))
+            .with_stp(SelfTradePrevention::ExpireMaker);
+        let err = WsExecution::place_order_ws(&mut kraken, &ws_stp).unwrap_err();
+        assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
+    }
+
     #[test]
     fn close_position_is_reduce_only_opposite() {
         let (mut kraken, mock) = signed_futures_client(1000);

@@ -2057,6 +2057,32 @@ mod tests {
         assert!(body.contains(r#""price":"101""#));
     }
 
+    /// The futures order path spells the time-in-force in `tif`, and a futures
+    /// market order is a zero-price IOC with no fill-or-kill spelling at all.
+    #[test]
+    fn futures_orders_carry_the_time_in_force_or_refuse_it() {
+        let (gate, mock) = signed_futures_client(1000);
+        mock.push_json(200, "{}");
+        let ioc = OrderRequest::limit_buy(symbol(), dec!(1), dec!(100))
+            .with_time_in_force(TimeInForce::Ioc);
+        let _ = gate.place_order(&ioc);
+        let body = mock.recorded_requests()[0].body.clone().unwrap_or_default();
+        assert!(body.contains(r#""tif":"ioc""#));
+
+        let (gate, mock) = signed_futures_client(1000);
+        mock.push_json(200, "{}");
+        let poc = OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)).post_only();
+        let _ = gate.place_order(&poc);
+        let body = mock.recorded_requests()[0].body.clone().unwrap_or_default();
+        assert!(body.contains(r#""tif":"poc""#));
+
+        let (gate, mock) = signed_futures_client(1000);
+        let fok = OrderRequest::market_buy(symbol(), dec!(1)).with_time_in_force(TimeInForce::Fok);
+        let err = gate.place_order(&fok).unwrap_err();
+        assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
+        assert!(mock.recorded_requests().is_empty());
+    }
+
     #[test]
     fn place_batch_reads_succeeded_flag() {
         let (gate, mock) = signed_client(1_000_000);

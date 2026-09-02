@@ -1812,6 +1812,17 @@ mod tests {
         assert!(body.contains(r#""newPx":"101""#));
     }
 
+    /// `post_only` is an OKX order *type*, so it cannot ride on a market order:
+    /// the two would need the one `ordType` slot at once.
+    #[test]
+    fn a_market_order_cannot_also_be_post_only() {
+        let (okx, mock) = signed_client(1000);
+        let request = OrderRequest::market_buy(symbol(), dec!(1)).post_only();
+        let err = okx.place_order(&request).unwrap_err();
+        assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
+        assert!(mock.recorded_requests().is_empty());
+    }
+
     #[test]
     fn place_batch_per_order_results() {
         let (okx, mock) = signed_client(1000);

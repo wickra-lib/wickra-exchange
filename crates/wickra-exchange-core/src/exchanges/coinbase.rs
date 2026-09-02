@@ -995,6 +995,26 @@ wHvqY4aizCFHQFTVNQCzDGy8/TOhRANCAAS69zNVQjOQ4RgxJVI8esP+jMfHLSTw\n\
             .is_ok());
     }
 
+    /// Coinbase names the time-in-force in the `order_configuration` key, and
+    /// `limit_limit_fok` carries no post-only flag; `post_only` belongs to the
+    /// limit configurations, so it cannot ride on a market order either.
+    #[test]
+    fn configurations_that_cannot_hold_both_settings_are_refused() {
+        let (coinbase, mock) = signed_client(1000);
+        let market_post_only = OrderRequest::market_buy(symbol(), dec!(1)).post_only();
+        let err = coinbase.place_order(&market_post_only).unwrap_err();
+        assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
+        assert!(mock.recorded_requests().is_empty());
+
+        let (coinbase, mock) = signed_client(1000);
+        let fok_post_only = OrderRequest::limit_buy(symbol(), dec!(1), dec!(100))
+            .post_only()
+            .with_time_in_force(TimeInForce::Fok);
+        let err = coinbase.place_order(&fok_post_only).unwrap_err();
+        assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
+        assert!(mock.recorded_requests().is_empty());
+    }
+
     #[test]
     fn ticker_parses() {
         let (coinbase, mock) = signed_client(1_000_000);

@@ -839,6 +839,27 @@ mod tests {
         (upbit, mock)
     }
 
+    /// Upbit is spot-only and its order API carries no reduce-only flag, so a
+    /// caller asking to reduce a position is asking for something this venue has
+    /// no concept of. The client order id it *does* carry, as `identifier`.
+    #[test]
+    fn spot_only_fields_are_refused_and_the_client_id_is_carried() {
+        let (upbit, mock) = signed_client(1000);
+        let reduce = OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)).reduce_only();
+        let err = upbit.place_order(&reduce).unwrap_err();
+        assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
+        assert!(mock.recorded_requests().is_empty());
+
+        let (upbit, mock) = signed_client(1000);
+        mock.push_json(200, "{}");
+        let identified =
+            OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)).with_client_order_id("abc-123");
+        let _ = upbit.place_order(&identified);
+        let url = mock.recorded_requests()[0].url.clone();
+        let body = mock.recorded_requests()[0].body.clone().unwrap_or_default();
+        assert!(url.contains("identifier=abc-123") || body.contains("abc-123"));
+    }
+
     #[test]
     fn wire_symbol_is_quote_first() {
         assert_eq!(Upbit::wire_symbol(&symbol()), "USDT-BTC");

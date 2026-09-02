@@ -2204,6 +2204,63 @@ mod tests {
         ));
     }
 
+    /// The swap `order_price_type` carries the time-in-force and post-only in one
+    /// field, and the futures market order is `optimal_5` -- IOC-shaped, with no
+    /// fill-or-kill spelling.
+    #[test]
+    fn futures_orders_carry_the_time_in_force_or_refuse_it() {
+        let (htx, mock) = signed_futures_client(1000);
+        mock.push_json(200, "{}");
+        let ioc = OrderRequest::limit_buy(symbol(), dec!(1), dec!(100))
+            .with_time_in_force(TimeInForce::Ioc);
+        let _ = htx.place_order(&ioc);
+        let body = mock.recorded_requests()[0].body.clone().unwrap_or_default();
+        assert!(body.contains(r#""order_price_type":"ioc""#));
+
+        let (htx, mock) = signed_futures_client(1000);
+        mock.push_json(200, "{}");
+        let fok = OrderRequest::limit_buy(symbol(), dec!(1), dec!(100))
+            .with_time_in_force(TimeInForce::Fok);
+        let _ = htx.place_order(&fok);
+        let body = mock.recorded_requests()[0].body.clone().unwrap_or_default();
+        assert!(body.contains(r#""order_price_type":"fok""#));
+
+        let (htx, mock) = signed_futures_client(1000);
+        mock.push_json(200, "{}");
+        let poc = OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)).post_only();
+        let _ = htx.place_order(&poc);
+        let body = mock.recorded_requests()[0].body.clone().unwrap_or_default();
+        assert!(body.contains(r#""order_price_type":"post_only""#));
+
+        // Post-only and a non-GTC time-in-force are both values of that one
+        // field, so asking for both is refused rather than half-honoured.
+        let (htx, mock) = signed_futures_client(1000);
+        let both = OrderRequest::limit_buy(symbol(), dec!(1), dec!(100))
+            .post_only()
+            .with_time_in_force(TimeInForce::Ioc);
+        let err = htx.place_order(&both).unwrap_err();
+        assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
+        assert!(mock.recorded_requests().is_empty());
+
+        let (htx, mock) = signed_futures_client(1000);
+        let market_fok =
+            OrderRequest::market_buy(symbol(), dec!(1)).with_time_in_force(TimeInForce::Fok);
+        let err = htx.place_order(&market_fok).unwrap_err();
+        assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
+        assert!(mock.recorded_requests().is_empty());
+    }
+
+    /// Post-only is the `limit-maker` order kind on spot, so it cannot ride on a
+    /// market order.
+    #[test]
+    fn spot_refuses_post_only_on_a_market_order() {
+        let (htx, mock) = signed_client(1000);
+        let request = OrderRequest::market_buy(symbol(), dec!(1)).post_only();
+        let err = htx.place_order(&request).unwrap_err();
+        assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
+        assert!(mock.recorded_requests().is_empty());
+    }
+
     #[test]
     fn close_position_is_reduce_only_opposite() {
         let (mut htx, mock) = signed_futures_client(0);
