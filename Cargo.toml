@@ -13,6 +13,7 @@ members = [
     "crates/wickra-exchange-bench",
     "bindings/python",
     "bindings/node",
+    "bindings/wasm",
     "bindings/c",
     "examples/rust",
 ]

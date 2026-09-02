@@ -170,6 +170,12 @@ def c_abi_spellings(verb: str) -> tuple[str, ...]:
 # matched case-insensitively against its own source, which covers PascalCase
 # (C#, Go), camelCase (Java) and the wkex_ prefix (R) without a table per
 # language that would go stale on its own.
+#
+# `bindings/wasm` is deliberately absent and must stay absent. It targets
+# wasm32-unknown-unknown, where there are no sockets and therefore no live venue
+# client, so it carries the offline subset (paper, replay) on purpose. This check
+# holds a binding to the *full* contract; adding wasm here would report a
+# deliberate scope as a defect, every time, forever.
 BINDINGS = [
     ("python", ("bindings/python/src/lib.rs",), lambda v: (v,)),
     ("node", ("bindings/node/src/lib.rs",), lambda v: (snake_to_camel(v), v)),
