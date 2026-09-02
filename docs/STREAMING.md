@@ -65,6 +65,53 @@ a replay tape can carry `Disconnected` / `Reconnected` exactly as a live stream
 emits them, so the control flow there is the one you would write against a
 venue.
 
+## Health
+
+`Health` is the same shape of thing as reconciliation: a snapshot the caller
+folds, not a subscription the client fills. The pull model already hands you
+every input — `Disconnected` / `Reconnected` say whether the stream is up and
+how often it has come back, `TradePrint` carries the venue's timestamp,
+`sync_time` returns the clock offset, and the rate budget lives in the
+`ThrottledTransport` you wrapped the client with.
+
+```rust
+use wickra_exchange::Health;
+
+let mut health = Health { clock_offset_ms: exchange.sync_time()?, ..Health::default() };
+for event in exchange.poll_events() {
+    match event {
+        Event::Disconnected => health.connected = false,
+        Event::Reconnected => { health.connected = true; health.reconnects += 1; }
+        Event::Trade(ref print) => { health.last_message_ms = Some(print.timestamp); }
+        _ => {}
+    }
+}
+```
+
+Ask it two questions, both relative to *now* rather than to the last message:
+`staleness_ms(now_ms)` is the silence so far, and `is_healthy(now_ms,
+max_staleness_ms)` combines it with `connected`. The pair matters because a
+stream that has stopped delivering is still connected — the socket is open and
+nothing is arriving, which `connected` alone cannot tell you.
+
+Only `TradePrint` carries a venue timestamp; tickers and book updates are
+identified by update id, so for those the caller's own clock stands in.
+
+Anything logged beside it must not carry the credential that signed the
+request. `redact(text, secret)` replaces every occurrence with `<redacted>` and
+ignores an empty secret, so it is safe to call unconditionally — including where
+no credentials are configured:
+
+```rust
+log(&redact(&venue_error_body, &api_secret));
+```
+
+Redact what *arrives*, rather than assembling a line that holds the secret and
+scrubbing it afterwards. See [AUTH.md](AUTH.md#keeping-secrets-out-of-logs).
+
+A runnable version of both is
+[`examples/rust/src/health_and_redaction.rs`](../examples/rust/src/health_and_redaction.rs).
+
 For live trading, pair that with a **dead-man's-switch** (`DeadMansSwitch`): arm
 it and feed it a heartbeat on every message; if the deadline passes without one,
 `is_expired` fires and you cancel every resting order (via the venue's cancel-all

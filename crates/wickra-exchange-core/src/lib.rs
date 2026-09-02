@@ -73,8 +73,8 @@ pub use traits::{
     AdvancedOrders, Derivatives, Exchange, Execution, MarketData, WsExecution, WsUserData,
 };
 pub use transport::{
-    HttpMethod, HttpRequest, HttpResponse, HttpTransport, MockHttpTransport, MockWsConnection,
-    MockWsTransport, WsConnection, WsTransport,
+    HttpMethod, HttpRequest, HttpResponse, HttpTransport, MockHttpTransport, MockWsTransport,
+    WsConnection, WsTransport,
 };
 pub use types::{
     Balance, OcoRequest, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker,

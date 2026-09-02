@@ -73,9 +73,11 @@ The differentiators are what make this more than "a typed ccxt":
 - **`PaperExchange`** implements the same `Exchange` trait but simulates fills
   through the `wickra-backtest` engine — so a strategy runs paper ↔ live by
   swapping the implementation.
-- **Microstructure feeds** (`feeds`) emit the exact typed shapes `wickra-core`
-  consumes (`DerivativesTick`, `OrderBook`, `TradePrint`, `CrossSection`), feeding
-  the 514 indicators and the backtester with zero glue.
+- **Microstructure feeds** (`feeds`) convert what the venue clients emit into
+  the exact typed shapes `wickra-core` consumes (`Trade`, `OrderBook`,
+  `CrossSection`), feeding the 514 indicators and the backtester with zero glue.
+  The derivatives channels fold into a `DerivativesTick` from caller-supplied
+  frames — no client subscribes to them yet.
 - **`ReplayExchange`** drives a recorded feed through the same trait.
 
 A Rust trading backend depends on `wickra-core`, `wickra-backtest-core` and

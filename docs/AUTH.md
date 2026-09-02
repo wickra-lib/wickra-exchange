@@ -33,3 +33,31 @@ let creds = Credentials::new("api-key", "api-secret")
 - The `Credentials` type is the only place secrets live; transports receive
   already-signed requests.
 - See [`SECURITY.md`](../SECURITY.md) and [`THREAT_MODEL.md`](../THREAT_MODEL.md).
+
+## Keeping secrets out of logs
+
+`Credentials` and every client redact secret material in their `Debug` output,
+so a `{:?}` of a client cannot leak a key. That covers the types this library
+hands you. What it cannot cover is a string that arrives carrying the credential
+— most often a venue error body quoting back the signature it rejected:
+
+```rust
+use wickra_exchange::redact;
+
+// {"code":"40103","msg":"invalid sign: <the key>"}
+log(&redact(&venue_error_body, &api_secret));
+```
+
+`redact` replaces every occurrence with `<redacted>` before the line is written,
+and ignores an empty secret, so it is safe to call unconditionally — including
+on the paths where no credentials are configured at all.
+
+Redact what arrives; do not interpolate what you hold. Building the line
+yourself and scrubbing afterwards leaves the unredacted string in memory first,
+and makes every later edit to the format string a chance to log the key — which
+is why a static analyser flags that shape and not this one.
+
+See [STREAMING.md](STREAMING.md#health) for the health snapshot it usually
+accompanies, and
+[`examples/rust/src/health_and_redaction.rs`](../examples/rust/src/health_and_redaction.rs)
+for both running.

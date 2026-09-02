@@ -335,8 +335,12 @@ impl WsTransport for MockWsTransport {
 }
 
 /// A scripted [`WsConnection`] produced by [`MockWsTransport`].
+///
+/// Crate-internal: `connect` hands it back as a `Box<dyn WsConnection>`, its
+/// fields are private and it has no constructor, so a caller can neither name
+/// nor build one. It drives the transport, not the public API.
 #[derive(Debug)]
-pub struct MockWsConnection {
+pub(crate) struct MockWsConnection {
     incoming: VecDeque<Result<Option<String>>>,
     sent: Arc<Mutex<Vec<String>>>,
     closed: bool,

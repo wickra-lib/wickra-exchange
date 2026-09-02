@@ -142,6 +142,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The CodSpeed comparison is bimodal per runner CPU, and now says so.** The
+  job reported `apply_delta` at 453.6 ns against a 399.4 ns base on this
+  release's documentation branch — the same pair as the earlier incident, to the
+  decimal, on a pull request whose only non-comment Rust change was one name
+  removed from a re-export list and one `pub` narrowed to `pub(crate)` on a
+  test-only mock. The base-commit fallback that explained the first occurrence
+  was ruled out: the base was measured on the newest `main` commit. The
+  diagnostic step added last time then answered it in one run — the base ran on
+  an AMD EPYC 7763 (family 25 model 1) and the head on an EPYC 9V74 (family 25
+  model 17), with the same kernel, rustc and LLVM on both. `simulation` mode
+  counts instructions, but the nanosecond figure is modelled from them against
+  the host's cache geometry, and Milan and Genoa do not share one; GitHub's
+  `ubuntu-latest` pool holds both. No fix is available — a standard runner
+  cannot be pinned to a CPU generation, and a threshold wide enough to swallow
+  12% would swallow a real 12% regression. The workflow comment now says to
+  compare the two recorded CPU lines before the diff, and names the figures the
+  artefact reproduces at.
+
+- **A public type nobody could name, and three doc links to nothing.**
+  `MockWsConnection` was exported from the crate root, but `connect` hands it
+  back as a `Box<dyn WsConnection>`, its fields are private and it has no
+  constructor — so no caller could name or build one. It is `pub(crate)` now,
+  which is what `unreachable_pub` says it always was.
+  Separately, three intra-doc links in public documentation resolved to private
+  items: `PaperExchange` and `ReplayExchange` each pointed at `[module docs]
+  (self)` in a private module, and Kraken's `subscribe_user_data` pointed at a
+  private method. All three are prose now. They survived because **nothing ran
+  rustdoc**: a broken intra-doc link is a warning, and the workspace's three
+  linters were two. `cargo doc` with `RUSTDOCFLAGS: -D warnings` now runs in the
+  lint job, over the two published crates rather than `--workspace` — the C
+  binding's lib is also named `wickra_exchange` and the two collide on the
+  output path.
+
+- **`Health` and `redact` were public, tested and undocumented.** Both are
+  exported from the crate root, and neither appeared anywhere outside the source
+  — `Health` had zero references in the entire repository apart from its own
+  `pub use` line. They are caller-facing by the same test that separated
+  `reconcile_orders` from the clock and the retry loop: the library cannot fill a
+  `Health` for you, because the pull model already hands you every input
+  (`Disconnected` / `Reconnected` for the connection and the reconnect count, the
+  print timestamp for staleness, `sync_time`'s return for the clock offset, and
+  the rate budget from the `ThrottledTransport` you wrapped the client with).
+  `docs/STREAMING.md` gains the fold and says why `connected` alone is not
+  enough — a stream that stopped delivering is still connected — and
+  `docs/AUTH.md` covers redaction where the credentials it protects are already
+  discussed. `examples/rust/src/health_and_redaction.rs` runs both offline
+  against a replay tape, and the `examples-smoke` job runs it.
+  The redaction guidance changed while writing it, and CodeQL is why: the first
+  draft assembled a request line holding the key and scrubbed it afterwards,
+  which `rust/cleartext-logging` flagged as high severity on the pull request.
+  It was right about the shape. The unredacted string exists first, and no
+  analyser can prove the scrub. Both pages now teach the case `redact` actually
+  exists for — a venue error body that quotes back the signature it rejected, a
+  string the process never assembled — and say plainly: redact what arrives, do
+  not interpolate what you hold.
+  Noted while writing it: only `TradePrint` carries a venue timestamp; `Ticker`,
+  `BookSnapshot` and `BookDelta` are identified by update id, so a staleness
+  clock over those events is the caller's own.
+
+- **The README sold a feed that nothing subscribes to.** Under the
+  differentiators it said funding, open interest, liquidations and long/short
+  ratio "arrive as the exact typed shapes `wickra-core` consumes". They do not
+  arrive at all: across all ten venue clients, `fundingRate`, `openInterest` and
+  `premiumIndex` appear zero times. `FundingRate`, `OpenInterest`,
+  `Liquidation`, `LongShortRatio`, `MarkIndex` and `DerivativesFeed` are six
+  public types with no producer — the shapes and the `DerivativesTickBuilder`
+  fold are real and tested, but the frames have to come from the caller.
+  What *is* wired is the other half of the same sentence, and it stays: every
+  client emits `TradePrint` and `OrderBookSnapshot` on its stream, and
+  `trade_from_print` / `order_book_from_snapshot` / `cross_section` convert them
+  into the core's input types with no glue. `README.md`, `ARCHITECTURE.md` and
+  the `feeds` module doc now separate the two halves, and
+  `docs/DERIVATIVES.md` gains a section saying which channels are subscribed and
+  which are shapes waiting for data. Subscribing to the derivatives channels on
+  eight futures venues is a feature, not a correction; naming the gap is what
+  this entry does.
+
 - **OKX signed with this machine's clock, and Upbit's nonce could repeat.**
   Two gaps in the clock work above, found by counting which clients actually
   hold the types involved rather than by re-reading the claim.

@@ -468,8 +468,8 @@ impl Kraken {
     /// from being dropped for inactivity.
     ///
     /// The **futures** client routes to the separate Kraken Futures feed
-    /// (`wss://futures.kraken.com/ws/v1`) with challenge/response auth; see
-    /// [`subscribe_user_data_futures`](Self::subscribe_user_data_futures).
+    /// (`wss://futures.kraken.com/ws/v1`), which authenticates by
+    /// challenge/response rather than with a token.
     ///
     /// # Errors
     /// Returns [`Error::InvalidCredentials`] without credentials,

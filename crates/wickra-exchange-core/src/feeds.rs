@@ -14,9 +14,13 @@
 //! | [`DerivativesFeed`] (via [`DerivativesTickBuilder`]) | [`DerivativesTick`] |
 //! | [`BreadthMember`] slice                 | [`CrossSection`]       |
 //!
-//! The derivatives channels arrive independently, so [`DerivativesTickBuilder`]
-//! folds each [`DerivativesFeed`] into a running tick and emits a validated
-//! [`DerivativesTick`] on demand.
+//! The first two rows are fed by this crate: every venue client emits
+//! [`TradePrint`] and [`OrderBookSnapshot`] on its stream. The last two are fed
+//! by the caller — a [`BreadthMember`] universe is assembled from tickers, and
+//! **no venue client subscribes to the derivatives channels yet**, so the
+//! [`DerivativesFeed`] frames are ones you supply. The derivatives channels
+//! arrive independently, so [`DerivativesTickBuilder`] folds each into a running
+//! tick and emits a validated [`DerivativesTick`] on demand.
 
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
