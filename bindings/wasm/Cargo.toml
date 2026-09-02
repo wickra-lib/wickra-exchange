@@ -1,0 +1,73 @@
+[package]
+name = "wickra-exchange-wasm"
+description = "WebAssembly bindings for wickra-exchange: the offline paper and replay simulators, in the browser."
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+# The crate-local README, not the workspace one. wasm-pack copies this into
+# pkg/ and npm shows it on the package page -- and this package carries a
+# deliberately smaller surface than the rest of the family, which is exactly
+# what a reader needs told before they look for `connect`.
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+# The *core* crate, not `wickra-exchange`. The transport crate pulls tokio,
+# reqwest and tokio-tungstenite, none of which have a wasm32-unknown-unknown
+# target: a browser has no sockets to give them. Everything this binding does
+# expose -- the paper account, the replay tape, the order book, the types --
+# lives in the core and is pure computation.
+wickra-exchange-core = { workspace = true }
+rust_decimal = { workspace = true }
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+serde = { workspace = true }
+serde-wasm-bindgen = "0.6"
+console_error_panic_hook = { version = "0.1", optional = true }
+
+# `p256` (Coinbase's ES256 request JWT) pulls getrandom in through
+# ecdsa -> elliptic-curve -> crypto-bigint. On wasm32-unknown-unknown getrandom
+# refuses to pick a backend by itself -- there is no ambient OS entropy source --
+# and fails the build with "the wasm32/64-unknown-unknown are not supported by
+# default". Enabling `wasm_js` selects the Web Crypto backend
+# (`crypto.getRandomValues`). Declared here because feature unification needs a
+# crate in the graph to ask for it, and this is the only one that knows it is
+# building for the web.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }
+
+[features]
+default = []
+panic-hook = ["dep:console_error_panic_hook"]
+
+[package.metadata.wasm-pack.profile.release.wasm-bindgen]
+debug-js-glue = false
+demangle-name-section = true
+dwarf-debug-info = false
+
+[package.metadata.wasm-pack.profile.release]
+# The wasm-opt that ships with wasm-pack is older than the WebAssembly features
+# rustc enables by default (reference-types, multivalue, bulk-memory,
+# sign-extension, mutable-globals, ...). Listing them all keeps wasm-opt happy
+# without requiring a binaryen upgrade in CI.
+wasm-opt = [
+    '-O3',
+    '--enable-bulk-memory',
+    '--enable-mutable-globals',
+    '--enable-nontrapping-float-to-int',
+    '--enable-sign-ext',
+    '--enable-reference-types',
+    '--enable-multivalue',
+]

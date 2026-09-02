@@ -60,6 +60,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A WASM binding, `bindings/wasm`, carrying the offline simulators.** The
+  README previously said there would be none, on the argument that
+  authenticated trading needs raw sockets and secret keys a browser forbids.
+  That argument holds and is unchanged — what it did not cover is the part of
+  this library that needs neither: `PaperExchange` and `ReplayExchange` are pure
+  computation, and they live in `wickra-exchange-core`, which has no tokio,
+  reqwest or tokio-tungstenite dependency. So the binding exists and is
+  deliberately smaller than its siblings: paper and replay accounts, order
+  placement, cancellation, lookup, balances, ticker and event draining. There is
+  no `connect`, no user-data or WebSocket execution, no derivatives and no
+  `klines`, because each needs a network.
+  - There is also no `orderBook`: the paper account has no depth feed and
+    answers `unsupported`, and replay delegates straight to it, so on both
+    backends reachable from WASM the call cannot succeed. A method that
+    type-checks and always throws is worse than an absent one.
+  - `golden.test.js` drives the two committed replay tapes in `golden/` through
+    the binding and asserts the same fill price and balances the Rust suite
+    pins, so the JavaScript path cannot drift from the Rust one silently.
+  - `p256` (Coinbase's ES256 request JWT) pulls in `getrandom`, which refuses to
+    pick a backend on `wasm32-unknown-unknown`; the crate enables its `wasm_js`
+    feature, selecting the Web Crypto backend.
+  - `scripts/check_binding_surface.py` deliberately does not list this binding:
+    it holds a binding to the *full* contract, which would report the smaller
+    surface as a defect on every run. The reason is recorded next to the list.
+
 - **`bindings/c/include/wickra_exchange.hpp`** — an optional, header-only C++
   layer over the C ABI. The ABI hands out five kinds of opaque handle, each
   released exactly once by its own `wickra_*_free`; every early return between

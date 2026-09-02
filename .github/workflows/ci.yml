@@ -511,6 +511,56 @@ jobs:
           go vet ./...
           go test ./...
 
+  wasm:
+    name: WASM build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30 # backstop against a hung job, not a budget
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain (with wasm target)
+        uses: ./.github/actions/setup-rust
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Install wasm-pack
+        # The taiki-e prebuilt installer, as for cbindgen and cargo-codspeed.
+        # jetli/wasm-pack-action with no `version:` installs a ~0.10 wasm-pack
+        # whose `build` does not accept `--features`, which this build needs.
+        uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2.87.1
+        timeout-minutes: 10 # fail fast on a stuck download instead of hanging the job
+        with:
+          tool: wasm-pack
+
+      - name: Build the browser package
+        run: wasm-pack build bindings/wasm --target web --release --features panic-hook
+
+      - name: Verify the generated artefacts
+        # wasm-pack reports success even when a rename upstream leaves the
+        # loader pointing at a file it did not emit; name the three files a
+        # consumer actually imports.
+        run: |
+          test -f bindings/wasm/pkg/wickra_exchange_wasm.js
+          test -f bindings/wasm/pkg/wickra_exchange_wasm_bg.wasm
+          test -f bindings/wasm/pkg/wickra_exchange_wasm.d.ts
+
+      - name: Build the nodejs package for the test suite
+        run: wasm-pack build bindings/wasm --target nodejs --release --out-dir pkg
+
+      # Through the generated JS glue rather than through wasm-bindgen-test:
+      # the glue is what a consumer imports and what silently changes shape
+      # (a HashMap arriving as a JS Map rather than an object, say), so it is
+      # the layer worth testing.
+      #
+      # The glob rather than the bare directory: Node resolves a directory
+      # argument as a module path and fails to load it.
+      - name: WASM suite -- golden parity against the committed fixtures
+        run: node --test bindings/wasm/tests/*.test.js
+
   node:
     name: Node ${{ matrix.node-version }} on ${{ matrix.os }}
     strategy:

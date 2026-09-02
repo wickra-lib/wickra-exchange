@@ -54,10 +54,17 @@ of Wickra**:
   backtest runs on *real* recorded microstructure.
 
 The same `Exchange` API is reachable from **Rust, Python, Node.js, C, C++, C#,
-Go, Java and R** — native PyO3 / napi bindings plus a C ABI hub. There is no WASM
-binding: authenticated trading needs raw sockets and secret keys, which a browser
-sandbox forbids (the browser-safe slice — public market data — is already covered
-by `wickra-wasm` over a browser WebSocket).
+Go, Java and R** — native PyO3 / napi bindings plus a C ABI hub.
+
+There is also a **WASM** binding, and it is deliberately smaller than the rest:
+`wasm32-unknown-unknown` has no sockets, so no live venue client can exist there,
+and authenticated trading needs raw sockets and secret keys a browser sandbox
+forbids. What it does carry is the part that needs neither — the offline
+`PaperExchange` and `ReplayExchange`, with the same order, balance and event API
+the live clients expose. That is enough to run a strategy, or a replay UI, in a
+page; the browser-safe slice of *public market data* remains covered by
+`wickra-wasm` over a browser WebSocket. See
+[bindings/wasm](bindings/wasm/README.md) for what is present and what is not.
 
 [`Decimal`]: https://docs.rs/rust_decimal
 
@@ -157,6 +164,7 @@ each cell is tracked in [docs/EXCHANGES.md](docs/EXCHANGES.md).
 | Go       | cgo | [bindings/go](bindings/go/README.md) |
 | Java     | FFM / Panama | [bindings/java](bindings/java/README.md) |
 | R        | `.Call` | [bindings/r](bindings/r/README.md) |
+| WASM     | wasm-pack | [bindings/wasm](bindings/wasm/README.md) — paper / replay only |
 
 The C, C++, C#, Go, Java and R bindings all call through the same C ABI hub. The
 [replay corpus](golden/) asserts every language normalises recorded exchange
@@ -178,14 +186,14 @@ wickra-exchange/
 │   ├── python/   PyO3 + maturin          ├── csharp/  P/Invoke over the C ABI
 │   ├── node/     napi-rs                 ├── go/      cgo over the C ABI
 │   ├── c/        C ABI (cdylib + header) ├── java/    FFM over the C ABI
-│   └── r/        .Call over the C ABI
+│   ├── r/        .Call over the C ABI    └── wasm/    wasm-pack (paper/replay only)
 ├── golden/       recorded-response replay corpus + expected normalised structs
 ├── examples/     one runnable program per language
 ├── docs/         exchanges, auth, streaming and architecture guides
 └── fuzz/         cargo-fuzz targets (nightly)
 ```
 
-There is no `bindings/wasm/` — see the intro for why.
+`bindings/wasm/` carries the offline simulators only — see the intro for why.
 
 ## Building everything from source
 
