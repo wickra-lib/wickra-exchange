@@ -94,6 +94,32 @@ jobs:
       # occurrence should take one run: it records the CPU, kernel and toolchain
       # of whatever machine produced a number. A diagnostic must never fail the
       # job, hence the fallback and the trailing `|| true`.
+      #
+      # It earned itself on the next occurrence, which took one run and had the
+      # opposite answer: that time it *was* the machine. `apply_delta` came back
+      # at exactly 453.6 ns against exactly 399.4 ns -- the same pair as above,
+      # to the decimal -- on a pull request whose only non-comment Rust change
+      # was one name removed from a re-export list and one `pub` narrowed to
+      # `pub(crate)` on a test-only mock. The base was measured on the newest
+      # main commit this time, so the fallback that explained the first
+      # occurrence was ruled out. What differed was the CPU:
+      #
+      #   base (main)     AMD EPYC 7763 64-Core, family 25 model 1   399.4 ns
+      #   head (the PR)   AMD EPYC 9V74 80-Core, family 25 model 17  453.6 ns
+      #
+      # Same kernel, same rustc, same LLVM. `simulation` mode counts
+      # instructions, but the nanosecond figure CodSpeed reports is modelled
+      # from them, and the model is fitted to the host's cache geometry --
+      # which differs between Milan and Genoa. GitHub's ubuntu-latest pool
+      # holds both, so the reported figure is bimodal per runner while the
+      # instruction stream is unchanged.
+      #
+      # There is no fix available here: a standard runner cannot be pinned to a
+      # CPU generation, and a threshold wide enough to swallow 12% would swallow
+      # a real 12% regression too. So this check is read, not obeyed: when it
+      # fires, compare the two CPU lines below before looking at the diff. If
+      # they differ and the diff cannot reach the benchmarked function, it is
+      # this, and the two figures will be that same pair again.
       - name: Record the measurement environment
         # `github.ref` reaches the shell through the environment, not through
         # template expansion: on a push it carries a branch name, and a branch

@@ -142,6 +142,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The CodSpeed comparison is bimodal per runner CPU, and now says so.** The
+  job reported `apply_delta` at 453.6 ns against a 399.4 ns base on this
+  release's documentation branch — the same pair as the earlier incident, to the
+  decimal, on a pull request whose only non-comment Rust change was one name
+  removed from a re-export list and one `pub` narrowed to `pub(crate)` on a
+  test-only mock. The base-commit fallback that explained the first occurrence
+  was ruled out: the base was measured on the newest `main` commit. The
+  diagnostic step added last time then answered it in one run — the base ran on
+  an AMD EPYC 7763 (family 25 model 1) and the head on an EPYC 9V74 (family 25
+  model 17), with the same kernel, rustc and LLVM on both. `simulation` mode
+  counts instructions, but the nanosecond figure is modelled from them against
+  the host's cache geometry, and Milan and Genoa do not share one; GitHub's
+  `ubuntu-latest` pool holds both. No fix is available — a standard runner
+  cannot be pinned to a CPU generation, and a threshold wide enough to swallow
+  12% would swallow a real 12% regression. The workflow comment now says to
+  compare the two recorded CPU lines before the diff, and names the figures the
+  artefact reproduces at.
+
 - **A public type nobody could name, and three doc links to nothing.**
   `MockWsConnection` was exported from the crate root, but `connect` hands it
   back as a `Box<dyn WsConnection>`, its fields are private and it has no
