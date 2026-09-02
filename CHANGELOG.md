@@ -40,6 +40,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The CodSpeed job now records the machine it measured on.** The job spent an
+  evening failing every pull request with the same figure: `apply_delta` at
+  453.6 ns against a 399.4 ns base, on five runs across two branches whose diffs
+  had nothing in common — the second touched neither `orderbook.rs` nor the
+  bench crate — while `main` went on reporting 399.4 although it already carried
+  the code the first branch had "regressed" on. It was never a real regression,
+  and that part is settled rather than assumed: built with `--emit=asm`, the two
+  functions the benchmark executes are identical between the revisions,
+  `apply_delta` modulo basic-block label numbering and `apply_level` but for the
+  names of anonymous panic constants. The offset then disappeared on its own
+  once `main` was measured again on a later commit, and base and head have
+  agreed since. So the cause lay in the comparison rather than the source, but
+  which part of it is not established — CodSpeed reported "Different runtime
+  environments detected" without naming the dimension, and separately fell back
+  to an unexpected base commit. The job now logs the CPU, kernel and toolchain
+  of whatever machine produced a number, so a recurrence is diagnosable instead
+  of re-derived from scratch. No threshold was added: one wide enough to hide a
+  constant 12% offset would hide a real 12% regression too.
+
 - `@napi-rs/cli` 3.7.4 → 3.8.6, with the regenerated `bindings/node/index.js`.
   The new CLI emits a different native loader — it chains load errors instead of
   discarding all but the last — so the committed file had to move with it. The

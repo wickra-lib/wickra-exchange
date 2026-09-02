@@ -51,6 +51,49 @@ jobs:
         with:
           tool: cargo-codspeed
 
+      # This job spent an evening failing every pull request with the same
+      # figure: `apply_delta` at 453.6 ns against a 399.4 ns base, on five runs
+      # across two branches whose diffs had nothing in common -- and the second
+      # of those branches touched neither `orderbook.rs` nor the bench crate.
+      # Meanwhile main kept reporting 399.4 while already carrying the code the
+      # first branch had "regressed" on.
+      #
+      # It was never a real regression, and that part is settled rather than
+      # assumed: building both revisions with `--emit=asm` and comparing the two
+      # functions the benchmark executes shows `apply_delta` identical modulo
+      # basic-block label numbering, and `apply_level` identical but for the
+      # names of anonymous panic constants.
+      #
+      # The offset then disappeared on its own, once main was measured again on
+      # a later commit -- base and head have agreed since. So the cause was in
+      # the comparison rather than in the source, but which part of it is not
+      # established: CodSpeed reported "Different runtime environments detected"
+      # without naming the dimension, and separately fell back to an unexpected
+      # base commit at one point.
+      #
+      # This step exists so a recurrence is diagnosable instead of re-derived
+      # from scratch: it records the CPU, kernel and toolchain of whatever
+      # machine produced the number. A diagnostic must never fail the job, hence
+      # the fallback and the trailing `|| true`.
+      - name: Record the measurement environment
+        # `github.ref` reaches the shell through the environment, not through
+        # template expansion: on a push it carries a branch name, and a branch
+        # name is attacker-controllable text that `${{ }}` would paste straight
+        # into the script (zizmor template-injection).
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+        run: |
+          echo "event=${EVENT_NAME} ref=${REF}"
+          echo "runner=${RUNNER_NAME:-?} arch=${RUNNER_ARCH:-?} os=${RUNNER_OS:-?}"
+          echo "--- cpu ---"
+          lscpu 2>/dev/null | grep -E 'Model name|CPU family|Model:|Stepping|CPU MHz' \
+            || grep -E 'model name|cpu family|stepping' /proc/cpuinfo | sort -u \
+            || true
+          echo "--- kernel / toolchain ---"
+          uname -srm
+          rustc --version --verbose
+
       # The bench crate depends on codspeed-criterion-compat aliased to
       # `criterion`. Without that alias these steps succeed and report nothing,
       # which is the failure mode worth naming: a green job that measured
