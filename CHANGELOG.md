@@ -150,6 +150,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A stop-loss was placed as an order that executed immediately.** The most
+  severe of the defects in this run, and the simplest: `OrderRequest::validate`
+  *requires* a `stop_price` on a `StopMarket`/`StopLimit` — so the library
+  accepted the order and asserted the trigger was there — and then every venue's
+  `order_type_str` mapped `StopMarket` down to `"market"` and `StopLimit` to
+  `"limit"` and sent no trigger at all. A stop-loss at 19 000 with the market at
+  20 000 went out as a market sell and filled at 20 000: exactly the loss it
+  existed to prevent.
+  Counting the order-building paths in the crate: **one of thirty-one** sent a
+  trigger price, `Binance::place_order`. The other thirty dropped it, including
+  Binance's own batch and WebSocket paths. (The `stop_price` references in the
+  OKX and KuCoin clients are `OcoRequest`, a different type on the bracket path,
+  which was never affected.)
+  Binance now carries `stopPrice` on all three of its order paths — the REST
+  mapping mirrored into the batch entry and the ws-api frame. **Every other
+  venue refuses a trigger order** with `Error::Exchange` code `unsupported`,
+  rather than placing the immediate order underneath it. Implementing trigger
+  orders natively on nine venues means nine different endpoints and parameter
+  sets; refusing is correct today, and each venue can move to carrying them one
+  at a time. `PaperExchange` already refused, and had done so from the start.
+  `tests/conformance.rs` now holds all ten clients to the contract — a trigger
+  order is either sent with its trigger or refused, never flattened — so a venue
+  added without either is caught, and one that gains native support later moves
+  between branches without the test changing.
+  `docs/CAPABILITIES.md` claimed "all order types are common across venues:
+  market, limit, stop-market, stop-limit". It now says which one is not.
+
 - **A hedged account got orders that named no side.** `position_mode` was the
   last field on `ExchangeOptions` that nothing read. On a hedged account a
   symbol holds a long and a short position at once, so every order has to name

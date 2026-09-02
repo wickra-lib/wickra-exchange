@@ -565,6 +565,9 @@ impl Htx {
     /// Returns an [`Error`] if the order is invalid, credentials are missing, or
     /// the venue rejects it.
     pub fn place_order(&self, request: &OrderRequest) -> Result<Order> {
+        if request.order_type.is_trigger() {
+            return Err(Error::unsupported_trigger("HTX"));
+        }
         request.validate()?;
         if self.is_futures() {
             return self.place_futures_order(request);
@@ -1538,6 +1541,9 @@ impl Htx {
     /// Returns an [`Error`] if the batch request itself fails, or if called on a
     /// futures client (spot batch endpoint).
     pub fn place_batch(&self, requests: &[OrderRequest]) -> Result<Vec<Result<Order>>> {
+        if requests.iter().any(|r| r.order_type.is_trigger()) {
+            return Err(Error::unsupported_trigger("HTX"));
+        }
         if requests.is_empty() {
             return Ok(Vec::new());
         }

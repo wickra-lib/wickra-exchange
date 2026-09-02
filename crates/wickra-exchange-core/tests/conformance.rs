@@ -8,11 +8,23 @@
 //! path is covered by its own module tests.
 
 use rust_decimal_macros::dec;
+use std::sync::Arc;
 use wickra_exchange_core::{
-    Binance, Bitget, Bybit, Coinbase, Event, Exchange, ExchangeOptions, Gate, Htx, Kraken, KuCoin,
-    MarketData, MarketType, MockHttpTransport, Okx, OrderRequest, OrderStatus, PaperExchange,
-    ReplayExchange, Symbol, TradePrint, Upbit, WsExecution, WsUserData,
+    Binance, Bitget, Bybit, Coinbase, Credentials, Error, Event, Exchange, ExchangeOptions, Gate,
+    HttpRequest, HttpResponse, HttpTransport, Htx, Kraken, KuCoin, MarketData, MarketType,
+    MockHttpTransport, Okx, OrderRequest, OrderStatus, OrderType, PaperExchange, ReplayExchange,
+    Result, Symbol, TradePrint, Upbit, WsExecution, WsUserData,
 };
+
+/// Share one [`MockHttpTransport`] between the test and the client that owns it,
+/// so the requests a client built can be read back after the call.
+struct ArcTransport(Arc<MockHttpTransport>);
+
+impl HttpTransport for ArcTransport {
+    fn execute(&self, request: &HttpRequest) -> Result<HttpResponse> {
+        self.0.execute(request)
+    }
+}
 
 /// The order lifecycle every execution backend must honour: a resting limit
 /// order is placed, found by query and open-orders, then cancelled.
@@ -149,4 +161,94 @@ fn every_trading_venue_is_object_safe_as_ws_user_data_and_ws_execution() {
     for client in &mut user_data {
         assert!(client.poll_events().is_empty());
     }
+}
+
+/// A trigger order either carries its trigger price to the venue, or is
+/// refused. It must never be sent as a plain order.
+///
+/// This is the contract nine of the ten clients were breaking. `OrderRequest`
+/// validates that a `StopMarket`/`StopLimit` carries a `stop_price`, and then
+/// every path but `Binance::place_order` dropped it and mapped the type down to
+/// `market`/`limit` -- so a stop-loss at 19000 was sent as a market order that
+/// executed at once, at the price it existed to protect against.
+///
+/// The assertion is deliberately shaped as "sent with a trigger, or refused",
+/// not as a list of which venues do which: a venue that gains native trigger
+/// orders later moves from one branch to the other without touching this test,
+/// and a venue added without either is caught.
+#[test]
+fn a_trigger_order_is_either_carried_or_refused_but_never_flattened() {
+    // What the venue answered is irrelevant here -- the mock replies `{}` and
+    // several clients then fail to parse it. What matters is what went out.
+    fn assert_contract(name: &str, outcome: &Result<wickra_exchange_core::Order>, sent: &[String]) {
+        let refused = matches!(outcome, Err(Error::Exchange { code, .. }) if code == "unsupported");
+        if refused {
+            assert!(
+                sent.is_empty(),
+                "{name}: refused, yet sent a request anyway"
+            );
+            return;
+        }
+        assert!(
+            !sent.is_empty(),
+            "{name}: neither refused the trigger order nor sent one"
+        );
+        let carried = sent
+            .iter()
+            .any(|req| req.contains("stopPrice") || req.contains("triggerPx"));
+        assert!(
+            carried,
+            "{name}: sent a trigger order with no trigger price; it would execute now"
+        );
+    }
+
+    let stop = |market: &Symbol| OrderRequest {
+        order_type: OrderType::StopMarket,
+        stop_price: Some(dec!(19000)),
+        ..OrderRequest::market_sell(market.clone(), dec!(1))
+    };
+    let market = market();
+    let creds = || {
+        Credentials::new("APIKEY", "SECRET")
+            .with_passphrase("PASS")
+            .with_private_key(
+                "-----BEGIN EC PRIVATE KEY-----
+x
+-----END EC PRIVATE KEY-----",
+            )
+    };
+    let options = ExchangeOptions::mainnet(MarketType::Spot);
+
+    macro_rules! check {
+        ($name:literal, $venue:ident) => {{
+            let mock = Arc::new(MockHttpTransport::new());
+            // Enough of a response that a client which *accepts* the order gets
+            // far enough to have sent its request; the contract is about what
+            // went out, not about what came back.
+            mock.push_json(200, "{}");
+            let client = $venue::with_credentials(
+                Box::new(ArcTransport(Arc::clone(&mock))),
+                &options,
+                creds(),
+            );
+            let outcome = client.place_order(&stop(&market));
+            let sent: Vec<String> = mock
+                .recorded_requests()
+                .iter()
+                .map(|r| format!("{} {}", r.url, r.body.clone().unwrap_or_default()))
+                .collect();
+            assert_contract($name, &outcome, &sent);
+        }};
+    }
+
+    check!("Binance", Binance);
+    check!("Bybit", Bybit);
+    check!("OKX", Okx);
+    check!("Bitget", Bitget);
+    check!("KuCoin", KuCoin);
+    check!("Gate.io", Gate);
+    check!("HTX", Htx);
+    check!("Kraken", Kraken);
+    check!("Coinbase", Coinbase);
+    check!("Upbit", Upbit);
 }

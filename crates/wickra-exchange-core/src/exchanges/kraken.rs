@@ -606,6 +606,9 @@ impl Kraken {
     /// separate feed), [`Error::NotConnected`] without a WebSocket transport, or
     /// another [`Error`] if the order is invalid or rejected.
     pub fn place_order_ws(&mut self, request: &OrderRequest) -> Result<Order> {
+        if request.order_type.is_trigger() {
+            return Err(Error::unsupported_trigger("Kraken"));
+        }
         self.ensure_one_way()?;
         request.validate()?;
         let mut params = serde_json::Map::new();
@@ -771,6 +774,9 @@ impl Kraken {
     /// Returns an [`Error`] if the order is invalid, credentials are missing, or
     /// the venue rejects it.
     pub fn place_order(&self, request: &OrderRequest) -> Result<Order> {
+        if request.order_type.is_trigger() {
+            return Err(Error::unsupported_trigger("Kraken"));
+        }
         self.ensure_one_way()?;
         request.validate()?;
         if self.is_futures() {
@@ -2152,6 +2158,9 @@ impl Kraken {
     /// the request itself fails (a per-order rejection is carried in its own
     /// [`Result`], not the outer one).
     pub fn place_batch(&self, requests: &[OrderRequest]) -> Result<Vec<Result<Order>>> {
+        if requests.iter().any(|r| r.order_type.is_trigger()) {
+            return Err(Error::unsupported_trigger("Kraken"));
+        }
         self.ensure_one_way()?;
         if requests.is_empty() {
             return Ok(Vec::new());

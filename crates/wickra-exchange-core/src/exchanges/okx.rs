@@ -475,6 +475,9 @@ impl Okx {
     /// Returns [`Error::NotConnected`] without a WebSocket transport, or another
     /// [`Error`] if the order is invalid or the venue rejects it.
     pub fn place_order_ws(&mut self, request: &OrderRequest) -> Result<Order> {
+        if request.order_type.is_trigger() {
+            return Err(Error::unsupported_trigger("OKX"));
+        }
         request.validate()?;
         let ord_type = if request.post_only && request.order_type == OrderType::Limit {
             "post_only"
@@ -596,6 +599,9 @@ impl Okx {
     /// Returns an [`Error`] if the order is invalid, credentials are missing, or
     /// the venue rejects it.
     pub fn place_order(&self, request: &OrderRequest) -> Result<Order> {
+        if request.order_type.is_trigger() {
+            return Err(Error::unsupported_trigger("OKX"));
+        }
         request.validate()?;
         let ord_type = if request.post_only && request.order_type == OrderType::Limit {
             "post_only"
@@ -1453,6 +1459,9 @@ impl Okx {
     /// # Errors
     /// Returns an [`Error`] if the batch request itself fails.
     pub fn place_batch(&self, requests: &[OrderRequest]) -> Result<Vec<Result<Order>>> {
+        if requests.iter().any(|r| r.order_type.is_trigger()) {
+            return Err(Error::unsupported_trigger("OKX"));
+        }
         let items: Vec<serde_json::Value> =
             requests.iter().map(|r| self.batch_order_json(r)).collect();
         let body = serde_json::Value::Array(items).to_string();

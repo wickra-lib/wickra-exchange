@@ -469,6 +469,9 @@ impl KuCoin {
     /// Returns an [`Error`] if the order is invalid, credentials are missing, or
     /// the venue rejects it.
     pub fn place_order(&self, request: &OrderRequest) -> Result<Order> {
+        if request.order_type.is_trigger() {
+            return Err(Error::unsupported_trigger("KuCoin"));
+        }
         self.ensure_one_way()?;
         request.validate()?;
         let client_oid = request
@@ -1122,6 +1125,9 @@ impl KuCoin {
     /// Returns an [`Error`] if the batch request itself fails, or if called on a
     /// futures client (multi is a spot endpoint).
     pub fn place_batch(&self, requests: &[OrderRequest]) -> Result<Vec<Result<Order>>> {
+        if requests.iter().any(|r| r.order_type.is_trigger()) {
+            return Err(Error::unsupported_trigger("KuCoin"));
+        }
         self.ensure_one_way()?;
         if requests.is_empty() {
             return Ok(Vec::new());

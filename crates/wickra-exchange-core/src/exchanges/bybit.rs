@@ -456,6 +456,9 @@ impl Bybit {
     /// Returns an [`Error`] if the order is invalid, credentials are missing, or
     /// the venue rejects it.
     pub fn place_order(&self, request: &OrderRequest) -> Result<Order> {
+        if request.order_type.is_trigger() {
+            return Err(Error::unsupported_trigger("Bybit"));
+        }
         request.validate()?;
         let time_in_force = if request.post_only {
             "PostOnly"
@@ -525,6 +528,9 @@ impl Bybit {
     /// Returns [`Error::NotConnected`] without a WebSocket transport, or another
     /// [`Error`] if the order is invalid or rejected.
     pub fn place_order_ws(&mut self, request: &OrderRequest) -> Result<Order> {
+        if request.order_type.is_trigger() {
+            return Err(Error::unsupported_trigger("Bybit"));
+        }
         request.validate()?;
         let time_in_force = if request.post_only {
             "PostOnly"
@@ -1417,6 +1423,9 @@ impl Bybit {
     /// # Errors
     /// Returns an [`Error`] if the batch request itself fails.
     pub fn place_batch(&self, requests: &[OrderRequest]) -> Result<Vec<Result<Order>>> {
+        if requests.iter().any(|r| r.order_type.is_trigger()) {
+            return Err(Error::unsupported_trigger("Bybit"));
+        }
         let items: Vec<serde_json::Value> = requests
             .iter()
             .map(|r| {

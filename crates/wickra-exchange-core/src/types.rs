@@ -49,6 +49,17 @@ impl OrderType {
     pub fn requires_price(self) -> bool {
         matches!(self, OrderType::Limit | OrderType::StopLimit)
     }
+
+    /// Whether this order type rests until a trigger price is reached.
+    ///
+    /// A trigger order is not a variation on a plain one: sending it without
+    /// the trigger produces an order that executes *now* rather than one that
+    /// waits. Every venue path that cannot carry the trigger checks this and
+    /// refuses, rather than placing the immediate order.
+    #[must_use]
+    pub fn is_trigger(self) -> bool {
+        matches!(self, OrderType::StopMarket | OrderType::StopLimit)
+    }
 }
 
 /// How long an order remains active.
@@ -218,11 +229,7 @@ impl OrderRequest {
                 None => return Err(Error::InvalidOrder("limit order requires a price")),
             }
         }
-        if matches!(
-            self.order_type,
-            OrderType::StopMarket | OrderType::StopLimit
-        ) && self.stop_price.is_none()
-        {
+        if self.order_type.is_trigger() && self.stop_price.is_none() {
             return Err(Error::InvalidOrder("stop order requires a stop price"));
         }
         Ok(())

@@ -954,6 +954,9 @@ impl Binance {
         if let Some(price) = request.price {
             params.push(("price".to_string(), format_decimal(price)));
         }
+        if let Some(stop) = request.stop_price {
+            params.push(("stopPrice".to_string(), format_decimal(stop)));
+        }
         if matches!(type_str, "LIMIT" | "STOP_LOSS_LIMIT" | "TAKE_PROFIT_LIMIT") {
             params.push((
                 "timeInForce".to_string(),
@@ -1239,6 +1242,9 @@ fn batch_order_json(request: &OrderRequest, position_mode: PositionMode) -> Stri
     }
     if request.order_type.requires_price() {
         obj["timeInForce"] = serde_json::json!(tif_str(request.time_in_force));
+    }
+    if let Some(stop) = request.stop_price {
+        obj["stopPrice"] = serde_json::json!(format_decimal(stop));
     }
     if let Some(id) = &request.client_order_id {
         obj["newClientOrderId"] = serde_json::json!(id);

@@ -271,6 +271,9 @@ impl Upbit {
     /// Returns an [`Error`] if the order is invalid, credentials are missing, or
     /// the venue rejects it.
     pub fn place_order(&self, request: &OrderRequest) -> Result<Order> {
+        if request.order_type.is_trigger() {
+            return Err(Error::unsupported_trigger("Upbit"));
+        }
         request.validate()?;
         let mut params: Vec<(&str, String)> = vec![
             ("market", Self::wire_symbol(&request.symbol)),
