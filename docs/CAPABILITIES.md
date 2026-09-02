@@ -33,11 +33,18 @@ Per-symbol filters (lot step, price tick, min-notional) are enforced through
 > surface (`ticker`, `klines`, `order_book`, `subscribe_trades` /
 > `subscribe_book` / `subscribe_ticker`, `poll_events`) and `Execution` surface
 > (`place_order`, `cancel_order`, `query_order`, `open_orders`, `balances`) are
-> reachable from **all nine language bindings** — Python, Node.js, the C ABI hub,
-> and the Go / C# / Java / R wrappers over it — not just from Rust. A
-> per-binding completeness test pins the canonical verb set so a dropped method
-> fails CI. (The C-ABI `order_book` projects the bid/ask levels; the venue
+> reachable from **all nine languages** — Rust, Python, Node.js, and C / C++ /
+> C# / Go / Java / R over the C ABI hub. What pins that is
+> `scripts/check_binding_surface.py`, which reads the canonical verb set out of
+> `traits.rs`, holds every binding's source to it, and runs in CI as its own job:
+> a dropped method fails the build. Python and Node additionally assert it at
+> run time. (The C-ABI `order_book` projects the bid/ask levels; the venue
 > sequence id stays on the native Rust/Python/Node path.)
+>
+> The **WASM** binding is deliberately outside this claim. It targets
+> `wasm32-unknown-unknown`, which has no sockets, so it carries the offline
+> paper and replay simulators and no live venue client at all — see
+> [bindings/wasm](../bindings/wasm/README.md).
 
 > **WS user-data streams** ([`WsUserData`]) push the account's own order and
 > balance updates: `subscribe_user_data` opens a private stream (Binance listen
