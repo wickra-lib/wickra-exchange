@@ -79,6 +79,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The sleep-and-retry loop that `Backoff` and `WeightedRateLimiter` were
+  written for.** Both were complete, tested policies that nothing called:
+  each had exactly one reference outside its own file, the `mod` line.
+  `retry.rs` even said "the actual sleep-and-retry loop lives in the real
+  transport adapter" — and that adapter did not have one. `ThrottledTransport`
+  is that loop, written as a decorator over any `HttpTransport`, so it applies
+  to all ten venues without one of them changing. `factory::transports` wraps
+  the real socket transport in it, which is what makes it reached rather than
+  merely available.
+  - **A write is never repeated after a timeout.** `Error::is_retryable`
+    includes `Timeout` and `Network`, and repeating a `POST /order` on either is
+    how one order becomes two — the venue may have executed it. Only an explicit
+    refusal (HTTP 429 / 418) is repeated on any method, because a refusal means
+    nothing happened. Timeouts and dropped connections are retried on `GET`
+    alone. A test pins each half of that rule.
+  - A venue that states a wait in `Retry-After` gets that wait, not the policy
+    curve — its number is the specific one. That is now readable at all, thanks
+    to the response headers added alongside.
+  - No request budget is configured by default. A capacity invented for a venue
+    that publishes a different one either throttles traffic the venue would have
+    accepted, or fails to protect against the limit it was meant to. The budget
+    is there, weighed per request and tested; a caller who knows their account's
+    limits opts in with `with_budget` and `with_weigher`.
+  - The clock, the sleep and the jitter source are injected, so the loop is
+    driven in tests with no real time passing.
+- `Backoff::new` is `const`, so a caller can state its policy as a constant next
+  to the reasoning for it.
+
 - **Golden-fixture parity in every binding.** The committed replay tapes in
   `golden/` were driven by the Rust suite alone. Each binding had a replay test
   that proved a tape reaches a fill, and none of them checked the numbers — a

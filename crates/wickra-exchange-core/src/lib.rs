@@ -34,6 +34,7 @@ mod reconcile;
 mod retry;
 mod signing;
 mod symbol;
+mod throttle;
 mod traits;
 mod transport;
 mod types;
@@ -67,6 +68,7 @@ pub use signing::{
     hmac_sha512_bytes, hmac_sha512_hex, sha256, sha512_hex,
 };
 pub use symbol::Symbol;
+pub use throttle::ThrottledTransport;
 pub use traits::{
     AdvancedOrders, Derivatives, Exchange, Execution, MarketData, WsExecution, WsUserData,
 };

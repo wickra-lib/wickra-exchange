@@ -11,14 +11,34 @@
 
 use crate::{ReqwestHttpTransport, TungsteniteWsTransport};
 use wickra_exchange_core::{
-    AdvancedOrders, Binance, Bitget, Bybit, Coinbase, Credentials, Derivatives, Error, Exchange,
-    ExchangeOptions, Gate, HttpTransport, Htx, Kraken, KuCoin, Okx, Result, Upbit, WsExecution,
-    WsTransport, WsUserData,
+    AdvancedOrders, Backoff, Binance, Bitget, Bybit, Coinbase, Credentials, Derivatives, Error,
+    Exchange, ExchangeOptions, Gate, HttpTransport, Htx, Kraken, KuCoin, Okx, Result,
+    ThrottledTransport, Upbit, WsExecution, WsTransport, WsUserData,
 };
 
+/// The retry policy every client built here gets: a quarter-second first wait,
+/// doubling, capped at eight seconds, giving up after three attempts.
+///
+/// Conservative on purpose. It is enough to ride out a venue's `Retry-After` on
+/// a burst or a dropped connection on a read, and short enough that a caller
+/// waiting on a quote is not parked for a minute. What it will *not* do is
+/// repeat a write after a timeout — see [`ThrottledTransport`], where that rule
+/// lives.
+const RETRY_POLICY: Backoff = Backoff::new(250, 8_000, 3);
+
 /// Build the real blocking HTTP + pull-based WebSocket transports for a client.
+///
+/// The HTTP transport is wrapped in [`ThrottledTransport`], so the retry loop
+/// applies to all ten venues without any of them knowing about it. No request
+/// budget is configured: a capacity invented for a venue that publishes a
+/// different one either throttles traffic the venue would have accepted or
+/// fails to protect against the limit it was meant to. The venue's own
+/// `Retry-After` still applies, because that number comes from the venue.
+/// Callers who know their account's limits can wrap a transport themselves and
+/// pass it to a client's `with_http` constructor.
 fn transports(options: &ExchangeOptions) -> Result<(Box<dyn HttpTransport>, Box<dyn WsTransport>)> {
-    let http = Box::new(ReqwestHttpTransport::new(options)?) as Box<dyn HttpTransport>;
+    let socket = Box::new(ReqwestHttpTransport::new(options)?) as Box<dyn HttpTransport>;
+    let http = Box::new(ThrottledTransport::new(socket, RETRY_POLICY)) as Box<dyn HttpTransport>;
     let ws = Box::new(TungsteniteWsTransport::new()) as Box<dyn WsTransport>;
     Ok((http, ws))
 }
