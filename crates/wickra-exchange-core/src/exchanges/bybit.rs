@@ -1982,6 +1982,40 @@ mod tests {
     }
 
     #[test]
+    fn post_only_and_reduce_only_reach_every_order_path() {
+        // Three paths build an order body; each spells post-only as the
+        // `PostOnly` time-in-force and reduce-only as its own flag.
+        let (bybit, mock) = signed_client(1000);
+        mock.push_json(
+            200,
+            r#"{"retCode":0,"result":{"orderId":"a","orderLinkId":""}}"#,
+        );
+        bybit
+            .place_order(
+                &OrderRequest::limit_buy(symbol(), dec!(1), dec!(100))
+                    .post_only()
+                    .reduce_only(),
+            )
+            .unwrap();
+        let body = mock.recorded_requests()[0].body.clone().unwrap();
+        assert!(body.contains(r#""timeInForce":"PostOnly""#));
+        assert!(body.contains(r#""reduceOnly":true"#));
+
+        mock.push_json(
+            200,
+            r#"{"retCode":0,"result":{"list":[{"orderId":"o1","orderLinkId":""}]}}"#,
+        );
+        bybit
+            .place_batch(&[OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)).reduce_only()])
+            .unwrap();
+        assert!(mock.recorded_requests()[1]
+            .body
+            .as_deref()
+            .unwrap()
+            .contains(r#""reduceOnly":true"#));
+    }
+
+    #[test]
     fn hedge_mode_sends_the_position_index() {
         // positionIdx 1 is the buy side of a hedged account, 2 the sell side.
         // 0 is one-way and is the venue default, so it is left off entirely.

@@ -10,10 +10,10 @@
 use rust_decimal_macros::dec;
 use std::sync::Arc;
 use wickra_exchange_core::{
-    Binance, Bitget, Bybit, Coinbase, Credentials, Error, Event, Exchange, ExchangeOptions, Gate,
-    HttpRequest, HttpResponse, HttpTransport, Htx, Kraken, KuCoin, MarketData, MarketType,
-    MockHttpTransport, Okx, OrderRequest, OrderStatus, OrderType, PaperExchange, ReplayExchange,
-    Result, Symbol, TradePrint, Upbit, WsExecution, WsUserData,
+    AdvancedOrders, Binance, Bitget, Bybit, Coinbase, Credentials, Error, Event, Exchange,
+    ExchangeOptions, Gate, HttpRequest, HttpResponse, HttpTransport, Htx, Kraken, KuCoin,
+    MarketData, MarketType, MockHttpTransport, Okx, OrderRequest, OrderStatus, OrderType,
+    PaperExchange, ReplayExchange, Result, Symbol, TradePrint, Upbit, WsExecution, WsUserData,
 };
 
 /// Share one [`MockHttpTransport`] between the test and the client that owns it,
@@ -251,4 +251,87 @@ x
     check!("Kraken", Kraken);
     check!("Coinbase", Coinbase);
     check!("Upbit", Upbit);
+}
+
+/// The same contract on the other two order paths.
+///
+/// `place_order` is not the only way an order reaches a venue: there is a batch
+/// endpoint on all eight trading venues and a WebSocket order API on five. The
+/// guard has to be on each of them, because a trigger order that slips through
+/// the batch path is exactly as immediate as one that slips through the single
+/// path -- and the batch builders were where the earlier `reduce_only` drop hid
+/// too.
+///
+/// Binance is checked in its own module tests instead: it *carries* the trigger
+/// on all three paths, so it needs a live response and a WebSocket transport
+/// rather than this refusal assertion.
+#[test]
+fn the_batch_and_websocket_paths_refuse_triggers_too() {
+    fn stop(market: &Symbol) -> OrderRequest {
+        OrderRequest {
+            order_type: OrderType::StopMarket,
+            stop_price: Some(dec!(19000)),
+            ..OrderRequest::market_sell(market.clone(), dec!(1))
+        }
+    }
+    fn refused(outcome: &Error) -> bool {
+        matches!(outcome, Error::Exchange { code, .. } if code == "unsupported")
+    }
+
+    let market = market();
+    let creds = || Credentials::new("APIKEY", "SECRET").with_passphrase("PASS");
+    let options = ExchangeOptions::mainnet(MarketType::Spot);
+
+    macro_rules! batch {
+        ($name:literal, $venue:ident) => {{
+            let mock = Arc::new(MockHttpTransport::new());
+            let mut client = $venue::with_credentials(
+                Box::new(ArcTransport(Arc::clone(&mock))),
+                &options,
+                creds(),
+            );
+            let err = AdvancedOrders::place_batch(&mut client, &[stop(&market)])
+                .expect_err(concat!($name, ": batch accepted a trigger order"));
+            assert!(
+                refused(&err),
+                concat!($name, ": batch refused for the wrong reason")
+            );
+            assert!(
+                mock.recorded_requests().is_empty(),
+                concat!($name, ": batch refused, yet sent a request")
+            );
+        }};
+    }
+
+    batch!("Bybit", Bybit);
+    batch!("OKX", Okx);
+    batch!("Bitget", Bitget);
+    batch!("KuCoin", KuCoin);
+    batch!("Gate.io", Gate);
+    batch!("HTX", Htx);
+    batch!("Kraken", Kraken);
+
+    // The WebSocket paths refuse before they open a connection, so no transport
+    // is attached here: reaching the guard is the whole point.
+    macro_rules! ws {
+        ($name:literal, $venue:ident) => {{
+            let mock = Arc::new(MockHttpTransport::new());
+            let mut client = $venue::with_credentials(
+                Box::new(ArcTransport(Arc::clone(&mock))),
+                &options,
+                creds(),
+            );
+            let err = WsExecution::place_order_ws(&mut client, &stop(&market))
+                .expect_err(concat!($name, ": ws accepted a trigger order"));
+            assert!(
+                refused(&err),
+                concat!($name, ": ws refused for the wrong reason")
+            );
+        }};
+    }
+
+    ws!("Bybit", Bybit);
+    ws!("OKX", Okx);
+    ws!("Gate.io", Gate);
+    ws!("Kraken", Kraken);
 }

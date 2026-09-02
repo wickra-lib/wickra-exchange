@@ -1893,6 +1893,45 @@ mod tests {
     }
 
     #[test]
+    fn post_only_and_client_ids_reach_the_batch_and_bracket_paths() {
+        let (okx, mock) = signed_client(1000);
+        mock.push_json(200, OKX_ORDER_OK);
+        okx.place_order(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)).post_only())
+            .unwrap();
+        assert!(mock.recorded_requests()[0]
+            .body
+            .as_deref()
+            .unwrap()
+            .contains(r#""ordType":"post_only""#));
+
+        mock.push_json(200, OKX_ORDER_OK);
+        okx.place_batch(&[
+            OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)).with_client_order_id("mine")
+        ])
+        .unwrap();
+        assert!(mock.recorded_requests()[1]
+            .body
+            .as_deref()
+            .unwrap()
+            .contains(r#""clOrdId":"mine""#));
+
+        mock.push_json(
+            200,
+            r#"{"code":"0","data":[{"algoId":"algo1","sCode":"0","sMsg":""}]}"#,
+        );
+        okx.place_oco(
+            &OcoRequest::new(symbol(), OrderSide::Sell, dec!(1), dec!(110), dec!(95))
+                .with_client_order_id("bracket"),
+        )
+        .unwrap();
+        assert!(mock.recorded_requests()[2]
+            .body
+            .as_deref()
+            .unwrap()
+            .contains(r#""algoClOrdId":"bracket""#));
+    }
+
+    #[test]
     fn hedge_mode_names_the_position_side() {
         // In long/short mode OKX wants `posSide` and refuses `reduceOnly`:
         // naming the side already says whether the order opens or closes.

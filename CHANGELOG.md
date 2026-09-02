@@ -176,6 +176,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   between branches without the test changing.
   `docs/CAPABILITIES.md` claimed "all order types are common across venues:
   market, limit, stop-market, stop-limit". It now says which one is not.
+  Codecov caught the first draft leaving the new guards untested on the batch
+  and WebSocket paths — the two places the earlier `reduce_only` drop had hidden
+  in as well. The conformance contract now drives all three order paths, and the
+  per-venue suites gained the cases whose branches were never entered: Binance's
+  trigger price on the batch entry and the ws-api frame, Gate's `close_short`
+  half of dual mode, and post-only and client-id handling on Bybit, OKX and
+  Bitget.
 
 - **A hedged account got orders that named no side.** `position_mode` was the
   last field on `ExchangeOptions` that nothing read. On a hedged account a

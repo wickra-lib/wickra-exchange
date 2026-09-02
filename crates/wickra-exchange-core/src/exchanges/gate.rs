@@ -2133,6 +2133,17 @@ mod tests {
         assert!(open.contains(r#""size":2"#));
         assert!(!open.contains("auto_size"));
 
+        // The other close: a buy that reduces is closing the short side.
+        mock.push_json(200, GATE_FUTURES_FILL);
+        hedged
+            .place_order(&OrderRequest::market_buy(symbol(), dec!(2)).reduce_only())
+            .unwrap();
+        assert!(mock.recorded_requests()[2]
+            .body
+            .as_deref()
+            .unwrap()
+            .contains(r#""auto_size":"close_short""#));
+
         // One-way is untouched: reduce_only, real size, no auto_size.
         let (one_way, one_way_mock) = signed_futures_client(1_000_000);
         one_way_mock.push_json(200, GATE_FUTURES_FILL);

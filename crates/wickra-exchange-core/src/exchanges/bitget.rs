@@ -1793,6 +1793,23 @@ mod tests {
     }
 
     #[test]
+    fn post_only_maps_to_the_post_only_order_type() {
+        let (bitget, mock) = signed_client(1000);
+        mock.push_json(
+            200,
+            r#"{"code":"00000","data":{"orderId":"1","clientOid":""}}"#,
+        );
+        bitget
+            .place_order(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)).post_only())
+            .unwrap();
+        assert!(mock.recorded_requests()[0]
+            .body
+            .as_deref()
+            .unwrap()
+            .contains("post_only"));
+    }
+
+    #[test]
     fn hedge_mode_sends_trade_side_instead_of_reduce_only() {
         let (hedged, mock) = hedged_futures_client(1000);
         for _ in 0..2 {
