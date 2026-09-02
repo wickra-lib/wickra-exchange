@@ -39,6 +39,16 @@ quantities never touch `f64`. Only the indicator-facing `Candle` (from
 `wickra-core`) uses `f64`. The `feeds` module converts venue microstructure into
 the exact wickra-core input types with no glue.
 
+**Where a binding cannot carry a `Decimal`, the conversion is the whole of the
+fidelity.** A C function signature has no decimal type, and Python, Node and
+WASM callers pass the language's own number, so those four take `f64` and
+convert. That conversion has to read the number the caller *wrote*, not the
+binary double it became: `Decimal::from_f64_retain` keeps the binary expansion,
+so a caller asking for 20000.15 sent `20000.150000000001455191522832` to the
+venue — which a price filter rejects and a tick check rounds away from. Every
+entry point uses `Decimal::from_f64` instead, and each binding has a test
+pinning the exact strings.
+
 ## Differentiators
 
 `PaperExchange` and `ReplayExchange` implement the same `Exchange` trait, so a

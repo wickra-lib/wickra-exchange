@@ -6,6 +6,7 @@
 use std::fs;
 use std::str::FromStr;
 
+use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde_json::Value;
@@ -24,7 +25,7 @@ fn read_json(path: &str) -> Value {
 }
 
 fn dec(value: &Value) -> Decimal {
-    Decimal::from_f64_retain(value.as_f64().unwrap()).unwrap()
+    Decimal::from_f64(value.as_f64().unwrap()).unwrap()
 }
 
 fn run_case(name: &str) {
@@ -54,7 +55,7 @@ fn run_case(name: &str) {
         .map(|(i, &price)| {
             Event::Trade(TradePrint {
                 symbol: symbol.clone(),
-                price: Decimal::from_f64_retain(price).unwrap(),
+                price: Decimal::from_f64(price).unwrap(),
                 quantity: Decimal::ONE,
                 aggressor: OrderSide::Buy,
                 timestamp: i64::try_from(i).unwrap(),

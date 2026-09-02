@@ -18,6 +18,7 @@ use std::ffi::CString;
 use std::fmt;
 use std::sync::OnceLock;
 
+use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use wickra_exchange::{
@@ -503,7 +504,7 @@ unsafe fn seed_balances(
         let asset_ptr = unsafe { *assets.add(i) };
         let asset = unsafe { opt_str(asset_ptr) }?;
         let amount = unsafe { *amounts.add(i) };
-        paper = paper.with_balance(asset, Decimal::from_f64_retain(amount)?);
+        paper = paper.with_balance(asset, Decimal::from_f64(amount)?);
     }
     Some(paper)
 }
@@ -537,18 +538,18 @@ fn opt_decimal_arg(value: f64) -> Result<Option<Decimal>, ()> {
     if value.is_nan() {
         return Ok(None);
     }
-    Decimal::from_f64_retain(value).map(Some).ok_or(())
+    Decimal::from_f64(value).map(Some).ok_or(())
 }
 
 /// Build an [`OrderRequest`] from C-ABI scalars: `side` is `WICKRA_SIDE_*`,
 /// a finite `price` yields a limit order and `NaN` a market order. Returns
 /// `None` on a bad side code or a non-finite quantity/price.
 fn build_request(symbol: Symbol, side: i32, quantity: f64, price: f64) -> Option<OrderRequest> {
-    let quantity = Decimal::from_f64_retain(quantity)?;
+    let quantity = Decimal::from_f64(quantity)?;
     let price = if price.is_nan() {
         None
     } else {
-        Some(Decimal::from_f64_retain(price)?)
+        Some(Decimal::from_f64(price)?)
     };
     match (side, price) {
         (WICKRA_SIDE_BUY, None) => Some(OrderRequest::market_buy(symbol, quantity)),
@@ -562,11 +563,8 @@ fn build_request(symbol: Symbol, side: i32, quantity: f64, price: f64) -> Option
 fn paper_with_costs(maker_bps: f64, taker_bps: f64, slippage_bps: f64) -> Option<PaperExchange> {
     Some(
         PaperExchange::new()
-            .with_fees(
-                Decimal::from_f64_retain(maker_bps)?,
-                Decimal::from_f64_retain(taker_bps)?,
-            )
-            .with_slippage_bps(Decimal::from_f64_retain(slippage_bps)?),
+            .with_fees(Decimal::from_f64(maker_bps)?, Decimal::from_f64(taker_bps)?)
+            .with_slippage_bps(Decimal::from_f64(slippage_bps)?),
     )
 }
 
@@ -641,7 +639,7 @@ pub unsafe extern "C" fn wickra_replay_new(
     let mut frames = Vec::with_capacity(n_tape);
     for i in 0..n_tape {
         let price = unsafe { *tape.add(i) };
-        let Some(price) = Decimal::from_f64_retain(price) else {
+        let Some(price) = Decimal::from_f64(price) else {
             return core::ptr::null_mut();
         };
         frames.push(Event::Trade(TradePrint {
@@ -754,7 +752,7 @@ pub unsafe extern "C" fn wickra_exchange_set_price(
     let Some(symbol) = parse_symbol(market) else {
         return WICKRA_ERR_INVALID_ARG;
     };
-    let Some(price) = Decimal::from_f64_retain(price) else {
+    let Some(price) = Decimal::from_f64(price) else {
         return WICKRA_ERR_INVALID_ARG;
     };
     match &mut exchange.inner {
@@ -819,20 +817,20 @@ fn place(
     let Some(symbol) = parse_symbol(market) else {
         return WICKRA_ERR_INVALID_ARG;
     };
-    let Some(quantity) = Decimal::from_f64_retain(quantity) else {
+    let Some(quantity) = Decimal::from_f64(quantity) else {
         return WICKRA_ERR_INVALID_ARG;
     };
     let request = match (side, price) {
         (WICKRA_SIDE_BUY, None) => OrderRequest::market_buy(symbol, quantity),
         (WICKRA_SIDE_SELL, None) => OrderRequest::market_sell(symbol, quantity),
         (WICKRA_SIDE_BUY, Some(price)) => {
-            let Some(price) = Decimal::from_f64_retain(price) else {
+            let Some(price) = Decimal::from_f64(price) else {
                 return WICKRA_ERR_INVALID_ARG;
             };
             OrderRequest::limit_buy(symbol, quantity, price)
         }
         (WICKRA_SIDE_SELL, Some(price)) => {
-            let Some(price) = Decimal::from_f64_retain(price) else {
+            let Some(price) = Decimal::from_f64(price) else {
                 return WICKRA_ERR_INVALID_ARG;
             };
             OrderRequest::limit_sell(symbol, quantity, price)
@@ -1615,15 +1613,15 @@ pub unsafe extern "C" fn wickra_advanced_place_oco(
         _ => return WICKRA_ERR_INVALID_ARG,
     };
     let (Some(quantity), Some(price), Some(stop_price)) = (
-        Decimal::from_f64_retain(quantity),
-        Decimal::from_f64_retain(price),
-        Decimal::from_f64_retain(stop_price),
+        Decimal::from_f64(quantity),
+        Decimal::from_f64(price),
+        Decimal::from_f64(stop_price),
     ) else {
         return WICKRA_ERR_INVALID_ARG;
     };
     let mut request = OcoRequest::new(symbol, side, quantity, price, stop_price);
     if !stop_limit_price.is_nan() {
-        let Some(slp) = Decimal::from_f64_retain(stop_limit_price) else {
+        let Some(slp) = Decimal::from_f64(stop_limit_price) else {
             return WICKRA_ERR_INVALID_ARG;
         };
         request = request.with_stop_limit_price(slp);
@@ -1954,6 +1952,7 @@ pub unsafe extern "C" fn wickra_ws_cancel_order(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wickra_exchange::format_decimal;
 
     fn cstr(value: &str) -> CString {
         CString::new(value).unwrap()
@@ -2452,6 +2451,49 @@ mod tests {
         assert!(hedged.testnet);
         assert_eq!(hedged.margin_mode, MarginMode::Isolated);
         assert_eq!(hedged.position_mode, PositionMode::Hedge);
+    }
+
+    #[test]
+    fn a_price_crosses_the_abi_as_the_number_the_caller_typed() {
+        // This ABI takes prices and quantities as `f64` -- a C function cannot
+        // carry a `Decimal` -- so the conversion back is the whole of the
+        // fidelity. It used to be `from_f64_retain`, which keeps the *binary*
+        // expansion of the double: a caller asking for 20000.15 sent
+        // "20000.150000000001455191522832" to the venue, which a price filter
+        // rejects and a tick check rounds away from. `from_f64` reads the
+        // number the caller wrote.
+        for (typed, expected) in [
+            (20000.15_f64, "20000.15"),
+            (0.1, "0.1"),
+            (1.005, "1.005"),
+            (0.000_000_01, "0.00000001"),
+            (123.456, "123.456"),
+        ] {
+            let request = build_request(Symbol::new("BTC", "USDT"), WICKRA_SIDE_BUY, typed, typed)
+                .expect("a finite price and quantity");
+            assert_eq!(format_decimal(request.price.unwrap()), expected);
+            assert_eq!(format_decimal(request.quantity), expected);
+        }
+    }
+
+    #[test]
+    fn a_non_finite_price_is_still_refused() {
+        // The guard has to survive the change: `from_f64` returns `None` for
+        // NaN and infinity exactly as `from_f64_retain` did, and NaN keeps its
+        // separate meaning of "market order" on the price argument.
+        let market = build_request(Symbol::new("BTC", "USDT"), WICKRA_SIDE_BUY, 1.0, f64::NAN)
+            .expect("NaN price means a market order");
+        assert!(market.price.is_none());
+        assert!(
+            build_request(Symbol::new("BTC", "USDT"), WICKRA_SIDE_BUY, f64::NAN, 1.0).is_none()
+        );
+        assert!(build_request(
+            Symbol::new("BTC", "USDT"),
+            WICKRA_SIDE_BUY,
+            1.0,
+            f64::INFINITY
+        )
+        .is_none());
     }
 
     #[test]
