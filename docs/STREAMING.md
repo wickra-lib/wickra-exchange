@@ -97,13 +97,17 @@ nothing is arriving, which `connected` alone cannot tell you.
 Only `TradePrint` carries a venue timestamp; tickers and book updates are
 identified by update id, so for those the caller's own clock stands in.
 
-Anything you then log about a request must not carry the credential that signed
-it. `redact(text, secret)` replaces every occurrence with `<redacted>`, and
-ignores an empty secret so it is safe to call unconditionally:
+Anything logged beside it must not carry the credential that signed the
+request. `redact(text, secret)` replaces every occurrence with `<redacted>` and
+ignores an empty secret, so it is safe to call unconditionally — including where
+no credentials are configured:
 
 ```rust
-log(&redact(&line, &api_secret));
+log(&redact(&venue_error_body, &api_secret));
 ```
+
+Redact what *arrives*, rather than assembling a line that holds the secret and
+scrubbing it afterwards. See [AUTH.md](AUTH.md#keeping-secrets-out-of-logs).
 
 A runnable version of both is
 [`examples/rust/src/health_and_redaction.rs`](../examples/rust/src/health_and_redaction.rs).

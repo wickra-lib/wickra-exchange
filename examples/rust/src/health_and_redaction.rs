@@ -114,12 +114,26 @@ fn main() {
     // catches a stream that stopped delivering.
     assert!(!health.is_healthy(checked_at, 500));
 
-    // Whatever this snapshot ends up in — a log line, an alert, a status
-    // endpoint — the request that produced it must not carry credentials into
-    // it. `redact` takes the secret out of a string before it is written; an
-    // empty secret is ignored, so it is safe to call unconditionally.
+    // Whatever this snapshot ends up beside in a log, the strings logged with
+    // it must not carry credentials. `Credentials` and every client already
+    // redact their own `Debug` output, so the case left over is a string this
+    // process did **not** assemble: a venue error body that quotes back what it
+    // rejected. Below is the shape Bitget and OKX return on a bad signature —
+    // the credential is inside a response, and logging it verbatim would put it
+    // in the file.
     let api_secret = "s3cr3t-signing-key";
-    let line = format!("GET /api/v3/account signed with {api_secret} -> 200");
-    println!("{}", redact(&line, api_secret));
-    assert!(!redact(&line, api_secret).contains(api_secret));
+    let venue_error = r#"{"code":"40103","msg":"invalid sign: s3cr3t-signing-key"}"#;
+
+    // `redact` takes it out before the line is written. An empty secret is
+    // ignored, so this is safe to call unconditionally — including on the paths
+    // where no credentials are configured at all.
+    let safe = redact(venue_error, api_secret);
+    println!("{safe}");
+    assert!(!safe.contains(api_secret));
+    assert!(safe.contains("<redacted>"));
+
+    // Assembling the line yourself and scrubbing afterwards is the pattern to
+    // avoid: the unredacted string exists first, and every later edit to the
+    // format string is a chance to log it. Redact what arrives, do not
+    // interpolate what you hold.
 }

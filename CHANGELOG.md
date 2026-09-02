@@ -189,6 +189,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `docs/AUTH.md` covers redaction where the credentials it protects are already
   discussed. `examples/rust/src/health_and_redaction.rs` runs both offline
   against a replay tape, and the `examples-smoke` job runs it.
+  The redaction guidance changed while writing it, and CodeQL is why: the first
+  draft assembled a request line holding the key and scrubbed it afterwards,
+  which `rust/cleartext-logging` flagged as high severity on the pull request.
+  It was right about the shape. The unredacted string exists first, and no
+  analyser can prove the scrub. Both pages now teach the case `redact` actually
+  exists for — a venue error body that quotes back the signature it rejected, a
+  string the process never assembled — and say plainly: redact what arrives, do
+  not interpolate what you hold.
   Noted while writing it: only `TradePrint` carries a venue timestamp; `Ticker`,
   `BookSnapshot` and `BookDelta` are identified by update id, so a staleness
   clock over those events is the caller's own.
