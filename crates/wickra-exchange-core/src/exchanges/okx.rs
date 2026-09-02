@@ -685,7 +685,7 @@ impl Okx {
     fn get(&self, path: &str, query: &str) -> Result<serde_json::Value> {
         let url = format!("{}{path}?{query}", self.rest_base);
         let response = self.http.execute(&HttpRequest::get(url))?;
-        unwrap_envelope(&response.body)
+        unwrap_envelope(&response.body).map_err(|e| e.with_retry_after(response.retry_after()))
     }
 
     /// Sign with the `OK-ACCESS-*` headers: base64(HMAC-SHA256) over
@@ -727,7 +727,7 @@ impl Okx {
                 .with_body(body.to_string());
         }
         let response = self.http.execute(&request)?;
-        unwrap_envelope(&response.body)
+        unwrap_envelope(&response.body).map_err(|e| e.with_retry_after(response.retry_after()))
     }
 }
 
@@ -2224,5 +2224,24 @@ mod tests {
         assert!(rendered.contains("authenticated: true"));
         assert!(!rendered.contains("SECRET"));
         assert!(!rendered.contains("APIKEY"));
+    }
+
+    /// A rate-limited response carries the venue's advised wait.
+    ///
+    /// The limit itself is recognised from the body -- a code in the error
+    /// envelope -- while the wait arrives in the `Retry-After` header, so the
+    /// two are read in different places. Until they were joined, every
+    /// `RateLimited` this client raised carried `retry_after: None`: a field
+    /// the error type documents, and that nothing in the crate ever filled.
+    #[test]
+    fn rate_limit_carries_the_venues_advised_wait() {
+        let (okx, mock) = client();
+        mock.push_response(
+            crate::transport::HttpResponse::new(200, r#"{"code":"50011","msg":"rate","data":[]}"#)
+                .with_header("Retry-After", "2.5"),
+        );
+        let err = okx.ticker(&symbol()).unwrap_err();
+        let wait = std::time::Duration::from_millis(2500);
+        assert!(matches!(err, Error::RateLimited { retry_after: Some(d) } if d == wait));
     }
 }

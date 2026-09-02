@@ -453,7 +453,7 @@ fn parse_body(response: &HttpResponse) -> Result<serde_json::Value> {
             .and_then(|e| e.get("message"))
             .and_then(serde_json::Value::as_str)
             .unwrap_or("");
-        Err(map_error(name, message, response.status))
+        Err(map_error(name, message, response.status).with_retry_after(response.retry_after()))
     }
 }
 
@@ -964,5 +964,27 @@ mod tests {
         assert!(rendered.contains("authenticated: true"));
         assert!(!rendered.contains("SECRET"));
         assert!(!rendered.contains("APIKEY"));
+    }
+
+    /// A rate-limited response carries the venue's advised wait.
+    ///
+    /// The limit itself is recognised from the body -- a code in the error
+    /// envelope -- while the wait arrives in the `Retry-After` header, so the
+    /// two are read in different places. Until they were joined, every
+    /// `RateLimited` this client raised carried `retry_after: None`: a field
+    /// the error type documents, and that nothing in the crate ever filled.
+    #[test]
+    fn rate_limit_carries_the_venues_advised_wait() {
+        let (upbit, mock) = client();
+        mock.push_response(
+            crate::transport::HttpResponse::new(
+                429,
+                r#"{"error":{"name":"too_many_requests","message":"slow"}}"#,
+            )
+            .with_header("Retry-After", "2.5"),
+        );
+        let err = upbit.ticker(&symbol()).unwrap_err();
+        let wait = std::time::Duration::from_millis(2500);
+        assert!(matches!(err, Error::RateLimited { retry_after: Some(d) } if d == wait));
     }
 }

@@ -105,16 +105,64 @@ impl HttpRequest {
 pub struct HttpResponse {
     /// The status code.
     pub status: u16,
+    /// The response headers, in the order the venue sent them.
+    ///
+    /// Carried because the body is not the whole answer: a venue that
+    /// rate-limits says *how long to wait* in `Retry-After`, and a response
+    /// without headers throws that away before anything can read it — which is
+    /// why [`Error::RateLimited`] used to be raised with `retry_after: None`
+    /// at every one of its construction sites.
+    pub headers: Vec<(String, String)>,
     /// The response body.
     pub body: String,
 }
 
 impl HttpResponse {
-    /// Build a response.
+    /// Build a response with no headers.
     pub fn new(status: u16, body: impl Into<String>) -> Self {
         Self {
             status,
+            headers: Vec::new(),
             body: body.into(),
+        }
+    }
+
+    /// Add a header.
+    #[must_use]
+    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((name.into(), value.into()));
+        self
+    }
+
+    /// The first value of `name`, matched case-insensitively.
+    ///
+    /// Header names are case-insensitive per RFC 9110, and venues are not
+    /// consistent about it: the same field arrives as `Retry-After` from one
+    /// and `retry-after` from another behind HTTP/2, which lower-cases them.
+    #[must_use]
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+
+    /// The venue's advised wait from `Retry-After`, if it sent one.
+    ///
+    /// Only the delta-seconds form is read. The HTTP-date form is legal but no
+    /// venue in this repository's error taxonomy uses it, and parsing dates
+    /// would mean a date library and a clock in a function that must stay
+    /// pure — an unread `None` is the better failure here than a wrong
+    /// duration. Fractional seconds are accepted because some venues send
+    /// them, though the RFC specifies an integer.
+    #[must_use]
+    pub fn retry_after(&self) -> Option<std::time::Duration> {
+        let raw = self.header("Retry-After")?.trim();
+        let seconds: f64 = raw.parse().ok()?;
+        if seconds.is_finite() && seconds >= 0.0 {
+            Some(std::time::Duration::from_secs_f64(seconds))
+        } else {
+            None
         }
     }
 
@@ -329,6 +377,7 @@ impl WsConnection for MockWsConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn http_method_strings() {
@@ -361,6 +410,37 @@ mod tests {
         assert!(HttpResponse::new(204, "").is_success());
         assert!(!HttpResponse::new(400, "{}").is_success());
         assert!(!HttpResponse::new(500, "{}").is_success());
+    }
+
+    #[test]
+    fn a_header_is_found_whatever_its_case() {
+        let response = HttpResponse::new(429, "{}").with_header("retry-after", "3");
+        assert_eq!(response.header("Retry-After"), Some("3"));
+        assert_eq!(response.header("RETRY-AFTER"), Some("3"));
+        assert_eq!(response.header("X-Absent"), None);
+    }
+
+    #[test]
+    fn retry_after_reads_whole_and_fractional_seconds() {
+        let whole = HttpResponse::new(429, "{}").with_header("Retry-After", "3");
+        assert_eq!(whole.retry_after(), Some(Duration::from_secs(3)));
+        let fractional = HttpResponse::new(429, "{}").with_header("Retry-After", " 2.5 ");
+        assert_eq!(fractional.retry_after(), Some(Duration::from_millis(2500)));
+    }
+
+    #[test]
+    fn retry_after_declines_what_it_cannot_read() {
+        // No header at all, the HTTP-date form this deliberately does not parse,
+        // an outright non-number, and a negative wait. Each yields None rather
+        // than a wrong duration a caller would then sleep for.
+        assert_eq!(HttpResponse::new(429, "{}").retry_after(), None);
+        let date = HttpResponse::new(429, "{}")
+            .with_header("Retry-After", "Wed, 21 Oct 2026 07:28:00 GMT");
+        assert_eq!(date.retry_after(), None);
+        let junk = HttpResponse::new(429, "{}").with_header("Retry-After", "soon");
+        assert_eq!(junk.retry_after(), None);
+        let negative = HttpResponse::new(429, "{}").with_header("Retry-After", "-1");
+        assert_eq!(negative.retry_after(), None);
     }
 
     #[test]

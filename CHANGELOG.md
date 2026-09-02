@@ -98,6 +98,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`Error::RateLimited` never carried the wait it documents.** The variant has
+  a `retry_after` field described as "the advised wait if the venue supplied one
+  (`Retry-After`)". It was constructed thirteen times across the ten venue
+  clients, every one of them with `None`; the only `Some` anywhere in the
+  repository was in a test of the `Display` implementation. A caller reading the
+  field to decide how long to back off always read nothing.
+  - The cause was one layer down: `HttpResponse` carried only a status and a
+    body, so the transport discarded the headers — and `Retry-After` is a
+    header — before any venue client could see it. `HttpResponse` now carries
+    them, with a case-insensitive `header` lookup (venues differ, and HTTP/2
+    lower-cases names) and a `retry_after` accessor.
+  - A rate limit is recognised from the *body*, a code in the venue's error
+    envelope, while the wait arrives in the *header*. `Error::with_retry_after`
+    joins the two at the call site that holds both, and refuses to overwrite a
+    wait the venue already stated in its body, which is the more specific of the
+    two.
+  - Only the delta-seconds form of `Retry-After` is read. The HTTP-date form is
+    legal, but no venue in this taxonomy sends it and parsing dates would put a
+    date library and a clock inside a pure function; an unread `None` beats a
+    wrong duration a caller would sleep for.
+  - All ten venues have a test that pushes a rate-limited response carrying
+    `Retry-After` and asserts the error arrives with the wait attached.
+
 - **The C examples asserted nothing on Windows.** They double as the C-side test
   suite, and CI builds them with `--config Release` — which on a multi-config
   generator defines `NDEBUG` and compiles every `assert` in them away. The
