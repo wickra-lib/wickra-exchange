@@ -142,6 +142,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The README sold a feed that nothing subscribes to.** Under the
+  differentiators it said funding, open interest, liquidations and long/short
+  ratio "arrive as the exact typed shapes `wickra-core` consumes". They do not
+  arrive at all: across all ten venue clients, `fundingRate`, `openInterest` and
+  `premiumIndex` appear zero times. `FundingRate`, `OpenInterest`,
+  `Liquidation`, `LongShortRatio`, `MarkIndex` and `DerivativesFeed` are six
+  public types with no producer — the shapes and the `DerivativesTickBuilder`
+  fold are real and tested, but the frames have to come from the caller.
+  What *is* wired is the other half of the same sentence, and it stays: every
+  client emits `TradePrint` and `OrderBookSnapshot` on its stream, and
+  `trade_from_print` / `order_book_from_snapshot` / `cross_section` convert them
+  into the core's input types with no glue. `README.md`, `ARCHITECTURE.md` and
+  the `feeds` module doc now separate the two halves, and
+  `docs/DERIVATIVES.md` gains a section saying which channels are subscribed and
+  which are shapes waiting for data. Subscribing to the derivatives channels on
+  eight futures venues is a feature, not a correction; naming the gap is what
+  this entry does.
+
 - **OKX signed with this machine's clock, and Upbit's nonce could repeat.**
   Two gaps in the clock work above, found by counting which clients actually
   hold the types involved rather than by re-reading the claim.

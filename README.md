@@ -46,10 +46,14 @@ of Wickra**:
 - **`PaperExchange`** — a first-class `Exchange` implementation that simulates
   fills through the [wickra-backtest](https://github.com/wickra-lib/wickra-backtest)
   engine. The *same* strategy runs paper ↔ live by swapping the implementation.
-- **Microstructure-native feeds** — funding, open interest, liquidations and
-  long/short ratio arrive as the exact typed shapes `wickra-core` consumes
-  (`DerivativesTick`, `OrderBook`, `TradePrint`, `CrossSection`), feeding 514
-  indicators and the backtester with zero glue.
+- **Microstructure-native feeds** — trades and depth arrive from the venue
+  streams already shaped for `wickra-core`, and one call converts each into the
+  exact input type the indicators consume (`Trade`, `OrderBook`, `CrossSection`)
+  — feeding 514 indicators and the backtester with zero glue. The derivatives
+  channels (funding, open interest, liquidations, positioning, mark/index) are
+  typed too and fold into a `DerivativesTick`, but **no venue client subscribes
+  to them yet**: you supply those frames. See
+  [Derivatives feeds](docs/DERIVATIVES.md#derivatives-feeds-typed-but-not-yet-subscribed).
 - **`ReplayExchange`** — a recorded feed driven through the same trait, so a
   backtest runs on *real* recorded microstructure.
 

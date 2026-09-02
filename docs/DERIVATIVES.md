@@ -135,6 +135,32 @@ client.cancel_order_ws(&sym, &order.id)?;
 `place_order_ws` requires a WebSocket transport (`with_ws`); without one it
 returns `Error::NotConnected`.
 
+## Derivatives feeds: typed but not yet subscribed
+
+The `feeds` module carries typed shapes for the derivatives microstructure
+channels — `FundingRate`, `OpenInterest`, `Liquidation`, `LongShortRatio` and
+`MarkIndex` — and `DerivativesTickBuilder` folds them into the
+`wickra_core::DerivativesTick` the perpetual-futures indicator family consumes:
+
+```rust
+use wickra_exchange::{DerivativesFeed, DerivativesTickBuilder, FundingRate};
+
+let mut builder = DerivativesTickBuilder::new();
+builder.apply(&DerivativesFeed::Funding(funding_rate));  // a frame you supply
+let tick = builder.build()?;                             // -> DerivativesTick
+```
+
+**No venue client subscribes to these channels.** The trade and depth streams
+are wired on all ten venues and emit `TradePrint` / `OrderBookSnapshot`
+directly; the derivatives channels are not, so the frames above are ones the
+caller obtains and applies. The shapes and the fold are here so that a caller
+who has the data does not write the conversion by hand — not because the client
+fetches it.
+
+`Derivatives` (above) is a different surface: `positions`, `set_leverage`,
+`set_margin_mode` and `close_position` are account operations and **are**
+implemented, on all eight futures venues.
+
 ## Honest gaps
 
 These two remain because the venue API does not exist — they are documented, not
