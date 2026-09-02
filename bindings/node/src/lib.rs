@@ -29,7 +29,7 @@ use wickra_exchange::{
     Credentials as CoreCredentials, Derivatives as CoreDerivatives, Event,
     Exchange as CoreExchange, ExchangeOptions, MarginMode, MarketType, OcoRequest, Order,
     OrderRequest as CoreOrderRequest, OrderSide, OrderStatus, PaperExchange, Position,
-    PositionSide, ReplayExchange, Symbol, TradePrint, WsExecution as CoreWsExecution,
+    PositionMode, PositionSide, ReplayExchange, Symbol, TradePrint, WsExecution as CoreWsExecution,
     WsUserData as CoreWsUserData,
 };
 
@@ -128,6 +128,50 @@ fn position_side_str(side: PositionSide) -> String {
         PositionSide::Short => "short",
     }
     .to_string()
+}
+
+/// Parse a market string into the [`MarketType`] a client routes to.
+///
+/// `connect` was fixed at spot, so no Node caller could reach a futures market
+/// on the exchange handle. Only spot and USDⓈ-margined futures are offered: no
+/// client routes coin-margined or margin consistently -- Binance treats
+/// coin-margined as spot.
+fn market_type_from_str(market: &str) -> napi::Result<MarketType> {
+    match market {
+        "spot" => Ok(MarketType::Spot),
+        "usdm_futures" => Ok(MarketType::UsdMFutures),
+        other => Err(napi::Error::from_reason(format!(
+            "market must be 'spot' or 'usdm_futures', got {other:?}"
+        ))),
+    }
+}
+
+fn position_mode_from_str(mode: &str) -> napi::Result<PositionMode> {
+    match mode {
+        "one_way" => Ok(PositionMode::OneWay),
+        "hedge" => Ok(PositionMode::Hedge),
+        other => Err(napi::Error::from_reason(format!(
+            "positionMode must be 'one_way' or 'hedge', got {other:?}"
+        ))),
+    }
+}
+
+/// Options for a live connection from the optional arguments the factories take.
+fn live_options(
+    testnet: Option<bool>,
+    market: &str,
+    margin_mode: Option<&str>,
+    position_mode: Option<&str>,
+) -> napi::Result<ExchangeOptions> {
+    let market = market_type_from_str(market)?;
+    let mut options = if testnet.unwrap_or(false) {
+        ExchangeOptions::testnet(market)
+    } else {
+        ExchangeOptions::mainnet(market)
+    };
+    options.margin_mode = margin_mode_from_str(margin_mode.unwrap_or("cross"))?;
+    options.position_mode = position_mode_from_str(position_mode.unwrap_or("one_way"))?;
+    Ok(options)
 }
 
 fn margin_mode_from_str(mode: &str) -> napi::Result<MarginMode> {
@@ -445,12 +489,16 @@ impl Exchange {
         name: String,
         credentials: &Credentials,
         testnet: Option<bool>,
+        market: Option<String>,
+        margin_mode: Option<String>,
+        position_mode: Option<String>,
     ) -> napi::Result<Self> {
-        let options = if testnet.unwrap_or(false) {
-            ExchangeOptions::testnet(MarketType::Spot)
-        } else {
-            ExchangeOptions::mainnet(MarketType::Spot)
-        };
+        let options = live_options(
+            testnet,
+            market.as_deref().unwrap_or("spot"),
+            margin_mode.as_deref(),
+            position_mode.as_deref(),
+        )?;
         let live = connect(&name, credentials.inner.clone(), &options).map_err(map_err)?;
         Ok(Self {
             inner: Inner::Live(live),
@@ -656,12 +704,15 @@ impl Derivatives {
         name: String,
         credentials: &Credentials,
         testnet: Option<bool>,
+        margin_mode: Option<String>,
+        position_mode: Option<String>,
     ) -> napi::Result<Self> {
-        let options = if testnet.unwrap_or(false) {
-            ExchangeOptions::testnet(MarketType::UsdMFutures)
-        } else {
-            ExchangeOptions::mainnet(MarketType::UsdMFutures)
-        };
+        let options = live_options(
+            testnet,
+            "usdm_futures",
+            margin_mode.as_deref(),
+            position_mode.as_deref(),
+        )?;
         let inner =
             connect_derivatives(&name, credentials.inner.clone(), &options).map_err(map_err)?;
         Ok(Self { inner })

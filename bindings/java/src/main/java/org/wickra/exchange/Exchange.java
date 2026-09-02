@@ -101,15 +101,35 @@ public final class Exchange implements AutoCloseable {
         }
     }
 
-    /** A live client for {@code name}, authenticated with API keys. */
+    /** A live spot client for {@code name}, authenticated with API keys. */
     public static Exchange connect(String name, String apiKey, String apiSecret,
                                    String passphrase, String privateKey, boolean testnet) {
+        return connect(name, apiKey, apiSecret, passphrase, privateKey, testnet,
+                Market.SPOT, Derivatives.MarginMode.CROSS, PositionMode.ONE_WAY);
+    }
+
+    /**
+     * A live client for {@code name} on a chosen market.
+     *
+     * <p>Two venues carry the margin mode on every order and four carry the
+     * position side, so both belong here rather than in a later call: an order
+     * placed before they are set carries the defaults.
+     */
+    public static Exchange connect(String name, String apiKey, String apiSecret,
+                                   String passphrase, String privateKey, boolean testnet,
+                                   Market market, Derivatives.MarginMode marginMode,
+                                   PositionMode positionMode) {
         try (Arena arena = Arena.ofConfined()) {
             MemorySegment pass = passphrase == null ? MemorySegment.NULL : arena.allocateFrom(passphrase);
             MemorySegment priv = privateKey == null ? MemorySegment.NULL : arena.allocateFrom(privateKey);
             MemorySegment h = (MemorySegment) Native.CONNECT.invokeExact(
                     arena.allocateFrom(name), arena.allocateFrom(apiKey), arena.allocateFrom(apiSecret),
-                    pass, priv, (byte) (testnet ? 1 : 0));
+                    pass, priv, (byte) (testnet ? 1 : 0),
+                    market.code(),
+                    marginMode == Derivatives.MarginMode.ISOLATED
+                            ? Native.MARGIN_ISOLATED
+                            : Native.MARGIN_CROSS,
+                    positionMode.code());
             return fromHandle(h, name);
         } catch (Throwable t) {
             throw new RuntimeException(t);

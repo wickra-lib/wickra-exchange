@@ -2,7 +2,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert");
-const { Derivatives, AdvancedOrders, Credentials, OrderRequest, UserData, WsExecution } = require("../index.js");
+const { Derivatives, AdvancedOrders, Credentials, Exchange, OrderRequest, UserData, WsExecution } = require("../index.js");
 
 // Construction is offline (no socket opens until an RPC is issued), so the class
 // surface and the spot-only rejection are checked without a network.
@@ -77,4 +77,30 @@ test("user-data and ws-execution construct and expose their surface", () => {
   for (const method of ["placeOrderWs", "cancelOrderWs"]) {
     assert.strictEqual(typeof exec[method], "function", `${method} must be a method`);
   }
+});
+
+test("the exchange handle can reach a futures market", () => {
+  // Exchange.connect used to build a spot client and nothing else, so no Node
+  // caller could place a futures order, read a futures book or cancel a
+  // futures order. Construction is offline; this pins that the door exists.
+  const creds = new Credentials("key", "secret");
+  assert.ok(Exchange.connect("binance", creds, false, "spot"));
+  assert.ok(Exchange.connect("binance", creds, false, "usdm_futures"));
+});
+
+test("the margin and position modes reach the client", () => {
+  // Two venues carry the margin mode on every order and four carry the
+  // position side, so neither can be set after the first order.
+  const creds = new Credentials("key", "secret");
+  assert.ok(Exchange.connect("okx", creds, false, "usdm_futures", "isolated", "hedge"));
+});
+
+test("an unrouted market or an unknown mode is rejected", () => {
+  const creds = new Credentials("key", "secret");
+  // coinm_futures is deliberately not offered: no client routes it
+  // consistently, and Binance treats it as spot outright.
+  assert.throws(() => Exchange.connect("binance", creds, false, "coinm_futures"));
+  assert.throws(() => Exchange.connect("binance", creds, false, "perpetual"));
+  assert.throws(() => Exchange.connect("binance", creds, false, "spot", "portfolio"));
+  assert.throws(() => Exchange.connect("binance", creds, false, "spot", "cross", "both"));
 });

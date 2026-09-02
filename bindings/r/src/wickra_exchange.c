@@ -152,11 +152,14 @@ SEXP wkex_version(void) {
  * and order execution were unreachable from R for any venue but paper and
  * replay. */
 SEXP wkex_connect(SEXP name, SEXP api_key, SEXP api_secret, SEXP passphrase,
-                  SEXP private_key, SEXP testnet) {
+                  SEXP private_key, SEXP testnet, SEXP market_type,
+                  SEXP margin_mode, SEXP position_mode) {
     WickraExchange *h = wickra_connect(
         CHAR(STRING_ELT(name, 0)), CHAR(STRING_ELT(api_key, 0)),
         CHAR(STRING_ELT(api_secret, 0)), opt_cstr(passphrase),
-        opt_cstr(private_key), (bool)Rf_asLogical(testnet));
+        opt_cstr(private_key), (bool)Rf_asLogical(testnet),
+        Rf_asInteger(market_type), Rf_asInteger(margin_mode),
+        Rf_asInteger(position_mode));
     return wrap_handle(h, "live");
 }
 
@@ -375,7 +378,8 @@ SEXP wkex_connect_derivatives(SEXP name, SEXP api_key, SEXP api_secret,
                               SEXP passphrase, SEXP private_key, SEXP testnet) {
     WickraDerivatives *h = wickra_connect_derivatives(
         CHAR(STRING_ELT(name, 0)), CHAR(STRING_ELT(api_key, 0)), CHAR(STRING_ELT(api_secret, 0)),
-        opt_cstr(passphrase), opt_cstr(private_key), (bool)Rf_asLogical(testnet));
+        opt_cstr(passphrase), opt_cstr(private_key), (bool)Rf_asLogical(testnet),
+        WICKRA_MARGIN_CROSS, WICKRA_POSITION_ONE_WAY);
     if (!h) {
         Rf_error("wickra: failed to connect derivatives client (spot-only or unknown venue?)");
     }
@@ -460,7 +464,8 @@ SEXP wkex_connect_advanced(SEXP name, SEXP api_key, SEXP api_secret,
     WickraAdvanced *h = wickra_connect_advanced(
         CHAR(STRING_ELT(name, 0)), CHAR(STRING_ELT(api_key, 0)), CHAR(STRING_ELT(api_secret, 0)),
         opt_cstr(passphrase), opt_cstr(private_key),
-        (bool)Rf_asLogical(testnet), (bool)Rf_asLogical(futures));
+        (bool)Rf_asLogical(testnet), (bool)Rf_asLogical(futures),
+        WICKRA_MARGIN_CROSS, WICKRA_POSITION_ONE_WAY);
     if (!h) {
         Rf_error("wickra: failed to connect advanced-orders client (spot-only or unknown venue?)");
     }
@@ -574,7 +579,8 @@ SEXP wkex_connect_user_data(SEXP name, SEXP api_key, SEXP api_secret,
     WickraUserData *h = wickra_connect_user_data(
         CHAR(STRING_ELT(name, 0)), CHAR(STRING_ELT(api_key, 0)), CHAR(STRING_ELT(api_secret, 0)),
         opt_cstr(passphrase), opt_cstr(private_key),
-        (bool)Rf_asLogical(testnet), (bool)Rf_asLogical(futures));
+        (bool)Rf_asLogical(testnet), (bool)Rf_asLogical(futures),
+        WICKRA_MARGIN_CROSS, WICKRA_POSITION_ONE_WAY);
     if (!h) {
         Rf_error("wickra: failed to connect user-data client (spot-only or unknown venue?)");
     }
@@ -630,7 +636,8 @@ SEXP wkex_connect_ws_execution(SEXP name, SEXP api_key, SEXP api_secret,
     WickraWsExecution *h = wickra_connect_ws_execution(
         CHAR(STRING_ELT(name, 0)), CHAR(STRING_ELT(api_key, 0)), CHAR(STRING_ELT(api_secret, 0)),
         opt_cstr(passphrase), opt_cstr(private_key),
-        (bool)Rf_asLogical(testnet), (bool)Rf_asLogical(futures));
+        (bool)Rf_asLogical(testnet), (bool)Rf_asLogical(futures),
+        WICKRA_MARGIN_CROSS, WICKRA_POSITION_ONE_WAY);
     if (!h) {
         Rf_error("wickra: failed to connect ws-execution client (spot-only or unknown venue?)");
     }
@@ -661,7 +668,7 @@ SEXP wkex_ws_cancel_order(SEXP ext, SEXP market, SEXP order_id) {
 
 static const R_CallMethodDef CallEntries[] = {
     {"wkex_version", (DL_FUNC)&wkex_version, 0},
-    {"wkex_connect", (DL_FUNC)&wkex_connect, 6},
+    {"wkex_connect", (DL_FUNC)&wkex_connect, 9},
     {"wkex_paper_new", (DL_FUNC)&wkex_paper_new, 5},
     {"wkex_replay_new", (DL_FUNC)&wkex_replay_new, 7},
     {"wkex_name", (DL_FUNC)&wkex_name, 1},

@@ -9,6 +9,24 @@ public enum MarginMode
     Isolated = Native.MarginIsolated,
 }
 
+/// <summary>
+/// Which of a venue's markets a client trades. Only spot and USDⓈ-margined
+/// futures are offered: no client routes coin-margined or margin consistently,
+/// and Binance treats coin-margined as spot outright.
+/// </summary>
+public enum Market
+{
+    Spot = Native.MarketSpot,
+    UsdMFutures = Native.MarketUsdMFutures,
+}
+
+/// <summary>One net position per symbol, or a long and a short at once.</summary>
+public enum PositionMode
+{
+    OneWay = Native.PositionOneWay,
+    Hedge = Native.PositionHedge,
+}
+
 /// <summary>The direction of a position.</summary>
 public enum PositionSide
 {
@@ -35,7 +53,9 @@ public sealed unsafe class Derivatives : IDisposable
     /// <summary>Connect a USDⓈ-M futures client for <paramref name="name"/>.</summary>
     public static Derivatives Connect(
         string name, string apiKey, string apiSecret,
-        string? passphrase = null, string? privateKey = null, bool testnet = false)
+        string? passphrase = null, string? privateKey = null, bool testnet = false,
+        MarginMode marginMode = MarginMode.Cross,
+        PositionMode positionMode = PositionMode.OneWay)
     {
         nint pass = passphrase is null ? 0 : Marshal.StringToCoTaskMemUTF8(passphrase);
         nint priv = privateKey is null ? 0 : Marshal.StringToCoTaskMemUTF8(privateKey);
@@ -48,7 +68,9 @@ public sealed unsafe class Derivatives : IDisposable
             fixed (byte* kp = keyBytes)
             fixed (byte* sp = secretBytes)
             {
-                nint handle = Native.wickra_connect_derivatives(np, kp, sp, (byte*)pass, (byte*)priv, testnet);
+                nint handle = Native.wickra_connect_derivatives(
+                    np, kp, sp, (byte*)pass, (byte*)priv, testnet,
+                    (int)marginMode, (int)positionMode);
                 if (handle == 0)
                 {
                     throw new WickraException($"failed to connect derivatives client for {name}");
@@ -178,7 +200,9 @@ public sealed unsafe class AdvancedOrders : IDisposable
     /// <summary>Connect an advanced-orders client; <paramref name="futures"/> selects USDⓈ-M futures.</summary>
     public static AdvancedOrders Connect(
         string name, string apiKey, string apiSecret,
-        string? passphrase = null, string? privateKey = null, bool testnet = false, bool futures = false)
+        string? passphrase = null, string? privateKey = null, bool testnet = false, bool futures = false,
+        MarginMode marginMode = MarginMode.Cross,
+        PositionMode positionMode = PositionMode.OneWay)
     {
         nint pass = passphrase is null ? 0 : Marshal.StringToCoTaskMemUTF8(passphrase);
         nint priv = privateKey is null ? 0 : Marshal.StringToCoTaskMemUTF8(privateKey);
@@ -191,7 +215,9 @@ public sealed unsafe class AdvancedOrders : IDisposable
             fixed (byte* kp = keyBytes)
             fixed (byte* sp = secretBytes)
             {
-                nint handle = Native.wickra_connect_advanced(np, kp, sp, (byte*)pass, (byte*)priv, testnet, futures);
+                nint handle = Native.wickra_connect_advanced(
+                    np, kp, sp, (byte*)pass, (byte*)priv, testnet, futures,
+                    (int)marginMode, (int)positionMode);
                 if (handle == 0)
                 {
                     throw new WickraException($"failed to connect advanced-orders client for {name}");
@@ -371,7 +397,9 @@ public sealed unsafe class UserData : IDisposable
     /// <summary>Connect a user-data client; <paramref name="futures"/> selects USDⓈ-M futures.</summary>
     public static UserData Connect(
         string name, string apiKey, string apiSecret,
-        string? passphrase = null, string? privateKey = null, bool testnet = false, bool futures = false)
+        string? passphrase = null, string? privateKey = null, bool testnet = false, bool futures = false,
+        MarginMode marginMode = MarginMode.Cross,
+        PositionMode positionMode = PositionMode.OneWay)
     {
         nint pass = passphrase is null ? 0 : Marshal.StringToCoTaskMemUTF8(passphrase);
         nint priv = privateKey is null ? 0 : Marshal.StringToCoTaskMemUTF8(privateKey);
@@ -384,7 +412,9 @@ public sealed unsafe class UserData : IDisposable
             fixed (byte* kp = keyBytes)
             fixed (byte* sp = secretBytes)
             {
-                nint handle = Native.wickra_connect_user_data(np, kp, sp, (byte*)pass, (byte*)priv, testnet, futures);
+                nint handle = Native.wickra_connect_user_data(
+                    np, kp, sp, (byte*)pass, (byte*)priv, testnet, futures,
+                    (int)marginMode, (int)positionMode);
                 if (handle == 0)
                 {
                     throw new WickraException($"failed to connect user-data client for {name}");
@@ -460,7 +490,9 @@ public sealed unsafe class WsExecution : IDisposable
     /// <summary>Connect a WebSocket order-API client; <paramref name="futures"/> selects USDⓈ-M futures.</summary>
     public static WsExecution Connect(
         string name, string apiKey, string apiSecret,
-        string? passphrase = null, string? privateKey = null, bool testnet = false, bool futures = false)
+        string? passphrase = null, string? privateKey = null, bool testnet = false, bool futures = false,
+        MarginMode marginMode = MarginMode.Cross,
+        PositionMode positionMode = PositionMode.OneWay)
     {
         nint pass = passphrase is null ? 0 : Marshal.StringToCoTaskMemUTF8(passphrase);
         nint priv = privateKey is null ? 0 : Marshal.StringToCoTaskMemUTF8(privateKey);
@@ -473,7 +505,9 @@ public sealed unsafe class WsExecution : IDisposable
             fixed (byte* kp = keyBytes)
             fixed (byte* sp = secretBytes)
             {
-                nint handle = Native.wickra_connect_ws_execution(np, kp, sp, (byte*)pass, (byte*)priv, testnet, futures);
+                nint handle = Native.wickra_connect_ws_execution(
+                    np, kp, sp, (byte*)pass, (byte*)priv, testnet, futures,
+                    (int)marginMode, (int)positionMode);
                 if (handle == 0)
                 {
                     throw new WickraException($"failed to connect ws-execution client for {name}");

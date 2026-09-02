@@ -42,7 +42,7 @@ export declare class Credentials {
  */
 export declare class Derivatives {
   /** Connect a USDⓈ-M futures client for `name`. Throws for a spot-only venue. */
-  static connect(name: string, credentials: Credentials, testnet?: boolean | undefined | null): Derivatives
+  static connect(name: string, credentials: Credentials, testnet?: boolean | undefined | null, marginMode?: string | undefined | null, positionMode?: string | undefined | null): Derivatives
   /** Open positions, optionally filtered to one `market`. */
   positions(market?: string | undefined | null): Array<PositionInfo>
   /** Set the leverage for `market`. */
@@ -69,7 +69,7 @@ export declare class Exchange {
    * A live client for `name` (see the crate README for the ten supported
    * venues), authenticated with `credentials`.
    */
-  static connect(name: string, credentials: Credentials, testnet?: boolean | undefined | null): Exchange
+  static connect(name: string, credentials: Credentials, testnet?: boolean | undefined | null, market?: string | undefined | null, marginMode?: string | undefined | null, positionMode?: string | undefined | null): Exchange
   /** The venue's lowercase identifier (`"paper"`, `"replay"`, `"binance"`, ...). */
   name(): string
   /** Set the mark price a paper account fills against (paper backend only). */

@@ -142,7 +142,10 @@ public sealed unsafe class Exchange : IDisposable
     /// <summary>A live client for <paramref name="name"/> authenticated with API keys.</summary>
     public static Exchange Connect(
         string name, string apiKey, string apiSecret,
-        string? passphrase = null, string? privateKey = null, bool testnet = false)
+        string? passphrase = null, string? privateKey = null, bool testnet = false,
+        Market market = Market.Spot,
+        MarginMode marginMode = MarginMode.Cross,
+        PositionMode positionMode = PositionMode.OneWay)
     {
         nint pass = passphrase is null ? 0 : Marshal.StringToCoTaskMemUTF8(passphrase);
         nint priv = privateKey is null ? 0 : Marshal.StringToCoTaskMemUTF8(privateKey);
@@ -155,7 +158,9 @@ public sealed unsafe class Exchange : IDisposable
             fixed (byte* kp = keyBytes)
             fixed (byte* sp = secretBytes)
             {
-                nint handle = Native.wickra_connect(np, kp, sp, (byte*)pass, (byte*)priv, testnet);
+                nint handle = Native.wickra_connect(
+                    np, kp, sp, (byte*)pass, (byte*)priv, testnet,
+                    (int)market, (int)marginMode, (int)positionMode);
                 if (handle == 0)
                 {
                     throw new WickraException($"failed to connect to {name}");

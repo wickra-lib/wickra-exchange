@@ -61,6 +61,26 @@
 #define WICKRA_SIDE_SELL 1
 
 /**
+ * Market: spot.
+ */
+#define WICKRA_MARKET_SPOT 0
+
+/**
+ * Market: USDⓈ-margined linear perpetual / futures.
+ */
+#define WICKRA_MARKET_USDM_FUTURES 1
+
+/**
+ * Position mode: one net position per symbol.
+ */
+#define WICKRA_POSITION_ONE_WAY 0
+
+/**
+ * Position mode: separate long and short positions per symbol.
+ */
+#define WICKRA_POSITION_HEDGE 1
+
+/**
  * Margin mode: cross (margin shared across positions).
  */
 #define WICKRA_MARGIN_CROSS 0
@@ -373,7 +393,10 @@ WickraExchange *wickra_connect(const char *name,
                                const char *api_secret,
                                const char *passphrase,
                                const char *private_key,
-                               bool testnet);
+                               bool testnet,
+                               int32_t market_type,
+                               int32_t margin_mode,
+                               int32_t position_mode);
 
 /**
  * Release an exchange handle. Safe to call with null.
@@ -558,7 +581,9 @@ WickraDerivatives *wickra_connect_derivatives(const char *name,
                                               const char *api_secret,
                                               const char *passphrase,
                                               const char *private_key,
-                                              bool testnet);
+                                              bool testnet,
+                                              int32_t margin_mode,
+                                              int32_t position_mode);
 
 /**
  * Release a derivatives handle. Safe to call with null.
@@ -640,7 +665,9 @@ WickraAdvanced *wickra_connect_advanced(const char *name,
                                         const char *passphrase,
                                         const char *private_key,
                                         bool testnet,
-                                        bool futures);
+                                        bool futures,
+                                        int32_t margin_mode,
+                                        int32_t position_mode);
 
 /**
  * Release an advanced-orders handle. Safe to call with null.
@@ -739,7 +766,9 @@ WickraUserData *wickra_connect_user_data(const char *name,
                                          const char *passphrase,
                                          const char *private_key,
                                          bool testnet,
-                                         bool futures);
+                                         bool futures,
+                                         int32_t margin_mode,
+                                         int32_t position_mode);
 
 /**
  * Release a user-data handle. Safe to call with null.
@@ -792,7 +821,9 @@ WickraWsExecution *wickra_connect_ws_execution(const char *name,
                                                const char *passphrase,
                                                const char *private_key,
                                                bool testnet,
-                                               bool futures);
+                                               bool futures,
+                                               int32_t margin_mode,
+                                               int32_t position_mode);
 
 /**
  * Release a ws-execution handle. Safe to call with null.
