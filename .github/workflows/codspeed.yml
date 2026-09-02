@@ -123,13 +123,40 @@ jobs:
       # `apply_delta` and `apply_level` are byte-identical between main and the
       # pull request's head once basic-block label numbering is normalised.
       #
-      # So the figure moves while the instruction stream does not, and the cause
-      # is not yet known. That is the honest state of it. When this fires:
-      # compare the recorded CPU lines, check the report's footnote for a base
-      # commit older than main's head (`No successful run was found on main`),
-      # and diff the emitted assembly for the named function. If the code is
-      # identical, the number is not about this pull request -- and the two
-      # figures will be that same pair again.
+      # So the figure moves while the instruction stream does not.
+      #
+      # The third occurrence narrowed it. On #197 the same pair appeared again --
+      # 399.4 against 453.6 -- and two things about that run are worth recording.
+      #
+      #   occurrence   base                head                figures
+      #   #186         EPYC 7763  399.4    EPYC 9V74  453.6    base low
+      #   #190         EPYC 9V74  399.4    EPYC 7763  455      base low
+      #   #197         Xeon 8573C          same pair again     base low
+      #
+      # First: a *third* CPU model, from a different vendor, produced the same
+      # two numbers to the tenth of a nanosecond. Under a wall-clock measurement
+      # that would be improbable. Under this job it is not, because `mode` below
+      # is `simulation`: the figure is an instruction count under instrumentation
+      # rather than elapsed time, so it is deterministic given the same code and
+      # the same simulated model. Which is the point -- a deterministic figure
+      # that changes without the code changing is not noise. Something other than
+      # the instruction stream is being modelled differently between the two
+      # sides of the comparison.
+      #
+      # Second, and new: CodSpeed now says so itself. The #197 report carried
+      # "Different runtime environments detected -- Some benchmarks with
+      # significant performance changes were compared across different runtime
+      # environments, which may affect the accuracy of the results." That is the
+      # vendor naming the base/head asymmetry this comment has been circling. It
+      # is not the CPU (three models, same numbers) and not the code (assembly
+      # byte-identical); it is the environment the simulation runs in.
+      #
+      # That is the honest state of it. When this fires: compare the recorded CPU
+      # lines, look for that "different runtime environments" note in the report,
+      # check the footnote for a base commit older than main's head (`No
+      # successful run was found on main`), and diff the emitted assembly for the
+      # named function. If the code is identical, the number is not about this
+      # pull request -- and the two figures will be that same pair again.
       #
       # A threshold is still not the answer: one wide enough to swallow 12%
       # would swallow a real 12% regression too.
