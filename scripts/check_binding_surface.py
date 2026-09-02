@@ -74,11 +74,19 @@ def strip_prose(text: str) -> str:
     Comments cover `/* */`, `//` (so Rust's `///`, Java's `/** */`, C#'s `///`)
     and `#` (so R's roxygen `#'`). String literals cover double-quoted spans,
     honouring backslash escapes.
+
+    The escape class is `\\[\\s\\S]` rather than `\\.`, because `.` does not match a
+    newline and Rust's line-continuation escape *is* a backslash followed by
+    one. With `\\.` such a literal never terminated, so the closing quote of the
+    *next* string paired with it instead -- and every quote after that was off
+    by one, which silently deleted whole functions as if they were prose. The
+    surface check then reported 2 of 25 verbs present in a binding that had all
+    25, on the strength of a message wrapped across two lines.
     """
     text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
     text = re.sub(r"(?m)//[^\n]*", " ", text)
     text = re.sub(r"(?m)#[^\n]*", " ", text)
-    return re.sub(r'"(?:\\.|[^"\\])*"', ' "" ', text)
+    return re.sub(r'"(?:\\[\s\S]|[^"\\])*"', ' "" ', text)
 
 
 def read_all(*paths: str) -> str:
@@ -250,6 +258,57 @@ CONSTRUCTOR_ALIASES = {
 # assurance, which is the failure this whole file exists to prevent.
 CONFIGURATION = ("market", "margin_mode", "position_mode")
 
+# The third axis: what an *order* can say.
+#
+# Verbs and configuration were both checked and both passed while every binding
+# could place only a market or limit order with a quantity and a price. The
+# trigger price that makes a stop-loss a stop-loss, the time-in-force that says
+# an order must not rest, post-only, reduce-only, self-trade prevention and the
+# client order id that makes a retry idempotent all existed in the core and had
+# no spelling in any language. `place_order` was present in all seven bindings
+# the whole time -- the verb was there, the order was not.
+#
+# So this checks the same thing one level down: a binding exposes `place_order`,
+# and every field an order carries can be reached through it. The fields are read
+# from `OrderRequest` in the core rather than listed here, so a field added there
+# is a field this demands.
+ORDER_REQUEST = "crates/wickra-exchange-core/src/types.rs"
+
+# The fields that need a way in. `symbol`, `side`, `order_type` and `quantity`
+# are excluded: every binding already takes those positionally, in the
+# constructor or the factory, and none of them was ever the gap.
+ORDER_FIELD_SKIP = frozenset({"symbol", "side", "order_type", "quantity", "price"})
+
+# How each field may be spelled. A binding that reaches it under any of these
+# names counts; the list is per field rather than per language because the
+# languages agree on the words and differ only in case, which `present` folds.
+ORDER_FIELD_SPELLINGS = {
+    "stop_price": ("stop_price", "stopprice", "R_STOP_PRICE"),
+    "time_in_force": ("time_in_force", "timeinforce", "TIF_GTC"),
+    "client_order_id": ("client_order_id", "clientorderid", "cliordid"),
+    "reduce_only": ("reduce_only", "reduceonly"),
+    "post_only": ("post_only", "postonly"),
+    "stp": ("stp",),
+}
+
+
+def order_fields():
+    """The fields of `OrderRequest`, read from the core rather than listed."""
+    source = read(ORDER_REQUEST)
+    body = re.search(r"pub struct OrderRequest \{(.*?)\n\}", source, re.S)
+    if body is None:
+        raise SystemExit(f"{ORDER_REQUEST}: could not locate `struct OrderRequest`")
+    found = re.findall(r"^\s*pub (\w+):", body.group(1), re.M)
+    fields = [f for f in found if f not in ORDER_FIELD_SKIP]
+    missing = [f for f in fields if f not in ORDER_FIELD_SPELLINGS]
+    if missing:
+        raise SystemExit(
+            "OrderRequest gained a field with no spelling recorded here: "
+            + ", ".join(missing)
+            + " -- add it to ORDER_FIELD_SPELLINGS and to every binding."
+        )
+    return fields
+
 # Where each binding declares the axes, and the spellings they may take there.
 # A binding whose declaration cannot be located fails loudly rather than passing
 # quietly.
@@ -315,8 +374,10 @@ def main() -> int:
             if verb not in contract:
                 contract.append(verb)
 
+    fields = order_fields()
     print(f"contract: {len(contract)} verbs across {len(REQUIRED_TRAITS)} traits "
-          f"(read from {TRAITS})\n")
+          f"(read from {TRAITS}), {len(fields)} order fields "
+          f"(read from {ORDER_REQUEST})\n")
 
     failures: list[str] = []
     for label, paths, spell in BINDINGS:
@@ -338,6 +399,12 @@ def main() -> int:
             if not present(haystack, spellings):
                 ctor_absent.append(f"{ctor} (as {'/'.join(spellings)})")
 
+        fields_absent = [
+            f"{field} (as {'/'.join(ORDER_FIELD_SPELLINGS[field])})"
+            for field in fields
+            if not present(haystack, ORDER_FIELD_SPELLINGS[field])
+        ]
+
         params = constructor_params(label, source)
         if params is None:
             config_absent = ["the exchange constructor could not be located"]
@@ -348,7 +415,7 @@ def main() -> int:
                 if not any(s in params for s in AXIS_SPELLINGS[axis])
             ]
 
-        if absent or ctor_absent or config_absent:
+        if absent or ctor_absent or config_absent or fields_absent:
             detail = []
             if absent:
                 detail.append("verbs: " + ", ".join(absent))
@@ -356,15 +423,19 @@ def main() -> int:
                 detail.append("constructors: " + ", ".join(ctor_absent))
             if config_absent:
                 detail.append("configuration: " + ", ".join(config_absent))
+            if fields_absent:
+                detail.append("order fields: " + ", ".join(fields_absent))
             failures.append(f"{label}: missing {'; '.join(detail)}")
             print(f"  {label:<8} {len(contract) - len(absent)}/{len(contract)} verbs, "
                   f"{len(CONSTRUCTORS) - len(ctor_absent)}/{len(CONSTRUCTORS)} constructors, "
-                  f"{len(CONFIGURATION) - len(config_absent)}/{len(CONFIGURATION)} config"
+                  f"{len(CONFIGURATION) - len(config_absent)}/{len(CONFIGURATION)} config, "
+                  f"{len(fields) - len(fields_absent)}/{len(fields)} order fields"
                   f"  MISSING: {'; '.join(detail)}")
         else:
             print(f"  {label:<8} {len(contract)}/{len(contract)} verbs, "
                   f"{len(CONSTRUCTORS)}/{len(CONSTRUCTORS)} constructors, "
-                  f"{len(CONFIGURATION)}/{len(CONFIGURATION)} config")
+                  f"{len(CONFIGURATION)}/{len(CONFIGURATION)} config, "
+                  f"{len(fields)}/{len(fields)} order fields")
 
     if failures:
         print("\nbindings have drifted from the trait contract:", file=sys.stderr)

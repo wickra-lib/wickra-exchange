@@ -12,6 +12,7 @@ const {
   AdvancedOrders,
   UserData,
   WsExecution,
+  OrderRequest,
 } = require("../index.js");
 
 // MarketData (7) + Execution (5) + Exchange (1). placeOrder is the unified
@@ -65,4 +66,63 @@ test("UserData exposes the full surface", () => {
 
 test("WsExecution exposes the full surface", () => {
   assertVerbs(WsExecution, WS_EXECUTION_VERBS, "WsExecution");
+});
+
+// The four factories plus every builder that decides what the order *is*.
+// Without these an order was a market/limit with a quantity and a price and
+// nothing else, so a stop-loss, an IOC, a post-only or an idempotent retry could
+// not be expressed from Node at all -- however much of it the Rust core
+// supported.
+const ORDER_REQUEST_VERBS = [
+  "withStopPrice",
+  "withTimeInForce",
+  "withClientOrderId",
+  "reduceOnly",
+  "postOnly",
+  "withStp",
+];
+
+test("OrderRequest exposes every field builder", () => {
+  for (const verb of ORDER_REQUEST_VERBS) {
+    assert.strictEqual(
+      typeof OrderRequest.prototype[verb],
+      "function",
+      `OrderRequest is missing ${verb}`,
+    );
+  }
+  for (const factory of ["marketBuy", "marketSell", "limitBuy", "limitSell"]) {
+    assert.strictEqual(
+      typeof OrderRequest[factory],
+      "function",
+      `OrderRequest is missing ${factory}`,
+    );
+  }
+});
+
+test("OrderRequest builders chain and return a new request", () => {
+  const base = OrderRequest.limitSell("BTC/USDT", 1.0, 19000.0);
+  const built = base
+    .withStopPrice(19500.0)
+    .withTimeInForce("IOC")
+    .withClientOrderId("retry-safe-1")
+    .reduceOnly();
+  assert.notStrictEqual(built, base);
+});
+
+test("an unknown time-in-force throws rather than defaulting to GTC", () => {
+  const request = OrderRequest.limitBuy("BTC/USDT", 1.0, 19000.0);
+  for (const bad of ["", "gtd", "immediate"]) {
+    assert.throws(() => request.withTimeInForce(bad), `withTimeInForce(${bad}) was accepted`);
+  }
+  for (const bad of ["", "cancel_maker"]) {
+    assert.throws(() => request.withStp(bad), `withStp(${bad}) was accepted`);
+  }
+});
+
+test("time-in-force and stp are case-insensitive", () => {
+  const request = OrderRequest.limitBuy("BTC/USDT", 1.0, 19000.0);
+  assert.ok(request.withTimeInForce("ioc"));
+  assert.ok(request.withTimeInForce("IOC"));
+  assert.ok(request.withStp("EXPIRE_MAKER"));
+  assert.ok(request.withStp("expire_both"));
 });

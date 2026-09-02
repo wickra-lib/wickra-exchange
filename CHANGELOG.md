@@ -87,6 +87,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Every binding can build the order the core supports.** `place_order` was
+  present in all seven bindings, and the order it could build was a market or
+  limit with a quantity and a price. The trigger price that makes a stop-loss a
+  stop-loss, the time-in-force that says an order must not rest, `post_only`,
+  `reduce_only`, self-trade prevention and the client order id that makes a
+  retry idempotent all existed in the core and had no spelling in any language:
+  the eight PRs of venue fixes before this one could not reach a binding user.
+
+  The C ABI gains `WickraOrderRequest` and three calls that take it
+  (`wickra_exchange_place_order`, `wickra_ws_place_order_full`,
+  `wickra_advanced_place_batch_full`). Python, Node and WASM — which hold
+  `OrderRequest` directly and were narrow only because nobody had widened them —
+  gain the core's builders. C#, Go, Java and R each carry the struct in the
+  shape that language already uses. `place_market` / `place_limit` remain
+  everywhere; nothing that compiled before stops compiling.
+
+- **`OrderRequest::with_stop_price`.** Setting a stop price was a struct literal
+  and nothing else — there was no builder for it in any language, Rust included,
+  which is why no binding could offer one. It promotes the order type along with
+  the price, because a trigger price on an order whose type says it is not a
+  trigger order is a field every venue ignores.
+
+- **The binding-surface check gained a third axis.** Verbs and configuration
+  both passed while no binding could place a stop-loss, because a verb being
+  present says nothing about what it can express.
+  `scripts/check_binding_surface.py` now reads the field list out of
+  `OrderRequest` and holds every binding to it; on the previous commit it
+  reports 2 of 6 fields reachable from Python.
+
 - **The binding surface check now covers configuration, not only verbs.** The
   defect above hid behind it for the life of the project: `place_order` was
   present in all seven bindings and could not place a futures order in any of
@@ -169,6 +198,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     on so a test can read four numbers and one array would be a poor trade.
 
 ### Fixed
+
+- **The binding-surface check could delete whole functions as if they were
+  prose.** Its string-literal regex escaped `\\.`, and `.` does not match a
+  newline — so a Rust line-continuation backslash (`"...text \\` at end of line)
+  never terminated the literal, the closing quote of the *next* string paired
+  with it, and every quote after that was off by one. The effect was silent and
+  large: the check reported 2 of 25 verbs present in a binding that had all 25,
+  on the strength of an error message wrapped across two lines.
 
 - **Seven of the ten clients never sent `time_in_force`.** `OrderRequest` has
   carried GTC / IOC / FOK since the first release and `docs/CAPABILITIES.md`

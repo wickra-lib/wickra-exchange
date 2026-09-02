@@ -30,8 +30,8 @@ use wickra_exchange::{
     Credentials as CoreCredentials, Derivatives as CoreDerivatives, Event,
     Exchange as CoreExchange, ExchangeOptions, MarginMode, MarketType, OcoRequest, Order,
     OrderRequest as CoreOrderRequest, OrderSide, OrderStatus, PaperExchange, Position,
-    PositionMode, PositionSide, ReplayExchange, Symbol, TradePrint, WsExecution as CoreWsExecution,
-    WsUserData as CoreWsUserData,
+    PositionMode, PositionSide, ReplayExchange, SelfTradePrevention, Symbol, TimeInForce,
+    TradePrint, WsExecution as CoreWsExecution, WsUserData as CoreWsUserData,
 };
 
 fn err(message: impl Into<String>) -> NapiError {
@@ -396,6 +396,89 @@ impl OrderRequest {
                 to_decimal(quantity)?,
                 to_decimal(price)?,
             ),
+        })
+    }
+
+    /// Rest until the market reaches `stopPrice`, then fire.
+    ///
+    /// This is what turns a market order into a stop-loss and a limit order into
+    /// a stop-limit. Without it the four factories above were the whole surface,
+    /// so a stop order could not be expressed from Node at all.
+    #[napi]
+    pub fn with_stop_price(&self, stop_price: f64) -> napi::Result<Self> {
+        Ok(Self {
+            inner: self.inner.clone().with_stop_price(to_decimal(stop_price)?),
+        })
+    }
+
+    /// `"GTC"` (rest until cancelled), `"IOC"` (fill what is possible now,
+    /// cancel the rest) or `"FOK"` (fill entirely now or not at all).
+    ///
+    /// Case-insensitive. Throws on anything else rather than falling back to
+    /// GTC: a silent fallback is exactly the defect #195 fixed in the core.
+    #[napi]
+    pub fn with_time_in_force(&self, tif: String) -> napi::Result<Self> {
+        let tif = match tif.to_ascii_uppercase().as_str() {
+            "GTC" => TimeInForce::Gtc,
+            "IOC" => TimeInForce::Ioc,
+            "FOK" => TimeInForce::Fok,
+            other => {
+                return Err(napi::Error::from_reason(format!(
+                    "unknown time-in-force {other:?}; expected GTC, IOC or FOK"
+                )))
+            }
+        };
+        Ok(Self {
+            inner: self.inner.clone().with_time_in_force(tif),
+        })
+    }
+
+    /// Attach a client order id, so a retried placement is recognised by the
+    /// venue as the same order rather than placed twice.
+    #[napi]
+    #[must_use]
+    pub fn with_client_order_id(&self, id: String) -> Self {
+        Self {
+            inner: self.inner.clone().with_client_order_id(id),
+        }
+    }
+
+    /// Close-only: the order may not increase a position.
+    #[napi]
+    #[must_use]
+    pub fn reduce_only(&self) -> Self {
+        Self {
+            inner: self.inner.clone().reduce_only(),
+        }
+    }
+
+    /// Maker-only: the order is cancelled rather than crossing the spread.
+    #[napi]
+    #[must_use]
+    pub fn post_only(&self) -> Self {
+        Self {
+            inner: self.inner.clone().post_only(),
+        }
+    }
+
+    /// Self-trade prevention: `"none"`, `"expire_maker"`, `"expire_taker"` or
+    /// `"expire_both"`. Case-insensitive; throws on anything else.
+    #[napi]
+    pub fn with_stp(&self, stp: String) -> napi::Result<Self> {
+        let stp = match stp.to_ascii_lowercase().as_str() {
+            "none" => SelfTradePrevention::None,
+            "expire_maker" => SelfTradePrevention::ExpireMaker,
+            "expire_taker" => SelfTradePrevention::ExpireTaker,
+            "expire_both" => SelfTradePrevention::ExpireBoth,
+            other => {
+                return Err(napi::Error::from_reason(format!(
+                    "unknown self-trade-prevention policy {other:?}; expected none, \
+                     expire_maker, expire_taker or expire_both"
+                )))
+            }
+        };
+        Ok(Self {
+            inner: self.inner.clone().with_stp(stp),
         })
     }
 }

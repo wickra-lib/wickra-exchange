@@ -116,6 +116,37 @@
 #define WICKRA_STATUS_EXPIRED 5
 
 /**
+ * Order type codes (mirror `OrderType`).
+ */
+#define WICKRA_ORDER_MARKET 0
+
+#define WICKRA_ORDER_LIMIT 1
+
+#define WICKRA_ORDER_STOP_MARKET 2
+
+#define WICKRA_ORDER_STOP_LIMIT 3
+
+/**
+ * Time-in-force codes (mirror `TimeInForce`).
+ */
+#define WICKRA_TIF_GTC 0
+
+#define WICKRA_TIF_IOC 1
+
+#define WICKRA_TIF_FOK 2
+
+/**
+ * Self-trade-prevention codes (mirror `SelfTradePrevention`).
+ */
+#define WICKRA_STP_NONE 0
+
+#define WICKRA_STP_EXPIRE_MAKER 1
+
+#define WICKRA_STP_EXPIRE_TAKER 2
+
+#define WICKRA_STP_EXPIRE_BOTH 3
+
+/**
  * Stream event kinds.
  */
 #define WICKRA_EVENT_TRADE 0
@@ -199,6 +230,70 @@ typedef struct {
      */
     double average_price;
 } WickraOrder;
+
+/**
+ * A full order, as the caller wants it placed (C-ABI projection of
+ * `OrderRequest`).
+ *
+ * [`wickra_exchange_place_market`] and [`wickra_exchange_place_limit`] take a
+ * market, a side, a quantity and a price, which is all an order was ever able
+ * to be from a binding. Everything else the core supports -- the trigger price
+ * that makes a stop-loss a stop-loss, the time-in-force that says an order must
+ * not rest, post-only, reduce-only, self-trade prevention, and the client order
+ * id that makes a retry idempotent -- had no way across this boundary. This
+ * struct is that way. The two narrow calls remain: they are the shortest
+ * spelling of the common case.
+ *
+ * Fill it by value and pass a pointer. `price` and `stop_price` are `NaN` when
+ * unset, matching how [`WickraOrder`] reports an absent price;
+ * `client_order_id` is `NULL` when unset.
+ */
+typedef struct {
+    /**
+     * Market, `BASE/QUOTE` (e.g. `"BTC/USDT"`). Required.
+     */
+    const char *market;
+    /**
+     * `WICKRA_SIDE_*`.
+     */
+    int32_t side;
+    /**
+     * `WICKRA_ORDER_*`.
+     */
+    int32_t order_type;
+    /**
+     * Order quantity in base units. Required, strictly positive.
+     */
+    double quantity;
+    /**
+     * Limit price, or `NaN` for none. Required by the limit order types.
+     */
+    double price;
+    /**
+     * Trigger price, or `NaN` for none. Required by the stop order types.
+     */
+    double stop_price;
+    /**
+     * `WICKRA_TIF_*`.
+     */
+    int32_t time_in_force;
+    /**
+     * Client order id, or `NULL` for none.
+     */
+    const char *client_order_id;
+    /**
+     * Close-only: the order may not increase a position.
+     */
+    bool reduce_only;
+    /**
+     * Maker-only: the order is cancelled rather than crossing the spread.
+     */
+    bool post_only;
+    /**
+     * `WICKRA_STP_*`.
+     */
+    int32_t stp;
+} WickraOrderRequest;
 
 /**
  * A single stream event (C-ABI projection of `Event`).
@@ -448,6 +543,29 @@ int32_t wickra_exchange_place_limit(WickraExchange *handle,
                                     int32_t side,
                                     double quantity,
                                     double price,
+                                    WickraOrder *out);
+
+/**
+ * Place a full order: every field [`OrderRequest`] carries, not just a market,
+ * a side, a quantity and a price.
+ *
+ * This is what makes a stop-loss placeable from a binding at all -- the two
+ * narrow calls have no field for the trigger price, so the order they build is
+ * not the order a caller asking for a stop wanted. The same goes for a
+ * time-in-force that says the order must not rest, for post-only, reduce-only,
+ * self-trade prevention, and for the client order id that makes a retry safe.
+ *
+ * Returns `WICKRA_ERR_INVALID_ARG` when a code is out of range or a number
+ * cannot be represented, `WICKRA_ERR_UNSUPPORTED` when the venue cannot express
+ * a field that was set (the order is refused rather than weakened), and
+ * `WICKRA_OK` with `out` filled otherwise.
+ *
+ * # Safety
+ * `handle` must be valid; `request` must point at an initialised
+ * [`WickraOrderRequest`]; `out` must point at writable [`WickraOrder`] storage.
+ */
+int32_t wickra_exchange_place_order(WickraExchange *handle,
+                                    const WickraOrderRequest *request,
                                     WickraOrder *out);
 
 /**
@@ -754,6 +872,28 @@ int32_t wickra_advanced_place_batch(WickraAdvanced *handle,
                                     uintptr_t cap);
 
 /**
+ * Place a batch of full orders in one request.
+ *
+ * The [`WickraOrderRequest`] form of [`wickra_advanced_place_batch`], whose four
+ * parallel arrays can say only market, side, quantity and price. `requests`
+ * points at `n` contiguous request structs.
+ *
+ * The return value covers the whole call; `out_codes[i]` carries that order's
+ * own outcome, so a partially-accepted batch still reports its successes.
+ *
+ * # Safety
+ * `handle` must be valid; `requests` must point at `n` initialised
+ * [`WickraOrderRequest`] values; `out` and `out_codes` must each be writable for
+ * `cap` elements.
+ */
+int32_t wickra_advanced_place_batch_full(WickraAdvanced *handle,
+                                         const WickraOrderRequest *requests,
+                                         uintptr_t n,
+                                         WickraOrder *out,
+                                         int32_t *out_codes,
+                                         uintptr_t cap);
+
+/**
  * Connect a private user-data client for `name`. `futures` selects the USDⓈ-M
  * futures market. Returns null for an unknown / spot-only venue or bad UTF-8.
  *
@@ -847,6 +987,21 @@ int32_t wickra_ws_place_order(WickraWsExecution *handle,
                               double quantity,
                               double price,
                               WickraOrder *out);
+
+/**
+ * Place a full order over the venue's WebSocket order API.
+ *
+ * The [`WickraOrderRequest`] form of [`wickra_ws_place_order`], for the same
+ * reason: the narrow call cannot carry a trigger price, a time-in-force, or any
+ * of the flags that decide what the order actually is.
+ *
+ * # Safety
+ * `handle` must be valid; `request` must point at an initialised
+ * [`WickraOrderRequest`]; `out` must point at writable [`WickraOrder`] storage.
+ */
+int32_t wickra_ws_place_order_full(WickraWsExecution *handle,
+                                   const WickraOrderRequest *request,
+                                   WickraOrder *out);
 
 /**
  * Cancel an order over the WebSocket order API by venue id.

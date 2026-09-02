@@ -25,8 +25,8 @@ use wickra_exchange::{
     connect, connect_advanced, connect_derivatives, connect_user_data, connect_ws_execution,
     AdvancedOrders, BookLevel, Candle, Credentials, Derivatives, Error, Event, Exchange,
     ExchangeOptions, MarginMode, MarketType, OcoRequest, Order, OrderRequest, OrderSide,
-    OrderStatus, PaperExchange, Position, PositionMode, PositionSide, ReplayExchange, Symbol,
-    Ticker, TradePrint, WsExecution, WsUserData,
+    OrderStatus, OrderType, PaperExchange, Position, PositionMode, PositionSide, ReplayExchange,
+    SelfTradePrevention, Symbol, Ticker, TimeInForce, TradePrint, WsExecution, WsUserData,
 };
 
 /// Success.
@@ -89,6 +89,23 @@ pub const WICKRA_STATUS_CANCELED: i32 = 3;
 pub const WICKRA_STATUS_REJECTED: i32 = 4;
 pub const WICKRA_STATUS_EXPIRED: i32 = 5;
 
+/// Order type codes (mirror `OrderType`).
+pub const WICKRA_ORDER_MARKET: i32 = 0;
+pub const WICKRA_ORDER_LIMIT: i32 = 1;
+pub const WICKRA_ORDER_STOP_MARKET: i32 = 2;
+pub const WICKRA_ORDER_STOP_LIMIT: i32 = 3;
+
+/// Time-in-force codes (mirror `TimeInForce`).
+pub const WICKRA_TIF_GTC: i32 = 0;
+pub const WICKRA_TIF_IOC: i32 = 1;
+pub const WICKRA_TIF_FOK: i32 = 2;
+
+/// Self-trade-prevention codes (mirror `SelfTradePrevention`).
+pub const WICKRA_STP_NONE: i32 = 0;
+pub const WICKRA_STP_EXPIRE_MAKER: i32 = 1;
+pub const WICKRA_STP_EXPIRE_TAKER: i32 = 2;
+pub const WICKRA_STP_EXPIRE_BOTH: i32 = 3;
+
 /// Stream event kinds.
 pub const WICKRA_EVENT_TRADE: i32 = 0;
 pub const WICKRA_EVENT_TICKER: i32 = 1;
@@ -119,6 +136,48 @@ pub struct WickraOrder {
     pub price: f64,
     /// Average fill price, or `NaN` if none.
     pub average_price: f64,
+}
+
+/// A full order, as the caller wants it placed (C-ABI projection of
+/// `OrderRequest`).
+///
+/// [`wickra_exchange_place_market`] and [`wickra_exchange_place_limit`] take a
+/// market, a side, a quantity and a price, which is all an order was ever able
+/// to be from a binding. Everything else the core supports -- the trigger price
+/// that makes a stop-loss a stop-loss, the time-in-force that says an order must
+/// not rest, post-only, reduce-only, self-trade prevention, and the client order
+/// id that makes a retry idempotent -- had no way across this boundary. This
+/// struct is that way. The two narrow calls remain: they are the shortest
+/// spelling of the common case.
+///
+/// Fill it by value and pass a pointer. `price` and `stop_price` are `NaN` when
+/// unset, matching how [`WickraOrder`] reports an absent price;
+/// `client_order_id` is `NULL` when unset.
+#[repr(C)]
+#[derive(Debug)]
+pub struct WickraOrderRequest {
+    /// Market, `BASE/QUOTE` (e.g. `"BTC/USDT"`). Required.
+    pub market: *const c_char,
+    /// `WICKRA_SIDE_*`.
+    pub side: i32,
+    /// `WICKRA_ORDER_*`.
+    pub order_type: i32,
+    /// Order quantity in base units. Required, strictly positive.
+    pub quantity: f64,
+    /// Limit price, or `NaN` for none. Required by the limit order types.
+    pub price: f64,
+    /// Trigger price, or `NaN` for none. Required by the stop order types.
+    pub stop_price: f64,
+    /// `WICKRA_TIF_*`.
+    pub time_in_force: i32,
+    /// Client order id, or `NULL` for none.
+    pub client_order_id: *const c_char,
+    /// Close-only: the order may not increase a position.
+    pub reduce_only: bool,
+    /// Maker-only: the order is cancelled rather than crossing the spread.
+    pub post_only: bool,
+    /// `WICKRA_STP_*`.
+    pub stp: i32,
 }
 
 /// A single stream event (C-ABI projection of `Event`).
@@ -509,6 +568,63 @@ unsafe fn seed_balances(
     Some(paper)
 }
 
+/// Build an [`OrderRequest`] from its C projection, or `None` when a code is out
+/// of range, a number cannot be represented, or the market is missing.
+///
+/// # Safety
+/// Every string field must be `NULL` or a valid C string.
+unsafe fn request_from_c(raw: &WickraOrderRequest) -> Option<OrderRequest> {
+    let symbol = parse_symbol(unsafe { opt_str(raw.market) }?)?;
+    let side = match raw.side {
+        WICKRA_SIDE_BUY => OrderSide::Buy,
+        WICKRA_SIDE_SELL => OrderSide::Sell,
+        _ => return None,
+    };
+    let order_type = match raw.order_type {
+        WICKRA_ORDER_MARKET => OrderType::Market,
+        WICKRA_ORDER_LIMIT => OrderType::Limit,
+        WICKRA_ORDER_STOP_MARKET => OrderType::StopMarket,
+        WICKRA_ORDER_STOP_LIMIT => OrderType::StopLimit,
+        _ => return None,
+    };
+    let time_in_force = match raw.time_in_force {
+        WICKRA_TIF_GTC => TimeInForce::Gtc,
+        WICKRA_TIF_IOC => TimeInForce::Ioc,
+        WICKRA_TIF_FOK => TimeInForce::Fok,
+        _ => return None,
+    };
+    let stp = match raw.stp {
+        WICKRA_STP_NONE => SelfTradePrevention::None,
+        WICKRA_STP_EXPIRE_MAKER => SelfTradePrevention::ExpireMaker,
+        WICKRA_STP_EXPIRE_TAKER => SelfTradePrevention::ExpireTaker,
+        WICKRA_STP_EXPIRE_BOTH => SelfTradePrevention::ExpireBoth,
+        _ => return None,
+    };
+    Some(OrderRequest {
+        symbol,
+        side,
+        order_type,
+        quantity: Decimal::from_f64(raw.quantity)?,
+        // `NaN` is the "unset" marker; any other value must convert, so a price
+        // the caller passed is never silently dropped for being unrepresentable.
+        price: if raw.price.is_nan() {
+            None
+        } else {
+            Some(Decimal::from_f64(raw.price)?)
+        },
+        stop_price: if raw.stop_price.is_nan() {
+            None
+        } else {
+            Some(Decimal::from_f64(raw.stop_price)?)
+        },
+        time_in_force,
+        client_order_id: unsafe { opt_str(raw.client_order_id) }.map(str::to_string),
+        reduce_only: raw.reduce_only,
+        post_only: raw.post_only,
+        stp,
+    })
+}
+
 fn parse_symbol(market: &str) -> Option<Symbol> {
     match market.split_once('/') {
         Some((base, quote)) if !base.is_empty() && !quote.is_empty() => {
@@ -795,6 +911,50 @@ pub unsafe extern "C" fn wickra_exchange_place_limit(
     out: *mut WickraOrder,
 ) -> i32 {
     place(handle, market, side, quantity, Some(price), out)
+}
+
+/// Place a full order: every field [`OrderRequest`] carries, not just a market,
+/// a side, a quantity and a price.
+///
+/// This is what makes a stop-loss placeable from a binding at all -- the two
+/// narrow calls have no field for the trigger price, so the order they build is
+/// not the order a caller asking for a stop wanted. The same goes for a
+/// time-in-force that says the order must not rest, for post-only, reduce-only,
+/// self-trade prevention, and for the client order id that makes a retry safe.
+///
+/// Returns `WICKRA_ERR_INVALID_ARG` when a code is out of range or a number
+/// cannot be represented, `WICKRA_ERR_UNSUPPORTED` when the venue cannot express
+/// a field that was set (the order is refused rather than weakened), and
+/// `WICKRA_OK` with `out` filled otherwise.
+///
+/// # Safety
+/// `handle` must be valid; `request` must point at an initialised
+/// [`WickraOrderRequest`]; `out` must point at writable [`WickraOrder`] storage.
+#[no_mangle]
+pub unsafe extern "C" fn wickra_exchange_place_order(
+    handle: *mut WickraExchange,
+    request: *const WickraOrderRequest,
+    out: *mut WickraOrder,
+) -> i32 {
+    let Some(exchange) = (unsafe { handle.as_mut() }) else {
+        return WICKRA_ERR_NULL;
+    };
+    let Some(raw) = (unsafe { request.as_ref() }) else {
+        return WICKRA_ERR_NULL;
+    };
+    if out.is_null() {
+        return WICKRA_ERR_NULL;
+    }
+    let Some(request) = (unsafe { request_from_c(raw) }) else {
+        return WICKRA_ERR_INVALID_ARG;
+    };
+    match exchange.inner.as_exchange().place_order(&request) {
+        Ok(order) => {
+            unsafe { fill_order(&mut *out, &order) };
+            WICKRA_OK
+        }
+        Err(e) => error_code(&e),
+    }
 }
 
 fn place(
@@ -1712,6 +1872,65 @@ pub unsafe extern "C" fn wickra_advanced_place_batch(
     }
 }
 
+/// Place a batch of full orders in one request.
+///
+/// The [`WickraOrderRequest`] form of [`wickra_advanced_place_batch`], whose four
+/// parallel arrays can say only market, side, quantity and price. `requests`
+/// points at `n` contiguous request structs.
+///
+/// The return value covers the whole call; `out_codes[i]` carries that order's
+/// own outcome, so a partially-accepted batch still reports its successes.
+///
+/// # Safety
+/// `handle` must be valid; `requests` must point at `n` initialised
+/// [`WickraOrderRequest`] values; `out` and `out_codes` must each be writable for
+/// `cap` elements.
+#[no_mangle]
+pub unsafe extern "C" fn wickra_advanced_place_batch_full(
+    handle: *mut WickraAdvanced,
+    requests: *const WickraOrderRequest,
+    n: usize,
+    out: *mut WickraOrder,
+    out_codes: *mut i32,
+    cap: usize,
+) -> i32 {
+    let Some(handle) = (unsafe { handle.as_mut() }) else {
+        return WICKRA_ERR_NULL;
+    };
+    if (out.is_null() || out_codes.is_null()) && cap != 0 {
+        return WICKRA_ERR_NULL;
+    }
+    if n != 0 && requests.is_null() {
+        return WICKRA_ERR_NULL;
+    }
+    let mut built = Vec::with_capacity(n);
+    for i in 0..n {
+        let raw = unsafe { &*requests.add(i) };
+        let Some(request) = (unsafe { request_from_c(raw) }) else {
+            return WICKRA_ERR_INVALID_ARG;
+        };
+        built.push(request);
+    }
+    match handle.inner.place_batch(&built) {
+        Ok(results) => {
+            let written = results.len().min(cap);
+            for (i, result) in results.iter().take(written).enumerate() {
+                let slot = unsafe { &mut *out.add(i) };
+                let code = unsafe { &mut *out_codes.add(i) };
+                match result {
+                    Ok(order) => {
+                        fill_order(slot, order);
+                        *code = WICKRA_OK;
+                    }
+                    Err(e) => *code = error_code(e),
+                }
+            }
+            i32::try_from(written).unwrap_or(i32::MAX)
+        }
+        Err(e) => error_code(&e),
+    }
+}
+
 // ------------------------------ user data ------------------------------------
 
 /// Connect a private user-data client for `name`. `futures` selects the USDⓈ-M
@@ -1924,6 +2143,42 @@ pub unsafe extern "C" fn wickra_ws_place_order(
     }
 }
 
+/// Place a full order over the venue's WebSocket order API.
+///
+/// The [`WickraOrderRequest`] form of [`wickra_ws_place_order`], for the same
+/// reason: the narrow call cannot carry a trigger price, a time-in-force, or any
+/// of the flags that decide what the order actually is.
+///
+/// # Safety
+/// `handle` must be valid; `request` must point at an initialised
+/// [`WickraOrderRequest`]; `out` must point at writable [`WickraOrder`] storage.
+#[no_mangle]
+pub unsafe extern "C" fn wickra_ws_place_order_full(
+    handle: *mut WickraWsExecution,
+    request: *const WickraOrderRequest,
+    out: *mut WickraOrder,
+) -> i32 {
+    let Some(handle) = (unsafe { handle.as_mut() }) else {
+        return WICKRA_ERR_NULL;
+    };
+    let Some(raw) = (unsafe { request.as_ref() }) else {
+        return WICKRA_ERR_NULL;
+    };
+    if out.is_null() {
+        return WICKRA_ERR_NULL;
+    }
+    let Some(request) = (unsafe { request_from_c(raw) }) else {
+        return WICKRA_ERR_INVALID_ARG;
+    };
+    match handle.inner.place_order_ws(&request) {
+        Ok(order) => {
+            unsafe { fill_order(&mut *out, &order) };
+            WICKRA_OK
+        }
+        Err(e) => error_code(&e),
+    }
+}
+
 /// Cancel an order over the WebSocket order API by venue id.
 ///
 /// # Safety
@@ -1966,6 +2221,210 @@ mod tests {
             .map(|&c| c as u8)
             .collect();
         String::from_utf8(bytes).unwrap()
+    }
+
+    /// A default-shaped request: everything unset, so it behaves exactly like
+    /// the narrow `place_market`/`place_limit` calls.
+    fn plain_request(market: *const c_char, side: i32, order_type: i32) -> WickraOrderRequest {
+        WickraOrderRequest {
+            market,
+            side,
+            order_type,
+            quantity: 1.0,
+            price: f64::NAN,
+            stop_price: f64::NAN,
+            time_in_force: WICKRA_TIF_GTC,
+            client_order_id: core::ptr::null(),
+            reduce_only: false,
+            post_only: false,
+            stp: WICKRA_STP_NONE,
+        }
+    }
+
+    /// The full-request call places the same order the narrow one does when no
+    /// extra field is set, and carries the fields the narrow one has nowhere to
+    /// put when they are.
+    /// The layout of [`WickraOrderRequest`], pinned.
+    ///
+    /// The Java binding addresses this struct by hand-written byte offsets and
+    /// the C# one by field order, so a field inserted in the middle would move
+    /// what those bindings read without any of them failing to compile. This is
+    /// the test that fails instead.
+    #[test]
+    fn the_request_layout_is_what_the_bindings_assume() {
+        use core::mem::{align_of, offset_of, size_of};
+
+        assert_eq!(size_of::<WickraOrderRequest>(), 64);
+        assert_eq!(align_of::<WickraOrderRequest>(), 8);
+        assert_eq!(offset_of!(WickraOrderRequest, market), 0);
+        assert_eq!(offset_of!(WickraOrderRequest, side), 8);
+        assert_eq!(offset_of!(WickraOrderRequest, order_type), 12);
+        assert_eq!(offset_of!(WickraOrderRequest, quantity), 16);
+        assert_eq!(offset_of!(WickraOrderRequest, price), 24);
+        assert_eq!(offset_of!(WickraOrderRequest, stop_price), 32);
+        assert_eq!(offset_of!(WickraOrderRequest, time_in_force), 40);
+        assert_eq!(offset_of!(WickraOrderRequest, client_order_id), 48);
+        assert_eq!(offset_of!(WickraOrderRequest, reduce_only), 56);
+        assert_eq!(offset_of!(WickraOrderRequest, post_only), 57);
+        assert_eq!(offset_of!(WickraOrderRequest, stp), 60);
+    }
+
+    #[test]
+    fn place_order_carries_every_field_across_the_abi() {
+        let market = cstr("BTC/USDT");
+        let usdt = cstr("USDT");
+        let client_id = cstr("my-order-1");
+        let assets = [usdt.as_ptr()];
+        let amounts = [100_000.0_f64];
+
+        unsafe {
+            let ex = wickra_paper_new(assets.as_ptr(), amounts.as_ptr(), 1, 1.0, 5.0, 10.0);
+            assert!(!ex.is_null());
+            assert_eq!(
+                wickra_exchange_set_price(ex, market.as_ptr(), 20_000.0),
+                WICKRA_OK
+            );
+
+            let request = plain_request(market.as_ptr(), WICKRA_SIDE_BUY, WICKRA_ORDER_MARKET);
+            let mut order = empty_order();
+            let rc = wickra_exchange_place_order(ex, &raw const request, &raw mut order);
+            assert_eq!(rc, WICKRA_OK);
+            assert_eq!(order.status, WICKRA_STATUS_FILLED);
+
+            // The client order id has no parameter on the narrow calls at all,
+            // so an idempotent placement was not expressible from any binding.
+            let mut identified =
+                plain_request(market.as_ptr(), WICKRA_SIDE_BUY, WICKRA_ORDER_LIMIT);
+            identified.price = 19_000.0;
+            identified.client_order_id = client_id.as_ptr();
+            identified.post_only = true;
+            identified.time_in_force = WICKRA_TIF_GTC;
+            let mut resting = empty_order();
+            let rc = wickra_exchange_place_order(ex, &raw const identified, &raw mut resting);
+            assert_eq!(rc, WICKRA_OK);
+            assert_eq!(resting.status, WICKRA_STATUS_NEW);
+
+            wickra_exchange_free(ex);
+        }
+    }
+
+    /// A stop order carries its trigger price across the ABI. This is the whole
+    /// point of the struct: `place_market` and `place_limit` have no parameter
+    /// for `stop_price`, so no binding could place a stop-loss at all -- the
+    /// core has carried the field since #190 and nothing could reach it.
+    #[test]
+    fn a_stop_order_reaches_the_abi_with_its_trigger() {
+        let market = cstr("BTC/USDT");
+        let usdt = cstr("USDT");
+        let assets = [usdt.as_ptr()];
+        let amounts = [100_000.0_f64];
+
+        unsafe {
+            let ex = wickra_paper_new(assets.as_ptr(), amounts.as_ptr(), 1, 1.0, 5.0, 10.0);
+            assert_eq!(
+                wickra_exchange_set_price(ex, market.as_ptr(), 20_000.0),
+                WICKRA_OK
+            );
+
+            let mut stop =
+                plain_request(market.as_ptr(), WICKRA_SIDE_SELL, WICKRA_ORDER_STOP_MARKET);
+            stop.stop_price = 19_000.0;
+            let mut order = empty_order();
+            let rc = wickra_exchange_place_order(ex, &raw const stop, &raw mut order);
+            // The paper backend refuses triggers, and that refusal is the proof
+            // the trigger arrived: a request with the field dropped would have
+            // been placed as a plain market sell instead.
+            assert_eq!(rc, WICKRA_ERR_INVALID_ARG);
+
+            // Without the trigger price the request is invalid on its own terms,
+            // which is a different failure and reported as one.
+            let mut no_trigger =
+                plain_request(market.as_ptr(), WICKRA_SIDE_SELL, WICKRA_ORDER_STOP_MARKET);
+            no_trigger.stop_price = f64::NAN;
+            let mut order = empty_order();
+            let rc = wickra_exchange_place_order(ex, &raw const no_trigger, &raw mut order);
+            assert_eq!(rc, WICKRA_ERR_INVALID_ARG);
+
+            wickra_exchange_free(ex);
+        }
+    }
+
+    /// Null pointers and out-of-range codes are rejected rather than dereferenced
+    /// or silently coerced to a default.
+    #[test]
+    fn place_order_rejects_null_and_out_of_range_codes() {
+        let market = cstr("BTC/USDT");
+        let usdt = cstr("USDT");
+        let assets = [usdt.as_ptr()];
+        let amounts = [100_000.0_f64];
+
+        unsafe {
+            let request = plain_request(market.as_ptr(), WICKRA_SIDE_BUY, WICKRA_ORDER_MARKET);
+            let mut order = empty_order();
+            let rc = wickra_exchange_place_order(
+                core::ptr::null_mut(),
+                &raw const request,
+                &raw mut order,
+            );
+            assert_eq!(rc, WICKRA_ERR_NULL);
+
+            let ex = wickra_paper_new(assets.as_ptr(), amounts.as_ptr(), 1, 1.0, 5.0, 10.0);
+            let rc = wickra_exchange_place_order(ex, core::ptr::null(), &raw mut order);
+            assert_eq!(rc, WICKRA_ERR_NULL);
+
+            let request = plain_request(market.as_ptr(), WICKRA_SIDE_BUY, WICKRA_ORDER_MARKET);
+            let rc = wickra_exchange_place_order(ex, &raw const request, core::ptr::null_mut());
+            assert_eq!(rc, WICKRA_ERR_NULL);
+
+            // Each enum-shaped field in turn.
+            let mut bad = plain_request(market.as_ptr(), 99, WICKRA_ORDER_MARKET);
+            let rc = wickra_exchange_place_order(ex, &raw const bad, &raw mut order);
+            assert_eq!(rc, WICKRA_ERR_INVALID_ARG);
+
+            bad = plain_request(market.as_ptr(), WICKRA_SIDE_BUY, 99);
+            let rc = wickra_exchange_place_order(ex, &raw const bad, &raw mut order);
+            assert_eq!(rc, WICKRA_ERR_INVALID_ARG);
+
+            bad = plain_request(market.as_ptr(), WICKRA_SIDE_BUY, WICKRA_ORDER_MARKET);
+            bad.time_in_force = 99;
+            let rc = wickra_exchange_place_order(ex, &raw const bad, &raw mut order);
+            assert_eq!(rc, WICKRA_ERR_INVALID_ARG);
+
+            bad = plain_request(market.as_ptr(), WICKRA_SIDE_BUY, WICKRA_ORDER_MARKET);
+            bad.stp = 99;
+            let rc = wickra_exchange_place_order(ex, &raw const bad, &raw mut order);
+            assert_eq!(rc, WICKRA_ERR_INVALID_ARG);
+
+            bad = plain_request(core::ptr::null(), WICKRA_SIDE_BUY, WICKRA_ORDER_MARKET);
+            let rc = wickra_exchange_place_order(ex, &raw const bad, &raw mut order);
+            assert_eq!(rc, WICKRA_ERR_INVALID_ARG);
+
+            wickra_exchange_free(ex);
+        }
+    }
+
+    /// `NaN` is the "unset" marker for a price, so it must not be mistaken for a
+    /// value; any other double must convert or the whole request is rejected.
+    #[test]
+    fn nan_prices_mean_unset_not_zero() {
+        let market = cstr("BTC/USDT");
+        unsafe {
+            let unset = plain_request(market.as_ptr(), WICKRA_SIDE_BUY, WICKRA_ORDER_MARKET);
+            let built = request_from_c(&unset).unwrap();
+            assert_eq!(built.price, None);
+            assert_eq!(built.stop_price, None);
+
+            let mut priced = plain_request(market.as_ptr(), WICKRA_SIDE_BUY, WICKRA_ORDER_LIMIT);
+            priced.price = 19_000.0;
+            let built = request_from_c(&priced).unwrap();
+            assert_eq!(built.price, Decimal::from_f64(19_000.0));
+
+            // An infinity is not "unset" -- it is a value that cannot be
+            // represented, and saying so beats placing an order without a price.
+            let mut infinite = plain_request(market.as_ptr(), WICKRA_SIDE_BUY, WICKRA_ORDER_LIMIT);
+            infinite.price = f64::INFINITY;
+            assert!(request_from_c(&infinite).is_none());
+        }
     }
 
     #[test]

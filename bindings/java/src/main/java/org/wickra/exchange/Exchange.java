@@ -183,6 +183,48 @@ public final class Exchange implements AutoCloseable {
         }
     }
 
+    /**
+     * Place a full order: every field the library supports, not just a market, a
+     * side, a quantity and a price.
+     *
+     * <p>{@link #placeMarket} and {@link #placeLimit} remain as the shortest
+     * spelling of the common case. This is the one that can place a stop-loss,
+     * an immediate-or-cancel, a post-only or an idempotent retry.
+     *
+     * <p>A field the venue cannot express refuses the order rather than
+     * weakening it, which arrives here as an exception rather than as a
+     * differently-shaped order reaching the exchange.
+     */
+    public OrderInfo placeOrder(OrderRequest request) {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment req = arena.allocate(Native.REQUEST_SIZE, 8);
+            req.set(Native.C_PTR, Native.R_MARKET, arena.allocateFrom(request.market()));
+            req.set(Native.C_INT, Native.R_SIDE, sideCode(request.side()));
+            req.set(Native.C_INT, Native.R_ORDER_TYPE, request.type().code());
+            req.set(Native.C_DOUBLE, Native.R_QUANTITY, request.quantity());
+            // NaN is how the ABI is told a price carries no value.
+            req.set(Native.C_DOUBLE, Native.R_PRICE,
+                    request.price() == null ? Double.NaN : request.price());
+            req.set(Native.C_DOUBLE, Native.R_STOP_PRICE,
+                    request.stopPrice() == null ? Double.NaN : request.stopPrice());
+            req.set(Native.C_INT, Native.R_TIME_IN_FORCE, request.timeInForce().code());
+            req.set(Native.C_PTR, Native.R_CLIENT_ORDER_ID,
+                    request.clientOrderId() == null
+                            ? MemorySegment.NULL
+                            : arena.allocateFrom(request.clientOrderId()));
+            req.set(Native.C_BOOL, Native.R_REDUCE_ONLY, (byte) (request.reduceOnly() ? 1 : 0));
+            req.set(Native.C_BOOL, Native.R_POST_ONLY, (byte) (request.postOnly() ? 1 : 0));
+            req.set(Native.C_INT, Native.R_STP, request.stp().code());
+
+            MemorySegment out = arena.allocate(Native.ORDER_SIZE, 8);
+            int rc = (int) Native.PLACE_ORDER.invokeExact(handle, req, out);
+            check(rc);
+            return readOrder(out);
+        } catch (Throwable t) {
+            throw new RuntimeException(t);
+        }
+    }
+
     /** Cancel an open order by venue id. */
     public void cancel(String market, String orderId) {
         try (Arena arena = Arena.ofConfined()) {

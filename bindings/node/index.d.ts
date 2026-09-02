@@ -106,6 +106,36 @@ export declare class OrderRequest {
   static marketSell(market: string, quantity: number): OrderRequest
   static limitBuy(market: string, quantity: number, price: number): OrderRequest
   static limitSell(market: string, quantity: number, price: number): OrderRequest
+  /**
+   * Rest until the market reaches `stopPrice`, then fire.
+   *
+   * This is what turns a market order into a stop-loss and a limit order into
+   * a stop-limit. Without it the four factories above were the whole surface,
+   * so a stop order could not be expressed from Node at all.
+   */
+  withStopPrice(stopPrice: number): OrderRequest
+  /**
+   * `"GTC"` (rest until cancelled), `"IOC"` (fill what is possible now,
+   * cancel the rest) or `"FOK"` (fill entirely now or not at all).
+   *
+   * Case-insensitive. Throws on anything else rather than falling back to
+   * GTC: a silent fallback is exactly the defect #195 fixed in the core.
+   */
+  withTimeInForce(tif: string): OrderRequest
+  /**
+   * Attach a client order id, so a retried placement is recognised by the
+   * venue as the same order rather than placed twice.
+   */
+  withClientOrderId(id: string): OrderRequest
+  /** Close-only: the order may not increase a position. */
+  reduceOnly(): OrderRequest
+  /** Maker-only: the order is cancelled rather than crossing the spread. */
+  postOnly(): OrderRequest
+  /**
+   * Self-trade prevention: `"none"`, `"expire_maker"`, `"expire_taker"` or
+   * `"expire_both"`. Case-insensitive; throws on anything else.
+   */
+  withStp(stp: string): OrderRequest
 }
 
 /**

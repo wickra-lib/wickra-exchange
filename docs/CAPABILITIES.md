@@ -92,6 +92,36 @@ is either sent with its trigger price or refused, never flattened into an
 immediate one. A venue that gains native trigger orders later moves from one
 branch to the other without the test changing.
 
+### The order a binding can build
+
+Every language can express every field of an `OrderRequest`. This was not true
+until recently, and the gap is worth naming because no check caught it: the
+`place_order` **verb** was present in all seven bindings the whole time, while
+the **order** it could build was a market or limit with a quantity and a price
+and nothing else. A stop-loss could not be placed from any language but Rust,
+however carefully the venue clients carried the trigger.
+
+| | Rust | Python | Node | WASM | C / C++ | C# | Go | Java | R |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| market / limit | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `stop_price` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `time_in_force` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `post_only` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `reduce_only` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `stp` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `client_order_id` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+
+The three native bindings (Python, Node, WASM) hold `OrderRequest` directly and
+carry the core's builders. The C-ABI languages pass a `WickraOrderRequest`
+struct, in whatever shape suits them: a widened struct in Go, a record with
+`init` properties in C#, a record with `with*` builders in Java, named arguments
+in R. `place_market` / `place_limit` remain everywhere as the shortest spelling
+of the common case.
+
+`scripts/check_binding_surface.py` reads the field list out of `OrderRequest`
+itself and holds every binding to it, as a third axis beside verbs and
+configuration. A field added to the core is a field the check demands.
+
 > **Full read/execution surface in every binding.** The complete `MarketData`
 > surface (`ticker`, `klines`, `order_book`, `subscribe_trades` /
 > `subscribe_book` / `subscribe_ticker`, `poll_events`) and `Execution` surface
