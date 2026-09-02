@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Assert that every binding exposes the same API surface.
+"""Assert that every binding exposes the same API surface, and can configure it.
 
 Each binding is written separately and each has its own test suite, so a method
 that goes missing in one of them fails nowhere: nothing compares the bindings
@@ -220,6 +220,86 @@ CONSTRUCTOR_ALIASES = {
     "node": {"paper_new": ("paper",), "replay_new": ("replayTrades", "replay_trades")},
 }
 
+# The configuration axes the *exchange constructor* must expose, not just the
+# verbs a binding must have.
+#
+# This exists because the verb check above passed for months while half the
+# `Execution` surface was unreachable in every binding: each built its exchange
+# client with `MarketType::Spot` hardcoded, so `place_order` was present
+# everywhere and could not place a futures order anywhere. Counting verbs cannot
+# see that -- the method is there, and it is pointed at the wrong API.
+#
+# An axis is listed when choosing it wrongly sends the request somewhere else,
+# or sends a different order than the caller asked for:
+#
+#   * `market` decides which of a venue's APIs every later call is routed to.
+#   * `margin_mode` travels on the order itself on OKX and Bitget, so a client
+#     that cannot be told it trades cross whatever the account is set to.
+#   * `position_mode` names the side of a hedged account an order acts on, and
+#     four venues reject or misapply an order that omits it.
+#
+# The last two cannot be set after construction: the first order already carries
+# them. That is what makes them constructor arguments rather than later calls,
+# and what makes their absence a defect rather than a missing convenience.
+#
+# The search is deliberately confined to the constructor's own parameter list.
+# A whole-file search does not work and is worse than nothing: `MarketType::Spot`
+# appears in every binding's source *because* of the bug, so a file-wide check
+# for a market spelling would have passed on the broken code. A check that
+# passes today and would not have caught yesterday's defect manufactures
+# assurance, which is the failure this whole file exists to prevent.
+CONFIGURATION = ("market", "margin_mode", "position_mode")
+
+# Where each binding declares the axes, and the spellings they may take there.
+# A binding whose declaration cannot be located fails loudly rather than passing
+# quietly.
+#
+# Not every language puts them in a parameter list, and that is idiom rather
+# than drift: Go carries them in an `Options` struct, which is how a Go API with
+# more than a couple of knobs is written. So the pattern names the place, per
+# language, instead of assuming one shape. Where a language offers overloads --
+# Java keeps the old six-argument `connect` delegating to the new one -- every
+# match is considered and the widest wins, since the narrow one is the
+# convenience wrapper.
+#
+# The captures exclude their own delimiters -- `[^()]*`, `[^{}]*` -- rather than
+# using a lazy `.*?`. A lazy capture is not bounded by the construct it starts
+# in: given a `connect(` whose return type does not match, it runs on to the
+# next one and swallows whatever lies between, which is how a removed parameter
+# still appeared to be present.
+CONSTRUCTOR_SIGNATURE = {
+    "python": r"fn connect\(([^()]*)\)\s*->\s*PyResult<Self>",
+    "node": r"pub fn connect\(([^()]*)\)\s*->\s*napi::Result<Self>",
+    "c": r"WickraExchange \*wickra_connect\(([^()]*)\);",
+    "csharp": r"static Exchange Connect\(([^()]*)\)",
+    "go": r"type Options struct \{([^{}]*)\}",
+    "java": r"static Exchange connect\(([^()]*)\)\s*\{",
+    "r": r"wkex_connect <- function\(([^()]*)\)\s*\{",
+}
+
+AXIS_SPELLINGS = {
+    "market": ("market_type", "markettype", "market"),
+    "margin_mode": ("margin_mode", "marginmode"),
+    "position_mode": ("position_mode", "positionmode"),
+}
+
+
+def constructor_params(label: str, source: str) -> str | None:
+    """The exchange constructor's parameter list, or None if it cannot be found.
+
+    Read from the raw source rather than the prose-stripped haystack: a
+    parameter list carries no prose, and stripping `#` lines would take the C
+    header's own declaration apart.
+    """
+    pattern = CONSTRUCTOR_SIGNATURE.get(label)
+    if pattern is None:
+        return None
+    matches = [m.group(1) for m in re.finditer(pattern, source, re.S)]
+    if not matches:
+        return None
+    return max(matches, key=len).lower()
+
+
 
 def main() -> int:
     traits = trait_verbs()
@@ -258,19 +338,33 @@ def main() -> int:
             if not present(haystack, spellings):
                 ctor_absent.append(f"{ctor} (as {'/'.join(spellings)})")
 
-        if absent or ctor_absent:
+        params = constructor_params(label, source)
+        if params is None:
+            config_absent = ["the exchange constructor could not be located"]
+        else:
+            config_absent = [
+                f"{axis} (as {'/'.join(AXIS_SPELLINGS[axis])})"
+                for axis in CONFIGURATION
+                if not any(s in params for s in AXIS_SPELLINGS[axis])
+            ]
+
+        if absent or ctor_absent or config_absent:
             detail = []
             if absent:
                 detail.append("verbs: " + ", ".join(absent))
             if ctor_absent:
                 detail.append("constructors: " + ", ".join(ctor_absent))
+            if config_absent:
+                detail.append("configuration: " + ", ".join(config_absent))
             failures.append(f"{label}: missing {'; '.join(detail)}")
             print(f"  {label:<8} {len(contract) - len(absent)}/{len(contract)} verbs, "
-                  f"{len(CONSTRUCTORS) - len(ctor_absent)}/{len(CONSTRUCTORS)} constructors"
+                  f"{len(CONSTRUCTORS) - len(ctor_absent)}/{len(CONSTRUCTORS)} constructors, "
+                  f"{len(CONFIGURATION) - len(config_absent)}/{len(CONFIGURATION)} config"
                   f"  MISSING: {'; '.join(detail)}")
         else:
             print(f"  {label:<8} {len(contract)}/{len(contract)} verbs, "
-                  f"{len(CONSTRUCTORS)}/{len(CONSTRUCTORS)} constructors")
+                  f"{len(CONSTRUCTORS)}/{len(CONSTRUCTORS)} constructors, "
+                  f"{len(CONFIGURATION)}/{len(CONFIGURATION)} config")
 
     if failures:
         print("\nbindings have drifted from the trait contract:", file=sys.stderr)

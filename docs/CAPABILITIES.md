@@ -61,8 +61,8 @@ branch to the other without the test changing.
 > run time. (The C-ABI `order_book` projects the bid/ask levels; the venue
 > sequence id stays on the native Rust/Python/Node path.)
 >
-> **What that check does not cover, and what it cost.** It reads the canonical
-> verb set and holds every binding to it — so it counts *verbs*, not reachable
+> **What that check did not cover, and what it cost.** It read the canonical
+> verb set and held every binding to it — so it counted *verbs*, not reachable
 > *configurations*. Every binding carried `place_order`, and every binding built
 > its exchange client with `MarketType::Spot` hardcoded. The full surface was
 > present and half the markets were unreachable: no caller in Python, Node, C,
@@ -83,6 +83,15 @@ branch to the other without the test changing.
 > does not describe where the order goes, which is the defect the parameter
 > exists to end — so they are refused, loudly, rather than silently downgraded
 > to spot.
+>
+> The check now covers the axes as well as the verbs: it reads each binding's
+> exchange constructor — wherever that language declares it, including Go's
+> `Options` struct — and fails if `market`, `margin_mode` or `position_mode` is
+> absent from it. The search is confined to the constructor on purpose. A
+> whole-file search would have passed on the broken code, because
+> `MarketType::Spot` appeared in every binding *because of* the bug; a check
+> that passes today and would not have caught yesterday's defect manufactures
+> assurance rather than providing it.
 >
 > The **WASM** binding is deliberately outside this claim. It targets
 > `wasm32-unknown-unknown`, which has no sockets, so it carries the offline

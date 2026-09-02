@@ -87,6 +87,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The binding surface check now covers configuration, not only verbs.** The
+  defect above hid behind it for the life of the project: `place_order` was
+  present in all seven bindings and could not place a futures order in any of
+  them, because counting verbs cannot see which API a verb points at.
+  `scripts/check_binding_surface.py` now also reads each binding's exchange
+  constructor and fails if `market`, `margin_mode` or `position_mode` is missing
+  from it — wherever that language declares it, including Go's `Options` struct
+  and Java's widest overload.
+  The search is confined to the constructor deliberately. The first draft
+  searched the whole binding source and was **false assurance**: `MarketType::Spot`
+  appears in every binding *because of* the bug, so a file-wide check for a
+  market spelling would have passed on the broken code. It was verified the
+  other way round instead — removing the parameter from each binding in turn and
+  confirming the check fails by name for that binding.
+  Worth recording for whoever edits it next: `strip_prose` drops every
+  `#`-prefixed line, because R's roxygen comments start with `#'`. That takes
+  every C `#define` with it, so the header's `WICKRA_MARKET_*` constants are
+  invisible to this script and the axis has to be recognised from the parameter
+  in the signature.
+
 - **A runnable example and a documented flow for reconciling after a
   reconnect.** `reconcile_orders` was reachable only by reading the source: the
   word "reconcile" appeared in the repository's documentation exactly once, in a
