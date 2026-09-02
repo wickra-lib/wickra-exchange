@@ -59,6 +59,26 @@ Kraken Futures (flex account) do not switch margin mode per symbol, so
 `set_margin_mode(Isolated)` returns `Error::Exchange`. Kraken `openpositions`
 omits mark price and unrealized PnL.
 
+### Margin mode is carried on the order, on two venues
+
+For most venues margin mode is purely an account setting, and `set_margin_mode`
+is the whole of it. **OKX and Bitget are not**: every order carries the mode as
+a field — OKX as `tdMode`, Bitget as `marginMode` — and the value on the order
+is what applies. So both halves have to agree, and the client keeps them in
+step from either direction:
+
+```rust
+let mut opts = ExchangeOptions::mainnet(MarketType::UsdMFutures);
+opts.margin_mode = MarginMode::Isolated;   // every order goes out isolated
+let mut okx = Okx::with_credentials(transport, &opts, creds);
+
+okx.set_margin_mode(&sym, MarginMode::Cross)?;  // and later orders follow
+```
+
+`ExchangeOptions.margin_mode` seeds it, and `set_margin_mode` updates it, so a
+client never sends an order whose margin mode contradicts what was configured
+or last set. OKX spot is unaffected — there `tdMode` is always `cash`.
+
 ## `AdvancedOrders` — amend, batch, OCO, and STP
 
 ```rust

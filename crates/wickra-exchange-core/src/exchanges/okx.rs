@@ -79,6 +79,9 @@ pub struct Okx {
     ws: Option<Box<dyn WsTransport>>,
     rest_base: String,
     inst_type: &'static str,
+    market_type: MarketType,
+    /// `tdMode` for every order, derived from the market and the configured
+    /// margin mode and kept in step by [`set_margin_mode`](Self::set_margin_mode).
     td_mode: &'static str,
     testnet: bool,
     credentials: Option<Credentials>,
@@ -137,7 +140,8 @@ impl Okx {
             ws: None,
             rest_base: "https://www.okx.com".to_string(),
             inst_type: inst_type(options.market_type),
-            td_mode: td_mode(options.market_type),
+            market_type: options.market_type,
+            td_mode: td_mode(options.market_type, options.margin_mode),
             testnet: options.testnet,
             credentials,
             now_ms: Box::new(system_now_ms),
@@ -775,10 +779,15 @@ fn inst_type(market_type: MarketType) -> &'static str {
     }
 }
 
-fn td_mode(market_type: MarketType) -> &'static str {
-    match market_type {
-        MarketType::Spot => "cash",
-        _ => "cross",
+/// OKX's `tdMode`, which every order carries. Spot is always `cash`; on every
+/// other market it *is* the margin mode, so a client configured for isolated
+/// margin has to say so on the order itself -- the account-level setting does
+/// not stand in for it.
+fn td_mode(market_type: MarketType, margin_mode: MarginMode) -> &'static str {
+    match (market_type, margin_mode) {
+        (MarketType::Spot, _) => "cash",
+        (_, MarginMode::Cross) => "cross",
+        (_, MarginMode::Isolated) => "isolated",
     }
 }
 
@@ -1287,12 +1296,16 @@ impl Okx {
     ///
     /// # Errors
     /// Returns an [`Error`] if the change is rejected or the request fails.
-    pub fn set_margin_mode(&self, symbol: &Symbol, mode: MarginMode) -> Result<()> {
+    pub fn set_margin_mode(&mut self, symbol: &Symbol, mode: MarginMode) -> Result<()> {
         let leverage = self
             .positions(Some(symbol))?
             .first()
             .map_or_else(|| "3".to_string(), |p| p.leverage.normalize().to_string());
-        self.apply_leverage(symbol, &leverage, mode)
+        self.apply_leverage(symbol, &leverage, mode)?;
+        // Every order carries `tdMode`, so the account-level change above is
+        // only half of it: without this the next order still says `cross`.
+        self.td_mode = td_mode(self.market_type, mode);
+        Ok(())
     }
 
     fn current_margin_mode(&self, symbol: &Symbol) -> Result<MarginMode> {
@@ -1800,6 +1813,123 @@ mod tests {
         assert!(mock.recorded_requests()[0].url.contains("instType=SWAP"));
     }
 
+    fn isolated_futures_client(now_ms: i64) -> (Okx, Arc<MockHttpTransport>) {
+        let mock = Arc::new(MockHttpTransport::new());
+        let mut opts = ExchangeOptions::mainnet(MarketType::UsdMFutures);
+        opts.margin_mode = MarginMode::Isolated;
+        let okx = Okx::with_credentials(
+            Box::new(ArcTransport(Arc::clone(&mock))),
+            &opts,
+            Credentials::new("APIKEY", "SECRET").with_passphrase("PASS"),
+        )
+        .with_clock(Box::new(move || now_ms));
+        (okx, mock)
+    }
+
+    const OKX_ORDER_OK: &str = r#"{"code":"0","data":[{"ordId":"1","sCode":"0"}]}"#;
+
+    #[test]
+    fn configured_margin_mode_reaches_every_order() {
+        // `tdMode` used to be derived from the market alone, so a client
+        // configured for isolated margin placed every order as `cross` --
+        // silently, with the whole account balance behind the position.
+        let (isolated, mock) = isolated_futures_client(1000);
+        mock.push_json(200, OKX_ORDER_OK);
+        isolated
+            .place_order(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)))
+            .unwrap();
+        let reqs = mock.recorded_requests();
+        assert!(reqs[0]
+            .body
+            .as_deref()
+            .unwrap()
+            .contains(r#""tdMode":"isolated""#));
+
+        // The default stays cross, and spot stays cash regardless.
+        let (cross, cross_mock) = signed_futures_client(1000);
+        cross_mock.push_json(200, OKX_ORDER_OK);
+        cross
+            .place_order(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)))
+            .unwrap();
+        let cross_reqs = cross_mock.recorded_requests();
+        assert!(cross_reqs[0]
+            .body
+            .as_deref()
+            .unwrap()
+            .contains(r#""tdMode":"cross""#));
+
+        let (spot, spot_mock) = signed_client(1000);
+        spot_mock.push_json(200, OKX_ORDER_OK);
+        spot.place_order(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)))
+            .unwrap();
+        let spot_reqs = spot_mock.recorded_requests();
+        assert!(spot_reqs[0]
+            .body
+            .as_deref()
+            .unwrap()
+            .contains(r#""tdMode":"cash""#));
+    }
+
+    #[test]
+    fn set_margin_mode_changes_what_later_orders_carry() {
+        // The account-level call is only half of it: the order carries the mode
+        // too, and a stale `tdMode` overrides what was just set.
+        let (mut okx, mock) = signed_futures_client(1000);
+        mock.push_json(200, OKX_POSITIONS); // leverage lookup
+        mock.push_json(
+            200,
+            r#"{"code":"0","msg":"","data":[{"lever":"10","mgnMode":"isolated","instId":"BTC-USDT-SWAP"}]}"#,
+        );
+        mock.push_json(200, OKX_ORDER_OK);
+
+        Derivatives::set_margin_mode(&mut okx, &symbol(), MarginMode::Isolated).unwrap();
+        okx.place_order(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)))
+            .unwrap();
+
+        let reqs = mock.recorded_requests();
+        assert!(reqs[2]
+            .body
+            .as_deref()
+            .unwrap()
+            .contains(r#""tdMode":"isolated""#));
+    }
+
+    #[test]
+    fn batch_and_oco_carry_the_configured_margin_mode() {
+        // Four sites read `tdMode`; two of them are not the single-order path.
+        let (isolated, mock) = isolated_futures_client(1000);
+        mock.push_json(200, r#"{"code":"0","data":[{"ordId":"1","sCode":"0"}]}"#);
+        isolated
+            .place_batch(&[OrderRequest::limit_buy(symbol(), dec!(1), dec!(100))])
+            .unwrap();
+
+        mock.push_json(
+            200,
+            r#"{"code":"0","data":[{"algoId":"algo1","sCode":"0","sMsg":""}]}"#,
+        );
+        isolated
+            .place_oco(&OcoRequest::new(
+                symbol(),
+                OrderSide::Sell,
+                dec!(1),
+                dec!(110),
+                dec!(95),
+            ))
+            .unwrap();
+
+        let reqs = mock.recorded_requests();
+        assert!(reqs[0]
+            .body
+            .as_deref()
+            .unwrap()
+            .contains(r#""tdMode":"isolated""#));
+        assert!(reqs[1]
+            .body
+            .as_deref()
+            .unwrap()
+            .contains(r#""tdMode":"isolated""#));
+    }
+
     #[test]
     fn derivatives_set_leverage_preserves_margin_mode() {
         let (mut okx, mock) = signed_futures_client(1000);
@@ -2125,6 +2255,36 @@ mod tests {
             ws.connected_urls()[1],
             "wss://ws.okx.com:8443/ws/v5/private"
         );
+    }
+
+    #[test]
+    fn ws_order_carries_the_configured_margin_mode() {
+        // The fourth `tdMode` site is the WebSocket order path, which builds its
+        // own frame rather than going through the REST body.
+        let http = Arc::new(MockHttpTransport::new());
+        let ws = Arc::new(MockWsTransport::new());
+        let mut opts = ExchangeOptions::mainnet(MarketType::UsdMFutures);
+        opts.margin_mode = MarginMode::Isolated;
+        let mut okx = Okx::with_credentials(
+            Box::new(ArcTransport(http)),
+            &opts,
+            Credentials::new("APIKEY", "SECRET").with_passphrase("PASS"),
+        )
+        .with_ws(Box::new(ArcWs(Arc::clone(&ws))))
+        .with_clock(Box::new(|| 1_700_000_000_000));
+        ws.push_connection(vec![
+            Ok(Some(r#"{"event":"login","code":"0"}"#.to_string())),
+            Ok(Some(
+                r#"{"id":"1700000000","op":"order","code":"0","msg":"","data":[{"ordId":"55",
+                "clOrdId":"my","sCode":"0","sMsg":""}]}"#
+                    .to_string(),
+            )),
+        ]);
+
+        okx.place_order_ws(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)))
+            .unwrap();
+
+        assert!(ws.sent()[1].contains(r#""tdMode":"isolated""#));
     }
 
     #[test]
