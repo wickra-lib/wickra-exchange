@@ -74,8 +74,28 @@ impl HttpTransport for ReqwestHttpTransport {
             }
         })?;
         let status = response.status().as_u16();
+        // Carried through because the body is not the whole answer: a venue
+        // that rate-limits says how long to wait in `Retry-After`, and
+        // dropping the headers here is what left `Error::RateLimited` with
+        // `retry_after: None` at every site that raises it. Values that are
+        // not valid UTF-8 are skipped rather than failing the response --
+        // a malformed header is not a reason to lose a body that parsed.
+        let headers: Vec<(String, String)> = response
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|value| (name.as_str().to_string(), value.to_string()))
+            })
+            .collect();
         let body = response.text().map_err(|e| Error::Network(e.to_string()))?;
-        Ok(HttpResponse { status, body })
+        Ok(HttpResponse {
+            status,
+            headers,
+            body,
+        })
     }
 }
 

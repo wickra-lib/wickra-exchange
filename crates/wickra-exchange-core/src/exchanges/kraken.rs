@@ -918,7 +918,7 @@ impl Kraken {
     fn get(&self, path: &str, query: &str) -> Result<serde_json::Value> {
         let url = format!("{}{path}?{query}", self.rest_base);
         let response = self.http.execute(&HttpRequest::get(url))?;
-        unwrap_result(&response.body)
+        unwrap_result(&response.body).map_err(|e| e.with_retry_after(response.retry_after()))
     }
 
     /// Sign a private POST: `API-Sign = base64(HMAC-SHA512(base64decode(secret),
@@ -957,7 +957,7 @@ impl Kraken {
             .with_header("Content-Type", "application/x-www-form-urlencoded")
             .with_body(postdata);
         let response = self.http.execute(&request)?;
-        unwrap_result(&response.body)
+        unwrap_result(&response.body).map_err(|e| e.with_retry_after(response.retry_after()))
     }
 
     /// Public Kraken Futures GET (no signing).
@@ -968,7 +968,7 @@ impl Kraken {
             format!("{}{path}?{query}", self.rest_base)
         };
         let response = self.http.execute(&HttpRequest::get(url))?;
-        unwrap_futures(&response.body)
+        unwrap_futures(&response.body).map_err(|e| e.with_retry_after(response.retry_after()))
     }
 
     /// Signed Kraken Futures request. The signature is
@@ -1011,7 +1011,7 @@ impl Kraken {
                 .with_body(post_data);
         }
         let response = self.http.execute(&request)?;
-        unwrap_futures(&response.body)
+        unwrap_futures(&response.body).map_err(|e| e.with_retry_after(response.retry_after()))
     }
 
     fn futures_klines(&self, symbol: &Symbol, interval: &str) -> Result<Vec<Candle>> {
@@ -3246,5 +3246,24 @@ mod tests {
             .filter(|request| request.url.contains("/0/private/GetWebSocketsToken"))
             .count();
         assert_eq!(token_fetches, 1, "a live token is not refetched");
+    }
+
+    /// A rate-limited response carries the venue's advised wait.
+    ///
+    /// The limit itself is recognised from the body -- a code in the error
+    /// envelope -- while the wait arrives in the `Retry-After` header, so the
+    /// two are read in different places. Until they were joined, every
+    /// `RateLimited` this client raised carried `retry_after: None`: a field
+    /// the error type documents, and that nothing in the crate ever filled.
+    #[test]
+    fn rate_limit_carries_the_venues_advised_wait() {
+        let (kraken, mock) = client();
+        mock.push_response(
+            crate::transport::HttpResponse::new(200, r#"{"error":["EAPI:Rate limit exceeded"]}"#)
+                .with_header("Retry-After", "2.5"),
+        );
+        let err = kraken.ticker(&symbol()).unwrap_err();
+        let wait = std::time::Duration::from_millis(2500);
+        assert!(matches!(err, Error::RateLimited { retry_after: Some(d) } if d == wait));
     }
 }

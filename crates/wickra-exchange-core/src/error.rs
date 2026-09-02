@@ -110,6 +110,25 @@ impl Error {
             _ => None,
         }
     }
+
+    /// Attach the venue's advised wait to a rate-limit error that was raised
+    /// without one.
+    ///
+    /// The venue clients recognise a rate limit from the *body* -- a numeric
+    /// code in the error envelope -- while the wait arrives in the
+    /// `Retry-After` *header*. The two are read in different places, so this
+    /// joins them at the call site that has both.
+    ///
+    /// Every other variant is returned untouched, and a `RateLimited` that
+    /// already carries a wait keeps it: a venue that states the delay in its
+    /// body is more specific than the header, and this must not overwrite it.
+    #[must_use]
+    pub fn with_retry_after(self, retry_after: Option<Duration>) -> Self {
+        match self {
+            Error::RateLimited { retry_after: None } => Error::RateLimited { retry_after },
+            other => other,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -213,5 +232,33 @@ mod tests {
             Error::Deserialization("bad json".into()).to_string(),
             "deserialization error: bad json"
         );
+    }
+
+    #[test]
+    fn with_retry_after_fills_an_empty_rate_limit() {
+        let filled = Error::RateLimited { retry_after: None }
+            .with_retry_after(Some(Duration::from_millis(2500)));
+        let expected = Some(Duration::from_millis(2500));
+        assert!(matches!(filled, Error::RateLimited { retry_after } if retry_after == expected));
+    }
+
+    #[test]
+    fn with_retry_after_does_not_overwrite_what_the_venue_already_said() {
+        // A venue that states the delay in its body is more specific than the
+        // header, so the header must not replace it.
+        let body_said = Error::RateLimited {
+            retry_after: Some(Duration::from_secs(60)),
+        };
+        let kept = body_said.with_retry_after(Some(Duration::from_secs(1)));
+        let expected = Some(Duration::from_secs(60));
+        assert!(matches!(kept, Error::RateLimited { retry_after } if retry_after == expected));
+    }
+
+    #[test]
+    fn with_retry_after_leaves_every_other_variant_alone() {
+        let timeout = Error::Timeout.with_retry_after(Some(Duration::from_secs(5)));
+        assert!(matches!(timeout, Error::Timeout));
+        let balance = Error::InsufficientBalance.with_retry_after(Some(Duration::from_secs(5)));
+        assert!(matches!(balance, Error::InsufficientBalance));
     }
 }

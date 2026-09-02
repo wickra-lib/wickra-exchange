@@ -1812,7 +1812,9 @@ fn map_error(response: &HttpResponse) -> Error {
     match err.code {
         -1121 => Error::InvalidSymbol(err.msg),
         -2010 | -2018 | -2019 => Error::InsufficientBalance,
-        -1003 => Error::RateLimited { retry_after: None },
+        -1003 => Error::RateLimited {
+            retry_after: response.retry_after(),
+        },
         -1022 | -2014 | -2015 => Error::Auth(err.msg),
         _ => Error::Exchange {
             code: err.code.to_string(),
@@ -3032,5 +3034,24 @@ mod tests {
         assert!(http.recorded_requests()[0]
             .url
             .contains("timestamp=1000000"));
+    }
+
+    /// A rate-limited response carries the venue's advised wait.
+    ///
+    /// The limit itself is recognised from the body -- a code in the error
+    /// envelope -- while the wait arrives in the `Retry-After` header, so the
+    /// two are read in different places. Until they were joined, every
+    /// `RateLimited` this client raised carried `retry_after: None`: a field
+    /// the error type documents, and that nothing in the crate ever filled.
+    #[test]
+    fn rate_limit_carries_the_venues_advised_wait() {
+        let (binance, mock) = client(MarketType::Spot, false);
+        mock.push_response(
+            crate::transport::HttpResponse::new(429, r#"{"code":-1003,"msg":"too many requests"}"#)
+                .with_header("Retry-After", "2.5"),
+        );
+        let err = binance.ticker(&symbol()).unwrap_err();
+        let wait = std::time::Duration::from_millis(2500);
+        assert!(matches!(err, Error::RateLimited { retry_after: Some(d) } if d == wait));
     }
 }
