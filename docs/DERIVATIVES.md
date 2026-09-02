@@ -186,27 +186,71 @@ Each venue spells the result under its own field name, and two of them replace
 [position-mode table](CAPABILITIES.md#position-mode) for the per-venue field and
 for the two venues that have no hedge mode and say so.
 
-## Derivatives feeds: typed but not yet subscribed
+## Derivatives feeds
 
 The `feeds` module carries typed shapes for the derivatives microstructure
 channels — `FundingRate`, `OpenInterest`, `Liquidation`, `LongShortRatio` and
 `MarkIndex` — and `DerivativesTickBuilder` folds them into the
-`wickra_core::DerivativesTick` the perpetual-futures indicator family consumes:
+`wickra_core::DerivativesTick` the perpetual-futures indicator family consumes.
+
+`DerivativesStream` is what fills them:
 
 ```rust
-use wickra_exchange::{DerivativesFeed, DerivativesTickBuilder, FundingRate};
+use wickra_exchange::{DerivativesChannel, DerivativesFeed, DerivativesStream,
+                      DerivativesTickBuilder, Event};
+
+client.subscribe_derivatives(&symbol, DerivativesChannel::Funding)?;
+client.subscribe_derivatives(&symbol, DerivativesChannel::Liquidations)?;
 
 let mut builder = DerivativesTickBuilder::new();
-builder.apply(&DerivativesFeed::Funding(funding_rate));  // a frame you supply
-let tick = builder.build()?;                             // -> DerivativesTick
+for event in client.poll_events() {
+    if let Event::Derivatives(feed) = event {
+        builder.apply(&feed);
+    }
+}
+// The polled figures are read, not awaited.
+builder.apply(&DerivativesFeed::OpenInterest(client.open_interest(&symbol)?));
+let tick = builder.build()?;                   // -> DerivativesTick
 ```
 
-**No venue client subscribes to these channels.** The trade and depth streams
-are wired on all ten venues and emit `TradePrint` / `OrderBookSnapshot`
-directly; the derivatives channels are not, so the frames above are ones the
-caller obtains and applies. The shapes and the fold are here so that a caller
-who has the data does not write the conversion by hand — not because the client
-fetches it.
+### Subscribed or read, and why the two differ
+
+Three channels are **pushed** and are subscribed to; two are **polled** and are
+read. That split is the venues' own, not a design choice. No venue in this crate
+streams open interest or long/short positioning — both are published on a fixed
+cadence over REST. Presenting them as subscriptions would have made this surface
+look symmetric and the data arrive never, so they are methods that return a
+value.
+
+| Channel | How | Binance | Bybit |
+|---|---|:---:|:---:|
+| `Funding` | subscribe | `@markPrice` | `tickers` |
+| `MarkIndex` | subscribe | `@markPrice` | `tickers` |
+| `Liquidations` | subscribe | `@forceOrder` | `allLiquidation` |
+| `open_interest()` | read | `/fapi/v1/openInterest` | `/v5/market/open-interest` |
+| `long_short_ratio()` | read | `/futures/data/globalLongShortAccountRatio` | `/v5/market/account-ratio` |
+
+Two things about that table are worth knowing before relying on it.
+
+**One frame can answer more than one subscription.** Binance's `@markPrice`
+carries the funding rate, the mark price and the index price together; Bybit's
+`tickers` carries all three *and* feeds the ordinary ticker. So the client emits
+only the prints that were actually subscribed to: a client watching prices does
+not start receiving funding prints it never asked for.
+
+**Bybit's `tickers` frames are deltas.** After the first snapshot only the
+changed fields are present, so a funding print is emitted only when the frame
+actually carries a rate. Carrying the last value forward would report a stale
+figure as current, and defaulting to zero would report a funding rate of zero —
+a number a strategy acts on.
+
+A venue that does not publish a channel refuses it, so a caller learns at the
+call rather than waiting on a stream that will never carry a frame. A spot
+client refuses all five.
+
+**Still to wire:** OKX, Bitget, Gate.io, HTX, KuCoin and Kraken. Their
+`DerivativesStream` is not implemented yet, so the trait is simply not available
+on those clients — the compiler says so rather than a silent empty stream.
 
 `Derivatives` (above) is a different surface: `positions`, `set_leverage`,
 `set_margin_mode` and `close_position` are account operations and **are**

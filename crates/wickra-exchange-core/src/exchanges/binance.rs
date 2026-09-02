@@ -31,6 +31,10 @@ use crate::clock::ServerClock;
 use crate::credentials::Credentials;
 use crate::error::{Error, Result};
 use crate::events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
+use crate::feeds::{
+    DerivativesChannel, DerivativesFeed, FundingRate, Liquidation, LongShortRatio, MarkIndex,
+    OpenInterest,
+};
 use crate::instruments::{Instrument, InstrumentCache, InstrumentFilters};
 use crate::normalize::{format_decimal, parse_decimal};
 use crate::options::{ExchangeOptions, MarginMode, MarketType, PositionMode, SelfTradePrevention};
@@ -38,7 +42,8 @@ use crate::positions::{Position, PositionSide};
 use crate::signing::hmac_sha256_hex;
 use crate::symbol::Symbol;
 use crate::traits::{
-    AdvancedOrders, Derivatives, Exchange, Execution, MarketData, WsExecution, WsUserData,
+    AdvancedOrders, Derivatives, DerivativesStream, Exchange, Execution, MarketData, WsExecution,
+    WsUserData,
 };
 use crate::transport::{
     HttpMethod, HttpRequest, HttpResponse, HttpTransport, WsConnection, WsTransport,
@@ -77,6 +82,11 @@ pub struct Binance {
     now_ms: Box<dyn Fn() -> i64 + Send + Sync>,
     connection: Option<Box<dyn WsConnection>>,
     subscriptions: Vec<(String, Symbol)>,
+    /// Which derivatives channels were subscribed, per wire symbol. Binance
+    /// carries funding and mark/index on one stream, so the frame alone cannot
+    /// say which the caller asked for -- emitting both would invent a print the
+    /// caller never subscribed to.
+    derivatives_channels: Vec<(String, DerivativesChannel)>,
     sub_id: u64,
     sub_messages: Vec<String>,
     instruments: InstrumentCache,
@@ -147,6 +157,7 @@ impl Binance {
             now_ms: Box::new(system_now_ms),
             connection: None,
             subscriptions: Vec::new(),
+            derivatives_channels: Vec::new(),
             sub_id: 0,
             sub_messages: Vec::new(),
             instruments: InstrumentCache::new(),
@@ -383,6 +394,102 @@ impl Binance {
         self.subscribe(symbol, "ticker")
     }
 
+    /// Subscribe to a pushed derivatives channel.
+    ///
+    /// Binance publishes funding and mark/index on the *same* stream --
+    /// `<symbol>@markPrice` carries the rate, the mark and the index in one
+    /// frame -- so both channels resolve to it and the parser emits whichever
+    /// the caller subscribed to. Forced liquidations are their own stream.
+    ///
+    /// These streams exist only on the futures venue; the spot client refuses
+    /// rather than subscribing to a channel that will never carry a frame.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] on a spot client, or if the subscription fails.
+    pub fn subscribe_derivatives(
+        &mut self,
+        symbol: &Symbol,
+        channel: DerivativesChannel,
+    ) -> Result<()> {
+        if !self.is_futures() {
+            return Err(Error::unsupported_field(
+                "Binance",
+                "a derivatives channel on a spot client",
+                "funding, mark/index and liquidations exist only on the futures venue",
+            ));
+        }
+        let stream = match channel {
+            DerivativesChannel::Funding | DerivativesChannel::MarkIndex => "markPrice",
+            DerivativesChannel::Liquidations => "forceOrder",
+        };
+        self.derivatives_channels
+            .push((Self::wire_symbol(symbol), channel));
+        self.subscribe(symbol, stream)
+    }
+
+    /// The current open interest (`GET /fapi/v1/openInterest`).
+    ///
+    /// Polled, not pushed: Binance has no open-interest stream.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] on a spot client or if the request fails.
+    pub fn open_interest(&self, symbol: &Symbol) -> Result<OpenInterest> {
+        if !self.is_futures() {
+            return Err(Error::unsupported_field(
+                "Binance",
+                "open interest on a spot client",
+                "open interest is a futures figure",
+            ));
+        }
+        let query = format!("symbol={}", Self::wire_symbol(symbol));
+        let body = self.get("/fapi/v1/openInterest", &query)?;
+        let value: serde_json::Value = deserialize(&body)?;
+        Ok(OpenInterest {
+            symbol: symbol.clone(),
+            open_interest: parse_decimal(field_str(&value, "openInterest")?)?,
+            timestamp: value
+                .get("time")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0),
+        })
+    }
+
+    /// The current long/short account ratio
+    /// (`GET /futures/data/globalLongShortAccountRatio`), most recent point.
+    ///
+    /// Polled, not pushed. Binance reports this as *account* proportions rather
+    /// than sizes, which sum to one; they are carried through as given, since
+    /// scaling them to a notional would invent a figure the venue did not
+    /// publish.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] on a spot client, if the request fails, or if the
+    /// venue returns no data point.
+    pub fn long_short_ratio(&self, symbol: &Symbol) -> Result<LongShortRatio> {
+        if !self.is_futures() {
+            return Err(Error::unsupported_field(
+                "Binance",
+                "long/short positioning on a spot client",
+                "positioning is a futures figure",
+            ));
+        }
+        let query = format!("symbol={}&period=5m&limit=1", Self::wire_symbol(symbol));
+        let body = self.get("/futures/data/globalLongShortAccountRatio", &query)?;
+        let points: Vec<serde_json::Value> = deserialize(&body)?;
+        let point = points
+            .first()
+            .ok_or_else(|| Error::NotFound("no long/short data point".to_string()))?;
+        Ok(LongShortRatio {
+            symbol: symbol.clone(),
+            long_size: parse_decimal(field_str(point, "longAccount")?)?,
+            short_size: parse_decimal(field_str(point, "shortAccount")?)?,
+            timestamp: point
+                .get("timestamp")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0),
+        })
+    }
+
     /// Open the connection if needed, send a SUBSCRIBE for `<symbol>@<channel>`,
     /// and register the symbol for wire-name resolution.
     fn subscribe(&mut self, symbol: &Symbol, channel: &str) -> Result<()> {
@@ -422,12 +529,17 @@ impl Binance {
                 .cloned()
                 .unwrap_or_else(|| Symbol::new(wire, ""))
         };
+        let channels = self.derivatives_channels.clone();
         let mut events = Vec::new();
         if let Some(connection) = self.connection.as_mut() {
             while let Ok(Some(frame)) = connection.recv() {
                 if let Ok(Some(event)) = parse_ws_message(&frame, &resolve) {
                     events.push(event);
                 }
+                // Derivatives frames are parsed separately because one
+                // `markPrice` frame can answer two subscriptions: it carries the
+                // funding rate and the mark/index pair together.
+                events.extend(parse_derivatives_message(&frame, &resolve, &channels));
             }
         }
         // Drain the private user-data stream (order/balance updates), if open.
@@ -1160,6 +1272,22 @@ impl Binance {
     }
 }
 
+impl DerivativesStream for Binance {
+    fn subscribe_derivatives(
+        &mut self,
+        symbol: &Symbol,
+        channel: DerivativesChannel,
+    ) -> Result<()> {
+        Binance::subscribe_derivatives(self, symbol, channel)
+    }
+    fn open_interest(&mut self, symbol: &Symbol) -> Result<OpenInterest> {
+        Binance::open_interest(self, symbol)
+    }
+    fn long_short_ratio(&mut self, symbol: &Symbol) -> Result<LongShortRatio> {
+        Binance::long_short_ratio(self, symbol)
+    }
+}
+
 impl WsExecution for Binance {
     fn place_order_ws(&mut self, request: &OrderRequest) -> Result<Order> {
         Binance::place_order_ws(self, request)
@@ -1505,6 +1633,116 @@ fn parse_ws_levels(value: Option<&serde_json::Value>) -> Result<Vec<BookLevel>> 
             Ok(BookLevel { price, quantity })
         })
         .collect()
+}
+
+/// Parse one Binance WebSocket frame into the derivatives events the caller
+/// subscribed to.
+///
+/// Returns a `Vec` rather than an `Option` because `markPrice` is one frame
+/// answering two possible subscriptions: it carries the funding rate, the mark
+/// price and the index price together. A client subscribed to both channels gets
+/// both prints from it; one subscribed to neither gets nothing, since emitting a
+/// print nobody asked for would put a figure into the stream that the caller has
+/// no reason to expect.
+fn parse_derivatives_message(
+    text: &str,
+    resolve: &impl Fn(&str) -> Symbol,
+    channels: &[(String, DerivativesChannel)],
+) -> Vec<Event> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return Vec::new();
+    };
+    let data = value.get("data").unwrap_or(&value);
+    let Some(event_type) = data.get("e").and_then(serde_json::Value::as_str) else {
+        return Vec::new();
+    };
+    let subscribed = |wire: &str, channel: DerivativesChannel| {
+        channels.iter().any(|(w, c)| w == wire && *c == channel)
+    };
+    let mut out = Vec::new();
+    match event_type {
+        "markPriceUpdate" => {
+            let Ok(wire) = field_str(data, "s") else {
+                return out;
+            };
+            let symbol = resolve(wire);
+            let timestamp = data
+                .get("E")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            let mark = field_str(data, "p")
+                .ok()
+                .and_then(|p| parse_decimal(p).ok());
+            let Some(mark_price) = mark else {
+                return out;
+            };
+            if subscribed(wire, DerivativesChannel::Funding) {
+                if let Some(rate) = field_str(data, "r")
+                    .ok()
+                    .and_then(|r| parse_decimal(r).ok())
+                {
+                    out.push(Event::Derivatives(DerivativesFeed::Funding(FundingRate {
+                        symbol: symbol.clone(),
+                        rate,
+                        mark_price,
+                        timestamp,
+                    })));
+                }
+            }
+            if subscribed(wire, DerivativesChannel::MarkIndex) {
+                if let Some(index_price) = field_str(data, "i")
+                    .ok()
+                    .and_then(|i| parse_decimal(i).ok())
+                {
+                    out.push(Event::Derivatives(DerivativesFeed::MarkIndex(MarkIndex {
+                        symbol,
+                        mark_price,
+                        index_price,
+                        timestamp,
+                    })));
+                }
+            }
+        }
+        "forceOrder" => {
+            // The liquidation payload is nested under `o`.
+            let Some(order) = data.get("o") else {
+                return out;
+            };
+            let Ok(wire) = field_str(order, "s") else {
+                return out;
+            };
+            if !subscribed(wire, DerivativesChannel::Liquidations) {
+                return out;
+            }
+            // `S` is the side of the forced order hitting the book: a liquidated
+            // long is sold, a liquidated short is bought.
+            let side = match order.get("S").and_then(serde_json::Value::as_str) {
+                Some("SELL") => OrderSide::Sell,
+                Some("BUY") => OrderSide::Buy,
+                _ => return out,
+            };
+            let (Ok(price), Ok(quantity)) = (
+                field_str(order, "p").and_then(parse_decimal),
+                field_str(order, "q").and_then(parse_decimal),
+            ) else {
+                return out;
+            };
+            out.push(Event::Derivatives(DerivativesFeed::Liquidation(
+                Liquidation {
+                    symbol: resolve(wire),
+                    side,
+                    price,
+                    quantity,
+                    timestamp: order
+                        .get("T")
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or(0),
+                },
+            )));
+        }
+        _ => {}
+    }
+    out
 }
 
 /// Parse one Binance WebSocket frame into an [`Event`], resolving the wire
@@ -2275,6 +2513,186 @@ mod tests {
         let err = binance.place_order(&request).unwrap_err();
         assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
         assert!(mock.recorded_requests().is_empty());
+    }
+
+    /// One `markPrice` frame answers two possible subscriptions, and answers
+    /// only the ones actually made. A client subscribed to funding gets the
+    /// rate; one subscribed to mark/index gets the pair; one subscribed to both
+    /// gets both; one subscribed to neither gets nothing, because a print nobody
+    /// asked for is a figure appearing in a stream for no reason the caller can
+    /// see.
+    #[test]
+    fn one_mark_price_frame_answers_only_the_channels_subscribed() {
+        const FRAME: &str = r#"{"e":"markPriceUpdate","E":1700000000000,"s":"BTCUSDT","p":"20000.5","i":"19998.25","r":"0.0001"}"#;
+        let resolve = |_: &str| symbol();
+
+        let none = parse_derivatives_message(FRAME, &resolve, &[]);
+        assert!(none.is_empty());
+
+        let funding_only = parse_derivatives_message(
+            FRAME,
+            &resolve,
+            &[("BTCUSDT".to_string(), DerivativesChannel::Funding)],
+        );
+        assert_eq!(funding_only.len(), 1);
+        let Event::Derivatives(DerivativesFeed::Funding(funding)) = &funding_only[0] else {
+            panic!("expected a funding print");
+        };
+        assert_eq!(funding.rate, dec!(0.0001));
+        assert_eq!(funding.mark_price, dec!(20000.5));
+        assert_eq!(funding.timestamp, 1_700_000_000_000);
+
+        let mark_only = parse_derivatives_message(
+            FRAME,
+            &resolve,
+            &[("BTCUSDT".to_string(), DerivativesChannel::MarkIndex)],
+        );
+        assert_eq!(mark_only.len(), 1);
+        let Event::Derivatives(DerivativesFeed::MarkIndex(mark)) = &mark_only[0] else {
+            panic!("expected a mark/index print");
+        };
+        assert_eq!(mark.mark_price, dec!(20000.5));
+        assert_eq!(mark.index_price, dec!(19998.25));
+
+        let both = parse_derivatives_message(
+            FRAME,
+            &resolve,
+            &[
+                ("BTCUSDT".to_string(), DerivativesChannel::Funding),
+                ("BTCUSDT".to_string(), DerivativesChannel::MarkIndex),
+            ],
+        );
+        assert_eq!(both.len(), 2);
+    }
+
+    /// A forced order is a liquidation, and its side is the side hitting the
+    /// book: a liquidated long is *sold*. Reading it the other way inverts every
+    /// liquidation-flow figure computed from the stream.
+    #[test]
+    fn a_forced_order_is_a_liquidation_on_the_side_hitting_the_book() {
+        const FRAME: &str = r#"{"e":"forceOrder","E":1700000000000,"o":{"s":"BTCUSDT","S":"SELL","p":"19000","q":"2.5","T":1700000000123}}"#;
+        let resolve = |_: &str| symbol();
+        let events = parse_derivatives_message(
+            FRAME,
+            &resolve,
+            &[("BTCUSDT".to_string(), DerivativesChannel::Liquidations)],
+        );
+        assert_eq!(events.len(), 1);
+        let Event::Derivatives(DerivativesFeed::Liquidation(liq)) = &events[0] else {
+            panic!("expected a liquidation print");
+        };
+        assert_eq!(liq.side, OrderSide::Sell);
+        assert_eq!(liq.price, dec!(19000));
+        assert_eq!(liq.quantity, dec!(2.5));
+        assert_eq!(liq.timestamp, 1_700_000_000_123);
+
+        // Not subscribed: nothing.
+        assert!(parse_derivatives_message(FRAME, &resolve, &[]).is_empty());
+    }
+
+    /// A frame that is not a derivatives print, or is malformed, yields nothing
+    /// rather than a partly-filled figure.
+    #[test]
+    fn a_frame_that_is_not_a_derivatives_print_yields_nothing() {
+        let resolve = |_: &str| symbol();
+        let subscribed = [
+            ("BTCUSDT".to_string(), DerivativesChannel::Funding),
+            ("BTCUSDT".to_string(), DerivativesChannel::MarkIndex),
+            ("BTCUSDT".to_string(), DerivativesChannel::Liquidations),
+        ];
+        for frame in [
+            r#"{"e":"trade","s":"BTCUSDT","p":"1","q":"1","m":false,"T":1}"#,
+            r#"{"result":null,"id":1}"#,
+            "not json at all",
+            // markPrice with no mark price to speak of
+            r#"{"e":"markPriceUpdate","s":"BTCUSDT","r":"0.0001"}"#,
+            // forceOrder with no nested payload
+            r#"{"e":"forceOrder","E":1}"#,
+            // forceOrder with a side that is neither
+            r#"{"e":"forceOrder","o":{"s":"BTCUSDT","S":"HOLD","p":"1","q":"1"}}"#,
+        ] {
+            assert!(parse_derivatives_message(frame, &resolve, &subscribed).is_empty());
+        }
+    }
+
+    /// The derivatives channels exist only on the futures venue. A spot client
+    /// refuses rather than subscribing to a stream that will never carry a frame
+    /// and leaving the caller waiting on it.
+    #[test]
+    fn a_spot_client_refuses_the_derivatives_channels() {
+        let (mut spot, _mock) = signed_client(1000);
+        let err = DerivativesStream::subscribe_derivatives(
+            &mut spot,
+            &symbol(),
+            DerivativesChannel::Funding,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
+
+        let err = DerivativesStream::open_interest(&mut spot, &symbol()).unwrap_err();
+        assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
+
+        let err = DerivativesStream::long_short_ratio(&mut spot, &symbol()).unwrap_err();
+        assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
+    }
+
+    /// Funding and mark/index share one stream, so both subscriptions send the
+    /// same `markPrice` message; liquidations are their own.
+    #[test]
+    fn the_subscription_names_the_stream_binance_publishes() {
+        let (mut futures, _mock) = signed_futures_client(1000);
+        let ws = Arc::new(MockWsTransport::new());
+        futures = futures.with_ws(Box::new(ArcWs(Arc::clone(&ws))));
+
+        DerivativesStream::subscribe_derivatives(
+            &mut futures,
+            &symbol(),
+            DerivativesChannel::Funding,
+        )
+        .unwrap();
+        DerivativesStream::subscribe_derivatives(
+            &mut futures,
+            &symbol(),
+            DerivativesChannel::Liquidations,
+        )
+        .unwrap();
+
+        let sent = ws.sent();
+        assert!(sent[0].contains("btcusdt@markPrice"));
+        assert!(sent[1].contains("btcusdt@forceOrder"));
+    }
+
+    /// Open interest and long/short positioning are read, not streamed.
+    #[test]
+    fn the_polled_figures_are_read_over_rest() {
+        let (futures, mock) = signed_futures_client(1000);
+        mock.push_json(
+            200,
+            r#"{"symbol":"BTCUSDT","openInterest":"12345.67","time":1700000000000}"#,
+        );
+        let oi = Binance::open_interest(&futures, &symbol()).unwrap();
+        assert_eq!(oi.open_interest, dec!(12345.67));
+        assert_eq!(oi.timestamp, 1_700_000_000_000);
+        assert!(mock.recorded_requests()[0]
+            .url
+            .contains("/fapi/v1/openInterest"));
+
+        let (futures, mock) = signed_futures_client(1000);
+        mock.push_json(
+            200,
+            r#"[{"symbol":"BTCUSDT","longShortRatio":"1.5","longAccount":"0.6","shortAccount":"0.4","timestamp":1700000000000}]"#,
+        );
+        let ratio = Binance::long_short_ratio(&futures, &symbol()).unwrap();
+        assert_eq!(ratio.long_size, dec!(0.6));
+        assert_eq!(ratio.short_size, dec!(0.4));
+        assert!(mock.recorded_requests()[0]
+            .url
+            .contains("globalLongShortAccountRatio"));
+
+        // An empty series is reported, not read as a zero.
+        let (futures, mock) = signed_futures_client(1000);
+        mock.push_json(200, "[]");
+        assert!(Binance::long_short_ratio(&futures, &symbol()).is_err());
     }
 
     #[test]

@@ -87,6 +87,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The derivatives feeds have producers.** `feeds.rs` carried `FundingRate`,
+  `OpenInterest`, `Liquidation`, `LongShortRatio`, `MarkIndex`,
+  `DerivativesFeed` and `DerivativesTickBuilder` — 471 lines of public API that
+  nothing in the crate ever constructed. Typed shapes with no data path.
+
+  `DerivativesStream` fills them. Three channels are pushed and subscribed to
+  (`Funding`, `MarkIndex`, `Liquidations`, arriving as the new
+  `Event::Derivatives`); open interest and long/short positioning are polled and
+  read, because no venue streams them and modelling them as subscriptions would
+  have made the surface look symmetric and the data arrive never.
+
+  Implemented on **Binance** and **Bybit**. The two venues publish these
+  channels quite differently — Binance on dedicated streams, Bybit folded into
+  the same `tickers` stream that feeds the ordinary ticker, as deltas — which is
+  what the design had to absorb. One frame can answer two subscriptions, so the
+  client emits only the prints actually subscribed to: a client watching prices
+  does not start receiving funding prints it never asked for. OKX, Bitget,
+  Gate.io, HTX, KuCoin and Kraken are not wired yet, and the trait is simply
+  absent on them rather than present and silent.
+
 - **Every binding can build the order the core supports.** `place_order` was
   present in all seven bindings, and the order it could build was a market or
   limit with a quantity and a price. The trigger price that makes a stop-loss a

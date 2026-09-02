@@ -50,8 +50,9 @@ pub use exchanges::{
     ReplayExchange, Upbit,
 };
 pub use feeds::{
-    cross_section, order_book_from_snapshot, trade_from_print, BreadthMember, DerivativesFeed,
-    DerivativesTickBuilder, FundingRate, Liquidation, LongShortRatio, MarkIndex, OpenInterest,
+    cross_section, order_book_from_snapshot, trade_from_print, BreadthMember, DerivativesChannel,
+    DerivativesFeed, DerivativesTickBuilder, FundingRate, Liquidation, LongShortRatio, MarkIndex,
+    OpenInterest,
 };
 pub use idempotency::ClientIdGenerator;
 pub use instruments::{Instrument, InstrumentCache, InstrumentFilters};
@@ -70,7 +71,8 @@ pub use signing::{
 pub use symbol::Symbol;
 pub use throttle::ThrottledTransport;
 pub use traits::{
-    AdvancedOrders, Derivatives, Exchange, Execution, MarketData, WsExecution, WsUserData,
+    AdvancedOrders, Derivatives, DerivativesStream, Exchange, Execution, MarketData, WsExecution,
+    WsUserData,
 };
 pub use transport::{
     HttpMethod, HttpRequest, HttpResponse, HttpTransport, MockHttpTransport, MockWsTransport,

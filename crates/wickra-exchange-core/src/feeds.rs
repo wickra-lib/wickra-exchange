@@ -14,16 +14,23 @@
 //! | [`DerivativesFeed`] (via [`DerivativesTickBuilder`]) | [`DerivativesTick`] |
 //! | [`BreadthMember`] slice                 | [`CrossSection`]       |
 //!
-//! The first two rows are fed by this crate: every venue client emits
-//! [`TradePrint`] and [`OrderBookSnapshot`] on its stream. The last two are fed
-//! by the caller — a [`BreadthMember`] universe is assembled from tickers, and
-//! **no venue client subscribes to the derivatives channels yet**, so the
-//! [`DerivativesFeed`] frames are ones you supply. The derivatives channels
-//! arrive independently, so [`DerivativesTickBuilder`] folds each into a running
-//! tick and emits a validated [`DerivativesTick`] on demand.
+//! Every venue client emits [`TradePrint`] and [`OrderBookSnapshot`] on its
+//! stream, and the futures clients emit [`DerivativesFeed`] frames as
+//! [`Event::Derivatives`](crate::events::Event::Derivatives) once the channel is
+//! subscribed with
+//! [`DerivativesStream`](crate::traits::DerivativesStream). Open interest and
+//! long/short positioning are polled rather than pushed -- no venue streams them
+//! -- so they are read through that same trait and returned directly.
+//!
+//! A [`BreadthMember`] universe is still assembled by the caller from tickers.
+//!
+//! The derivatives channels arrive independently, so [`DerivativesTickBuilder`]
+//! folds each into a running tick and emits a validated [`DerivativesTick`] on
+//! demand.
 
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 use wickra_core::{CrossSection, DerivativesTick, Level, Member, OrderBook, Side, Trade};
 
 use crate::error::{Error, Result};
@@ -86,7 +93,7 @@ pub fn order_book_from_snapshot(snapshot: &OrderBookSnapshot) -> Result<OrderBoo
 }
 
 /// One symbol's contribution to a market-breadth cross-section.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BreadthMember {
     /// Price change versus the previous close (sign classifies advance/decline).
     pub change: Decimal,
@@ -121,7 +128,7 @@ pub fn cross_section(members: &[BreadthMember], timestamp: i64) -> Result<CrossS
 }
 
 /// A funding-rate update for a perpetual market.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FundingRate {
     /// The market.
     pub symbol: Symbol,
@@ -134,7 +141,7 @@ pub struct FundingRate {
 }
 
 /// An open-interest update: outstanding contracts / notional.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenInterest {
     /// The market.
     pub symbol: Symbol,
@@ -145,7 +152,7 @@ pub struct OpenInterest {
 }
 
 /// A forced liquidation print.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Liquidation {
     /// The market.
     pub symbol: Symbol,
@@ -162,7 +169,7 @@ pub struct Liquidation {
 }
 
 /// A long/short positioning ratio update.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LongShortRatio {
     /// The market.
     pub symbol: Symbol,
@@ -175,7 +182,7 @@ pub struct LongShortRatio {
 }
 
 /// A mark/index price update.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MarkIndex {
     /// The market.
     pub symbol: Symbol,
@@ -187,8 +194,28 @@ pub struct MarkIndex {
     pub timestamp: i64,
 }
 
+/// A derivatives channel a venue can **push** over its WebSocket.
+///
+/// Not every channel is a stream. Open interest and long/short positioning are
+/// polled figures on every venue in this crate -- they are published on a fixed
+/// cadence over REST and no venue pushes them -- so they are read with
+/// [`DerivativesStream::open_interest`](crate::traits::DerivativesStream::open_interest)
+/// and
+/// [`long_short_ratio`](crate::traits::DerivativesStream::long_short_ratio)
+/// rather than subscribed to. Modelling them as subscriptions would have made
+/// the API look symmetric and the data arrive never.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DerivativesChannel {
+    /// The funding rate and the mark price it is charged against.
+    Funding,
+    /// Mark price and the index price the perpetual tracks.
+    MarkIndex,
+    /// Forced liquidations hitting the book.
+    Liquidations,
+}
+
 /// One channel of the derivatives microstructure feed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DerivativesFeed {
     /// A funding-rate print.
     Funding(FundingRate),

@@ -131,6 +131,11 @@ pub enum Event {
     Disconnected,
     /// The stream reconnected and resubscribed.
     Reconnected,
+    /// A derivatives microstructure print: funding, mark/index, or a forced
+    /// liquidation. Arrives only on a futures client that subscribed to the
+    /// channel through
+    /// [`DerivativesStream`](crate::traits::DerivativesStream).
+    Derivatives(crate::feeds::DerivativesFeed),
 }
 
 #[cfg(test)]
