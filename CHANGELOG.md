@@ -150,6 +150,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Every WebSocket order dropped a flag its own REST path sends.** Smaller than
+  the trigger defect above and the same shape: the request carried a field, the
+  REST body honoured it, and the WebSocket frame on the same client left it out.
+  Nothing inverts the order — each one weakens it. A self-trade-prevention
+  policy that is not sent is not applied, and a post-only order that loses the
+  flag can take liquidity and pay the taker fee.
+  Comparing each `place_order_ws` against the REST path it can actually reach:
+  Binance, Bybit and Gate dropped `stp`; OKX dropped `stp` and `reduce_only`;
+  Kraken dropped `post_only`.
+  On four of the five the fix is a mirror, and the evidence for it is in the
+  file: those frames already use the venue's REST field names throughout
+  (`instId`/`tdMode`/`clOrdId` on OKX, `currency_pair`/`time_in_force` on Gate),
+  so the REST mapping function applies unchanged.
+  **Kraken is refused instead.** Its v2 frame names every field differently —
+  `order_qty`, `limit_price`, `cl_ord_id` — so the REST spelling `oflags=post`
+  proves nothing about the WebSocket one, and guessing it would be the same
+  mistake in a smaller font. A post-only order over Kraken's WebSocket now
+  returns `Error::Exchange` pointing at REST.
+  (Gate's WebSocket path is spot-only and Kraken's is guarded to spot by
+  `ensure_ws_api`, so both are compared against their spot REST body rather than
+  the futures one — measuring against an unreachable path would have invented
+  two more findings than exist.)
+
 - **A stop-loss was placed as an order that executed immediately.** The most
   severe of the defects in this run, and the simplest: `OrderRequest::validate`
   *requires* a `stop_price` on a `StopMarket`/`StopLimit` — so the library

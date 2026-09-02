@@ -554,6 +554,9 @@ impl Bybit {
         if request.reduce_only {
             arg["reduceOnly"] = serde_json::json!(true);
         }
+        if let Some(smp) = smp_str(request.stp) {
+            arg["smpType"] = serde_json::json!(smp);
+        }
         if let Some(idx) = self.position_idx(request) {
             arg["positionIdx"] = serde_json::json!(idx);
         }
@@ -2316,6 +2319,31 @@ mod tests {
         assert_eq!(auth_frames, 2);
         assert_eq!(ws.connected_urls().len(), 2);
         assert_eq!(ws.connected_urls()[1], "wss://stream.bybit.com/v5/private");
+    }
+
+    #[test]
+    fn the_websocket_frame_carries_the_stp_policy() {
+        // Self-trade prevention was set on the request, honoured on the REST
+        // path, and dropped on this one -- a policy that is not sent is not
+        // applied.
+        let (mut bybit, ws) = signed_ws_client(1000);
+        ws.push_connection(vec![
+            Ok(Some(
+                r#"{"op":"auth","retCode":0,"retMsg":"OK"}"#.to_string(),
+            )),
+            Ok(Some(
+                r#"{"reqId":"1000","retCode":0,"retMsg":"OK","op":"order.create",
+                "data":{"orderId":"55","orderLinkId":""}}"#
+                    .to_string(),
+            )),
+        ]);
+        bybit
+            .place_order_ws(
+                &OrderRequest::limit_buy(symbol(), dec!(1), dec!(100))
+                    .with_stp(SelfTradePrevention::ExpireTaker),
+            )
+            .unwrap();
+        assert!(ws.sent()[1].contains(r#""smpType":"CancelTaker""#));
     }
 
     #[test]

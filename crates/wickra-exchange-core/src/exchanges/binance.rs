@@ -966,6 +966,9 @@ impl Binance {
         if let Some(id) = &request.client_order_id {
             params.push(("newClientOrderId".to_string(), id.clone()));
         }
+        if let Some(mode) = stp_str(request.stp) {
+            params.push(("selfTradePreventionMode".to_string(), mode.to_string()));
+        }
         // The ws-api connection goes to ws-fapi on a futures client, so a hedged
         // account needs the side named here exactly as on the REST path.
         if self.is_futures() && self.position_mode == PositionMode::Hedge {
@@ -2099,6 +2102,35 @@ mod tests {
         )
         .with_clock(Box::new(move || now_ms));
         (binance, mock)
+    }
+
+    #[test]
+    fn the_websocket_frame_carries_the_stp_policy() {
+        // The ws-api takes the REST parameter names verbatim, and this one was
+        // simply not being pushed.
+        let ws = Arc::new(MockWsTransport::new());
+        let http = Arc::new(MockHttpTransport::new());
+        let mut client = Binance::with_credentials(
+            Box::new(ArcTransport(http)),
+            &ExchangeOptions::mainnet(MarketType::Spot),
+            Credentials::new("APIKEY", "SECRET"),
+        )
+        .with_ws(Box::new(ArcWs(Arc::clone(&ws))))
+        .with_clock(Box::new(|| 1000));
+        ws.push_connection(vec![Ok(Some(
+            r#"{"id":"1","status":200,"result":{"symbol":"BTCUSDT","orderId":7,
+            "clientOrderId":"","status":"NEW","type":"LIMIT","side":"BUY",
+            "origQty":"1","executedQty":"0","price":"100"}}"#
+                .to_string(),
+        ))]);
+        client
+            .place_order_ws(
+                &OrderRequest::limit_buy(symbol(), dec!(1), dec!(100))
+                    .with_stp(SelfTradePrevention::ExpireTaker),
+            )
+            .unwrap();
+        assert!(ws.sent()[0].contains("selfTradePreventionMode"));
+        assert!(ws.sent()[0].contains("EXPIRE_TAKER"));
     }
 
     #[test]

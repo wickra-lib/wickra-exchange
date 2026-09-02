@@ -83,6 +83,16 @@ branch to the other without the test changing.
 > WebSocket order API; Bitget, KuCoin and HTX have no such API and return a
 > documented `Error::Exchange`. Coinbase and Upbit do not implement it.
 >
+> A WebSocket order carries the same flags its own REST sibling does. On four of
+> the five the frame uses the venue's REST field names, so the mapping is the
+> same one — Binance `selfTradePreventionMode`, Bybit `smpType`, OKX `stpMode`
+> and `reduceOnly`, Gate `stp_act`. **Kraken is the exception**: its v2 frame
+> names every field differently (`order_qty`, `limit_price`, `cl_ord_id`), so
+> the REST spelling of post-only (`oflags=post`) proves nothing about the
+> WebSocket one. A post-only order over Kraken's WebSocket returns
+> `Error::Exchange` and points at REST, rather than being placed as a limit that
+> may take liquidity.
+>
 > All three surfaces are reachable through the facade factory
 > (`connect`, `connect_derivatives`, `connect_advanced`, `connect_user_data`,
 > `connect_ws_execution`) **and through all nine language bindings** — Python,
