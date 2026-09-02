@@ -18,8 +18,11 @@ pub struct Backoff {
 impl Backoff {
     /// A policy starting at `base_ms`, doubling each attempt, capped at `max_ms`,
     /// giving up after `max_retries`.
+    ///
+    /// `const` so a caller can state its policy as a constant next to the
+    /// reasoning for it, rather than rebuilding one per call.
     #[must_use]
-    pub fn new(base_ms: u64, max_ms: u64, max_retries: u32) -> Self {
+    pub const fn new(base_ms: u64, max_ms: u64, max_retries: u32) -> Self {
         Self {
             base_ms,
             max_ms,
