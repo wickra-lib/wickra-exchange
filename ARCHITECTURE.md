@@ -12,7 +12,6 @@ crates/
 ├── wickra-exchange-core/   traits, types, credentials, the shared connectivity
 │                           machinery, and the per-exchange implementations
 ├── wickra-exchange/        facade crate — the stable public re-export
-├── wickra-exchange-cli/    the `wkex` command-line client
 └── wickra-exchange-bench/  criterion benchmarks (signing / parse / filter)
 ```
 
@@ -63,8 +62,9 @@ Indicator inputs stay `f64`; the boundary is the order layer.
 sync, nonce, JWT TTL), `ratelimiter` (weight-based + 429/418 back-off),
 `retry`/`idempotency`, `instruments` (exchangeInfo cache), `orderbook` (local L2
 builder with diff-apply + gap detection + auto-resync), `positions`/`reconcile`,
-`observability` (tracing + redaction + health), `error` (a unified taxonomy
-mapping exchange codes to an enum), and `normalize`.
+`observability` (secret redaction + a health snapshot; there is no
+tracing in this crate yet), `error` (a unified taxonomy mapping exchange
+codes to an enum), and `normalize`.
 
 ## Integration with the rest of Wickra
 

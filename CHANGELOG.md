@@ -126,6 +126,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Three documents described things that are not in the tree.**
+  - `README.md` and `ARCHITECTURE.md` both listed `crates/wickra-exchange-cli/`
+    — "the `wkex` command-line client" — in their project layouts. There is no
+    such crate, no such workspace member, and no mention of a CLI in
+    `ROADMAP.md`. A layout diagram is a description of the tree; both now
+    describe it. (Every other path in both diagrams was checked and exists.)
+  - `ARCHITECTURE.md` described the `observability` module as
+    "tracing + redaction + health". There is no tracing anywhere in the
+    workspace: `tracing` is declared in `[workspace.dependencies]` and no crate
+    depends on it, and the repository contains zero log statements. The module
+    is secret redaction and a health snapshot, and the line now says so, with
+    the absence named rather than papered over.
 - **`docs/CAPABILITIES.md` claimed a test that does not exist.** It said "a
   per-binding completeness test pins the canonical verb set so a dropped method
   fails CI". There is no such test in five of the seven bindings — only Python

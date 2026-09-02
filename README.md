@@ -180,7 +180,6 @@ wickra-exchange/
 │   │                           orderbook builder, transport, ws, reconcile, feeds)
 │   │                           and the per-exchange implementations
 │   ├── wickra-exchange/        facade crate (re-exports the public surface)
-│   ├── wickra-exchange-cli/    the `wkex` command-line client
 │   └── wickra-exchange-bench/  criterion signing / parse / filter benchmarks
 ├── bindings/
 │   ├── python/   PyO3 + maturin          ├── csharp/  P/Invoke over the C ABI
