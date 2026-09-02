@@ -142,6 +142,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`Health` and `redact` were public, tested and undocumented.** Both are
+  exported from the crate root, and neither appeared anywhere outside the source
+  — `Health` had zero references in the entire repository apart from its own
+  `pub use` line. They are caller-facing by the same test that separated
+  `reconcile_orders` from the clock and the retry loop: the library cannot fill a
+  `Health` for you, because the pull model already hands you every input
+  (`Disconnected` / `Reconnected` for the connection and the reconnect count, the
+  print timestamp for staleness, `sync_time`'s return for the clock offset, and
+  the rate budget from the `ThrottledTransport` you wrapped the client with).
+  `docs/STREAMING.md` gains the fold and says why `connected` alone is not
+  enough — a stream that stopped delivering is still connected — and
+  `docs/AUTH.md` covers redaction where the credentials it protects are already
+  discussed. `examples/rust/src/health_and_redaction.rs` runs both offline
+  against a replay tape, and the `examples-smoke` job runs it.
+  Noted while writing it: only `TradePrint` carries a venue timestamp; `Ticker`,
+  `BookSnapshot` and `BookDelta` are identified by update id, so a staleness
+  clock over those events is the caller's own.
+
 - **The README sold a feed that nothing subscribes to.** Under the
   differentiators it said funding, open interest, liquidations and long/short
   ratio "arrive as the exact typed shapes `wickra-core` consumes". They do not

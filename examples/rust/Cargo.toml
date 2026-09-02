@@ -25,3 +25,7 @@ path = "src/ticker.rs"
 [[bin]]
 name = "reconcile_after_reconnect"
 path = "src/reconcile_after_reconnect.rs"
+
+[[bin]]
+name = "health_and_redaction"
+path = "src/health_and_redaction.rs"

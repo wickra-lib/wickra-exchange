@@ -167,6 +167,7 @@ jobs:
         run: |
           cargo run -p wickra-exchange-examples --bin paper_trade
           cargo run -p wickra-exchange-examples --bin reconcile_after_reconnect
+          cargo run -p wickra-exchange-examples --bin health_and_redaction
 
       - name: Node example — syntax check
         run: |
