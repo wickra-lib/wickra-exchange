@@ -34,7 +34,7 @@ keywords = ["crypto", "exchange", "trading", "connectivity", "streaming"]
 categories = ["finance", "api-bindings", "asynchronous"]
 
 [workspace.dependencies]
-wickra-core = "0.9"
+wickra-core = "1.0"
 wickra-exchange-core = { version = "0.1.0", path = "crates/wickra-exchange-core" }
 wickra-exchange = { version = "0.1.0", path = "crates/wickra-exchange" }
 serde = { version = "1", features = ["derive"] }
