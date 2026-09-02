@@ -18,7 +18,7 @@ use crate::credentials::Credentials;
 use crate::error::{Error, Result};
 use crate::events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
 use crate::normalize::{format_decimal, parse_decimal};
-use crate::options::{ExchangeOptions, MarginMode, MarketType, SelfTradePrevention};
+use crate::options::{ExchangeOptions, MarginMode, MarketType, PositionMode, SelfTradePrevention};
 use crate::positions::{Position, PositionSide};
 use crate::signing::hmac_sha256_base64;
 use crate::symbol::Symbol;
@@ -80,6 +80,9 @@ pub struct Okx {
     rest_base: String,
     inst_type: &'static str,
     market_type: MarketType,
+    /// One-way (`net`) or hedge (`long`/`short`). OKX calls it `posSide` and
+    /// requires it on every order once the account is in long/short mode.
+    position_mode: PositionMode,
     /// `tdMode` for every order, derived from the market and the configured
     /// margin mode and kept in step by [`set_margin_mode`](Self::set_margin_mode).
     td_mode: &'static str,
@@ -141,6 +144,7 @@ impl Okx {
             rest_base: "https://www.okx.com".to_string(),
             inst_type: inst_type(options.market_type),
             market_type: options.market_type,
+            position_mode: options.position_mode,
             td_mode: td_mode(options.market_type, options.margin_mode),
             testnet: options.testnet,
             credentials,
@@ -490,6 +494,9 @@ impl Okx {
         if let Some(id) = &request.client_order_id {
             arg["clOrdId"] = serde_json::json!(id.clone());
         }
+        if let Some(pos_side) = self.pos_side(request) {
+            arg["posSide"] = serde_json::json!(pos_side);
+        }
         let data = self.ws_order_request("order", &arg)?;
         let list: Vec<PlaceResult> = parse_json(data)?;
         let placed = list.into_iter().next().ok_or_else(|| Error::Exchange {
@@ -608,7 +615,9 @@ impl Okx {
         if let Some(id) = &request.client_order_id {
             body["clOrdId"] = serde_json::json!(id.clone());
         }
-        if request.reduce_only {
+        if let Some(pos_side) = self.pos_side(request) {
+            body["posSide"] = serde_json::json!(pos_side);
+        } else if request.reduce_only {
             body["reduceOnly"] = serde_json::json!(true);
         }
         if let Some(mode) = stp_mode_str(request.stp) {
@@ -776,6 +785,26 @@ fn inst_type(market_type: MarketType) -> &'static str {
     match market_type {
         MarketType::Spot | MarketType::Margin => "SPOT",
         MarketType::UsdMFutures | MarketType::CoinMFutures => "SWAP",
+    }
+}
+
+impl Okx {
+    /// OKX's `posSide`, or `None` when the order does not carry one.
+    ///
+    /// `net` is the one-way default and is left off rather than sent. In
+    /// long/short mode the order names the side it acts on, and OKX then
+    /// rejects `reduceOnly` -- naming the side is already what says whether the
+    /// order opens or closes. Spot has no position side.
+    fn pos_side(&self, request: &OrderRequest) -> Option<&'static str> {
+        if self.market_type == MarketType::Spot || self.position_mode == PositionMode::OneWay {
+            return None;
+        }
+        Some(
+            match PositionSide::for_order(request.side, request.reduce_only) {
+                PositionSide::Long => "long",
+                PositionSide::Short => "short",
+            },
+        )
     }
 }
 
@@ -1410,7 +1439,9 @@ impl Okx {
         if let Some(id) = &request.client_order_id {
             o["clOrdId"] = serde_json::json!(id.clone());
         }
-        if request.reduce_only {
+        if let Some(pos_side) = self.pos_side(request) {
+            o["posSide"] = serde_json::json!(pos_side);
+        } else if request.reduce_only {
             o["reduceOnly"] = serde_json::json!(true);
         }
         o
@@ -1500,6 +1531,17 @@ impl Okx {
         });
         if let Some(id) = &request.client_order_id {
             body["algoClOrdId"] = serde_json::json!(id.clone());
+        }
+        // An OCO bracket protects a position that is already open, so in
+        // long/short mode it acts on the side its own side closes: a sell
+        // bracket closes the long, a buy bracket closes the short. `OcoRequest`
+        // carries no `reduce_only` because a bracket is always one.
+        if self.market_type != MarketType::Spot && self.position_mode == PositionMode::Hedge {
+            body["posSide"] =
+                serde_json::json!(match PositionSide::for_order(request.side, true) {
+                    PositionSide::Long => "long",
+                    PositionSide::Short => "short",
+                });
         }
         let data = self.signed_request(
             HttpMethod::Post,
@@ -1827,6 +1869,91 @@ mod tests {
     }
 
     const OKX_ORDER_OK: &str = r#"{"code":"0","data":[{"ordId":"1","sCode":"0"}]}"#;
+
+    fn hedged_futures_client(now_ms: i64) -> (Okx, Arc<MockHttpTransport>) {
+        let mock = Arc::new(MockHttpTransport::new());
+        let mut opts = ExchangeOptions::mainnet(MarketType::UsdMFutures);
+        opts.position_mode = PositionMode::Hedge;
+        let okx = Okx::with_credentials(
+            Box::new(ArcTransport(Arc::clone(&mock))),
+            &opts,
+            Credentials::new("APIKEY", "SECRET").with_passphrase("PASS"),
+        )
+        .with_clock(Box::new(move || now_ms));
+        (okx, mock)
+    }
+
+    #[test]
+    fn hedge_mode_names_the_position_side() {
+        // In long/short mode OKX wants `posSide` and refuses `reduceOnly`:
+        // naming the side already says whether the order opens or closes.
+        let (hedged, mock) = hedged_futures_client(1000);
+        for _ in 0..2 {
+            mock.push_json(200, OKX_ORDER_OK);
+        }
+        hedged
+            .place_order(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)))
+            .unwrap();
+        hedged
+            .place_order(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)).reduce_only())
+            .unwrap();
+        let reqs = mock.recorded_requests();
+        assert!(reqs[0]
+            .body
+            .as_deref()
+            .unwrap()
+            .contains(r#""posSide":"long""#));
+        // A buy that reduces closes the short side.
+        assert!(reqs[1]
+            .body
+            .as_deref()
+            .unwrap()
+            .contains(r#""posSide":"short""#));
+        assert!(!reqs[1].body.as_deref().unwrap().contains("reduceOnly"));
+
+        // One-way keeps `reduceOnly` and sends no `posSide`; spot never has one.
+        let (net, net_mock) = signed_futures_client(1000);
+        net_mock.push_json(200, OKX_ORDER_OK);
+        net.place_order(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)).reduce_only())
+            .unwrap();
+        let net_body = net_mock.recorded_requests()[0].body.clone().unwrap();
+        assert!(net_body.contains(r#""reduceOnly":true"#));
+        assert!(!net_body.contains("posSide"));
+    }
+
+    #[test]
+    fn hedge_mode_reaches_the_batch_and_bracket_paths() {
+        let (hedged, mock) = hedged_futures_client(1000);
+        mock.push_json(200, OKX_ORDER_OK);
+        hedged
+            .place_batch(&[OrderRequest::limit_buy(symbol(), dec!(1), dec!(100))])
+            .unwrap();
+        mock.push_json(
+            200,
+            r#"{"code":"0","data":[{"algoId":"algo1","sCode":"0","sMsg":""}]}"#,
+        );
+        hedged
+            .place_oco(&OcoRequest::new(
+                symbol(),
+                OrderSide::Sell,
+                dec!(1),
+                dec!(110),
+                dec!(95),
+            ))
+            .unwrap();
+        let reqs = mock.recorded_requests();
+        assert!(reqs[0]
+            .body
+            .as_deref()
+            .unwrap()
+            .contains(r#""posSide":"long""#));
+        // A bracket protects an open position, so a sell bracket closes the long.
+        assert!(reqs[1]
+            .body
+            .as_deref()
+            .unwrap()
+            .contains(r#""posSide":"long""#));
+    }
 
     #[test]
     fn configured_margin_mode_reaches_every_order() {

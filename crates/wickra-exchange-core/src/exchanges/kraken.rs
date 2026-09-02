@@ -36,7 +36,7 @@ use crate::credentials::Credentials;
 use crate::error::{Error, Result};
 use crate::events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
 use crate::normalize::{format_decimal, parse_decimal};
-use crate::options::{ExchangeOptions, MarginMode, MarketType};
+use crate::options::{ExchangeOptions, MarginMode, MarketType, PositionMode};
 use crate::positions::{Position, PositionSide};
 use crate::signing::{hmac_sha512_base64_with_b64_secret, sha256};
 use crate::symbol::Symbol;
@@ -71,6 +71,9 @@ pub struct Kraken {
     ws: Option<Box<dyn WsTransport>>,
     rest_base: String,
     market_type: MarketType,
+    /// One-way or hedge. Kraken Futures is one-way only, so a hedged
+    /// configuration is refused rather than silently ignored.
+    position_mode: PositionMode,
     credentials: Option<Credentials>,
     now_ms: Box<dyn Fn() -> i64 + Send + Sync>,
     /// Offset between this machine's clock and the venue's, applied to every
@@ -149,6 +152,7 @@ impl Kraken {
             ws: None,
             rest_base: if futures { FUTURES_HOST } else { SPOT_HOST }.to_string(),
             market_type: options.market_type,
+            position_mode: options.position_mode,
             credentials,
             now_ms: Box::new(system_now_ms),
             clock: ServerClock::new(),
@@ -209,6 +213,29 @@ impl Kraken {
     /// than the spot REST API.
     fn is_futures(&self) -> bool {
         self.market_type.is_derivatives()
+    }
+
+    /// Refuse a futures order on a client configured for hedge mode.
+    ///
+    /// Kraken Futures holds one net position per contract and has no
+    /// hedge (dual-side) mode, so there is no
+    /// field on the order that could carry the side. Placing the order anyway
+    /// would open or close the single net position -- which is what the caller
+    /// asked to avoid by configuring hedge. Same treatment as
+    /// `set_margin_mode(Isolated)` here: say so rather than do something else.
+    ///
+    /// # Errors
+    /// Returns [`Error::Exchange`] on a futures client in
+    /// [`PositionMode::Hedge`](crate::PositionMode).
+    fn ensure_one_way(&self) -> Result<()> {
+        if self.is_futures() && self.position_mode == PositionMode::Hedge {
+            return Err(Error::Exchange {
+                code: "unsupported".to_string(),
+                message: "Kraken Futures is one-way only; PositionMode::Hedge cannot be                           expressed on its orders"
+                    .to_string(),
+            });
+        }
+        Ok(())
     }
 
     /// The Kraken **Futures** perpetual symbol for a canonical [`Symbol`]
@@ -579,6 +606,7 @@ impl Kraken {
     /// separate feed), [`Error::NotConnected`] without a WebSocket transport, or
     /// another [`Error`] if the order is invalid or rejected.
     pub fn place_order_ws(&mut self, request: &OrderRequest) -> Result<Order> {
+        self.ensure_one_way()?;
         request.validate()?;
         let mut params = serde_json::Map::new();
         params.insert(
@@ -743,6 +771,7 @@ impl Kraken {
     /// Returns an [`Error`] if the order is invalid, credentials are missing, or
     /// the venue rejects it.
     pub fn place_order(&self, request: &OrderRequest) -> Result<Order> {
+        self.ensure_one_way()?;
         request.validate()?;
         if self.is_futures() {
             return self.place_futures_order(request);
@@ -1171,6 +1200,7 @@ impl Kraken {
     /// Returns [`Error::NotFound`] if there is no open position, or another
     /// [`Error`] if the request fails.
     pub fn close_position(&self, symbol: &Symbol) -> Result<Order> {
+        self.ensure_one_way()?;
         let want = Self::futures_symbol(symbol);
         let position = self
             .positions(Some(symbol))?
@@ -2122,6 +2152,7 @@ impl Kraken {
     /// the request itself fails (a per-order rejection is carried in its own
     /// [`Result`], not the outer one).
     pub fn place_batch(&self, requests: &[OrderRequest]) -> Result<Vec<Result<Order>>> {
+        self.ensure_one_way()?;
         if requests.is_empty() {
             return Ok(Vec::new());
         }
@@ -2283,6 +2314,34 @@ mod tests {
         )
         .with_clock(Box::new(move || now_ms));
         (kraken, mock)
+    }
+    fn hedged_futures_client(now_ms: i64) -> (Kraken, Arc<MockHttpTransport>) {
+        let mock = Arc::new(MockHttpTransport::new());
+        let mut opts = ExchangeOptions::mainnet(crate::MarketType::UsdMFutures);
+        opts.position_mode = PositionMode::Hedge;
+        let kraken = Kraken::with_credentials(
+            Box::new(ArcTransport(Arc::clone(&mock))),
+            &opts,
+            Credentials::new("APIKEY", "c2VjcmV0"),
+        )
+        .with_clock(Box::new(move || now_ms));
+        (kraken, mock)
+    }
+
+    #[test]
+    fn hedge_mode_is_refused_rather_than_ignored() {
+        // Kraken Futures is one-way only: there is no field on the order that
+        // could carry a side. Placing it anyway would move the single net
+        // position, which is what configuring hedge asked to avoid.
+        let (hedged, _mock) = hedged_futures_client(1000);
+        let err = hedged
+            .place_order(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)))
+            .unwrap_err();
+        assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
+
+        // One-way on the same venue still places orders.
+        let (one_way, _) = signed_futures_client(1000);
+        let _ = one_way.place_order(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)));
     }
 
     fn signed_ws_client(now_ms: i64) -> (Kraken, Arc<MockHttpTransport>, Arc<MockWsTransport>) {

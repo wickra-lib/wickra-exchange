@@ -19,7 +19,7 @@ use crate::error::{Error, Result};
 use crate::events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
 use crate::idempotency::ClientIdGenerator;
 use crate::normalize::{format_decimal, parse_decimal};
-use crate::options::{ExchangeOptions, MarginMode, MarketType, SelfTradePrevention};
+use crate::options::{ExchangeOptions, MarginMode, MarketType, PositionMode, SelfTradePrevention};
 use crate::positions::{Position, PositionSide};
 use crate::signing::hmac_sha256_base64;
 use crate::symbol::Symbol;
@@ -50,6 +50,9 @@ pub struct KuCoin {
     ws: Option<Box<dyn WsTransport>>,
     rest_base: String,
     market_type: MarketType,
+    /// One-way or hedge. KuCoin Futures is one-way only, so a hedged
+    /// configuration is refused rather than silently ignored.
+    position_mode: PositionMode,
     credentials: Option<Credentials>,
     now_ms: Box<dyn Fn() -> i64 + Send + Sync>,
     /// Client order ids for orders the caller did not name.
@@ -118,6 +121,7 @@ impl KuCoin {
                 "https://api.kucoin.com".to_string()
             },
             market_type: options.market_type,
+            position_mode: options.position_mode,
             credentials,
             now_ms: Box::new(system_now_ms),
             client_ids: ClientIdGenerator::with_seed(
@@ -173,6 +177,29 @@ impl KuCoin {
     /// contract symbols like `XBTUSDTM`) rather than spot.
     fn is_futures(&self) -> bool {
         self.market_type.is_derivatives()
+    }
+
+    /// Refuse a futures order on a client configured for hedge mode.
+    ///
+    /// KuCoin Futures holds one net position per contract and has no
+    /// hedge (dual-side) mode, so there is no
+    /// field on the order that could carry the side. Placing the order anyway
+    /// would open or close the single net position -- which is what the caller
+    /// asked to avoid by configuring hedge. Same treatment as
+    /// `set_margin_mode(Isolated)` here: say so rather than do something else.
+    ///
+    /// # Errors
+    /// Returns [`Error::Exchange`] on a futures client in
+    /// [`PositionMode::Hedge`](crate::PositionMode).
+    fn ensure_one_way(&self) -> Result<()> {
+        if self.is_futures() && self.position_mode == PositionMode::Hedge {
+            return Err(Error::Exchange {
+                code: "unsupported".to_string(),
+                message: "KuCoin Futures is one-way only; PositionMode::Hedge cannot be                           expressed on its orders"
+                    .to_string(),
+            });
+        }
+        Ok(())
     }
 
     /// The KuCoin **futures** contract symbol for a canonical [`Symbol`]:
@@ -442,6 +469,7 @@ impl KuCoin {
     /// Returns an [`Error`] if the order is invalid, credentials are missing, or
     /// the venue rejects it.
     pub fn place_order(&self, request: &OrderRequest) -> Result<Order> {
+        self.ensure_one_way()?;
         request.validate()?;
         let client_oid = request
             .client_order_id
@@ -1072,6 +1100,7 @@ impl KuCoin {
     /// Returns [`Error::NotFound`] if there is no open position, or another
     /// [`Error`] if the request fails.
     pub fn close_position(&self, symbol: &Symbol) -> Result<Order> {
+        self.ensure_one_way()?;
         let position = self
             .positions(Some(symbol))?
             .into_iter()
@@ -1093,6 +1122,7 @@ impl KuCoin {
     /// Returns an [`Error`] if the batch request itself fails, or if called on a
     /// futures client (multi is a spot endpoint).
     pub fn place_batch(&self, requests: &[OrderRequest]) -> Result<Vec<Result<Order>>> {
+        self.ensure_one_way()?;
         if requests.is_empty() {
             return Ok(Vec::new());
         }
@@ -1179,6 +1209,7 @@ impl KuCoin {
     /// # Errors
     /// Returns an [`Error`] if the OCO is invalid or rejected.
     pub fn place_oco(&self, request: &OcoRequest) -> Result<Vec<Order>> {
+        self.ensure_one_way()?;
         request.validate()?;
         let client_oid = request
             .client_order_id
@@ -1581,6 +1612,34 @@ mod tests {
         )
         .with_clock(Box::new(move || now_ms));
         (kucoin, mock)
+    }
+    fn hedged_futures_client(now_ms: i64) -> (KuCoin, Arc<MockHttpTransport>) {
+        let mock = Arc::new(MockHttpTransport::new());
+        let mut opts = ExchangeOptions::mainnet(crate::MarketType::UsdMFutures);
+        opts.position_mode = PositionMode::Hedge;
+        let kucoin = KuCoin::with_credentials(
+            Box::new(ArcTransport(Arc::clone(&mock))),
+            &opts,
+            Credentials::new("APIKEY", "SECRET").with_passphrase("PASS"),
+        )
+        .with_clock(Box::new(move || now_ms));
+        (kucoin, mock)
+    }
+
+    #[test]
+    fn hedge_mode_is_refused_rather_than_ignored() {
+        // KuCoin Futures is one-way only: there is no field on the order that
+        // could carry a side. Placing it anyway would move the single net
+        // position, which is what configuring hedge asked to avoid.
+        let (hedged, _mock) = hedged_futures_client(1000);
+        let err = hedged
+            .place_order(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)))
+            .unwrap_err();
+        assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
+
+        // One-way on the same venue still places orders.
+        let (one_way, _) = signed_futures_client(1000);
+        let _ = one_way.place_order(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)));
     }
 
     const KU_POSITIONS: &str = r#"{"code":"200000","data":[

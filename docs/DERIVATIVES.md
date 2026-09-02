@@ -155,6 +155,37 @@ client.cancel_order_ws(&sym, &order.id)?;
 `place_order_ws` requires a WebSocket transport (`with_ws`); without one it
 returns `Error::NotConnected`.
 
+## Position mode is carried on every order
+
+`ExchangeOptions.position_mode` describes how the account is configured, and a
+hedged account changes every order rather than any single call: a symbol holds a
+long and a short position at once, so an order has to name the one it means.
+
+```rust
+let mut opts = ExchangeOptions::mainnet(MarketType::UsdMFutures);
+opts.position_mode = PositionMode::Hedge;
+let binance = Binance::with_credentials(transport, &opts, creds);
+
+binance.place_order(&OrderRequest::limit_buy(sym, qty, px))?;              // opens the long
+binance.place_order(&OrderRequest::limit_sell(sym, qty, px).reduce_only())?; // closes it
+```
+
+The side is derived rather than asked for — buying opens the long side or
+closes the short one, and `reduce_only` separates the two:
+
+| side | `reduce_only` | acts on |
+|------|---------------|---------|
+| buy  | `false`       | long, opening |
+| sell | `false`       | short, opening |
+| buy  | `true`        | short, closing |
+| sell | `true`        | long, closing |
+
+Each venue spells the result under its own field name, and two of them replace
+`reduce_only` rather than joining it — Binance rejects `positionSide` and
+`reduceOnly` together, and so does OKX. See the
+[position-mode table](CAPABILITIES.md#position-mode) for the per-venue field and
+for the two venues that have no hedge mode and say so.
+
 ## Derivatives feeds: typed but not yet subscribed
 
 The `feeds` module carries typed shapes for the derivatives microstructure

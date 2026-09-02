@@ -22,7 +22,7 @@ use crate::error::{Error, Result};
 use crate::events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
 use crate::idempotency::ClientIdGenerator;
 use crate::normalize::{format_decimal, parse_decimal};
-use crate::options::{ExchangeOptions, MarginMode, MarketType, SelfTradePrevention};
+use crate::options::{ExchangeOptions, MarginMode, MarketType, PositionMode, SelfTradePrevention};
 use crate::positions::{Position, PositionSide};
 use crate::signing::hmac_sha256_base64;
 use crate::symbol::Symbol;
@@ -49,6 +49,17 @@ fn system_now_ms() -> i64 {
         .as_millis() as i64
 }
 
+/// Bitget's `tradeSide` for a hedged futures order: `open` grows the side the
+/// order's own side implies, `close` reduces the opposite one. One-way orders
+/// carry `reduceOnly` instead and no `tradeSide` at all.
+fn trade_side(request: &OrderRequest) -> &'static str {
+    if request.reduce_only {
+        "close"
+    } else {
+        "open"
+    }
+}
+
 /// Bitget's wire word for a margin mode. Cross is `crossed`, not `cross`.
 fn margin_wire(mode: MarginMode) -> &'static str {
     match mode {
@@ -66,6 +77,9 @@ pub struct Bitget {
     /// The margin mode every futures order carries, kept in step by
     /// [`set_margin_mode`](Self::set_margin_mode).
     margin_mode: MarginMode,
+    /// One-way or hedge. Bitget's v2 mix API says which side a hedged order
+    /// acts on with `tradeSide`, alongside the plain buy/sell `side`.
+    position_mode: PositionMode,
     credentials: Option<Credentials>,
     now_ms: Box<dyn Fn() -> i64 + Send + Sync>,
     /// Client order ids for orders the caller did not name.
@@ -123,6 +137,7 @@ impl Bitget {
             rest_base: "https://api.bitget.com".to_string(),
             market_type: options.market_type,
             margin_mode: options.margin_mode,
+            position_mode: options.position_mode,
             credentials,
             now_ms: Box::new(system_now_ms),
             client_ids: ClientIdGenerator::with_seed(
@@ -485,7 +500,13 @@ impl Bitget {
             body["productType"] = serde_json::json!("USDT-FUTURES");
             body["marginMode"] = serde_json::json!(margin_wire(self.margin_mode));
             body["marginCoin"] = serde_json::json!("USDT");
-            if request.reduce_only {
+            if self.position_mode == PositionMode::Hedge {
+                // A hedged account holds both sides at once, so `tradeSide`
+                // says whether this order grows a side or reduces one.
+                // `reduceOnly` is the one-way spelling of the same thing and
+                // Bitget does not accept the two together.
+                body["tradeSide"] = serde_json::json!(trade_side(request));
+            } else if request.reduce_only {
                 body["reduceOnly"] = serde_json::json!("YES");
             }
             "/api/v2/mix/order/place-order"
@@ -1256,6 +1277,16 @@ impl Bitget {
                 if let Some(price) = r.price {
                     o["price"] = serde_json::json!(format_decimal(price));
                 }
+                if self.is_futures() {
+                    // The position half of the order, which this builder was
+                    // dropping entirely: a batched reduce-only order lost the
+                    // flag, and a hedged one never said which side it acts on.
+                    if self.position_mode == PositionMode::Hedge {
+                        o["tradeSide"] = serde_json::json!(trade_side(r));
+                    } else if r.reduce_only {
+                        o["reduceOnly"] = serde_json::json!("YES");
+                    }
+                }
                 o
             })
             .collect();
@@ -1740,6 +1771,87 @@ mod tests {
         )
         .with_clock(Box::new(move || now_ms));
         (bitget, mock)
+    }
+
+    fn hedged_futures_client(now_ms: i64) -> (Bitget, Arc<MockHttpTransport>) {
+        let mock = Arc::new(MockHttpTransport::new());
+        let mut opts = ExchangeOptions::mainnet(crate::MarketType::UsdMFutures);
+        opts.position_mode = PositionMode::Hedge;
+        let bitget = Bitget::with_credentials(
+            Box::new(ArcTransport(Arc::clone(&mock))),
+            &opts,
+            Credentials::new("APIKEY", "SECRET").with_passphrase("PASS"),
+        )
+        .with_clock(Box::new(move || now_ms));
+        (bitget, mock)
+    }
+
+    #[test]
+    fn hedge_mode_sends_trade_side_instead_of_reduce_only() {
+        let (hedged, mock) = hedged_futures_client(1000);
+        for _ in 0..2 {
+            mock.push_json(
+                200,
+                r#"{"code":"00000","data":{"orderId":"1","clientOid":""}}"#,
+            );
+        }
+        hedged
+            .place_order(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)))
+            .unwrap();
+        hedged
+            .place_order(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)).reduce_only())
+            .unwrap();
+        let reqs = mock.recorded_requests();
+        assert!(reqs[0]
+            .body
+            .as_deref()
+            .unwrap()
+            .contains(r#""tradeSide":"open""#));
+        assert!(reqs[1]
+            .body
+            .as_deref()
+            .unwrap()
+            .contains(r#""tradeSide":"close""#));
+        assert!(!reqs[1].body.as_deref().unwrap().contains("reduceOnly"));
+    }
+
+    #[test]
+    fn the_batch_entry_carries_the_position_half_it_was_dropping() {
+        // The batched builder sent neither `reduceOnly` nor `tradeSide`, so a
+        // batched reduce-only order silently became an opening one.
+        let (one_way, mock) = signed_futures_client(1000);
+        mock.push_json(
+            200,
+            r#"{"code":"00000","data":{
+            "successList":[{"orderId":"o1","clientOid":"b-0"}],"failureList":[]}}"#,
+        );
+        one_way
+            .place_batch(&[OrderRequest::limit_sell(symbol(), dec!(1), dec!(100))
+                .reduce_only()
+                .with_client_order_id("b-0")])
+            .unwrap();
+        assert!(mock.recorded_requests()[0]
+            .body
+            .as_deref()
+            .unwrap()
+            .contains(r#""reduceOnly":"YES""#));
+
+        let (hedged, hedged_mock) = hedged_futures_client(1000);
+        hedged_mock.push_json(
+            200,
+            r#"{"code":"00000","data":{
+            "successList":[{"orderId":"o1","clientOid":"b-0"}],"failureList":[]}}"#,
+        );
+        hedged
+            .place_batch(&[OrderRequest::limit_sell(symbol(), dec!(1), dec!(100))
+                .reduce_only()
+                .with_client_order_id("b-0")])
+            .unwrap();
+        assert!(hedged_mock.recorded_requests()[0]
+            .body
+            .as_deref()
+            .unwrap()
+            .contains(r#""tradeSide":"close""#));
     }
 
     #[test]

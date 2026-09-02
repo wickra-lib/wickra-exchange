@@ -94,6 +94,39 @@ path/host; see [DERIVATIVES.md](DERIVATIVES.md).
 3. Kraken `openpositions` omits mark price and unrealized PnL (reported as zero);
    leverage is the recorded preference, not a per-position field.
 
+### Position mode
+
+`ExchangeOptions.position_mode` says whether the account holds one net position
+per symbol (`OneWay`) or a long and a short at once (`Hedge`). It is not an
+account setting this library changes — it is a statement of how the account is
+already configured, and what a hedged account changes is **every order**: each
+one has to name the side it acts on, under a different field name per venue.
+
+| Venue   | hedge field                       | one-way | hedge |
+|---------|-----------------------------------|:-------:|:-----:|
+| Binance | `positionSide` (`reduceOnly` out) |   ✅    |  ✅   |
+| Bybit   | `positionIdx` 1/2                 |   ✅    |  ✅   |
+| OKX     | `posSide` long/short              |   ✅    |  ✅   |
+| Bitget  | `tradeSide` open/close            |   ✅    |  ✅   |
+| Gate.io | `auto_size` close_long/close_short |  ✅    |  ✅   |
+| HTX     | `direction` + `offset`            |   ✅    |  ✅¹  |
+| KuCoin  | —                                 |   ✅    |  —²   |
+| Kraken  | —                                 |   ✅    |  —²   |
+
+1. HTX needs no branch: its swap orders already carry `direction` (buy/sell)
+   **and** `offset` (open/close), which is the hedged encoding, and the venue
+   accepts the same shape in one-way mode.
+2. KuCoin Futures and Kraken Futures hold one net position per contract and
+   have no hedge mode, so no field on the order could carry a side. A futures
+   order from a client configured `Hedge` returns `Error::Exchange` rather than
+   moving the net position — the same treatment as `set_margin_mode(Isolated)`
+   above.
+
+The side is derived, not asked for: `OrderRequest` carries `side` and
+`reduce_only`, and buying opens the long side or closes the short one. The
+mapping lives in `PositionSide::for_order` and is applied identically on every
+venue.
+
 **Futures order lifecycle:** `query_order` / `cancel_order` / `open_orders` now
 route to the futures order endpoints on all eight futures venues — including Gate
 (`/futures/usdt/orders`), Bitget (mix `/api/v2/mix/order/*`), HTX

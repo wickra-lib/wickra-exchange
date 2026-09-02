@@ -33,7 +33,7 @@ use crate::error::{Error, Result};
 use crate::events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
 use crate::instruments::{Instrument, InstrumentCache, InstrumentFilters};
 use crate::normalize::{format_decimal, parse_decimal};
-use crate::options::{ExchangeOptions, MarginMode, MarketType, SelfTradePrevention};
+use crate::options::{ExchangeOptions, MarginMode, MarketType, PositionMode, SelfTradePrevention};
 use crate::positions::{Position, PositionSide};
 use crate::signing::hmac_sha256_hex;
 use crate::symbol::Symbol;
@@ -68,6 +68,9 @@ pub struct Binance {
     ws: Option<Box<dyn WsTransport>>,
     rest_base: String,
     market_type: MarketType,
+    /// One-way or hedge. In hedge mode every futures order names the side of
+    /// the account it acts on, and `reduceOnly` is not accepted.
+    position_mode: PositionMode,
     testnet: bool,
     credentials: Option<Credentials>,
     recv_window_ms: u64,
@@ -137,6 +140,7 @@ impl Binance {
             ws: None,
             rest_base: rest_base_url(options.market_type, options.testnet).to_string(),
             market_type: options.market_type,
+            position_mode: options.position_mode,
             testnet: options.testnet,
             credentials,
             recv_window_ms: options.recv_window_ms,
@@ -194,6 +198,33 @@ impl Binance {
     /// than spot (api/v3 paths).
     fn is_futures(&self) -> bool {
         matches!(self.market_type, MarketType::UsdMFutures)
+    }
+
+    /// The position half of an order: `positionSide` and `reduceOnly`.
+    ///
+    /// Binance treats these as alternatives rather than as two independent
+    /// flags. In one-way mode a futures order carries `reduceOnly` and no
+    /// `positionSide` (the venue defaults it to `BOTH`). In hedge mode it
+    /// carries `positionSide` and **must not** carry `reduceOnly`: the venue
+    /// rejects the combination with `-1106 Parameter 'reduceonly' sent when not
+    /// required`, because naming the side is already what says whether the
+    /// order opens or closes.
+    ///
+    /// Only a hedged *futures* client takes the second branch. Spot is
+    /// untouched, and so is one-way futures.
+    fn position_params(&self, request: &OrderRequest) -> String {
+        if self.is_futures() && self.position_mode == PositionMode::Hedge {
+            let side = match PositionSide::for_order(request.side, request.reduce_only) {
+                PositionSide::Long => "LONG",
+                PositionSide::Short => "SHORT",
+            };
+            return format!("&positionSide={side}");
+        }
+        if request.reduce_only {
+            "&reduceOnly=true".to_string()
+        } else {
+            String::new()
+        }
     }
 
     /// The single-order endpoint (place/cancel/query) for this market.
@@ -473,9 +504,7 @@ impl Binance {
             params.push_str("&newClientOrderId=");
             params.push_str(id);
         }
-        if request.reduce_only {
-            params.push_str("&reduceOnly=true");
-        }
+        params.push_str(&self.position_params(request));
         if let Some(mode) = stp_str(request.stp) {
             params.push_str("&selfTradePreventionMode=");
             params.push_str(mode);
@@ -814,7 +843,7 @@ impl Binance {
         if self.is_futures() {
             let items = requests
                 .iter()
-                .map(batch_order_json)
+                .map(|request| batch_order_json(request, self.position_mode))
                 .collect::<Vec<_>>()
                 .join(",");
             let params = format!("batchOrders={}", percent_encode(&format!("[{items}]")));
@@ -933,6 +962,15 @@ impl Binance {
         }
         if let Some(id) = &request.client_order_id {
             params.push(("newClientOrderId".to_string(), id.clone()));
+        }
+        // The ws-api connection goes to ws-fapi on a futures client, so a hedged
+        // account needs the side named here exactly as on the REST path.
+        if self.is_futures() && self.position_mode == PositionMode::Hedge {
+            let side = match PositionSide::for_order(request.side, request.reduce_only) {
+                PositionSide::Long => "LONG",
+                PositionSide::Short => "SHORT",
+            };
+            params.push(("positionSide".to_string(), side.to_string()));
         }
         let result = self.ws_request("order.place", params)?;
         let raw: RawOrder =
@@ -1189,7 +1227,7 @@ fn percent_encode(s: &str) -> String {
 }
 
 /// One element of a futures `batchOrders` JSON array.
-fn batch_order_json(request: &OrderRequest) -> String {
+fn batch_order_json(request: &OrderRequest, position_mode: PositionMode) -> String {
     let mut obj = serde_json::json!({
         "symbol": Binance::wire_symbol(&request.symbol),
         "side": side_str(request.side),
@@ -1205,7 +1243,18 @@ fn batch_order_json(request: &OrderRequest) -> String {
     if let Some(id) = &request.client_order_id {
         obj["newClientOrderId"] = serde_json::json!(id);
     }
-    if request.reduce_only {
+    // Only ever called on the futures batch endpoint, so the hedge rule applies
+    // exactly as it does on the single-order path: name the side instead of
+    // sending `reduceOnly`.
+    if position_mode == PositionMode::Hedge {
+        obj["positionSide"] = serde_json::json!(match PositionSide::for_order(
+            request.side,
+            request.reduce_only
+        ) {
+            PositionSide::Long => "LONG",
+            PositionSide::Short => "SHORT",
+        });
+    } else if request.reduce_only {
         obj["reduceOnly"] = serde_json::json!("true");
     }
     obj.to_string()
@@ -2030,6 +2079,75 @@ mod tests {
         )
         .with_clock(Box::new(move || now_ms));
         (binance, mock)
+    }
+
+    /// An authenticated USDⓈ-M futures client whose account is in hedge mode.
+    fn hedged_futures_client(now_ms: i64) -> (Binance, Arc<MockHttpTransport>) {
+        let mock = Arc::new(MockHttpTransport::new());
+        let mut opts = ExchangeOptions::mainnet(MarketType::UsdMFutures);
+        opts.position_mode = PositionMode::Hedge;
+        let binance = Binance::with_credentials(
+            Box::new(ArcTransport(Arc::clone(&mock))),
+            &opts,
+            Credentials::new("APIKEY", "SECRET"),
+        )
+        .with_clock(Box::new(move || now_ms));
+        (binance, mock)
+    }
+
+    #[test]
+    fn hedge_mode_names_the_side_and_drops_reduce_only() {
+        // A hedged account holds both sides at once. Without `positionSide`
+        // Binance rejects the order with -4061; with `reduceOnly` alongside it,
+        // with -1106. Opening buys the long side, closing sells it.
+        let (hedged, mock) = hedged_futures_client(1000);
+        for _ in 0..2 {
+            mock.push_json(200, ORDER_JSON);
+        }
+        hedged
+            .place_order(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)))
+            .unwrap();
+        hedged
+            .place_order(&OrderRequest::limit_sell(symbol(), dec!(1), dec!(100)).reduce_only())
+            .unwrap();
+
+        let reqs = mock.recorded_requests();
+        assert!(reqs[0].url.contains("positionSide=LONG"));
+        assert!(reqs[1].url.contains("positionSide=LONG")); // a sell closes the long
+        assert!(!reqs[1].url.contains("reduceOnly"));
+    }
+
+    #[test]
+    fn one_way_futures_and_spot_are_unchanged() {
+        // The hedge branch is the only new one: one-way futures and spot still
+        // send `reduceOnly` and no `positionSide`.
+        let (futures, mock) = signed_futures_client(1000);
+        mock.push_json(200, ORDER_JSON);
+        futures
+            .place_order(&OrderRequest::limit_sell(symbol(), dec!(1), dec!(100)).reduce_only())
+            .unwrap();
+        let reqs = mock.recorded_requests();
+        assert!(reqs[0].url.contains("reduceOnly=true"));
+        assert!(!reqs[0].url.contains("positionSide"));
+    }
+
+    #[test]
+    fn hedge_mode_reaches_the_batch_and_websocket_paths() {
+        // Three futures order paths, not one: REST, the native batch endpoint
+        // and the ws-fapi order API.
+        let json = batch_order_json(
+            &OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)),
+            PositionMode::Hedge,
+        );
+        assert!(json.contains(r#""positionSide":"LONG""#));
+        assert!(!json.contains("reduceOnly"));
+
+        let one_way = batch_order_json(
+            &OrderRequest::limit_sell(symbol(), dec!(1), dec!(100)).reduce_only(),
+            PositionMode::OneWay,
+        );
+        assert!(one_way.contains(r#""reduceOnly":"true""#));
+        assert!(!one_way.contains("positionSide"));
     }
 
     #[test]

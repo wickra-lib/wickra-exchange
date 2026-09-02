@@ -8,6 +8,7 @@
 
 use crate::options::MarginMode;
 use crate::symbol::Symbol;
+use crate::types::OrderSide;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +28,31 @@ impl PositionSide {
         match self {
             PositionSide::Long => Decimal::ONE,
             PositionSide::Short => Decimal::NEGATIVE_ONE,
+        }
+    }
+
+    /// Which side of a hedged account an order acts on.
+    ///
+    /// In [`PositionMode::Hedge`](crate::PositionMode) a symbol carries a long
+    /// and a short position at once, so an order has to name the one it means.
+    /// [`OrderRequest`](crate::OrderRequest) does not carry that name, and does
+    /// not need to: buying opens the long side or closes the short one, and
+    /// selling does the reverse. `reduce_only` is what separates the two.
+    ///
+    /// | side | `reduce_only` | acts on |
+    /// |------|---------------|---------|
+    /// | buy  | `false`       | long, opening |
+    /// | sell | `false`       | short, opening |
+    /// | buy  | `true`        | short, closing |
+    /// | sell | `true`        | long, closing |
+    ///
+    /// Every venue that supports hedged accounts spells this the same way under
+    /// a different field name, so the mapping lives here once.
+    #[must_use]
+    pub fn for_order(side: OrderSide, reduce_only: bool) -> Self {
+        match (side, reduce_only) {
+            (OrderSide::Buy, false) | (OrderSide::Sell, true) => PositionSide::Long,
+            (OrderSide::Sell, false) | (OrderSide::Buy, true) => PositionSide::Short,
         }
     }
 }
@@ -90,6 +116,28 @@ mod tests {
             unrealized_pnl: dec!(0),
             margin_mode: MarginMode::Cross,
         }
+    }
+
+    #[test]
+    fn hedge_side_follows_side_and_reduce_only() {
+        // Opening: the side of the order is the side of the position.
+        assert_eq!(
+            PositionSide::for_order(OrderSide::Buy, false),
+            PositionSide::Long
+        );
+        assert_eq!(
+            PositionSide::for_order(OrderSide::Sell, false),
+            PositionSide::Short
+        );
+        // Closing: the order takes the opposite side of the position it reduces.
+        assert_eq!(
+            PositionSide::for_order(OrderSide::Buy, true),
+            PositionSide::Short
+        );
+        assert_eq!(
+            PositionSide::for_order(OrderSide::Sell, true),
+            PositionSide::Long
+        );
     }
 
     #[test]
