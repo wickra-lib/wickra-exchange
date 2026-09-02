@@ -98,6 +98,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The CodSpeed gate was comparing against the wrong commit, and the path
+  filter on `main` was why.** CodSpeed measures a pull request against a
+  measurement of `main`; when the newest `main` commit has none it falls back to
+  an older one and says so in a footnote. The workflow only ran on pushes that
+  touched `crates/**`, `Cargo.toml`, `Cargo.lock` or its own file, so every
+  merge that changed bindings, examples or documentation left `main` unmeasured
+  — three in a row at one point. Pull requests were then compared against a base
+  several merges old, and everything in between was reported as *their*
+  regression: `apply_delta` at 453.6 ns against a 399.4 ns base, on branches
+  whose generated assembly for that function was byte-identical.
+  - It was not the machine. The diagnostic step added alongside recorded the
+    same CPU (Intel Xeon 6973P-C, family 6 model 173 stepping 1), the same
+    kernel and the same rustc on both sides of one such comparison, which is
+    what ruled the environment out and left the base selection.
+  - The `push` trigger no longer filters by path, so every commit that lands on
+    `main` is measured and the base is always the real one. The `pull_request`
+    filter stays: a pull request that touches nothing relevant needs no run. The
+    cost is one job per merge, against a gate that cried wolf until people
+    stopped reading it.
+
 - **`Error::RateLimited` never carried the wait it documents.** The variant has
   a `retry_after` field described as "the advised wait if the venue supplied one
   (`Retry-After`)". It was constructed thirteen times across the ten venue

@@ -11,10 +11,27 @@ name: CodSpeed
 # BENCHMARKS.md -- those are throughput, this is relative change. Both are true;
 # they answer different questions.
 on:
+  # Deliberately unfiltered on main, unlike the pull_request trigger below.
+  #
+  # A path filter here was the cause of a run of false regressions. CodSpeed
+  # compares a pull request against a measurement of main; when the newest main
+  # commit has none it falls back to an older one and says so in a footnote
+  # ("No successful run was found on main (<sha>), so <older sha> was used
+  # instead"). Everything merged between those two commits then shows up as this
+  # pull request's regression. With the filter, main went unmeasured on every
+  # merge that touched only bindings, examples or docs -- three in a row at one
+  # point -- and `apply_delta` was reported 12% slower on branches whose
+  # generated assembly for that function was byte-identical.
+  #
+  # It was not the machine: the diagnostic step below recorded the same CPU
+  # (Intel Xeon 6973P-C, family 6 model 173 stepping 1), the same kernel and the
+  # same rustc on both sides of one such comparison.
+  #
+  # So: measure every commit that lands on main, and the base is always the real
+  # one. The cost is one job per merge; the alternative was a gate that cried
+  # wolf until people stopped reading it.
   push:
     branches: [main]
-    paths:
-      ["crates/**", "Cargo.toml", "Cargo.lock", ".github/workflows/codspeed.yml"]
   pull_request:
     branches: [main]
     paths:
@@ -64,17 +81,19 @@ jobs:
       # basic-block label numbering, and `apply_level` identical but for the
       # names of anonymous panic constants.
       #
-      # The offset then disappeared on its own, once main was measured again on
-      # a later commit -- base and head have agreed since. So the cause was in
-      # the comparison rather than in the source, but which part of it is not
-      # established: CodSpeed reported "Different runtime environments detected"
-      # without naming the dimension, and separately fell back to an unexpected
-      # base commit at one point.
+      # This step then answered the rest of it on its first pair of runs. The
+      # main run and the pull-request run it was compared against reported the
+      # same CPU (Intel Xeon 6973P-C, family 6 model 173 stepping 1), the same
+      # kernel (6.17.0-1022-azure) and the same rustc 1.98.0 -- so CodSpeed's
+      # "Different runtime environments detected" was not about the machine, and
+      # what remained was its own footnote: it had fallen back to an older base
+      # commit because the newest main commit had never been measured. The path
+      # filter that caused that is gone from the push trigger above.
       #
-      # This step exists so a recurrence is diagnosable instead of re-derived
-      # from scratch: it records the CPU, kernel and toolchain of whatever
-      # machine produced the number. A diagnostic must never fail the job, hence
-      # the fallback and the trailing `|| true`.
+      # The step stays because the answer took an evening to reach and the next
+      # occurrence should take one run: it records the CPU, kernel and toolchain
+      # of whatever machine produced a number. A diagnostic must never fail the
+      # job, hence the fallback and the trailing `|| true`.
       - name: Record the measurement environment
         # `github.ref` reaches the shell through the environment, not through
         # template expansion: on a push it carries a branch name, and a branch
