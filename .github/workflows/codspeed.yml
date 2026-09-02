@@ -151,12 +151,22 @@ jobs:
       # is not the CPU (three models, same numbers) and not the code (assembly
       # byte-identical); it is the environment the simulation runs in.
       #
-      # That is the honest state of it. When this fires: compare the recorded CPU
-      # lines, look for that "different runtime environments" note in the report,
-      # check the footnote for a base commit older than main's head (`No
-      # successful run was found on main`), and diff the emitted assembly for the
-      # named function. If the code is identical, the number is not about this
-      # pull request -- and the two figures will be that same pair again.
+      # Third, and it settles the question as far as this repository can: the
+      # next run on that same branch reported no regression at all. The commit
+      # between them touched only this comment -- not one line the benchmark
+      # executes -- so the code under measurement was identical across a red run
+      # and a green one. Whatever varies, it is not in this repository.
+      #
+      # That is the honest state of it, and it now comes with a cheaper first
+      # step. When this fires: check whether the report carries the "different
+      # runtime environments" note, and if the diff does not touch the benchmarked
+      # path, re-run the job before investigating further -- the figure has
+      # resolved itself on a re-run with unchanged code. If it persists, then
+      # compare the recorded CPU lines, check the footnote for a base commit
+      # older than main's head (`No successful run was found on main`), and diff
+      # the emitted assembly for the named function. If the code is identical,
+      # the number is not about this pull request -- and the two figures will be
+      # that same pair again.
       #
       # A threshold is still not the answer: one wide enough to swallow 12%
       # would swallow a real 12% regression too.
