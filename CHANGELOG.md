@@ -142,6 +142,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **OKX signed with this machine's clock, and Upbit's nonce could repeat.**
+  Two gaps in the clock work above, found by counting which clients actually
+  hold the types involved rather than by re-reading the claim.
+  - **OKX** had no `ServerClock` and no `sync_time` at all: eight of the ten
+    clients had one. It stamps `OK-ACCESS-TIMESTAMP` on every signed request and
+    refuses one whose time is too far from its own, so this is the exact failure
+    the clock work set out to end — a machine a few seconds off has every signed
+    call rejected, with a message about the timestamp rather than about the
+    clock. It now reads `GET /api/v5/public/time` (the timestamp arrives as a
+    string inside the envelope's one-element `data` array) and signs with the
+    corrected value.
+  - **Upbit's** JWT nonce was `wkex-{wall clock in ms}`. Upbit refuses a nonce it
+    has seen, so two signed calls inside one millisecond meant the second was
+    rejected. This is the same defect `NonceGenerator` was written for and fixed
+    on Kraken — Kraken was the only venue using it. Upbit now uses it too.
+  - Upbit still has no `ServerClock`, and deliberately: its JWT carries a nonce
+    rather than a validity timestamp, so its signature does not depend on
+    agreeing with the venue's clock. Nine of ten is the correct number here, and
+    the entry above now says so instead of "each client".
+
 - **Three documents described things that are not in the tree.**
   - `README.md` and `ARCHITECTURE.md` both listed `crates/wickra-exchange-cli/`
     — "the `wkex` command-line client" — in their project layouts. There is no
@@ -385,8 +405,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   signatures from the local clock. A venue refuses a signed request whose
   timestamp falls outside its receive window, so a machine a few seconds off had
   every order rejected — with a message about the window rather than about the
-  clock. Each client gains `sync_time()`, which reads the venue's own time
-  endpoint, and every signed path uses the corrected value. The endpoint shapes
+  clock. Nine of the ten clients gain `sync_time()`, which reads the venue's
+  own time endpoint, and every signed path uses the corrected value. Upbit is
+  the exception and needs none: its JWT carries a nonce rather than a
+  validity timestamp, so nothing in its signature depends on agreeing with
+  the venue's clock. The endpoint shapes
   were read off the live public endpoints rather than taken from documentation:
   Kraken reports seconds where everyone else reports milliseconds, and Bitget,
   OKX and Coinbase return the number as a string.

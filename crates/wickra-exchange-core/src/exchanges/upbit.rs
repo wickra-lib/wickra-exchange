@@ -7,6 +7,7 @@
 //! market-data JSON encodes numbers as JSON numbers. There is no envelope;
 //! errors come back as an HTTP error status with `{error:{name, message}}`.
 
+use crate::clock::NonceGenerator;
 use crate::credentials::Credentials;
 use crate::error::{Error, Result};
 use crate::events::{BookLevel, Event, OrderBookSnapshot, TradePrint};
@@ -43,6 +44,11 @@ pub struct Upbit {
     rest_base: String,
     credentials: Option<Credentials>,
     now_ms: Box<dyn Fn() -> i64 + Send + Sync>,
+    /// Upbit refuses a JWT whose `nonce` it has seen before. The wall clock in
+    /// milliseconds repeats when two signed calls land inside one millisecond,
+    /// so the nonce is forced strictly upward instead -- the same generator
+    /// Kraken uses, for the same reason.
+    nonces: NonceGenerator,
     connection: Option<Box<dyn WsConnection>>,
     sub_messages: Vec<String>,
 }
@@ -76,6 +82,7 @@ impl Upbit {
             rest_base: "https://api.upbit.com".to_string(),
             credentials,
             now_ms: Box::new(system_now_ms),
+            nonces: NonceGenerator::new(0),
             connection: None,
             sub_messages: Vec::new(),
         }
@@ -405,7 +412,8 @@ impl Upbit {
             "signed endpoint requires credentials",
         ))?;
         let header = br#"{"alg":"HS512","typ":"JWT"}"#;
-        let nonce = format!("wkex-{:x}", (self.now_ms)());
+        let candidate = u64::try_from((self.now_ms)()).unwrap_or(0);
+        let nonce = format!("wkex-{:x}", self.nonces.next(candidate));
         let mut payload = serde_json::json!({
             "access_key": creds.api_key,
             "nonce": nonce,
@@ -986,5 +994,51 @@ mod tests {
         let err = upbit.ticker(&symbol()).unwrap_err();
         let wait = std::time::Duration::from_millis(2500);
         assert!(matches!(err, Error::RateLimited { retry_after: Some(d) } if d == wait));
+    }
+
+    /// Two signed calls inside one millisecond get different nonces.
+    ///
+    /// Upbit refuses a JWT whose `nonce` it has already seen. The nonce used to
+    /// be the wall clock in milliseconds, so a client issuing two signed calls
+    /// fast enough sent the same one twice and the second was rejected -- the
+    /// same defect `NonceGenerator` was written for and applied to Kraken,
+    /// which was the only venue using it.
+    ///
+    /// The clock here is frozen, which is the worst case rather than an
+    /// artificial one: it is what a burst inside a single millisecond looks
+    /// like.
+    #[test]
+    fn two_signed_calls_on_a_frozen_clock_get_different_nonces() {
+        let (upbit, mock) = signed_client(1_000);
+        mock.push_json(200, r#"{"uuid":"U1","side":"bid","state":"wait"}"#);
+        mock.push_json(200, r#"{"uuid":"U2","side":"bid","state":"wait"}"#);
+
+        upbit
+            .place_order(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)))
+            .unwrap();
+        upbit
+            .place_order(&OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)))
+            .unwrap();
+
+        let nonce_of = |index: usize| -> String {
+            let request = &mock.recorded_requests()[index];
+            let jwt = request
+                .headers
+                .iter()
+                .find(|(name, _)| name == "Authorization")
+                .map(|(_, value)| value.strip_prefix("Bearer ").unwrap())
+                .unwrap();
+            let payload = jwt.split('.').nth(1).unwrap();
+            let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(payload)
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+            value["nonce"].as_str().unwrap().to_string()
+        };
+
+        let first = nonce_of(0);
+        let second = nonce_of(1);
+        assert_eq!(first, "wkex-3e8", "the first still tracks the clock");
+        assert_ne!(first, second, "a repeated nonce is refused by the venue");
     }
 }
