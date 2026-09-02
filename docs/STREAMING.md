@@ -38,6 +38,33 @@ When the peer closes a stream, the client transparently **reconnects and replays
 every subscription** — the consumer only sees a `Disconnected` followed by a
 `Reconnected` event, and the buffer keeps filling.
 
+A reconnect is also the moment to check what the account did while you were not
+watching. The client cannot do this for you: it knows what the venue lists right
+now, not what *you* believed was open. So the two halves are yours to join —
+`Event::Reconnected` tells you when, and `reconcile_orders` compares your list of
+open order ids against `open_orders`:
+
+```rust
+if matches!(event, Event::Reconnected) {
+    let diff = reconcile_orders(&believed_open, &exchange.open_orders(None)?);
+    for id in &diff.vanished {
+        // Believed open here, not open at the venue: it filled or cancelled
+        // unseen. Fetch its final state before trusting any position or risk
+        // figure derived from it.
+        let order = exchange.query_order(&market, id)?;
+    }
+}
+```
+
+`vanished` is the half that matters. `appeared` means an order exists that this
+client did not place — another session, or an acknowledgement that was lost.
+
+A runnable version, offline and deterministic, is
+[`examples/rust/src/reconcile_after_reconnect.rs`](../examples/rust/src/reconcile_after_reconnect.rs):
+a replay tape can carry `Disconnected` / `Reconnected` exactly as a live stream
+emits them, so the control flow there is the one you would write against a
+venue.
+
 For live trading, pair that with a **dead-man's-switch** (`DeadMansSwitch`): arm
 it and feed it a heartbeat on every message; if the deadline passes without one,
 `is_expired` fires and you cancel every resting order (via the venue's cancel-all

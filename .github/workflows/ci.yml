@@ -159,6 +159,15 @@ jobs:
       - name: Build the C ABI library
         run: cargo build -p wickra-exchange-c --release
 
+      # The Rust examples are workspace members, so `cargo test --workspace`
+      # compiles them -- and nothing ran them, which meant the assertions
+      # inside were never executed. These two are offline and deterministic:
+      # `ticker` is excluded because it opens a socket to a live venue.
+      - name: Rust examples — run the offline ones
+        run: |
+          cargo run -p wickra-exchange-examples --bin paper_trade
+          cargo run -p wickra-exchange-examples --bin reconcile_after_reconnect
+
       - name: Node example — syntax check
         run: |
           set -euo pipefail

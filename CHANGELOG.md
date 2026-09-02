@@ -79,6 +79,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A runnable example and a documented flow for reconciling after a
+  reconnect.** `reconcile_orders` was reachable only by reading the source: the
+  word "reconcile" appeared in the repository's documentation exactly once, in a
+  directory listing. It is not an unwired internal responsibility — the library
+  cannot reconcile alone, because it knows what the venue lists and not what the
+  caller believed was open — but nothing showed a caller how to join the two
+  halves it does provide. `docs/STREAMING.md` now does, and
+  `examples/rust/src/reconcile_after_reconnect.rs` runs it: a replay tape can
+  carry `Disconnected` / `Reconnected` exactly as a live stream emits them, so
+  the example is offline and deterministic while its control flow is the one a
+  live caller writes.
+- The `examples-smoke` job now **runs** the two offline Rust examples instead of
+  only compiling them. They are workspace members, so `cargo test --workspace`
+  built them and nothing executed them — the assertions inside had never run.
+  `ticker` stays excluded: it opens a socket to a live venue.
+
 - **The sleep-and-retry loop that `Backoff` and `WeightedRateLimiter` were
   written for.** Both were complete, tested policies that nothing called:
   each had exactly one reference outside its own file, the `mod` line.
