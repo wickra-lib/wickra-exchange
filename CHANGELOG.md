@@ -24,6 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `wss://.../ws/<listenKey>`, and a listen key opens the account's order and
   balance stream.
 
+  The three failure outcomes now have tests, which none of them had: the mock
+  WebSocket transport could only ever open a connection that accepted
+  everything, so a refused reconnect and a reconnect whose subscriptions cannot
+  be replayed were unreachable from a test. `MockWsTransport` gains
+  `push_refused_connection` and `push_unsendable_connection` for them.
+
   `retry.rs` and `deadman.rs` were candidates and are deliberately left alone.
   Both are pure policy types with no I/O — `DeadMansSwitch` has no call site in
   the library at all, the caller holds it — so there is no decision there to
