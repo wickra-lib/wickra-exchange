@@ -76,7 +76,7 @@ def test_a_bool_is_not_a_quantity():
 
 def test_an_exact_order_still_places():
     """The exact spelling is not a separate path: it places like any other."""
-    ex = wx.Exchange.paper({"USDT": 100_000.0})
+    ex = wx.Exchange.paper({"USDT": 100_000.0, "BTC": 10.0})
     ex.set_price("BTC/USDT", 20_000.0)
     order = ex.place_order(wx.OrderRequest.limit_sell("BTC/USDT", "1.5", "21000.5"))
     assert order["status"] == "new"
