@@ -477,10 +477,29 @@ impl Okx {
     /// # Errors
     /// Returns [`Error::NotConnected`] without a WebSocket transport, or another
     /// [`Error`] if the order is invalid or the venue rejects it.
+    /// Refuse `reduce_only` on a spot client, on every path that takes an order.
+    ///
+    /// A spot account holds balances, not positions, so there is nothing for a
+    /// reduce-only order to reduce. OKX applies `reduceOnly` to margin orders
+    /// and to futures and swaps in net mode; under the `cash` trade mode it is
+    /// carried and ignored, which leaves the caller believing an order can only
+    /// close when it can open.
+    fn ensure_reduce_only_is_reducible(&self, request: &OrderRequest) -> Result<()> {
+        if request.reduce_only && self.market_type == MarketType::Spot {
+            return Err(Error::unsupported_field(
+                "OKX",
+                "reduce_only on a spot order",
+                "spot holds balances, not positions, and has none to reduce",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn place_order_ws(&mut self, request: &OrderRequest) -> Result<Order> {
         if request.order_type.is_trigger() {
             return Err(Error::unsupported_trigger("OKX"));
         }
+        self.ensure_reduce_only_is_reducible(request)?;
         request.validate()?;
         let ord_type = ord_type_for(request)?;
         let mut arg = serde_json::json!({
@@ -606,6 +625,7 @@ impl Okx {
         if request.order_type.is_trigger() {
             return Err(Error::unsupported_trigger("OKX"));
         }
+        self.ensure_reduce_only_is_reducible(request)?;
         request.validate()?;
         let ord_type = ord_type_for(request)?;
         let mut body = serde_json::json!({
@@ -1508,6 +1528,9 @@ impl Okx {
         if requests.iter().any(|r| r.order_type.is_trigger()) {
             return Err(Error::unsupported_trigger("OKX"));
         }
+        for request in requests {
+            self.ensure_reduce_only_is_reducible(request)?;
+        }
         let items: Vec<serde_json::Value> = requests
             .iter()
             .map(|r| self.batch_order_json(r))
@@ -2391,6 +2414,22 @@ mod tests {
         ));
     }
 
+    /// The same, on a swap client. `reduce_only` names a position, so the field
+    /// only has a meaning to test where one can exist.
+    fn signed_futures_ws_client(now_ms: i64) -> (Okx, Arc<MockWsTransport>) {
+        let http = Arc::new(MockHttpTransport::new());
+        let ws = Arc::new(MockWsTransport::new());
+        let opts = ExchangeOptions::mainnet(MarketType::UsdMFutures);
+        let okx = Okx::with_credentials(
+            Box::new(ArcTransport(http)),
+            &opts,
+            Credentials::new("APIKEY", "SECRET").with_passphrase("PASS"),
+        )
+        .with_ws(Box::new(ArcWs(Arc::clone(&ws))))
+        .with_clock(Box::new(move || now_ms));
+        (okx, ws)
+    }
+
     fn signed_ws_client(now_ms: i64) -> (Okx, Arc<MockWsTransport>) {
         let http = Arc::new(MockHttpTransport::new());
         let ws = Arc::new(MockWsTransport::new());
@@ -2546,8 +2585,9 @@ mod tests {
     #[test]
     fn the_websocket_frame_carries_reduce_only_and_the_stp_policy() {
         // Both are honoured on the REST body and were dropped from this frame,
-        // which uses the same key spellings.
-        let (mut okx, ws) = signed_ws_client(1_700_000_000_000);
+        // which uses the same key spellings. On a swap client: `reduce_only`
+        // names a position, and the spot client refuses it for want of one.
+        let (mut okx, ws) = signed_futures_ws_client(1_700_000_000_000);
         ws.push_connection(vec![
             Ok(Some(r#"{"event":"login","code":"0"}"#.to_string())),
             Ok(Some(

@@ -349,10 +349,28 @@ impl Coinbase {
         ))
     }
 
+    /// Refuse `reduce_only` where there is no position to reduce.
+    ///
+    /// A spot account holds balances, not positions, so a reduce-only order has
+    /// nothing to close. Dropping the flag would place an opening order where a
+    /// closing one was asked for -- the opposite trade -- so it is refused, the
+    /// way Binance's spot path and Upbit already refuse it.
+    fn ensure_reduce_only_is_reducible(request: &OrderRequest) -> Result<()> {
+        if request.reduce_only {
+            return Err(Error::unsupported_field(
+                "Coinbase",
+                "reduce_only on a spot order",
+                "Coinbase Advanced Trade is spot-only and holds no positions to reduce",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn place_order(&self, request: &OrderRequest) -> Result<Order> {
         if request.order_type.is_trigger() {
             return Err(Error::unsupported_trigger("Coinbase"));
         }
+        Self::ensure_reduce_only_is_reducible(request)?;
         request.validate()?;
         let client_order_id = request
             .client_order_id

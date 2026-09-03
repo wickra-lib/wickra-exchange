@@ -618,6 +618,7 @@ impl Kraken {
         if request.order_type.is_trigger() {
             return Err(Error::unsupported_trigger("Kraken"));
         }
+        self.ensure_reduce_only_is_reducible(request)?;
         self.ensure_one_way()?;
         // The REST spot body spells post-only as `oflags=post`; this frame is
         // the v2 WebSocket protocol, which names every other field differently
@@ -801,10 +802,28 @@ impl Kraken {
     /// # Errors
     /// Returns an [`Error`] if the order is invalid, credentials are missing, or
     /// the venue rejects it.
+    /// Refuse `reduce_only` where there is no position to reduce.
+    ///
+    /// A spot account holds balances, not positions, so a reduce-only order has
+    /// nothing to close. Dropping the flag would place an opening order where a
+    /// closing one was asked for -- the opposite trade -- so it is refused, the
+    /// way Binance's spot path and Upbit already refuse it.
+    fn ensure_reduce_only_is_reducible(&self, request: &OrderRequest) -> Result<()> {
+        if request.reduce_only && !self.is_futures() {
+            return Err(Error::unsupported_field(
+                "Kraken",
+                "reduce_only on a spot order",
+                "spot holds balances, not positions, and has none to reduce",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn place_order(&self, request: &OrderRequest) -> Result<Order> {
         if request.order_type.is_trigger() {
             return Err(Error::unsupported_trigger("Kraken"));
         }
+        self.ensure_reduce_only_is_reducible(request)?;
         self.ensure_one_way()?;
         request.validate()?;
         ensure_no_stp(request)?;
@@ -2245,6 +2264,9 @@ impl Kraken {
     pub fn place_batch(&self, requests: &[OrderRequest]) -> Result<Vec<Result<Order>>> {
         if requests.iter().any(|r| r.order_type.is_trigger()) {
             return Err(Error::unsupported_trigger("Kraken"));
+        }
+        for request in requests {
+            self.ensure_reduce_only_is_reducible(request)?;
         }
         self.ensure_one_way()?;
         if requests.is_empty() {

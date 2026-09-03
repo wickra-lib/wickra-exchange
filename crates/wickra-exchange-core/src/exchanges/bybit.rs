@@ -228,6 +228,24 @@ impl Bybit {
         self.category != "spot"
     }
 
+    /// Refuse `reduce_only` on a spot client, on every path that takes an order.
+    ///
+    /// A spot account holds balances, not positions, so there is nothing for a
+    /// reduce-only order to reduce. Bybit's `reduceOnly` belongs to the `linear`
+    /// and `inverse` categories; the spot endpoint takes the field and does not
+    /// act on it, which is worse than rejecting it -- the caller is told the
+    /// order can only close, and it can open.
+    fn ensure_reduce_only_is_reducible(&self, request: &OrderRequest) -> Result<()> {
+        if request.reduce_only && !self.is_futures() {
+            return Err(Error::unsupported_field(
+                "Bybit",
+                "reduce_only on a spot order",
+                "spot holds balances, not positions, and has none to reduce",
+            ));
+        }
+        Ok(())
+    }
+
     /// The Bybit product category this client targets (`spot`/`linear`/`inverse`).
     #[must_use]
     pub fn category(&self) -> &'static str {
@@ -600,6 +618,7 @@ impl Bybit {
         if request.order_type.is_trigger() {
             return Err(Error::unsupported_trigger("Bybit"));
         }
+        self.ensure_reduce_only_is_reducible(request)?;
         request.validate()?;
         let time_in_force = tif_for(request)?;
         let mut body = serde_json::json!({
@@ -668,6 +687,7 @@ impl Bybit {
         if request.order_type.is_trigger() {
             return Err(Error::unsupported_trigger("Bybit"));
         }
+        self.ensure_reduce_only_is_reducible(request)?;
         request.validate()?;
         let time_in_force = tif_for(request)?;
         let mut arg = serde_json::json!({
@@ -1711,6 +1731,9 @@ impl Bybit {
         if requests.iter().any(|r| r.order_type.is_trigger()) {
             return Err(Error::unsupported_trigger("Bybit"));
         }
+        for request in requests {
+            self.ensure_reduce_only_is_reducible(request)?;
+        }
         // Resolved before the batch is built, so a request the venue cannot
         // express refuses the whole call rather than being sent weakened.
         let tifs = requests.iter().map(tif_for).collect::<Result<Vec<_>>>()?;
@@ -2421,8 +2444,10 @@ mod tests {
     #[test]
     fn post_only_and_reduce_only_reach_every_order_path() {
         // Three paths build an order body; each spells post-only as the
-        // `PostOnly` time-in-force and reduce-only as its own flag.
-        let (bybit, mock) = signed_client(1000);
+        // `PostOnly` time-in-force and reduce-only as its own flag. A futures
+        // client, because `reduce_only` names a position: on spot there is none
+        // to reduce and every path refuses it.
+        let (bybit, mock) = signed_futures_client(1000);
         mock.push_json(
             200,
             r#"{"retCode":0,"result":{"orderId":"a","orderLinkId":""}}"#,
