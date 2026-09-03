@@ -116,7 +116,8 @@ Track progress in [ROADMAP.md](ROADMAP.md). Not released to any registry.
   spot/futures, positions/leverage/margin, and STP/amend/batch/OCO/WS-order.
 - **[Architecture](ARCHITECTURE.md)** — crates, traits, the transport abstraction
   and design decisions.
-- **[Benchmarks](BENCHMARKS.md)** — signing / parse / filter-rounding throughput.
+- **[Benchmarks](BENCHMARKS.md)** — signing / parse / filter-rounding throughput,
+  and what each binding costs to cross.
 - **[Examples](examples/)** — one runnable program per language.
 
 ## Quickstart
@@ -208,6 +209,7 @@ wickra-exchange/
 │   ├── r/        .Call over the C ABI    └── wasm/    wasm-pack (paper/replay only)
 ├── golden/       recorded-response replay corpus + expected normalised structs
 ├── examples/     one runnable program per language
+├── benchmarks/   what each binding costs to cross, one program per language
 ├── docs/         exchanges, auth, streaming and architecture guides
 └── fuzz/         cargo-fuzz targets (nightly)
 ```
