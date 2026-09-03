@@ -641,10 +641,33 @@ impl KuCoin {
         Ok(())
     }
 
-    pub fn place_order(&self, request: &OrderRequest) -> Result<Order> {
-        if request.order_type.is_trigger() {
-            return Err(Error::unsupported_trigger("KuCoin"));
+    /// Add KuCoin's trigger fields to an order body.
+    ///
+    /// `stop` says **which way the market must cross the trigger**, and KuCoin
+    /// will not infer it. `loss` fires when the market moves against the side
+    /// -- down for a sell, up for a buy -- which is what a stop-loss means;
+    /// `entry` fires the other way, which is a breakout entry. The wrong one is
+    /// a different order that happens to use the same price.
+    ///
+    /// On futures, `stopPriceType` names the price that arms it: `MP` is the
+    /// mark, which is what a position is liquidated against, so it is what a
+    /// stop there is meant to watch. Spot has no mark and takes no such field.
+    fn add_trigger(&self, body: &mut serde_json::Value, request: &OrderRequest) -> Result<()> {
+        let stop = request
+            .stop_price
+            .ok_or(Error::InvalidOrder("a trigger order requires a stop price"))?;
+        body["stop"] = serde_json::json!(match request.side {
+            OrderSide::Sell => "loss",
+            OrderSide::Buy => "entry",
+        });
+        body["stopPrice"] = serde_json::json!(format_decimal(stop));
+        if self.is_futures() {
+            body["stopPriceType"] = serde_json::json!("MP");
         }
+        Ok(())
+    }
+
+    pub fn place_order(&self, request: &OrderRequest) -> Result<Order> {
         self.ensure_reduce_only_is_reducible(request)?;
         self.ensure_one_way()?;
         request.validate()?;
@@ -683,8 +706,20 @@ impl KuCoin {
                 body["reduceOnly"] = serde_json::json!(true);
             }
         }
-        let data =
-            self.signed_request(HttpMethod::Post, "/api/v1/orders", "", &body.to_string())?;
+        // Spot serves trigger orders from their own path; futures takes them on
+        // this one, with three extra fields. The body above is shared, so the
+        // two cannot drift on everything that is not the trigger.
+        let path = if request.order_type.is_trigger() {
+            self.add_trigger(&mut body, request)?;
+            if self.is_futures() {
+                "/api/v1/orders"
+            } else {
+                "/api/v1/stop-order"
+            }
+        } else {
+            "/api/v1/orders"
+        };
+        let data = self.signed_request(HttpMethod::Post, path, "", &body.to_string())?;
         let placed: PlaceResult = parse_json(data)?;
         Ok(Order {
             id: placed.order_id,
@@ -2293,6 +2328,71 @@ mod tests {
         )
         .with_clock(Box::new(move || now_ms));
         (kucoin, mock)
+    }
+
+    /// Spot triggers go to their own path; `stop` says which way the market has
+    /// to cross the trigger and KuCoin will not infer it.
+    ///
+    /// `loss` fires when the market moves against the side -- down for a sell --
+    /// which is what a stop-loss means. `entry` fires the other way, which is a
+    /// breakout entry: a different order that happens to use the same price.
+    #[test]
+    fn a_spot_trigger_goes_to_the_stop_order_path_with_its_direction() {
+        for (side, expected) in [(OrderSide::Sell, "loss"), (OrderSide::Buy, "entry")] {
+            let (kucoin, mock) = signed_client(1_700_000_000_000);
+            mock.push_json(200, r#"{"code":"200000","data":{"orderId":"s-1"}}"#);
+            let request = OrderRequest {
+                order_type: OrderType::StopMarket,
+                stop_price: Some(dec!(19000)),
+                side,
+                ..OrderRequest::market_sell(symbol(), dec!(1))
+            };
+            KuCoin::place_order(&kucoin, &request).unwrap();
+
+            let sent = &mock.recorded_requests()[0];
+            assert!(sent.url.contains("/api/v1/stop-order"), "{}", sent.url);
+            let body = sent.body.clone().unwrap();
+            assert!(body.contains(r#""stopPrice":"19000""#), "{body}");
+            assert!(
+                body.contains(&format!(r#""stop":"{expected}""#)),
+                "a {side:?} stop fires the other way: {body}"
+            );
+            // Spot has no mark price, so it takes no `stopPriceType`.
+            assert!(!body.contains("stopPriceType"), "{body}");
+        }
+    }
+
+    /// Futures takes the trigger on the ordinary order path, and names the mark
+    /// as the price that arms it -- the price a position is liquidated against.
+    #[test]
+    fn a_futures_trigger_stays_on_the_order_path_and_watches_the_mark() {
+        let (kucoin, mock) = signed_futures_client(1_700_000_000_000);
+        mock.push_json(200, r#"{"code":"200000","data":{"orderId":"f-1"}}"#);
+        let request = OrderRequest {
+            order_type: OrderType::StopLimit,
+            stop_price: Some(dec!(19000)),
+            ..OrderRequest::limit_sell(symbol(), dec!(1), dec!(18900))
+        };
+        KuCoin::place_order(&kucoin, &request).unwrap();
+
+        let sent = &mock.recorded_requests()[0];
+        assert!(sent.url.contains("/api/v1/orders"), "{}", sent.url);
+        assert!(!sent.url.contains("stop-order"), "{}", sent.url);
+        let body = sent.body.clone().unwrap();
+        assert!(body.contains(r#""stopPriceType":"MP""#), "{body}");
+        assert!(body.contains(r#""price":"18900""#), "{body}");
+    }
+
+    #[test]
+    fn a_kucoin_trigger_without_a_stop_price_is_refused() {
+        let (kucoin, mock) = signed_client(1_700_000_000_000);
+        let request = OrderRequest {
+            order_type: OrderType::StopMarket,
+            stop_price: None,
+            ..OrderRequest::market_sell(symbol(), dec!(1))
+        };
+        assert!(KuCoin::place_order(&kucoin, &request).is_err());
+        assert!(mock.recorded_requests().is_empty());
     }
     fn hedged_futures_client(now_ms: i64) -> (KuCoin, Arc<MockHttpTransport>) {
         let mock = Arc::new(MockHttpTransport::new());
