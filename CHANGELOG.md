@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Bitget subscribes to the derivatives channels it publishes.** The fourth of
+  the eight futures venues. Its mix `ticker` frame carries the funding rate, the
+  mark price and the index price beside the quote, all read at one moment, so
+  `Funding` and `MarkIndex` are one subscription seen two ways -- and a
+  `MarkIndex` from it is a single observation rather than two stitched together.
+  Open interest and long/short positioning are read from
+  `/api/v2/mix/market/open-interest` and `/api/v2/mix/market/account-long-short`;
+  Bitget publishes both proportions directly, so nothing is derived.
+
+  **`Liquidations` is refused.** Bitget publishes no public stream of forced
+  orders, and accepting a subscription that will never deliver would be the
+  worse answer.
+
+- **OKX subscribes to the derivatives channels it publishes.** It is the third
+  of the eight futures venues to implement `DerivativesStream`, after Binance
+  and Bybit: `funding-rate` and `liquidation-orders` are subscribed, and open
+  interest and long/short positioning are read from
+  `/api/v5/public/open-interest` and
+  `/api/v5/rubik/stat/contracts/long-short-account-ratio`.
+
+  Two of OKX's differences are visible in what the client does, rather than
+  hidden behind a uniform-looking API:
+
+  **A combined mark/index subscription is refused.** OKX publishes the mark
+  price on `mark-price` and the index price on `index-tickers`, under different
+  instrument ids, and never in one frame. Joining them would report two prices
+  observed at different moments as one simultaneous reading. Binance and Bybit
+  carry both in a single frame and are unaffected.
+
+  **Forced orders are subscribed per product, not per market.** One stream
+  carries every liquidation on the product, so the client drops frames for
+  markets that were not asked for rather than handing a caller watching BTC the
+  venue's entire forced flow.
+
+  The long/short reply is a *ratio* where Binance's is a pair of proportions;
+  with two categories the conversion is exact, so the feed type carries
+  proportions from every venue. Every field name and response shape here was
+  checked against the live API rather than taken from documentation.
+
+  The README no longer says no venue client subscribes to these channels, which
+  stopped being true when Binance and Bybit landed.
+
 ### Changed
 
 - **The shared reconnect says which of its four outcomes happened.** Every
@@ -38,6 +82,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   return value says rather than recover something lost.
 
 ### Fixed
+
+- **On four venues a futures client watched the spot market.** KuCoin, Gate, HTX
+  and Kraken each opened one hardcoded *spot* socket and sent spot channels,
+  whatever market the client was built for. A futures client therefore read
+  futures over REST and streamed the spot book, the spot trades and the spot
+  quote — a different instrument at a different price, with nothing to say so.
+  Five of the eight futures venues were wrong, counting Bitget above.
+
+  Their futures streams live on a different host with different channel names
+  and a different symbol form, which is a per-venue implementation rather than a
+  parameter. Until that lands the subscription is **refused**: a caller told
+  "not implemented here" can fall back to the REST reads, while a caller handed
+  the wrong market's book has no way to tell.
+
+  **The private stream had the same defect**, on KuCoin, Gate and HTX: a futures
+  client watching its own fills subscribed to the spot account, where a futures
+  order never appears. It would have waited for fills that could not arrive,
+  with nothing reporting an error. Those three refuse too. Kraken was already
+  correct — `subscribe_user_data` dispatches to `subscribe_user_data_futures` —
+  and Bitget's now names its market.
+
+  `a_futures_client_never_subscribes_to_a_spot_stream` holds all eight to it —
+  carried on the market the client is on, or refused, never quietly something
+  else. That is the trigger contract applied to the streams, and no test had
+  ever driven a futures client through `subscribe` before: all 559 passed
+  throughout.
+
+- **A Bitget futures client streamed spot.** Bitget v2 serves one WebSocket URL
+  for every product and tells them apart by `instType`, the way its REST paths
+  tell them apart by `productType`. The REST paths did; both subscribe paths
+  hardcoded `SPOT`. So a futures client read futures over REST and watched the
+  **spot** book and the **spot** trades over the socket — and its private
+  user-data stream watched the spot account, where a futures order never
+  appears at all.
+
+  Nothing failed while it was wrong, which is why it lasted: the venue answers a
+  spot subscription perfectly well, with the wrong market's data. Every
+  subscription now names the client's own market, and a test pins both
+  directions.
 
 - **A reduce-only close sent over Binance's WebSocket opened a position.** The
   REST body and the WebSocket frame each resolved the position fields for

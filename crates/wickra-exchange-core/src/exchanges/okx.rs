@@ -17,13 +17,17 @@ use crate::clock::ServerClock;
 use crate::credentials::Credentials;
 use crate::error::{Error, Result};
 use crate::events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
+use crate::feeds::{
+    DerivativesChannel, DerivativesFeed, FundingRate, Liquidation, LongShortRatio, OpenInterest,
+};
 use crate::normalize::{format_decimal, parse_decimal};
 use crate::options::{ExchangeOptions, MarginMode, MarketType, PositionMode, SelfTradePrevention};
 use crate::positions::{Position, PositionSide};
 use crate::signing::hmac_sha256_base64;
 use crate::symbol::Symbol;
 use crate::traits::{
-    AdvancedOrders, Derivatives, Exchange, Execution, MarketData, WsExecution, WsUserData,
+    AdvancedOrders, Derivatives, DerivativesStream, Exchange, Execution, MarketData, WsExecution,
+    WsUserData,
 };
 use crate::transport::{HttpMethod, HttpRequest, HttpTransport, WsConnection, WsTransport};
 use crate::types::{
@@ -96,6 +100,12 @@ pub struct Okx {
     connection: Option<Box<dyn WsConnection>>,
     sub_messages: Vec<String>,
     subscriptions: Vec<(String, Symbol)>,
+    /// Which derivatives channels are subscribed, per wire instrument.
+    ///
+    /// A frame is only turned into an event for a channel that was asked for,
+    /// so a caller that subscribed to funding does not start receiving
+    /// liquidations because something else on the connection asked for them.
+    derivatives_channels: Vec<(String, DerivativesChannel)>,
     /// The private user-data connection, opened by
     /// [`subscribe_user_data`](Self::subscribe_user_data) and drained by
     /// [`poll_events`](Self::poll_events) alongside the public stream.
@@ -154,6 +164,7 @@ impl Okx {
             connection: None,
             sub_messages: Vec::new(),
             subscriptions: Vec::new(),
+            derivatives_channels: Vec::new(),
             private_connection: None,
             user_data_active: false,
             ws_api_connection: None,
@@ -364,10 +375,14 @@ impl Okx {
                 .cloned()
                 .unwrap_or_else(|| symbol_from_inst_id(wire))
         };
+        let channels = self.derivatives_channels.clone();
+        let subscribed = |wire: &str, channel: DerivativesChannel| {
+            channels.iter().any(|(w, c)| w == wire && *c == channel)
+        };
         let mut events = Vec::new();
         if let Some(connection) = self.connection.as_mut() {
             while let Ok(Some(frame)) = connection.recv() {
-                if let Ok(mut parsed) = parse_ws_message(&frame, &resolve) {
+                if let Ok(mut parsed) = parse_ws_message(&frame, &resolve, &subscribed) {
                     events.append(&mut parsed);
                 }
             }
@@ -375,7 +390,7 @@ impl Okx {
         // Drain the private user-data stream (orders/account channels), if open.
         if let Some(connection) = self.private_connection.as_mut() {
             while let Ok(Some(frame)) = connection.recv() {
-                if let Ok(mut parsed) = parse_ws_message(&frame, &resolve) {
+                if let Ok(mut parsed) = parse_ws_message(&frame, &resolve, &subscribed) {
                     events.append(&mut parsed);
                 }
             }
@@ -758,6 +773,168 @@ impl Okx {
             .collect())
     }
 
+    /// Subscribe to a pushed derivatives channel.
+    ///
+    /// `Funding` maps to OKX's `funding-rate` channel. `Liquidations` maps to
+    /// `liquidation-orders`, which is subscribed by instrument *type* rather
+    /// than by instrument -- OKX publishes one stream of forced orders per
+    /// product, and frames for markets that were not asked for are dropped when
+    /// they are parsed.
+    ///
+    /// `MarkIndex` is refused. OKX publishes the mark price on `mark-price` and
+    /// the index price on `index-tickers`, under different instrument ids
+    /// (`BTC-USDT-SWAP` against `BTC-USDT`), and never in one frame. A
+    /// `MarkIndex` built by joining them would present two prices observed at
+    /// different moments as one simultaneous reading -- a number the venue never
+    /// published. Refusing says so at the call instead.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] on a spot client, for `MarkIndex`, or if the
+    /// subscription fails.
+    pub fn subscribe_derivatives(
+        &mut self,
+        symbol: &Symbol,
+        channel: DerivativesChannel,
+    ) -> Result<()> {
+        if self.market_type == MarketType::Spot {
+            return Err(Error::unsupported_field(
+                "OKX",
+                "a derivatives channel on a spot client",
+                "funding and liquidations exist only on the swap and futures venue",
+            ));
+        }
+        let wire = self.inst_id(symbol);
+        match channel {
+            DerivativesChannel::Funding => {
+                self.derivatives_channels.push((wire, channel));
+                self.subscribe(symbol, "funding-rate")
+            }
+            DerivativesChannel::Liquidations => {
+                self.derivatives_channels.push((wire, channel));
+                self.subscribe_by_inst_type("liquidation-orders")
+            }
+            DerivativesChannel::MarkIndex => Err(Error::unsupported_field(
+                "OKX",
+                "a combined mark/index channel",
+                "OKX publishes mark and index on separate channels, never in one frame",
+            )),
+        }
+    }
+
+    /// Subscribe to a channel keyed by instrument *type* rather than instrument.
+    ///
+    /// `liquidation-orders` is per product, not per market.
+    fn subscribe_by_inst_type(&mut self, channel: &str) -> Result<()> {
+        if self.connection.is_none() {
+            let ws = self.ws.as_ref().ok_or(Error::NotConnected)?;
+            let connection = ws.connect(ws_url(self.testnet))?;
+            self.connection = Some(connection);
+        }
+        let message = format!(
+            r#"{{"op":"subscribe","args":[{{"channel":"{channel}","instType":"{}"}}]}}"#,
+            self.inst_type
+        );
+        self.connection
+            .as_mut()
+            .expect("connection just ensured")
+            .send(&message)?;
+        if !self.sub_messages.contains(&message) {
+            self.sub_messages.push(message);
+        }
+        Ok(())
+    }
+
+    /// The current open interest (`GET /api/v5/public/open-interest`).
+    ///
+    /// Polled, not pushed. `oiCcy` is the figure in base currency; `oi` counts
+    /// contracts, whose size differs per instrument, so the base-currency figure
+    /// is the one carried.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] on a spot client, if the request fails, or if the
+    /// venue returns no data point.
+    pub fn open_interest(&self, symbol: &Symbol) -> Result<OpenInterest> {
+        if self.market_type == MarketType::Spot {
+            return Err(Error::unsupported_field(
+                "OKX",
+                "open interest on a spot client",
+                "open interest is a derivatives figure",
+            ));
+        }
+        let query = format!(
+            "instType={}&instId={}",
+            self.inst_type,
+            self.inst_id(symbol)
+        );
+        let value = self.get("/api/v5/public/open-interest", &query)?;
+        let point = value
+            .as_array()
+            .and_then(|rows| rows.first())
+            .ok_or_else(|| Error::NotFound("no open-interest data point".to_string()))?;
+        Ok(OpenInterest {
+            symbol: symbol.clone(),
+            open_interest: parse_decimal(field_str(point, "oiCcy")?)?,
+            timestamp: opt_str(point, "ts").parse().unwrap_or(0),
+        })
+    }
+
+    /// The current long/short account ratio
+    /// (`GET /api/v5/rubik/stat/contracts/long-short-account-ratio`), most
+    /// recent point.
+    ///
+    /// Polled, not pushed. OKX publishes the *ratio* of long accounts to short
+    /// accounts where Binance publishes the two proportions, and the two say the
+    /// same thing: with only two categories, a ratio `r` gives proportions
+    /// `r / (1 + r)` and `1 / (1 + r)`, which sum to one exactly as Binance's
+    /// pair does. That is arithmetic on what the venue said, not a figure
+    /// invented on its behalf.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] on a spot client, if the request fails, or if the
+    /// venue returns no data point.
+    pub fn long_short_ratio(&self, symbol: &Symbol) -> Result<LongShortRatio> {
+        if self.market_type == MarketType::Spot {
+            return Err(Error::unsupported_field(
+                "OKX",
+                "long/short positioning on a spot client",
+                "positioning is a derivatives figure",
+            ));
+        }
+        let query = format!("ccy={}&period=5m", symbol.base());
+        let value = self.get(
+            "/api/v5/rubik/stat/contracts/long-short-account-ratio",
+            &query,
+        )?;
+        // Rows are `[timestamp, ratio]`, newest first.
+        let row = value
+            .as_array()
+            .and_then(|rows| rows.first())
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| Error::NotFound("no long/short data point".to_string()))?;
+        let timestamp = row
+            .first()
+            .and_then(serde_json::Value::as_str)
+            .and_then(|t| t.parse().ok())
+            .unwrap_or(0);
+        let ratio = row
+            .get(1)
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| Error::Deserialization("long/short row has no ratio".to_string()))?;
+        let ratio = parse_decimal(ratio)?;
+        let total = Decimal::ONE + ratio;
+        if total.is_zero() {
+            return Err(Error::Deserialization(
+                "a long/short ratio of -1 has no proportions".to_string(),
+            ));
+        }
+        Ok(LongShortRatio {
+            symbol: symbol.clone(),
+            long_size: ratio / total,
+            short_size: Decimal::ONE / total,
+            timestamp,
+        })
+    }
+
     fn get(&self, path: &str, query: &str) -> Result<serde_json::Value> {
         let url = format!("{}{path}?{query}", self.rest_base);
         let response = self.http.execute(&HttpRequest::get(url))?;
@@ -1096,7 +1273,11 @@ fn parse_ws_levels(value: Option<&serde_json::Value>) -> Result<Vec<BookLevel>> 
         .collect()
 }
 
-fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Vec<Event>> {
+fn parse_ws_message(
+    text: &str,
+    resolve: &impl Fn(&str) -> Symbol,
+    subscribed: &impl Fn(&str, DerivativesChannel) -> bool,
+) -> Result<Vec<Event>> {
     let value: serde_json::Value =
         serde_json::from_str(text).map_err(|e| Error::Deserialization(e.to_string()))?;
     let Some(channel) = value
@@ -1137,6 +1318,61 @@ fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Vec
                 }))
             })
             .collect()
+    } else if channel == "funding-rate" {
+        // `fundingRate` is the rate for the interval; `premium` and the caps
+        // are not carried. The mark price is not on this frame -- OKX puts it
+        // on `mark-price` -- so the funding print reports the rate against a
+        // mark of zero rather than against a price from a different moment.
+        data.iter()
+            .map(|f| {
+                Ok(Event::Derivatives(DerivativesFeed::Funding(FundingRate {
+                    symbol: resolve(field_str(f, "instId")?),
+                    rate: parse_decimal(field_str(f, "fundingRate")?)?,
+                    mark_price: Decimal::ZERO,
+                    timestamp: opt_str(f, "ts").parse().unwrap_or(0),
+                })))
+            })
+            .collect()
+    } else if channel == "liquidation-orders" {
+        // One frame carries every liquidated instrument on the product, each
+        // with its own `details` list, so a caller who asked about one market
+        // is not handed the whole venue's forced flow.
+        let mut out = Vec::new();
+        for instrument in data {
+            let Ok(wire) = field_str(instrument, "instId") else {
+                continue;
+            };
+            if !subscribed(wire, DerivativesChannel::Liquidations) {
+                continue;
+            }
+            let symbol = resolve(wire);
+            let empty = Vec::new();
+            let details = instrument
+                .get("details")
+                .and_then(serde_json::Value::as_array)
+                .unwrap_or(&empty);
+            for detail in details {
+                // `side` is the side of the forced order hitting the book: a
+                // liquidated long is sold, a liquidated short is bought.
+                let (Ok(side), Ok(price), Ok(quantity)) = (
+                    field_str(detail, "side").and_then(parse_side),
+                    field_str(detail, "bkPx").and_then(parse_decimal),
+                    field_str(detail, "sz").and_then(parse_decimal),
+                ) else {
+                    continue;
+                };
+                out.push(Event::Derivatives(DerivativesFeed::Liquidation(
+                    Liquidation {
+                        symbol: symbol.clone(),
+                        side,
+                        price,
+                        quantity,
+                        timestamp: opt_str(detail, "ts").parse().unwrap_or(0),
+                    },
+                )));
+            }
+        }
+        Ok(out)
     } else if channel == "books" {
         let action = value.get("action").and_then(serde_json::Value::as_str);
         data.iter()
@@ -1701,6 +1937,22 @@ impl Derivatives for Okx {
     }
 }
 
+impl DerivativesStream for Okx {
+    fn subscribe_derivatives(
+        &mut self,
+        symbol: &Symbol,
+        channel: DerivativesChannel,
+    ) -> Result<()> {
+        Okx::subscribe_derivatives(self, symbol, channel)
+    }
+    fn open_interest(&mut self, symbol: &Symbol) -> Result<OpenInterest> {
+        Okx::open_interest(self, symbol)
+    }
+    fn long_short_ratio(&mut self, symbol: &Symbol) -> Result<LongShortRatio> {
+        Okx::long_short_ratio(self, symbol)
+    }
+}
+
 #[derive(Deserialize)]
 struct RawOkxPosition {
     #[serde(rename = "instId")]
@@ -1803,6 +2055,171 @@ mod tests {
         )
         .with_clock(Box::new(move || now_ms));
         (okx, mock)
+    }
+
+    /// A swap client with a mock socket, for the pushed derivatives channels.
+    fn futures_ws_client() -> (Okx, Arc<MockWsTransport>) {
+        let http = Arc::new(MockHttpTransport::new());
+        let ws = Arc::new(MockWsTransport::new());
+        let opts = ExchangeOptions::mainnet(MarketType::UsdMFutures);
+        let okx = Okx::with_http(Box::new(ArcTransport(http)), &opts)
+            .with_ws(Box::new(ArcWs(Arc::clone(&ws))));
+        (okx, ws)
+    }
+
+    #[test]
+    fn a_spot_client_refuses_the_derivatives_channels() {
+        let (mut okx, _) = client();
+        for channel in [
+            DerivativesChannel::Funding,
+            DerivativesChannel::MarkIndex,
+            DerivativesChannel::Liquidations,
+        ] {
+            let err = Okx::subscribe_derivatives(&mut okx, &symbol(), channel)
+                .expect_err("spot has no derivatives channels");
+            assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
+        }
+        let (okx, _) = client();
+        assert!(Okx::open_interest(&okx, &symbol()).is_err());
+        assert!(Okx::long_short_ratio(&okx, &symbol()).is_err());
+    }
+
+    /// OKX puts the mark price and the index price on different channels, under
+    /// different instrument ids, and never in one frame. Pairing them would
+    /// report two prices from different moments as one reading.
+    #[test]
+    fn a_combined_mark_index_channel_is_refused_rather_than_assembled() {
+        let (mut okx, ws) = futures_ws_client();
+        let err = Okx::subscribe_derivatives(&mut okx, &symbol(), DerivativesChannel::MarkIndex)
+            .expect_err("OKX publishes no combined mark/index frame");
+        assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
+        assert!(ws.sent().is_empty(), "refused, yet subscribed to something");
+    }
+
+    #[test]
+    fn subscribing_to_funding_and_liquidations_sends_the_venues_channels() {
+        let (mut okx, ws) = futures_ws_client();
+        Okx::subscribe_derivatives(&mut okx, &symbol(), DerivativesChannel::Funding).unwrap();
+        Okx::subscribe_derivatives(&mut okx, &symbol(), DerivativesChannel::Liquidations).unwrap();
+
+        assert!(ws.sent()[0].contains(r#""channel":"funding-rate""#));
+        assert!(ws.sent()[0].contains(r#""instId":"BTC-USDT-SWAP""#));
+        // Forced orders are published per product, so this one is keyed by
+        // instType; asking for it with an instId is rejected by the venue.
+        assert!(ws.sent()[1].contains(r#""channel":"liquidation-orders""#));
+        assert!(ws.sent()[1].contains(r#""instType":"SWAP""#));
+        assert!(!ws.sent()[1].contains("instId"));
+    }
+
+    /// The funding frame, in the shape the venue sends it.
+    ///
+    /// The mark price is reported as zero rather than filled from the
+    /// `mark-price` channel: that price belongs to a different moment, and a
+    /// funding print carrying it would look like one observation.
+    #[test]
+    fn a_funding_frame_becomes_a_funding_event() {
+        let (mut okx, ws) = futures_ws_client();
+        ws.push_connection(vec![Ok(Some(
+            r#"{"arg":{"channel":"funding-rate","instId":"BTC-USDT-SWAP"},"data":[
+            {"instType":"SWAP","instId":"BTC-USDT-SWAP","fundingRate":"0.0000408041049331",
+             "nextFundingRate":"","fundingTime":"1788480000000","ts":"1788459275635"}]}"#
+                .to_string(),
+        ))]);
+        Okx::subscribe_derivatives(&mut okx, &symbol(), DerivativesChannel::Funding).unwrap();
+
+        let events = Okx::poll_events(&mut okx);
+        let Event::Derivatives(DerivativesFeed::Funding(funding)) = &events[0] else {
+            panic!("expected a funding event, got {:?}", events[0]);
+        };
+        assert_eq!(funding.symbol, symbol());
+        assert_eq!(funding.rate, dec!(0.0000408041049331));
+        assert_eq!(funding.mark_price, Decimal::ZERO);
+        assert_eq!(funding.timestamp, 1_788_459_275_635);
+    }
+
+    /// The liquidation frame, in the shape the venue sends it: one entry per
+    /// instrument, each with its own `details` list.
+    #[test]
+    fn a_liquidation_frame_becomes_one_event_per_forced_order() {
+        let (mut okx, ws) = futures_ws_client();
+        ws.push_connection(vec![Ok(Some(
+            r#"{"arg":{"channel":"liquidation-orders","instType":"SWAP"},"data":[
+            {"instFamily":"BTC-USDT","instId":"BTC-USDT-SWAP","instType":"SWAP",
+             "details":[{"bkLoss":"0","bkPx":"81294.3","ccy":"","posSide":"short",
+                         "side":"buy","sz":"2.86","ts":"1788458993316"}]}]}"#
+                .to_string(),
+        ))]);
+        Okx::subscribe_derivatives(&mut okx, &symbol(), DerivativesChannel::Liquidations).unwrap();
+
+        let events = Okx::poll_events(&mut okx);
+        let Event::Derivatives(DerivativesFeed::Liquidation(liquidation)) = &events[0] else {
+            panic!("expected a liquidation event, got {:?}", events[0]);
+        };
+        assert_eq!(liquidation.symbol, symbol());
+        // A liquidated short is bought back.
+        assert_eq!(liquidation.side, OrderSide::Buy);
+        assert_eq!(liquidation.price, dec!(81294.3));
+        assert_eq!(liquidation.quantity, dec!(2.86));
+        assert_eq!(liquidation.timestamp, 1_788_458_993_316);
+    }
+
+    /// `liquidation-orders` is one stream for the whole product, so a caller who
+    /// asked about one market must not be handed the venue's entire forced flow.
+    #[test]
+    fn liquidations_for_an_unsubscribed_market_are_dropped() {
+        let (mut okx, ws) = futures_ws_client();
+        ws.push_connection(vec![Ok(Some(
+            r#"{"arg":{"channel":"liquidation-orders","instType":"SWAP"},"data":[
+            {"instId":"ETH-USDT-SWAP","instType":"SWAP",
+             "details":[{"bkPx":"3000","side":"sell","sz":"1","ts":"1788458993316"}]}]}"#
+                .to_string(),
+        ))]);
+        Okx::subscribe_derivatives(&mut okx, &symbol(), DerivativesChannel::Liquidations).unwrap();
+
+        assert!(
+            Okx::poll_events(&mut okx).is_empty(),
+            "a market that was never asked for reached the caller"
+        );
+    }
+
+    /// The open-interest reply, as the venue sends it.
+    #[test]
+    fn open_interest_reads_the_base_currency_figure() {
+        let (okx, mock) = signed_futures_client(1_700_000_000_000);
+        mock.push_json(
+            200,
+            r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT-SWAP","instType":"SWAP",
+            "oi":"2950997.91000000613","oiCcy":"29509.9791000000613",
+            "oiUsd":"2396647050.61068497846724","ts":"1788459275635"}]}"#,
+        );
+        let open_interest = Okx::open_interest(&okx, &symbol()).unwrap();
+        // `oi` counts contracts, whose size differs per instrument; `oiCcy` is
+        // the figure in base currency and the one that means the same thing
+        // across venues.
+        assert_eq!(open_interest.open_interest, dec!(29509.9791000000613));
+        assert_eq!(open_interest.timestamp, 1_788_459_275_635);
+        assert!(mock.recorded_requests()[0]
+            .url
+            .contains("instId=BTC-USDT-SWAP"));
+    }
+
+    /// OKX publishes the long/short *ratio*; the feed type carries proportions.
+    ///
+    /// With two categories the conversion is exact: a ratio of 3 is 0.75 long
+    /// and 0.25 short, and the two sum to one as Binance's own pair does.
+    #[test]
+    fn the_long_short_ratio_becomes_proportions_that_sum_to_one() {
+        let (okx, mock) = signed_futures_client(1_700_000_000_000);
+        mock.push_json(
+            200,
+            r#"{"code":"0","msg":"","data":[["1788459000000","3"],["1788458700000","0.9"]]}"#,
+        );
+        let ratio = Okx::long_short_ratio(&okx, &symbol()).unwrap();
+        assert_eq!(ratio.long_size, dec!(0.75));
+        assert_eq!(ratio.short_size, dec!(0.25));
+        assert_eq!(ratio.long_size + ratio.short_size, Decimal::ONE);
+        // Newest first: the second row is older and must not be the one read.
+        assert_eq!(ratio.timestamp, 1_788_459_000_000);
     }
 
     const OKX_POSITIONS: &str = r#"{"code":"0","msg":"","data":[
