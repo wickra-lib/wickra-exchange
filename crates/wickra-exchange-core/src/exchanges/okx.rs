@@ -636,12 +636,104 @@ impl Okx {
     /// # Errors
     /// Returns an [`Error`] if the order is invalid, credentials are missing, or
     /// the venue rejects it.
-    pub fn place_order(&self, request: &OrderRequest) -> Result<Order> {
-        if request.order_type.is_trigger() {
-            return Err(Error::unsupported_trigger("OKX"));
+    /// Place a trigger order through OKX's algo endpoint
+    /// (`POST /api/v5/trade/order-algo`).
+    ///
+    /// OKX does not take a trigger on its ordinary order call: a conditional
+    /// order is a different resource, with `ordType: "conditional"` and the
+    /// trigger in `slTriggerPx`.
+    ///
+    /// `slOrdPx` is where the order rests once the trigger fires, and **`-1` is
+    /// a sentinel meaning "take the market"**, not a price. A stop-market
+    /// therefore sends `-1`; a stop-limit sends its limit. Sending a real price
+    /// where `-1` was meant would rest the order at that level instead of
+    /// taking the market, which is the difference between a stop that fills and
+    /// one that sits through the move it was meant to escape.
+    ///
+    /// The reply carries an `algoId` rather than an `ordId`; it is returned as
+    /// the order id, since it is the handle the venue accepts for a cancel.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the trigger price is missing or the request
+    /// fails.
+    fn place_algo_order(&self, request: &OrderRequest) -> Result<Order> {
+        let stop = request
+            .stop_price
+            .ok_or(Error::InvalidOrder("a trigger order requires a stop price"))?;
+        // `-1` is OKX's "market on trigger"; a limit price is sent as itself.
+        let order_price = match request.price {
+            Some(price) => format_decimal(price),
+            None => "-1".to_string(),
+        };
+        let mut body = serde_json::json!({
+            "instId": self.inst_id(&request.symbol),
+            "tdMode": self.td_mode,
+            "side": side_str(request.side),
+            "ordType": "conditional",
+            "sz": format_decimal(request.quantity),
+            "slTriggerPx": format_decimal(stop),
+            "slOrdPx": order_price,
+        });
+        if let Some(id) = &request.client_order_id {
+            body["algoClOrdId"] = serde_json::json!(id.clone());
         }
+        if request.reduce_only {
+            body["reduceOnly"] = serde_json::json!(true);
+        }
+        if let Some(pos_side) = self.pos_side(request) {
+            body["posSide"] = serde_json::json!(pos_side);
+        }
+        let result = self.signed_request(
+            HttpMethod::Post,
+            "/api/v5/trade/order-algo",
+            "",
+            &body.to_string(),
+        )?;
+        let placed = result
+            .as_array()
+            .and_then(|rows| rows.first())
+            .ok_or_else(|| Error::Deserialization("no algo order in the reply".to_string()))?;
+        let code = placed
+            .get("sCode")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("0");
+        if code != "0" {
+            return Err(Error::OrderRejected {
+                code: code.to_string(),
+                message: placed
+                    .get("sMsg")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            });
+        }
+        Ok(Order {
+            // An algo order is identified by `algoId`, which is also the handle
+            // a cancel takes.
+            id: placed
+                .get("algoId")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            client_order_id: request.client_order_id.clone(),
+            symbol: request.symbol.clone(),
+            side: request.side,
+            order_type: request.order_type,
+            status: OrderStatus::New,
+            quantity: request.quantity,
+            filled_quantity: Decimal::ZERO,
+            price: request.price,
+            average_price: None,
+        })
+    }
+
+    pub fn place_order(&self, request: &OrderRequest) -> Result<Order> {
         self.ensure_reduce_only_is_reducible(request)?;
         request.validate()?;
+        // A trigger is a different endpoint here, not a field on this one.
+        if request.order_type.is_trigger() {
+            return self.place_algo_order(request);
+        }
         let ord_type = ord_type_for(request)?;
         let mut body = serde_json::json!({
             "instId": self.inst_id(&request.symbol),
@@ -2043,6 +2135,95 @@ mod tests {
         )
         .with_clock(Box::new(move || now_ms));
         (okx, mock)
+    }
+
+    /// A trigger goes to a different endpoint, and `-1` is not a price.
+    ///
+    /// `slOrdPx` says where the order rests once the trigger fires, and OKX
+    /// spells "take the market" as the sentinel `-1`. Sending a real price
+    /// where `-1` was meant rests the order at that level instead of taking the
+    /// market -- the difference between a stop that fills and one that sits
+    /// through the move it was meant to escape.
+    #[test]
+    fn a_stop_market_goes_to_the_algo_endpoint_with_the_market_sentinel() {
+        let (okx, mock) = signed_client(1_700_000_000_000);
+        mock.push_json(
+            200,
+            r#"{"code":"0","msg":"","data":[{"algoId":"a-1","sCode":"0"}]}"#,
+        );
+        let request = OrderRequest {
+            order_type: OrderType::StopMarket,
+            stop_price: Some(dec!(19000)),
+            ..OrderRequest::market_sell(symbol(), dec!(1))
+        };
+        let order = Okx::place_order(&okx, &request).unwrap();
+
+        let sent = &mock.recorded_requests()[0];
+        assert!(
+            sent.url.contains("/api/v5/trade/order-algo"),
+            "{}",
+            sent.url
+        );
+        let body = sent.body.clone().unwrap();
+        assert!(body.contains(r#""ordType":"conditional""#), "{body}");
+        assert!(body.contains(r#""slTriggerPx":"19000""#), "{body}");
+        assert!(
+            body.contains(r#""slOrdPx":"-1""#),
+            "market on trigger: {body}"
+        );
+        // The algo id is the handle a cancel takes, so it is the order id.
+        assert_eq!(order.id, "a-1");
+    }
+
+    #[test]
+    fn a_stop_limit_sends_its_limit_rather_than_the_sentinel() {
+        let (okx, mock) = signed_client(1_700_000_000_000);
+        mock.push_json(
+            200,
+            r#"{"code":"0","msg":"","data":[{"algoId":"a-2","sCode":"0"}]}"#,
+        );
+        let request = OrderRequest {
+            order_type: OrderType::StopLimit,
+            stop_price: Some(dec!(19000)),
+            ..OrderRequest::limit_sell(symbol(), dec!(1), dec!(18900))
+        };
+        Okx::place_order(&okx, &request).unwrap();
+
+        let body = mock.recorded_requests()[0].body.clone().unwrap();
+        assert!(body.contains(r#""slOrdPx":"18900""#), "{body}");
+        assert!(!body.contains("-1"), "{body}");
+    }
+
+    /// A per-order rejection on the algo endpoint is reported, not swallowed.
+    #[test]
+    fn an_algo_rejection_surfaces() {
+        let (okx, mock) = signed_client(1_700_000_000_000);
+        mock.push_json(
+            200,
+            r#"{"code":"0","msg":"","data":[{"algoId":"","sCode":"51000",
+            "sMsg":"parameter slTriggerPx error"}]}"#,
+        );
+        let request = OrderRequest {
+            order_type: OrderType::StopMarket,
+            stop_price: Some(dec!(19000)),
+            ..OrderRequest::market_sell(symbol(), dec!(1))
+        };
+        assert!(matches!(
+            Okx::place_order(&okx, &request),
+            Err(Error::OrderRejected { .. })
+        ));
+    }
+
+    #[test]
+    fn an_okx_trigger_without_a_stop_price_is_refused() {
+        let (okx, mock) = signed_client(1_700_000_000_000);
+        let request = OrderRequest {
+            order_type: OrderType::StopMarket,
+            stop_price: None,
+            ..OrderRequest::market_sell(symbol(), dec!(1))
+        };
+        assert!(Okx::place_order(&okx, &request).is_err());
+        assert!(mock.recorded_requests().is_empty());
     }
 
     fn signed_futures_client(now_ms: i64) -> (Okx, Arc<MockHttpTransport>) {
