@@ -23,13 +23,17 @@ use crate::clock::ServerClock;
 use crate::credentials::Credentials;
 use crate::error::{Error, Result};
 use crate::events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
+use crate::feeds::{
+    DerivativesChannel, DerivativesFeed, FundingRate, LongShortRatio, MarkIndex, OpenInterest,
+};
 use crate::normalize::{format_decimal, parse_decimal};
 use crate::options::{ExchangeOptions, MarginMode, MarketType, PositionMode, SelfTradePrevention};
 use crate::positions::{Position, PositionSide};
 use crate::signing::{hmac_sha512_hex, sha512_hex};
 use crate::symbol::Symbol;
 use crate::traits::{
-    AdvancedOrders, Derivatives, Exchange, Execution, MarketData, WsExecution, WsUserData,
+    AdvancedOrders, Derivatives, DerivativesStream, Exchange, Execution, MarketData, WsExecution,
+    WsUserData,
 };
 use crate::transport::{
     HttpMethod, HttpRequest, HttpResponse, HttpTransport, WsConnection, WsTransport,
@@ -70,6 +74,11 @@ pub struct Gate {
     connection: Option<Box<dyn WsConnection>>,
     sub_messages: Vec<String>,
     subscriptions: Vec<(String, Symbol)>,
+    /// Which derivatives channels are subscribed, per contract.
+    ///
+    /// `futures.tickers` carries the funding rate, the mark price and the
+    /// index beside the quote, so one frame can answer three subscriptions.
+    derivatives_channels: Vec<(String, DerivativesChannel)>,
     /// Leverage applied when switching to isolated margin. Gate couples the
     /// margin mode with its leverage endpoint (`leverage=0` = cross), so
     /// [`set_leverage`](Self::set_leverage) records the value here.
@@ -129,6 +138,7 @@ impl Gate {
             connection: None,
             sub_messages: Vec::new(),
             subscriptions: Vec::new(),
+            derivatives_channels: Vec::new(),
             leverage: 1,
             private_connection: None,
             user_data_active: false,
@@ -321,6 +331,133 @@ impl Gate {
         })
     }
 
+    /// Subscribe to a pushed derivatives channel.
+    ///
+    /// Gate publishes the funding rate, the mark price and the index price
+    /// inside the `futures.tickers` frame -- one reading at one moment -- so
+    /// `Funding` and `MarkIndex` are the same subscription seen two ways.
+    ///
+    /// `Liquidations` is refused. Gate has a `futures.liquidates` channel, but
+    /// it answers an anonymous subscribe with *"authentication required for
+    /// Channel futures.liquidates"*: it reports the caller's own liquidations,
+    /// not the venue's forced flow, so it is not the public feed this channel
+    /// means.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] on a spot client, for `Liquidations`, or if the
+    /// subscription fails.
+    pub fn subscribe_derivatives(
+        &mut self,
+        symbol: &Symbol,
+        channel: DerivativesChannel,
+    ) -> Result<()> {
+        if !self.is_futures() {
+            return Err(Error::unsupported_field(
+                "Gate.io",
+                "a derivatives channel on a spot client",
+                "funding and mark/index exist only on the futures venue",
+            ));
+        }
+        if channel == DerivativesChannel::Liquidations {
+            return Err(Error::unsupported_field(
+                "Gate.io",
+                "a liquidations channel",
+                "Gate's `futures.liquidates` needs authentication and reports the \
+                 caller's own liquidations, not the venue's forced flow",
+            ));
+        }
+        let wire = Self::wire_symbol(symbol);
+        if !self
+            .derivatives_channels
+            .iter()
+            .any(|(w, c)| w == &wire && *c == channel)
+        {
+            self.derivatives_channels.push((wire, channel));
+        }
+        self.subscribe(symbol, "spot.tickers")
+    }
+
+    /// The current open interest
+    /// (`GET /futures/usdt/contract_stats`), most recent point.
+    ///
+    /// Polled, not pushed. The figure is in contracts, the unit this client's
+    /// futures order path takes. The row's `time` is in *seconds*, where every
+    /// other stamp in this crate is milliseconds.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] on a spot client, if the request fails, or if the
+    /// venue returns no data point.
+    pub fn open_interest(&self, symbol: &Symbol) -> Result<OpenInterest> {
+        if !self.is_futures() {
+            return Err(Error::unsupported_field(
+                "Gate.io",
+                "open interest on a spot client",
+                "open interest is a futures figure",
+            ));
+        }
+        let point = self.contract_stats(symbol)?;
+        Ok(OpenInterest {
+            symbol: symbol.clone(),
+            open_interest: parse_decimal(
+                &point
+                    .get("open_interest")
+                    .and_then(serde_json::Value::as_i64)
+                    .ok_or_else(|| Error::Deserialization("no open_interest".to_string()))?
+                    .to_string(),
+            )?,
+            timestamp: stats_millis(&point),
+        })
+    }
+
+    /// The current long/short account ratio
+    /// (`GET /futures/usdt/contract_stats`), most recent point.
+    ///
+    /// Polled, not pushed. Gate publishes `lsr_account`, the ratio of long
+    /// accounts to short ones, where Binance publishes the two proportions.
+    /// With two categories the conversion is exact and sums to one.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] on a spot client, if the request fails, or if the
+    /// venue returns no data point.
+    pub fn long_short_ratio(&self, symbol: &Symbol) -> Result<LongShortRatio> {
+        if !self.is_futures() {
+            return Err(Error::unsupported_field(
+                "Gate.io",
+                "long/short positioning on a spot client",
+                "positioning is a futures figure",
+            ));
+        }
+        let point = self.contract_stats(symbol)?;
+        let ratio = point
+            .get("lsr_account")
+            .and_then(serde_json::Value::as_f64)
+            .and_then(|r| parse_decimal(&r.to_string()).ok())
+            .ok_or_else(|| Error::Deserialization("no lsr_account".to_string()))?;
+        let total = Decimal::ONE + ratio;
+        if total.is_zero() {
+            return Err(Error::Deserialization(
+                "a long/short ratio of -1 has no proportions".to_string(),
+            ));
+        }
+        Ok(LongShortRatio {
+            symbol: symbol.clone(),
+            long_size: ratio / total,
+            short_size: Decimal::ONE / total,
+            timestamp: stats_millis(&point),
+        })
+    }
+
+    /// The newest `contract_stats` row, which carries both polled figures.
+    fn contract_stats(&self, symbol: &Symbol) -> Result<serde_json::Value> {
+        let query = format!("contract={}&limit=1", Self::wire_symbol(symbol));
+        let value = self.get("/futures/usdt/contract_stats", &query)?;
+        value
+            .as_array()
+            .and_then(|rows| rows.first())
+            .cloned()
+            .ok_or_else(|| Error::NotFound("no contract-stats data point".to_string()))
+    }
+
     /// Subscribe to the public trade stream for `symbol`.
     ///
     /// # Errors
@@ -400,10 +537,14 @@ impl Gate {
                 .cloned()
                 .unwrap_or_else(|| Symbol::new(wire, ""))
         };
+        let channels = self.derivatives_channels.clone();
+        let subscribed = |wire: &str, channel: DerivativesChannel| {
+            channels.iter().any(|(w, c)| w == wire && *c == channel)
+        };
         let mut events = Vec::new();
         if let Some(connection) = self.connection.as_mut() {
             while let Ok(Some(frame)) = connection.recv() {
-                if let Ok(mut parsed) = parse_ws_message(&frame, &resolve) {
+                if let Ok(mut parsed) = parse_ws_message(&frame, &resolve, &subscribed) {
                     events.append(&mut parsed);
                 }
             }
@@ -411,7 +552,7 @@ impl Gate {
         // Drain the private user-data stream (spot.orders/spot.balances), if open.
         if let Some(connection) = self.private_connection.as_mut() {
             while let Ok(Some(frame)) = connection.recv() {
-                if let Ok(mut parsed) = parse_ws_message(&frame, &resolve) {
+                if let Ok(mut parsed) = parse_ws_message(&frame, &resolve, &subscribed) {
                     events.append(&mut parsed);
                 }
             }
@@ -1255,6 +1396,19 @@ fn parse_ws_levels(value: Option<&serde_json::Value>) -> Result<Vec<BookLevel>> 
         .collect()
 }
 
+/// A `contract_stats` row's stamp, in milliseconds.
+///
+/// Gate reports it in *seconds* here, where every other stamp in this crate is
+/// milliseconds. Carrying it through unconverted would date every reading to
+/// 1970.
+fn stats_millis(point: &serde_json::Value) -> i64 {
+    point
+        .get("time")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0)
+        * 1000
+}
+
 /// Gate's futures WebSocket.
 const FUTURES_WS_URL: &str = "wss://fx-ws.gateio.ws/v4/ws/usdt";
 
@@ -1303,7 +1457,11 @@ fn futures_levels(value: Option<&serde_json::Value>) -> Vec<BookLevel> {
         .unwrap_or_default()
 }
 
-fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Vec<Event>> {
+fn parse_ws_message(
+    text: &str,
+    resolve: &impl Fn(&str) -> Symbol,
+    subscribed: &impl Fn(&str, DerivativesChannel) -> bool,
+) -> Result<Vec<Event>> {
     let value: serde_json::Value =
         serde_json::from_str(text).map_err(|e| Error::Deserialization(e.to_string()))?;
     if value.get("event").and_then(serde_json::Value::as_str) != Some("update") {
@@ -1361,34 +1519,64 @@ fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Vec
                     .unwrap_or(0),
             })])
         }
-        "futures.tickers" => Ok(result
-            .as_array()
-            .map(|tickers| {
-                tickers
-                    .iter()
-                    .filter_map(|ticker| {
-                        Some(Event::Ticker(Ticker {
-                            symbol: resolve(ticker.get("contract")?.as_str()?),
-                            last: parse_decimal(ticker.get("last")?.as_str()?).ok()?,
-                            // The futures ticker publishes no top of book; the
-                            // book channel is where those live, and inventing
-                            // them from the last price would be a fabrication.
-                            bid: Decimal::ZERO,
-                            ask: Decimal::ZERO,
-                            volume: ticker
-                                .get("volume_24h_base")
-                                .and_then(serde_json::Value::as_str)
-                                .and_then(|v| parse_decimal(v).ok())
-                                .unwrap_or_default(),
-                            timestamp: ticker
-                                .get("t")
-                                .and_then(serde_json::Value::as_i64)
-                                .unwrap_or(0),
-                        }))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()),
+        // One frame, up to three answers: the futures ticker carries the
+        // funding rate, the mark price and the index beside the quote, all read
+        // at one moment. Only what was subscribed to is emitted.
+        "futures.tickers" => {
+            let empty = Vec::new();
+            let mut out = Vec::new();
+            for ticker in result.as_array().unwrap_or(&empty) {
+                let Some(wire) = ticker.get("contract").and_then(serde_json::Value::as_str) else {
+                    continue;
+                };
+                let symbol = resolve(wire);
+                let timestamp = ticker
+                    .get("t")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0);
+                let field = |key: &str| {
+                    ticker
+                        .get(key)
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|v| parse_decimal(v).ok())
+                };
+                if let Some(last) = field("last") {
+                    out.push(Event::Ticker(Ticker {
+                        symbol: symbol.clone(),
+                        last,
+                        // The futures ticker publishes no top of book; the book
+                        // channel is where those live, and inventing them from
+                        // the last price would be a fabrication.
+                        bid: Decimal::ZERO,
+                        ask: Decimal::ZERO,
+                        volume: field("volume_24h_base").unwrap_or_default(),
+                        timestamp,
+                    }));
+                }
+                let mark = field("mark_price");
+                if subscribed(wire, DerivativesChannel::Funding) {
+                    if let (Some(rate), Some(mark_price)) = (field("funding_rate"), mark) {
+                        out.push(Event::Derivatives(DerivativesFeed::Funding(FundingRate {
+                            symbol: symbol.clone(),
+                            rate,
+                            mark_price,
+                            timestamp,
+                        })));
+                    }
+                }
+                if subscribed(wire, DerivativesChannel::MarkIndex) {
+                    if let (Some(mark_price), Some(index_price)) = (mark, field("index_price")) {
+                        out.push(Event::Derivatives(DerivativesFeed::MarkIndex(MarkIndex {
+                            symbol,
+                            mark_price,
+                            index_price,
+                            timestamp,
+                        })));
+                    }
+                }
+            }
+            Ok(out)
+        }
         "spot.trades" => Ok(vec![Event::Trade(TradePrint {
             symbol: resolve(field_str(result, "currency_pair")?),
             price: parse_decimal(field_str(result, "price")?)?,
@@ -1783,6 +1971,22 @@ impl Derivatives for Gate {
     }
 }
 
+impl DerivativesStream for Gate {
+    fn subscribe_derivatives(
+        &mut self,
+        symbol: &Symbol,
+        channel: DerivativesChannel,
+    ) -> Result<()> {
+        Gate::subscribe_derivatives(self, symbol, channel)
+    }
+    fn open_interest(&mut self, symbol: &Symbol) -> Result<OpenInterest> {
+        Gate::open_interest(self, symbol)
+    }
+    fn long_short_ratio(&mut self, symbol: &Symbol) -> Result<LongShortRatio> {
+        Gate::long_short_ratio(self, symbol)
+    }
+}
+
 impl Gate {
     /// Amend a resting spot order's price and/or amount in place
     /// (`PATCH /api/v4/spot/orders/{id}`).
@@ -1975,6 +2179,94 @@ mod tests {
         let gate = Gate::with_http(Box::new(ArcTransport(http)), &opts)
             .with_ws(Box::new(ArcWs(Arc::clone(&ws))));
         (gate, ws)
+    }
+
+    /// One ticker frame answers both subscriptions.
+    #[test]
+    fn the_futures_ticker_answers_funding_and_mark_index_on_gate() {
+        let (mut gate, ws) = futures_ws_client();
+        ws.push_connection(vec![Ok(Some(
+            r#"{"time":1788462378,"channel":"futures.tickers","event":"update",
+            "result":[{"contract":"BTC_USDT","last":"81231.4","mark_price":"81238.4",
+            "index_price":"81271.1","funding_rate":"0.000073",
+            "volume_24h_base":"81628.265","t":1788462378855}]}"#
+                .to_string(),
+        ))]);
+        Gate::subscribe_derivatives(&mut gate, &symbol(), DerivativesChannel::Funding).unwrap();
+        Gate::subscribe_derivatives(&mut gate, &symbol(), DerivativesChannel::MarkIndex).unwrap();
+
+        let events = Gate::poll_events(&mut gate);
+        assert_eq!(events.len(), 3, "ticker, funding, mark/index: {events:?}");
+
+        let Event::Derivatives(DerivativesFeed::Funding(funding)) = &events[1] else {
+            panic!("expected funding, got {:?}", events[1]);
+        };
+        assert_eq!(funding.rate, dec!(0.000073));
+        assert_eq!(funding.mark_price, dec!(81238.4));
+
+        let Event::Derivatives(DerivativesFeed::MarkIndex(mark)) = &events[2] else {
+            panic!("expected mark/index, got {:?}", events[2]);
+        };
+        assert_eq!(mark.index_price, dec!(81271.1));
+    }
+
+    /// Gate's `futures.liquidates` needs authentication and reports the
+    /// caller's own liquidations, not the venue's forced flow, so it is not the
+    /// public feed this channel means.
+    #[test]
+    fn gate_refuses_liquidations() {
+        let (mut gate, ws) = futures_ws_client();
+        let err =
+            Gate::subscribe_derivatives(&mut gate, &symbol(), DerivativesChannel::Liquidations)
+                .expect_err("Gate publishes no public forced-order feed");
+        assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
+        assert!(ws.sent().is_empty());
+    }
+
+    /// `contract_stats` carries both polled figures, and stamps in **seconds**.
+    #[test]
+    fn the_polled_figures_come_from_one_row_stamped_in_seconds() {
+        let http = Arc::new(MockHttpTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::UsdMFutures);
+        let gate = Gate::with_http(Box::new(ArcTransport(Arc::clone(&http))), &opts);
+        http.push_json(
+            200,
+            r#"[{"time":1788464400,"lsr_taker":1.6098,"lsr_account":3.0,
+            "open_interest":626095712,"mark_price":81477,
+            "open_interest_usd":5101240032.6624}]"#,
+        );
+        let open_interest = Gate::open_interest(&gate, &symbol()).unwrap();
+        assert_eq!(open_interest.open_interest, dec!(626095712));
+        // Seconds on the wire, milliseconds in the type.
+        assert_eq!(open_interest.timestamp, 1_788_464_400_000);
+
+        http.push_json(
+            200,
+            r#"[{"time":1788464400,"lsr_account":3.0,"open_interest":626095712}]"#,
+        );
+        let ratio = Gate::long_short_ratio(&gate, &symbol()).unwrap();
+        // A ratio of 3 is 0.75 long and 0.25 short, and the two sum to one.
+        assert_eq!(ratio.long_size, dec!(0.75));
+        assert_eq!(ratio.short_size, dec!(0.25));
+        assert_eq!(ratio.long_size + ratio.short_size, Decimal::ONE);
+    }
+
+    #[test]
+    fn a_spot_client_refuses_the_gate_derivatives_surface() {
+        let ws = Arc::new(MockWsTransport::new());
+        let http = Arc::new(MockHttpTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::Spot);
+        let mut gate = Gate::with_http(Box::new(ArcTransport(Arc::clone(&http))), &opts)
+            .with_ws(Box::new(ArcWs(Arc::clone(&ws))));
+        for channel in [
+            DerivativesChannel::Funding,
+            DerivativesChannel::MarkIndex,
+            DerivativesChannel::Liquidations,
+        ] {
+            assert!(Gate::subscribe_derivatives(&mut gate, &symbol(), channel).is_err());
+        }
+        assert!(Gate::open_interest(&gate, &symbol()).is_err());
+        assert!(Gate::long_short_ratio(&gate, &symbol()).is_err());
     }
 
     /// Both the host and the channel prefix follow the market.
