@@ -171,6 +171,54 @@ Kraken's trigger rides in a field every limit order also has, so no list of
 spellings could tell the two apart. A venue that gains native trigger orders
 later moves from one branch to the other without the test changing.
 
+### The markets a client refuses
+
+`MarketType` names four markets and no client here routes all four. Until
+recently none of them said so: an unrouted market did not fail, it resolved to
+whatever that client's URL builder produced, and the venue answered. This was
+measured against the live venues, one request per client:
+
+| Venue | asked for coin-margined, answered from | asked for margin |
+|-------|----------------------------------------|------------------|
+| Binance | `api/v3/ticker/24hr?symbol=BTCUSD` — the **spot** host ¹ | the spot path |
+| Bybit | `category=inverse` — correct ² | the spot category |
+| OKX | `BTC-USD-SWAP` — correct ² | `BTC-USD` spot |
+| Bitget | `productType=USDT-FUTURES` → empty list | the spot path |
+| KuCoin | `BTC-USD` on the futures host → 404 ³ | the spot path |
+| Gate.io | `/futures/usdt/` → `CONTRACT_NOT_FOUND` ⁴ | the spot path |
+| HTX | `linear-swap-ex` → `invalid-parameter` ⁵ | the spot path |
+| Kraken | `PF_XBTUSD` — its **linear** perpetual ⁶ | the spot path |
+| Coinbase | — (no coin-margined product) | the spot path |
+| Upbit | `USD-BTC` → 404 (Upbit is spot-only) | the spot path |
+
+1. The worst of them, because it *works*: `BTCUSD` is a real Binance **spot**
+   pair, so a coin-margined request returned real spot prices with no error and
+   nothing to notice, and an order would have bought spot BTC with USD instead
+   of opening an inverse position. Binance's coin-margined API is a different
+   host and prefix entirely (`dapi.binance.com/dapi/v1`).
+2. Bybit and OKX are the two that would have routed the *data* correctly, both
+   verified against the live venues. They are refused with the rest anyway: an
+   inverse order's size is denominated differently — Bybit's inverse `qty` is in
+   USD, not in the base coin — so `quantity` would silently mean something else
+   on those two clients than on every other one. Half a market is the defect
+   this refusal exists to prevent, not a smaller version of the feature.
+3. KuCoin's inverse contracts are named `XBTUSDM`, not `BTC-USD`.
+4. Gate settles inverse contracts under `/futures/btc/`, not `/futures/usdt/`.
+5. HTX serves coin-margined swaps from `swap-ex`, not `linear-swap-ex`.
+6. `PF_XBTUSD` and `PI_XBTUSD` both exist and both answer; `PF_` is the linear
+   multi-collateral perpetual and `PI_` the coin-margined one.
+
+**Margin was routed nowhere at all** — every client sent it down its plain spot
+path, where a margin order becomes an ordinary spot order and the borrow the
+caller asked for simply does not happen.
+
+The guard sits at the seams that reach a venue: the HTTP helpers and each
+WebSocket connect. That is a handful of places per client rather than forty
+public methods, and it is where "nothing was sent" can actually be asserted.
+`tests/conformance.rs` holds every client to it — market data, an order and a
+stream, per unrouted market, each refused with `Error::Exchange` code
+`unsupported` and **no request recorded**. Removing any single guard fails it.
+
 ### The order a binding can build
 
 Every language can express every field of an `OrderRequest`. This was not true
@@ -257,14 +305,12 @@ reaches a field on one path and not another fails rather than averaging out.
 > the first order is placed.
 >
 > Only **spot** and **USDⓈ-margined futures** are offered. `MarketType` also has
-> `CoinMFutures` and `Margin`, and no client routes either consistently: Binance
-> treats coin-margined as spot outright (its `is_futures` is USDⓈ-only and its
-> base URL falls through to the spot host), five venues route it to their USDT
-> futures path, and only Bybit maps it to a genuine inverse category. `Margin`
-> is routed nowhere. A binding that offered them would hand a caller a name that
-> does not describe where the order goes, which is the defect the parameter
-> exists to end — so they are refused, loudly, rather than silently downgraded
-> to spot.
+> `CoinMFutures` and `Margin`, and no client routes either. **Every venue client
+> now refuses an unrouted market before it sends anything**, rather than
+> answering from whichever market its URL builder happened to name — see
+> [the markets a client refuses](#the-markets-a-client-refuses) below for what
+> each one answered instead. Coinbase and Upbit serve spot only and refuse
+> linear futures on the same grounds.
 >
 > The check now covers the axes as well as the verbs: it reads each binding's
 > exchange constructor — wherever that language declares it, including Go's

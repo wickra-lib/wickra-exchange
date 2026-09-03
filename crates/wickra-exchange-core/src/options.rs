@@ -29,6 +29,17 @@ impl MarketType {
     pub fn is_derivatives(self) -> bool {
         matches!(self, MarketType::UsdMFutures | MarketType::CoinMFutures)
     }
+
+    /// This market in words, for the message a client refuses with.
+    #[must_use]
+    pub fn describe(self) -> &'static str {
+        match self {
+            MarketType::Spot => "the spot market",
+            MarketType::UsdMFutures => "USD-margined (linear) futures",
+            MarketType::CoinMFutures => "coin-margined (inverse) futures",
+            MarketType::Margin => "the margin market",
+        }
+    }
 }
 
 /// Position mode for derivatives accounts.

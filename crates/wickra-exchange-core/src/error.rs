@@ -5,6 +5,7 @@
 //! `InvalidSymbol`, …) without knowing which venue produced it. Variants that
 //! originate at a venue keep the raw `code`/`message` for diagnostics.
 
+use crate::options::MarketType;
 use std::time::Duration;
 
 /// The crate-wide result type.
@@ -102,6 +103,26 @@ impl Error {
             code: "unsupported".to_string(),
             message: format!(
                 "{venue}: trigger (stop) orders are not implemented on this path;                  sending one without its trigger price would execute immediately                  instead of resting"
+            ),
+        }
+    }
+
+    /// A market this client does not route.
+    ///
+    /// [`MarketType`](crate::MarketType) names four markets, and a venue client
+    /// that quietly serves a different one than the caller asked for is the
+    /// same defect as an order that quietly drops a field: the answer looks
+    /// right and describes something else. Binance's spot host answers
+    /// `BTCUSD` -- it is a real spot pair -- so a coin-margined request there
+    /// returned real, wrong prices, and would have placed a real, wrong order.
+    ///
+    /// So a market a client does not route is refused before anything is sent.
+    pub(crate) fn unsupported_market(venue: &str, market: MarketType) -> Self {
+        Error::Exchange {
+            code: "unsupported".to_string(),
+            message: format!(
+                "{venue}: {} is not routed by this client; the request would reach                  a different market than the one asked for",
+                market.describe()
             ),
         }
     }

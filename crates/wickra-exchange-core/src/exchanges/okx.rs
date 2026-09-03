@@ -144,6 +144,17 @@ impl fmt::Debug for Okx {
 }
 
 impl Okx {
+    /// Refuse a market this client does not route.
+    ///
+    /// Called at every seam that reaches the venue -- the HTTP helpers and each
+    /// WebSocket connect -- so an unrouted market is refused before a request
+    /// is built rather than answered by whichever market the URL happened to
+    /// name. See [`ensure_market_is_routed`](super::ensure_market_is_routed)
+    /// for what each client used to answer instead.
+    fn ensure_market_is_routed(&self) -> Result<()> {
+        super::ensure_market_is_routed("OKX", self.market_type, super::SPOT_AND_LINEAR)
+    }
+
     fn build(
         http: Box<dyn HttpTransport>,
         options: &ExchangeOptions,
@@ -345,6 +356,7 @@ impl Okx {
     }
 
     fn subscribe(&mut self, symbol: &Symbol, channel: &str) -> Result<()> {
+        self.ensure_market_is_routed()?;
         let wire = self.inst_id(symbol);
         if self.connection.is_none() {
             let ws = self.ws.as_ref().ok_or(Error::NotConnected)?;
@@ -458,6 +470,7 @@ impl Okx {
     }
 
     pub fn subscribe_user_data(&mut self) -> Result<()> {
+        self.ensure_market_is_routed()?;
         let login = self.ws_login_frame()?;
         let subscribe = format!(
             r#"{{"op":"subscribe","args":[{{"channel":"orders","instType":"{}"}},{{"channel":"account"}}]}}"#,
@@ -582,6 +595,7 @@ impl Okx {
     /// consuming the login acknowledgement so later requests read their own
     /// responses.
     fn ensure_ws_api(&mut self) -> Result<()> {
+        self.ensure_market_is_routed()?;
         if self.ws_api_connection.is_some() {
             return Ok(());
         }
@@ -917,6 +931,7 @@ impl Okx {
     ///
     /// `liquidation-orders` is per product, not per market.
     fn subscribe_by_inst_type(&mut self, channel: &str) -> Result<()> {
+        self.ensure_market_is_routed()?;
         if self.connection.is_none() {
             let ws = self.ws.as_ref().ok_or(Error::NotConnected)?;
             let connection = ws.connect(ws_url(self.testnet))?;
@@ -1028,6 +1043,7 @@ impl Okx {
     }
 
     fn get(&self, path: &str, query: &str) -> Result<serde_json::Value> {
+        self.ensure_market_is_routed()?;
         let url = format!("{}{path}?{query}", self.rest_base);
         let response = self.http.execute(&HttpRequest::get(url))?;
         unwrap_envelope(&response.body).map_err(|e| e.with_retry_after(response.retry_after()))
@@ -1042,6 +1058,7 @@ impl Okx {
         query: &str,
         body: &str,
     ) -> Result<serde_json::Value> {
+        self.ensure_market_is_routed()?;
         let creds = self.credentials.as_ref().ok_or(Error::InvalidCredentials(
             "signed endpoint requires credentials",
         ))?;

@@ -65,6 +65,11 @@ pub struct Bybit {
     ws: Option<Box<dyn WsTransport>>,
     rest_base: String,
     category: &'static str,
+    /// The market this client was built for.
+    ///
+    /// Kept alongside `category` rather than derived from it: two market types
+    /// map to the same category, so the string cannot say which was asked for.
+    market_type: MarketType,
     /// One-way or hedge. Bybit names the side with `positionIdx`, which is only
     /// meaningful on a derivatives category.
     position_mode: PositionMode,
@@ -122,6 +127,17 @@ impl fmt::Debug for Bybit {
 }
 
 impl Bybit {
+    /// Refuse a market this client does not route.
+    ///
+    /// Called at every seam that reaches the venue -- the HTTP helpers and each
+    /// WebSocket connect -- so an unrouted market is refused before a request
+    /// is built rather than answered by whichever market the URL happened to
+    /// name. See [`ensure_market_is_routed`](super::ensure_market_is_routed)
+    /// for what each client used to answer instead.
+    fn ensure_market_is_routed(&self) -> Result<()> {
+        super::ensure_market_is_routed("Bybit", self.market_type, super::SPOT_AND_LINEAR)
+    }
+
     fn build(
         http: Box<dyn HttpTransport>,
         options: &ExchangeOptions,
@@ -136,6 +152,7 @@ impl Bybit {
                 "https://api.bybit.com".to_string()
             },
             category: category(options.market_type),
+            market_type: options.market_type,
             position_mode: options.position_mode,
             testnet: options.testnet,
             credentials,
@@ -480,6 +497,7 @@ impl Bybit {
     /// Open the connection if needed, send an `op:subscribe` for `topic`, and
     /// register the symbol for wire-name resolution.
     fn subscribe(&mut self, symbol: &Symbol, topic: &str) -> Result<()> {
+        self.ensure_market_is_routed()?;
         let wire = Self::wire_symbol(symbol);
         if self.connection.is_none() {
             let ws = self.ws.as_ref().ok_or(Error::NotConnected)?;
@@ -571,6 +589,7 @@ impl Bybit {
     /// Returns [`Error::InvalidCredentials`] without credentials, [`Error::NotConnected`]
     /// without a WebSocket transport, or another [`Error`] if the request fails.
     pub fn subscribe_user_data(&mut self) -> Result<()> {
+        self.ensure_market_is_routed()?;
         let creds = self.credentials.as_ref().ok_or(Error::InvalidCredentials(
             "user-data stream requires credentials",
         ))?;
@@ -751,6 +770,7 @@ impl Bybit {
     /// `op:auth` frame (same signature as the private stream) and consumes the
     /// auth acknowledgement so later requests read their own responses.
     fn ensure_ws_trade(&mut self) -> Result<()> {
+        self.ensure_market_is_routed()?;
         if self.ws_api_connection.is_some() {
             return Ok(());
         }
@@ -896,6 +916,7 @@ impl Bybit {
 
     /// GET a public endpoint and unwrap the `{retCode, retMsg, result}` envelope.
     fn get(&self, path: &str, query: &str) -> Result<serde_json::Value> {
+        self.ensure_market_is_routed()?;
         let url = format!("{}{path}?{query}", self.rest_base);
         let response = self.http.execute(&HttpRequest::get(url))?;
         unwrap_envelope(&response.body).map_err(|e| e.with_retry_after(response.retry_after()))
@@ -910,6 +931,7 @@ impl Bybit {
         query: &str,
         body: &str,
     ) -> Result<serde_json::Value> {
+        self.ensure_market_is_routed()?;
         let creds = self.credentials.as_ref().ok_or(Error::InvalidCredentials(
             "signed endpoint requires credentials",
         ))?;

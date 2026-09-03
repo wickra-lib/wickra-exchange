@@ -231,6 +231,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A market a client does not route is now refused, not silently swapped.**
+  `MarketType` names four markets; no client routes all four, and until now none
+  of them said so. An unrouted market did not fail — it resolved to whichever
+  market that client's URL builder happened to produce, and the venue answered.
+
+  Binance was the worst of them, because it *worked*: a coin-margined request
+  went to `api/v3/ticker/24hr?symbol=BTCUSD`, and `BTCUSD` is a real Binance
+  **spot** pair. Real spot prices came back for a futures question, with no
+  error and nothing to notice; an order would have bought spot BTC with USD
+  instead of opening an inverse position. Kraken asked for `PF_XBTUSD`, its
+  *linear* perpetual, where the coin-margined product is `PI_XBTUSD` — both
+  exist, both answer. **`Margin` was routed nowhere on any venue**: every client
+  sent it down its plain spot path, where a margin order is an ordinary spot
+  order and the borrow never happens. Coinbase and Upbit ignored the market
+  outright, so a futures client there was a spot client with a different name.
+
+  Bybit and OKX would have routed coin-margined *data* correctly — verified
+  against the live venues — and are refused with the rest anyway: an inverse
+  order's size is denominated differently, so `quantity` would silently mean
+  something else on those two clients than on every other one.
+
+  The guard sits at the seams that reach a venue, and the conformance suite
+  holds all ten clients to it: market data, an order and a stream, per unrouted
+  market, each refused before a single request goes out.
+
 - **HTX read only one of the venue's two response envelopes.** Its v1 and swap
   endpoints answer `status: ok`; its v2 endpoints answer `code: 200` and carry
   no `status` at all. Every v2 success was therefore reported as an error with

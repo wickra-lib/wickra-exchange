@@ -12,7 +12,7 @@ use crate::credentials::Credentials;
 use crate::error::{Error, Result};
 use crate::events::{BookLevel, Event, OrderBookSnapshot, TradePrint};
 use crate::normalize::{format_decimal, parse_decimal};
-use crate::options::{ExchangeOptions, SelfTradePrevention};
+use crate::options::{ExchangeOptions, MarketType, SelfTradePrevention};
 use crate::signing::{hmac_sha512_bytes, sha512_hex};
 use crate::symbol::Symbol;
 use crate::traits::{Exchange, Execution, MarketData};
@@ -44,6 +44,12 @@ pub struct Upbit {
     http: Box<dyn HttpTransport>,
     ws: Option<Box<dyn WsTransport>>,
     rest_base: String,
+    /// The market this client was built for.
+    ///
+    /// This venue serves spot only, and the market was previously dropped on the
+    /// floor: a client built for futures answered spot questions with spot data
+    /// and said nothing.
+    market_type: MarketType,
     credentials: Option<Credentials>,
     now_ms: Box<dyn Fn() -> i64 + Send + Sync>,
     /// Upbit refuses a JWT whose `nonce` it has seen before. The wall clock in
@@ -73,15 +79,27 @@ impl fmt::Debug for Upbit {
 }
 
 impl Upbit {
+    /// Refuse a market this client does not route.
+    ///
+    /// Called at every seam that reaches the venue -- the HTTP helpers and each
+    /// WebSocket connect -- so an unrouted market is refused before a request
+    /// is built rather than answered by whichever market the URL happened to
+    /// name. See [`ensure_market_is_routed`](super::ensure_market_is_routed)
+    /// for what each client used to answer instead.
+    fn ensure_market_is_routed(&self) -> Result<()> {
+        super::ensure_market_is_routed("Upbit", self.market_type, super::SPOT_ONLY)
+    }
+
     fn build(
         http: Box<dyn HttpTransport>,
-        _options: &ExchangeOptions,
+        options: &ExchangeOptions,
         credentials: Option<Credentials>,
     ) -> Self {
         Self {
             http,
             ws: None,
             rest_base: "https://api.upbit.com".to_string(),
+            market_type: options.market_type,
             credentials,
             now_ms: Box::new(system_now_ms),
             nonces: NonceGenerator::new(0),
@@ -234,6 +252,7 @@ impl Upbit {
     }
 
     fn subscribe(&mut self, symbol: &Symbol, kind: &str) -> Result<()> {
+        self.ensure_market_is_routed()?;
         let market = Self::wire_symbol(symbol);
         if self.connection.is_none() {
             let ws = self.ws.as_ref().ok_or(Error::NotConnected)?;
@@ -388,6 +407,7 @@ impl Upbit {
     }
 
     fn get(&self, path: &str, query: &str) -> Result<serde_json::Value> {
+        self.ensure_market_is_routed()?;
         let url = format!("{}{path}?{query}", self.rest_base);
         let response = self.http.execute(&HttpRequest::get(url))?;
         parse_body(&response)
@@ -401,6 +421,7 @@ impl Upbit {
         path: &str,
         params: &[(&str, String)],
     ) -> Result<serde_json::Value> {
+        self.ensure_market_is_routed()?;
         let query_string = params
             .iter()
             .map(|(key, val)| format!("{key}={val}"))

@@ -121,6 +121,17 @@ impl fmt::Debug for Gate {
 }
 
 impl Gate {
+    /// Refuse a market this client does not route.
+    ///
+    /// Called at every seam that reaches the venue -- the HTTP helpers and each
+    /// WebSocket connect -- so an unrouted market is refused before a request
+    /// is built rather than answered by whichever market the URL happened to
+    /// name. See [`ensure_market_is_routed`](super::ensure_market_is_routed)
+    /// for what each client used to answer instead.
+    fn ensure_market_is_routed(&self) -> Result<()> {
+        super::ensure_market_is_routed("Gate.io", self.market_type, super::SPOT_AND_LINEAR)
+    }
+
     fn build(
         http: Box<dyn HttpTransport>,
         options: &ExchangeOptions,
@@ -483,6 +494,7 @@ impl Gate {
     }
 
     fn subscribe(&mut self, symbol: &Symbol, channel: &str) -> Result<()> {
+        self.ensure_market_is_routed()?;
         // Gate serves spot and futures from different hosts with differently
         // named channels, so both follow the market the client is on. The
         // channel arrives spelled `spot.<name>`; on a futures client the prefix
@@ -599,6 +611,7 @@ impl Gate {
     /// [`Error::NotConnected`] without a WebSocket transport, or another
     /// [`Error`] if the request fails.
     pub fn subscribe_user_data(&mut self) -> Result<()> {
+        self.ensure_market_is_routed()?;
         // The stream below is the venue's *spot* private feed. A futures client
         // would watch the spot account, where its own futures orders never
         // appear -- so it would wait for fills that cannot arrive, with nothing
@@ -724,6 +737,7 @@ impl Gate {
     /// request signs `api\nspot.login\n\n<timestamp>`; later requests on the same
     /// connection inherit the session, so they are unsigned.
     fn ensure_ws_api(&mut self) -> Result<()> {
+        self.ensure_market_is_routed()?;
         if self.ws_api_connection.is_some() {
             return Ok(());
         }
@@ -1212,6 +1226,7 @@ impl Gate {
     }
 
     fn get(&self, path: &str, query: &str) -> Result<serde_json::Value> {
+        self.ensure_market_is_routed()?;
         let url = format!("{}{path}?{query}", self.rest_base);
         let response = self.http.execute(&HttpRequest::get(url))?;
         parse_body(&response)
@@ -1226,6 +1241,7 @@ impl Gate {
         query: &str,
         body: &str,
     ) -> Result<serde_json::Value> {
+        self.ensure_market_is_routed()?;
         let creds = self.credentials.as_ref().ok_or(Error::InvalidCredentials(
             "signed endpoint requires credentials",
         ))?;
