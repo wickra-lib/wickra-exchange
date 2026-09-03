@@ -715,6 +715,10 @@ jobs:
           cp bindings/go/include/wickra_exchange.h "$out/include/"
           cp bindings/go/README.md "$out/"
           cp LICENSE-MIT LICENSE-APACHE "$out/"
+          # golden_test.go travels with the module, so the tapes it reads have
+          # to travel too: in this repository they sit two directories above the
+          # package, which is outside the module a consumer gets.
+          cp -r golden "$out/golden"
           # The in-repo go.mod already declares the standalone module path.
           cp bindings/go/go.mod "$out/go.mod"
           declare -A GO=(
@@ -778,9 +782,15 @@ jobs:
           }
           GO
           go vet ./...
-          go test -run TestAssembledModuleSmoke -v ./...
+          # The whole suite, not one test by name. Running a single test by name
+          # is how a mirrored test that cannot pass stayed invisible: the module
+          # shipped golden_test.go, which reads tapes from a repository-relative
+          # path that does not exist under the module, and the verify step never
+          # ran it. `./...` means a test the mirror cannot run fails the release
+          # rather than the consumer's first `go test`.
+          go test -v ./...
           rm smoke_main_test.go
-          echo "module builds, links and runs"
+          echo "module builds, links and runs its whole suite"
 
       - name: Push to wickra-exchange-go and tag the release
         shell: bash
