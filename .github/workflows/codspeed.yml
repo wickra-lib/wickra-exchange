@@ -170,17 +170,43 @@ jobs:
       # which is also what the vendor's own "different runtime environments" note
       # says on each red run.
       #
+      # Fourth, and it removes the last way to read this as real: the figure
+      # appeared again on a change that *did* touch the benchmarked function.
+      # #198 added one `i64` assignment to `apply_delta` and CodSpeed reported
+      # 399.4 -> 455, which is the other of the two pairs from the table above.
+      #
+      # That was measured rather than assumed, and the measurement is the useful
+      # part. Running the criterion bench locally with and without that single
+      # assignment:
+      #
+      #   with the assignment      1.7669 ns
+      #   without the assignment   1.8802 ns   (+6.3%, p < 0.05)
+      #
+      # The line CodSpeed blamed for a 12% regression makes the function
+      # *faster* by local wall-clock, which is to say the difference is noise at
+      # this size: the whole function is under two nanoseconds, and one store
+      # cannot be found in it either way. What cannot be noise is CodSpeed
+      # reporting the same two figures to the tenth of a nanosecond across runs,
+      # CPUs, and now across a code change.
+      #
       # So a re-run is a coin toss, not a fix, and this comment does not tell you
       # to keep flipping until it lands green: a green run bought that way says
-      # nothing the red one did not. What to do when this fires: confirm the diff
-      # does not touch the benchmarked path, confirm the report carries the
-      # "different runtime environments" note, and confirm the pair of figures is
-      # that same 399.4/453.6. Those three together are the signature of this
-      # phenomenon and not of a regression. If any of them differs -- a different
-      # pair, a missing note, a diff that does touch `orderbook.rs` -- then treat
-      # it as real: compare the recorded CPU lines, check the footnote for a base
-      # commit older than main's head (`No successful run was found on main`),
-      # and diff the emitted assembly for the named function.
+      # nothing the red one did not. What to do when this fires:
+      #
+      #   1. Is the pair one of 399.4/453.6 or 399.4/455, and does the report
+      #      carry the "different runtime environments" note? Those two together
+      #      are this phenomenon's signature.
+      #   2. Does the diff touch the benchmarked function at all? If not, stop --
+      #      the number is not about this pull request.
+      #   3. If it does, measure it rather than reasoning about it:
+      #      `cargo bench -p wickra-exchange-bench --bench throughput --
+      #      "orderbook/apply_delta"`, then again with the change reverted.
+      #      Criterion prints the delta and a p-value. That is a five-minute
+      #      answer to a question this comment spent three incidents on.
+      #   4. Only if the local measurement agrees with CodSpeed: compare the
+      #      recorded CPU lines, check the footnote for a base commit older than
+      #      main's head (`No successful run was found on main`), and diff the
+      #      emitted assembly for the named function.
       #
       # A threshold is still not the answer: one wide enough to swallow 12%
       # would swallow a real 12% regression too.
