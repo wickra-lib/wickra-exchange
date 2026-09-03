@@ -234,10 +234,23 @@ SEXP wkex_place(SEXP ext, SEXP market, SEXP side, SEXP quantity, SEXP price) {
  * The strings point into the R vectors, which the caller keeps alive for the
  * duration of the call.
  */
+/* An element of an optional character vector, or NULL.
+ *
+ * The exact-number arguments are NULL when the caller did not give them and may
+ * hold NA per element, both of which mean "use the double beside it".
+ */
+static const char *optional_text(SEXP texts, R_xlen_t i) {
+    if (texts == R_NilValue || TYPEOF(texts) != STRSXP || STRING_ELT(texts, i) == NA_STRING) {
+        return NULL;
+    }
+    return CHAR(STRING_ELT(texts, i));
+}
+
 static WickraOrderRequest request_at(SEXP markets, SEXP sides, SEXP order_types, SEXP quantities,
                                      SEXP prices, SEXP stop_prices, SEXP times_in_force,
                                      SEXP client_order_ids, SEXP reduce_onlys, SEXP post_onlys,
-                                     SEXP stps, R_xlen_t i) {
+                                     SEXP stps, SEXP quantity_texts, SEXP price_texts,
+                                     SEXP stop_price_texts, R_xlen_t i) {
     double p = REAL(prices)[i];
     double sp = REAL(stop_prices)[i];
     const char *coid = NULL;
@@ -256,17 +269,24 @@ static WickraOrderRequest request_at(SEXP markets, SEXP sides, SEXP order_types,
         (bool)LOGICAL(reduce_onlys)[i],
         (bool)LOGICAL(post_onlys)[i],
         INTEGER(stps)[i],
+        /* Exact decimal text, NULL to use the double beside it. R's numeric is
+         * a double and holds about fifteen significant digits; these are how a
+         * wider number reaches the venue as written. */
+        optional_text(quantity_texts, i),
+        optional_text(price_texts, i),
+        optional_text(stop_price_texts, i),
     };
     return request;
 }
 
 SEXP wkex_place_order(SEXP ext, SEXP market, SEXP side, SEXP order_type, SEXP quantity,
                       SEXP price, SEXP stop_price, SEXP time_in_force, SEXP client_order_id,
-                      SEXP reduce_only, SEXP post_only, SEXP stp) {
+                      SEXP reduce_only, SEXP post_only, SEXP stp, SEXP quantity_text,
+                      SEXP price_text, SEXP stop_price_text) {
     WickraOrder order;
     WickraOrderRequest request = request_at(market, side, order_type, quantity, price, stop_price,
                                             time_in_force, client_order_id, reduce_only, post_only,
-                                            stp, 0);
+                                            stp, quantity_text, price_text, stop_price_text, 0);
     int rc = wickra_exchange_place_order(handle_of(ext), &request, &order);
     if (rc != WICKRA_OK) {
         Rf_error("wickra: order failed with code %d", rc);
@@ -631,14 +651,16 @@ SEXP wkex_advanced_place_batch(SEXP ext, SEXP markets, SEXP sides,
 SEXP wkex_advanced_place_batch_full(SEXP ext, SEXP markets, SEXP sides, SEXP order_types,
                                     SEXP quantities, SEXP prices, SEXP stop_prices,
                                     SEXP times_in_force, SEXP client_order_ids,
-                                    SEXP reduce_onlys, SEXP post_onlys, SEXP stps) {
+                                    SEXP reduce_onlys, SEXP post_onlys, SEXP stps,
+                                    SEXP quantity_texts, SEXP price_texts,
+                                    SEXP stop_price_texts) {
     R_xlen_t n = Rf_xlength(markets);
     WickraOrderRequest *requests =
         (WickraOrderRequest *)R_alloc(n, sizeof(WickraOrderRequest));
     for (R_xlen_t i = 0; i < n; i++) {
         requests[i] = request_at(markets, sides, order_types, quantities, prices, stop_prices,
                                  times_in_force, client_order_ids, reduce_onlys, post_onlys,
-                                 stps, i);
+                                 stps, quantity_texts, price_texts, stop_price_texts, i);
     }
     WickraOrder *out = (WickraOrder *)R_alloc(n, sizeof(WickraOrder));
     int *codes = (int *)R_alloc(n, sizeof(int));
@@ -772,11 +794,12 @@ SEXP wkex_ws_place_order(SEXP ext, SEXP market, SEXP side, SEXP quantity, SEXP p
  */
 SEXP wkex_ws_place_order_full(SEXP ext, SEXP market, SEXP side, SEXP order_type, SEXP quantity,
                               SEXP price, SEXP stop_price, SEXP time_in_force,
-                              SEXP client_order_id, SEXP reduce_only, SEXP post_only, SEXP stp) {
+                              SEXP client_order_id, SEXP reduce_only, SEXP post_only, SEXP stp,
+                              SEXP quantity_text, SEXP price_text, SEXP stop_price_text) {
     WickraOrder order;
     WickraOrderRequest request = request_at(market, side, order_type, quantity, price, stop_price,
                                             time_in_force, client_order_id, reduce_only, post_only,
-                                            stp, 0);
+                                            stp, quantity_text, price_text, stop_price_text, 0);
     int rc = wickra_ws_place_order_full(ws_execution_of(ext), &request, &order);
     if (rc != WICKRA_OK) {
         Rf_error("wickra: ws place_order_full failed with code %d", rc);
@@ -799,7 +822,7 @@ static const R_CallMethodDef CallEntries[] = {
     {"wkex_replay_new", (DL_FUNC)&wkex_replay_new, 7},
     {"wkex_name", (DL_FUNC)&wkex_name, 1},
     {"wkex_set_price", (DL_FUNC)&wkex_set_price, 3},
-    {"wkex_place_order", (DL_FUNC)&wkex_place_order, 12},
+    {"wkex_place_order", (DL_FUNC)&wkex_place_order, 15},
     {"wkex_place", (DL_FUNC)&wkex_place, 5},
     {"wkex_cancel", (DL_FUNC)&wkex_cancel, 3},
     {"wkex_balance", (DL_FUNC)&wkex_balance, 2},
@@ -823,14 +846,14 @@ static const R_CallMethodDef CallEntries[] = {
     {"wkex_advanced_cancel_batch", (DL_FUNC)&wkex_advanced_cancel_batch, 3},
     {"wkex_advanced_place_oco", (DL_FUNC)&wkex_advanced_place_oco, 7},
     {"wkex_advanced_place_batch", (DL_FUNC)&wkex_advanced_place_batch, 5},
-    {"wkex_advanced_place_batch_full", (DL_FUNC)&wkex_advanced_place_batch_full, 12},
+    {"wkex_advanced_place_batch_full", (DL_FUNC)&wkex_advanced_place_batch_full, 15},
     {"wkex_connect_user_data", (DL_FUNC)&wkex_connect_user_data, 7},
     {"wkex_user_data_subscribe", (DL_FUNC)&wkex_user_data_subscribe, 1},
     {"wkex_user_data_keepalive", (DL_FUNC)&wkex_user_data_keepalive, 1},
     {"wkex_user_data_poll", (DL_FUNC)&wkex_user_data_poll, 2},
     {"wkex_connect_ws_execution", (DL_FUNC)&wkex_connect_ws_execution, 7},
     {"wkex_ws_place_order", (DL_FUNC)&wkex_ws_place_order, 5},
-    {"wkex_ws_place_order_full", (DL_FUNC)&wkex_ws_place_order_full, 12},
+    {"wkex_ws_place_order_full", (DL_FUNC)&wkex_ws_place_order_full, 15},
     {"wkex_ws_cancel_order", (DL_FUNC)&wkex_ws_cancel_order, 3},
     {NULL, NULL, 0}};
 

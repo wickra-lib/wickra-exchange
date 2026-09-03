@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -98,6 +99,24 @@ public sealed record OrderRequest(string Market, Side Side, OrderType Type, doub
 
     /// <summary>Self-trade-prevention policy.</summary>
     public SelfTradePrevention Stp { get; init; } = SelfTradePrevention.None;
+
+    /// <summary>
+    /// Exact quantity, used instead of <see cref="Quantity"/> when set.
+    /// </summary>
+    /// <remarks>
+    /// A <c>double</c> holds about fifteen significant digits; the core holds
+    /// every order number in an exact decimal, and C#'s own <c>decimal</c>
+    /// holds twenty-eight. Sent as a double, <c>12345678.90123456789</c>
+    /// arrives as <c>12345678.90123457</c> — a different order, placed without
+    /// a word. Set this and the number reaches the venue as written.
+    /// </remarks>
+    public decimal? ExactQuantity { get; init; }
+
+    /// <summary>Exact limit price, used instead of <see cref="Price"/> when set.</summary>
+    public decimal? ExactPrice { get; init; }
+
+    /// <summary>Exact trigger price, used instead of <see cref="StopPrice"/> when set.</summary>
+    public decimal? ExactStopPrice { get; init; }
 }
 
 /// <summary>The kind of a stream event.</summary>
@@ -312,29 +331,20 @@ public sealed unsafe class Exchange : IDisposable
     /// </remarks>
     public OrderInfo PlaceOrder(OrderRequest request)
     {
-        var m = Utf8(request.Market);
-        var c = request.ClientOrderId is null ? null : Utf8(request.ClientOrderId);
-        Native.Order order;
-        fixed (byte* mp = m)
-        fixed (byte* cp = c)
+        // Through `ToNative` like the batch and socket paths, rather than
+        // filling the struct here: a field added to the order is then added to
+        // all three at once, which is the property that comment claims.
+        var native = ToNative(request);
+        try
         {
-            var native = new Native.OrderRequest
-            {
-                Market = mp,
-                Side = (int)request.Side,
-                OrderType = (int)request.Type,
-                Quantity = request.Quantity,
-                Price = request.Price ?? double.NaN,
-                StopPrice = request.StopPrice ?? double.NaN,
-                TimeInForce = (int)request.TimeInForce,
-                ClientOrderId = cp,
-                ReduceOnly = request.ReduceOnly,
-                PostOnly = request.PostOnly,
-                Stp = (int)request.Stp,
-            };
+            Native.Order order;
             Check(Native.wickra_exchange_place_order(_handle, &native, &order));
+            return ReadOrder(order);
         }
-        return ReadOrder(order);
+        finally
+        {
+            FreeNative(native);
+        }
     }
 
     /// <summary>Cancel an open order by venue id.</summary>
@@ -593,7 +603,26 @@ public sealed unsafe class Exchange : IDisposable
             ReduceOnly = request.ReduceOnly,
             PostOnly = request.PostOnly,
             Stp = (int)request.Stp,
+            QuantityText = ExactText(request.ExactQuantity),
+            PriceText = ExactText(request.ExactPrice),
+            StopPriceText = ExactText(request.ExactStopPrice),
         };
+    }
+
+    /// <summary>
+    /// A decimal as the invariant text the C ABI reads, or null when unset.
+    /// </summary>
+    /// <remarks>
+    /// Invariant on purpose: a machine whose culture writes a comma for the
+    /// decimal point would otherwise send `19000,5`, which is not a number the
+    /// venue can read — and the failure would only appear on those machines.
+    /// </remarks>
+    private static byte* ExactText(decimal? value)
+    {
+        return value is null
+            ? null
+            : (byte*)Marshal.StringToCoTaskMemUTF8(
+                value.Value.ToString(CultureInfo.InvariantCulture));
     }
 
     /// <summary>Free the strings <see cref="ToNative"/> allocated.</summary>
@@ -601,6 +630,9 @@ public sealed unsafe class Exchange : IDisposable
     {
         if (native.Market is not null) { Marshal.FreeCoTaskMem((nint)native.Market); }
         if (native.ClientOrderId is not null) { Marshal.FreeCoTaskMem((nint)native.ClientOrderId); }
+        if (native.QuantityText is not null) { Marshal.FreeCoTaskMem((nint)native.QuantityText); }
+        if (native.PriceText is not null) { Marshal.FreeCoTaskMem((nint)native.PriceText); }
+        if (native.StopPriceText is not null) { Marshal.FreeCoTaskMem((nint)native.StopPriceText); }
     }
 
     private static (nint[] assets, double[] amounts) MarshalBalances(IReadOnlyDictionary<string, double> balances)

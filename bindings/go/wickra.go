@@ -829,15 +829,36 @@ type OrderRequest struct {
 	PostOnly bool
 	// STP is the self-trade-prevention policy (STPNone by the zero value).
 	STP SelfTradePrevention
+	// QuantityText is the exact quantity, used instead of Quantity when set.
+	//
+	// A float64 holds about fifteen significant digits, and the library holds
+	// every order number in an exact decimal. Sent as a float64,
+	// "12345678.90123456789" arrives as 12345678.90123457 -- a different order,
+	// placed without a word. Go has no decimal type, so the exact spelling is a
+	// string, which is what every exchange's own API takes for the same reason.
+	//
+	// Text that is not a decimal number refuses the order rather than placing
+	// one at some other number.
+	QuantityText string
+	// PriceText is the exact limit price, used instead of Price when set.
+	PriceText string
+	// StopPriceText is the exact trigger price, used instead of StopPrice when
+	// set.
+	StopPriceText string
 }
 
 // orderType derives the C order-type code from which prices are set.
+//
+// A price set only as exact text counts as set: reading the float64 alone would
+// make a limit order with an exact price into a market order, which is the
+// order that takes whatever the book offers.
 func (r OrderRequest) orderType() C.int32_t {
-	limit := isSet(r.Price)
+	limit := isSet(r.Price) || r.PriceText != ""
+	stop := isSet(r.StopPrice) || r.StopPriceText != ""
 	switch {
-	case isSet(r.StopPrice) && limit:
+	case stop && limit:
 		return C.WICKRA_ORDER_STOP_LIMIT
-	case isSet(r.StopPrice):
+	case stop:
 		return C.WICKRA_ORDER_STOP_MARKET
 	case limit:
 		return C.WICKRA_ORDER_LIMIT
@@ -869,10 +890,20 @@ func (r OrderRequest) toC() (C.WickraOrderRequest, func()) {
 	if r.ClientOrderID != "" {
 		cClientID = C.CString(r.ClientOrderID)
 	}
+	// Empty stays NULL: the ABI reads the float64 beside a null pointer, so a
+	// request built without the text fields behaves exactly as it did.
+	cQuantityText := optionalCString(r.QuantityText)
+	cPriceText := optionalCString(r.PriceText)
+	cStopText := optionalCString(r.StopPriceText)
 	free := func() {
 		C.free(unsafe.Pointer(cMarket))
 		if cClientID != nil {
 			C.free(unsafe.Pointer(cClientID))
+		}
+		for _, p := range []*C.char{cQuantityText, cPriceText, cStopText} {
+			if p != nil {
+				C.free(unsafe.Pointer(p))
+			}
 		}
 	}
 	return C.WickraOrderRequest{
@@ -887,7 +918,18 @@ func (r OrderRequest) toC() (C.WickraOrderRequest, func()) {
 		reduce_only:     C.bool(r.ReduceOnly),
 		post_only:       C.bool(r.PostOnly),
 		stp:             C.int32_t(r.STP),
+		quantity_text:   cQuantityText,
+		price_text:      cPriceText,
+		stop_price_text: cStopText,
 	}, free
+}
+
+// optionalCString allocates a C string, or returns NULL for the empty one.
+func optionalCString(value string) *C.char {
+	if value == "" {
+		return nil
+	}
+	return C.CString(value)
 }
 
 // BatchResult is one order's outcome in a batch placement: Err is nil and Order

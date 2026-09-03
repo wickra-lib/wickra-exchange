@@ -290,4 +290,42 @@ stopifnot(inherits(try(wickraexchange:::.wkex_stp("cancel_maker"), silent = TRUE
 stopifnot(wickraexchange:::.wkex_tif("IOC") == 1L)
 stopifnot(wickraexchange:::.wkex_stp("EXPIRE_BOTH") == 3L)
 
+## An order number arrives as the number that was written.
+##
+## R's numeric is a double and holds about fifteen significant digits, where this
+## library holds every order number in an exact decimal: written as a number,
+## 12345678.90123456789 becomes 12345678.90123457, which is a different order
+## placed without a word. The text arguments are the exact spelling.
+exact <- wkex_paper(c(USDT = 1e6, BTC = 100))
+wkex_set_price(exact, "BTC/USDT", 20000)
+
+## The exact value is the one that is used, and the numeric beside it may say
+## anything -- which is what can be observed here, since every number this
+## binding reports is a double.
+sized <- wkex_place_order(exact, "BTC/USDT", "sell", 999, price = 21000,
+                          quantity_text = "1.5")
+stopifnot(abs(sized$quantity - 1.5) < 1e-9)
+
+priced <- wkex_place_order(exact, "BTC/USDT", "sell", 1, price = 21000,
+                           price_text = "21111.25")
+stopifnot(abs(priced$price - 21111.25) < 1e-9)
+
+## A price given only as exact text still makes the order a limit order. Reading
+## the numeric alone would send a *market* order, which takes whatever the book
+## offers.
+stopifnot(wickraexchange:::.wkex_order_type(NA_real_, NA_real_, "19000",
+                                            NA_character_) == 1L)
+stopifnot(wickraexchange:::.wkex_order_type(NA_real_, NA_real_, NA_character_,
+                                            "19000") == 2L)
+stopifnot(wickraexchange:::.wkex_order_type(NA_real_, NA_real_, "18900",
+                                            "19000") == 3L)
+
+## Text that is not a decimal is a refused order, not an order at some other
+## number.
+stopifnot(inherits(
+  try(wkex_place_order(exact, "BTC/USDT", "sell", 1, price_text = "nineteen"),
+      silent = TRUE),
+  "try-error"
+))
+
 cat("wickra.exchange R tests passed\n")

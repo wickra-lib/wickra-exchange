@@ -65,7 +65,7 @@ final class Native {
     // WickraOrderRequest. The offsets are pinned by a Rust test
     // (`the_request_layout_is_what_the_bindings_assume`), because nothing here
     // would fail to compile if a field moved.
-    static final long REQUEST_SIZE = 64;
+    static final long REQUEST_SIZE = 88;
     static final long R_MARKET = 0;
     static final long R_SIDE = 8;
     static final long R_ORDER_TYPE = 12;
@@ -77,6 +77,11 @@ final class Native {
     static final long R_REDUCE_ONLY = 56;
     static final long R_POST_ONLY = 57;
     static final long R_STP = 60;
+    // Exact decimal text, or NULL to use the double beside it. Appended, so
+    // every offset above is the one this binding already assumed.
+    static final long R_QUANTITY_TEXT = 64;
+    static final long R_PRICE_TEXT = 72;
+    static final long R_STOP_PRICE_TEXT = 80;
 
     static final long ORDER_SIZE = 104;
     static final long O_ID = 0;
