@@ -457,6 +457,14 @@ impl Htx {
         let mut events = Vec::new();
         if let Some(connection) = self.connection.as_mut() {
             while let Ok(Some(frame)) = connection.recv() {
+                // HTX closes a stream that does not answer its heartbeat, and
+                // the reply has to carry the same value back. Best-effort: if
+                // the pong cannot be sent the connection is already gone, and
+                // the next poll reconnects.
+                if let Some(pong) = pong_for(&frame) {
+                    let _ = connection.send(&pong);
+                    continue;
+                }
                 if let Ok(mut parsed) = parse_ws_message(&frame, &resolve) {
                     events.append(&mut parsed);
                 }
@@ -465,6 +473,10 @@ impl Htx {
         // Drain the private user-data (v2 `orders`/`accounts.update`) stream, if open.
         if let Some(connection) = self.private_connection.as_mut() {
             while let Ok(Some(frame)) = connection.recv() {
+                if let Some(pong) = pong_for(&frame) {
+                    let _ = connection.send(&pong);
+                    continue;
+                }
                 if let Ok(mut parsed) = parse_ws_message(&frame, &resolve) {
                     events.append(&mut parsed);
                 }
@@ -1485,6 +1497,30 @@ fn ws_balance_from_data(data: &serde_json::Value) -> Result<Balance> {
     })
 }
 
+/// The reply HTX's heartbeat asks for, or `None` if this frame is not one.
+///
+/// Two shapes, because HTX runs two protocols: the public market socket sends
+/// `{"ping": <ms>}` and the private v2 socket `{"action":"ping","data":{"ts":..}}`.
+/// Both want the value echoed back. A frame that goes unanswered closes the
+/// stream -- and since the reconnect opens another socket that is closed for the
+/// same reason, the result is a stream that reconnects forever and delivers
+/// nothing.
+fn pong_for(frame: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(frame).ok()?;
+    if let Some(ping) = value.get("ping") {
+        return Some(format!(r#"{{"pong":{ping}}}"#));
+    }
+    if value.get("action").and_then(serde_json::Value::as_str) == Some("ping") {
+        let ts = value
+            .get("data")
+            .and_then(|d| d.get("ts"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        return Some(format!(r#"{{"action":"pong","data":{{"ts":{ts}}}}}"#));
+    }
+    None
+}
+
 fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Vec<Event>> {
     let value: serde_json::Value =
         serde_json::from_str(text).map_err(|e| Error::Deserialization(e.to_string()))?;
@@ -1938,6 +1974,58 @@ mod tests {
         .with_ws(Box::new(ArcWs(Arc::clone(&ws))))
         .with_clock(Box::new(move || now_ms));
         (htx, ws)
+    }
+
+    /// HTX closes a stream that does not answer its heartbeat.
+    ///
+    /// The public socket sends `{"ping": <ms>}` and the private v2 socket
+    /// `{"action":"ping",...}`. Both were dropped as unrecognised -- they carry
+    /// no `ch` -- so the venue closed the connection, the reconnect opened
+    /// another, and that one was closed for the same reason. A stream that
+    /// reconnects forever and delivers nothing.
+    #[test]
+    fn the_public_heartbeat_is_answered_with_the_same_value() {
+        let (mut htx, ws) = signed_ws_client(1_700_000_000_000);
+        ws.push_connection(vec![Ok(Some(r#"{"ping":1788462493057}"#.to_string()))]);
+        Htx::subscribe_trades(&mut htx, &symbol()).unwrap();
+
+        let events = Htx::poll_events(&mut htx);
+        assert!(events.is_empty(), "a heartbeat is not an event: {events:?}");
+        assert!(
+            ws.sent().iter().any(|f| f == r#"{"pong":1788462493057}"#),
+            "the heartbeat went unanswered: {:?}",
+            ws.sent()
+        );
+    }
+
+    #[test]
+    fn the_private_heartbeat_is_answered_in_its_own_shape() {
+        assert_eq!(
+            pong_for(r#"{"action":"ping","data":{"ts":1788462493057}}"#).as_deref(),
+            Some(r#"{"action":"pong","data":{"ts":1788462493057}}"#)
+        );
+        // An ordinary market frame is not a heartbeat.
+        assert!(pong_for(r#"{"ch":"market.BTC-USDT.trade.detail","tick":{}}"#).is_none());
+        assert!(pong_for("not json").is_none());
+    }
+
+    /// A real frame from the venue's own socket, in the shape it actually
+    /// arrives -- recorded from `api.hbdm.com/linear-swap-ws`.
+    #[test]
+    fn a_real_trade_frame_parses() {
+        let (mut htx, ws) = signed_ws_client(1_700_000_000_000);
+        ws.push_connection(vec![Ok(Some(
+            r#"{"ch":"market.BTC-USDT.trade.detail","ts":1788462493057,"tick":{
+            "id":100127722487328,"ts":1788462493055,"data":[{"amount":2,"quantity":0.002,
+            "trade_turnover":162.4354,"ts":1788462493055,"id":1001277224873280000,
+            "price":81217.7,"direction":"buy"}]}}"#
+                .to_string(),
+        ))]);
+        Htx::subscribe_trades(&mut htx, &symbol()).unwrap();
+
+        let events = Htx::poll_events(&mut htx);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(matches!(events[0], Event::Trade(_)));
     }
 
     #[test]

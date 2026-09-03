@@ -53,6 +53,9 @@ futures-util = "0.3"
 # HTTP + WebSocket transport (rustls TLS, no OpenSSL system dependency).
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["rustls-tls-webpki-roots", "connect"] }
+# HTX sends every WebSocket frame gzip-compressed, so reading its stream at
+# all needs a decoder in the transport adapter.
+flate2 = "1"
 url = "2"
 # Request signing primitives (HMAC-SHA256/512, base64, hex).
 # base64 stays on the 0.22 line on purpose: reqwest pulls 0.22 in through

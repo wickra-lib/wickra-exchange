@@ -6,7 +6,9 @@
 //! exercised only by gated `#[ignore]` integration tests against live testnets,
 //! never by the offline unit suite that drives the mock transports.
 
+use flate2::read::GzDecoder;
 use futures_util::{SinkExt, StreamExt};
+use std::io::Read as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
@@ -118,6 +120,28 @@ impl TungsteniteWsTransport {
     }
 }
 
+/// Turn a binary frame into text, decompressing it if it is gzip.
+///
+/// HTX sends **every** frame gzip-compressed, over spot and futures alike, and
+/// gzip is never valid UTF-8 -- its first two bytes are `1f 8b`. This arm used
+/// to forward a binary frame only when it decoded as UTF-8, so an HTX stream
+/// delivered nothing: not one trade, not one book update, no error either. The
+/// venue's unit tests passed throughout, because the mock transport hands the
+/// parser plain JSON and never a real frame.
+///
+/// A frame that is neither gzip nor UTF-8 is still dropped: there is nothing to
+/// hand a parser that speaks text.
+fn decode_binary(bytes: &[u8]) -> Option<String> {
+    if bytes.starts_with(&[0x1f, 0x8b]) {
+        let mut text = String::new();
+        return GzDecoder::new(bytes)
+            .read_to_string(&mut text)
+            .ok()
+            .map(|_| text);
+    }
+    String::from_utf8(bytes.to_vec()).ok()
+}
+
 impl WsTransport for TungsteniteWsTransport {
     fn connect(&self, url: &str) -> Result<Box<dyn WsConnection>> {
         let (inbound_tx, inbound_rx) = mpsc::channel::<Result<Option<String>>>();
@@ -161,7 +185,7 @@ impl WsTransport for TungsteniteWsTransport {
                                 }
                             }
                             Some(Ok(Message::Binary(bytes))) => {
-                                if let Ok(text) = String::from_utf8(bytes.to_vec()) {
+                                if let Some(text) = decode_binary(&bytes) {
                                     if inbound_tx.send(Ok(Some(text))).is_err() {
                                         break;
                                     }
@@ -258,6 +282,39 @@ mod tests {
         assert!(ReqwestHttpTransport::new(&opts).is_ok());
     }
 
+    /// A gzip frame becomes text; plain UTF-8 still passes; noise is dropped.
+    ///
+    /// HTX sends every frame gzip-compressed, and this arm forwarded a binary
+    /// frame only when it decoded as UTF-8 -- which gzip never does. An HTX
+    /// stream therefore delivered nothing at all, with no error, while the
+    /// venue's unit tests passed on plain JSON through the mock transport.
+    #[test]
+    fn a_gzip_frame_is_decoded_and_plain_text_still_passes() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write as _;
+
+        let payload = r#"{"ch":"market.BTC-USDT.trade.detail","ts":1788462493057}"#;
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(payload.as_bytes()).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        assert_eq!(
+            &compressed[..2],
+            &[0x1f, 0x8b],
+            "the fixture must actually be gzip, or this proves nothing"
+        );
+        assert!(
+            String::from_utf8(compressed.clone()).is_err(),
+            "gzip is not valid UTF-8, which is why the old arm dropped it"
+        );
+
+        assert_eq!(decode_binary(&compressed).as_deref(), Some(payload));
+        assert_eq!(decode_binary(payload.as_bytes()).as_deref(), Some(payload));
+        // Neither gzip nor UTF-8: there is nothing to hand a parser.
+        assert!(decode_binary(&[0xff, 0xfe, 0xfd]).is_none());
+    }
+
     #[test]
     #[ignore = "hits the network; run explicitly with --ignored"]
     fn live_request_reaches_binance() {
@@ -315,5 +372,62 @@ mod tests {
         }
         connection.close().unwrap();
         assert!(got.is_some_and(|f| f.contains("btcusdt") || f.contains("\"e\"")));
+    }
+
+    /// HTX's socket, over the real transport, delivering a real frame.
+    ///
+    /// This is the test that would have failed before the gzip decoder: every
+    /// frame HTX sends is gzip-compressed, so `recv` returned nothing at all,
+    /// for as long as anyone waited. The venue's own unit tests could not notice
+    /// -- the mock transport hands the parser plain JSON, and a real frame never
+    /// reached it.
+    ///
+    /// Unreachable is a skip, for the reason the Binance one gives.
+    #[test]
+    #[ignore = "opens a live WebSocket; run explicitly with --ignored"]
+    fn live_ws_receives_htx_frames_that_arrive_gzipped() {
+        use std::time::Duration;
+
+        let transport = TungsteniteWsTransport::new();
+        let mut connection = match transport.connect("wss://api.huobi.pro/ws") {
+            Ok(connection) => connection,
+            Err(err) => {
+                eprintln!("skipping live HTX ws test: unreachable ({err})");
+                return;
+            }
+        };
+        if connection
+            .send(r#"{"sub":"market.btcusdt.trade.detail","id":"1"}"#)
+            .is_err()
+        {
+            eprintln!("skipping live HTX ws test: subscribe failed");
+            return;
+        }
+
+        let mut got = None;
+        for _ in 0..60 {
+            let frame = match connection.recv() {
+                Ok(frame) => frame,
+                Err(err) => {
+                    eprintln!("skipping live HTX ws test: WS unreachable ({err})");
+                    return;
+                }
+            };
+            if let Some(frame) = frame {
+                got = Some(frame);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        connection.close().ok();
+
+        let frame = got.expect(
+            "HTX sent nothing readable in 12 seconds -- every frame it sends is \
+             gzip, so this is what a missing decoder looks like",
+        );
+        assert!(
+            frame.contains("\"ping\"") || frame.contains("market.btcusdt"),
+            "unexpected frame: {frame}"
+        );
     }
 }
