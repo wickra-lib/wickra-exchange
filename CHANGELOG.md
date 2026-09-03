@@ -304,6 +304,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A coin-margined or margin client traded the wrong market, silently.**
+  `MarketType` has four variants and most clients distinguish two. What the rest
+  did was not reject the market -- it was to fall through to a path built for a
+  different one.
+
+  On Binance, `is_futures()` tests `UsdMFutures` alone, so a `CoinMFutures`
+  client took the *spot* base URL and the spot order path: an order meant for a
+  coin-margined contract went to spot, was accepted there, and traded the wrong
+  instrument. On Bitget, KuCoin, Gate, HTX and Kraken the mirror image happened
+  -- `is_derivatives()` is true for both futures variants, so inverse contracts
+  were routed to the USDⓈ-margined endpoints (Gate's `/futures/usdt/`, HTX's
+  `/linear-swap-api/`). And `MarketType::Margin` resolved to spot on all ten:
+  no client signs a margin-account order anywhere.
+
+  This is the shape of #192, where every binding built a spot client and no
+  caller could reach futures at all: a market type accepted, ignored, and
+  quietly replaced. The factory now refuses what a client does not route, which
+  covers all nine languages in one place because every binding reaches the
+  library through it. Bybit (`inverse`) and OKX (`SWAP`, where linear and
+  inverse differ by instrument id rather than endpoint) do route coin-margined
+  contracts and are not refused.
+
 - **The binding-surface check could delete whole functions as if they were
   prose.** Its string-literal regex escaped `\\.`, and `.` does not match a
   newline — so a Rust line-continuation backslash (`"...text \\` at end of line)
