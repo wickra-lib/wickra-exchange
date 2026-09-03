@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **OKX subscribes to the derivatives channels it publishes.** It is the third
+  of the eight futures venues to implement `DerivativesStream`, after Binance
+  and Bybit: `funding-rate` and `liquidation-orders` are subscribed, and open
+  interest and long/short positioning are read from
+  `/api/v5/public/open-interest` and
+  `/api/v5/rubik/stat/contracts/long-short-account-ratio`.
+
+  Two of OKX's differences are visible in what the client does, rather than
+  hidden behind a uniform-looking API:
+
+  **A combined mark/index subscription is refused.** OKX publishes the mark
+  price on `mark-price` and the index price on `index-tickers`, under different
+  instrument ids, and never in one frame. Joining them would report two prices
+  observed at different moments as one simultaneous reading. Binance and Bybit
+  carry both in a single frame and are unaffected.
+
+  **Forced orders are subscribed per product, not per market.** One stream
+  carries every liquidation on the product, so the client drops frames for
+  markets that were not asked for rather than handing a caller watching BTC the
+  venue's entire forced flow.
+
+  The long/short reply is a *ratio* where Binance's is a pair of proportions;
+  with two categories the conversion is exact, so the feed type carries
+  proportions from every venue. Every field name and response shape here was
+  checked against the live API rather than taken from documentation.
+
+  The README no longer says no venue client subscribes to these channels, which
+  stopped being true when Binance and Bybit landed.
+
 ### Changed
 
 - **The shared reconnect says which of its four outcomes happened.** Every

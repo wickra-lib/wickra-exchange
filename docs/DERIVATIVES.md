@@ -222,13 +222,30 @@ cadence over REST. Presenting them as subscriptions would have made this surface
 look symmetric and the data arrive never, so they are methods that return a
 value.
 
-| Channel | How | Binance | Bybit |
-|---|---|:---:|:---:|
-| `Funding` | subscribe | `@markPrice` | `tickers` |
-| `MarkIndex` | subscribe | `@markPrice` | `tickers` |
-| `Liquidations` | subscribe | `@forceOrder` | `allLiquidation` |
-| `open_interest()` | read | `/fapi/v1/openInterest` | `/v5/market/open-interest` |
-| `long_short_ratio()` | read | `/futures/data/globalLongShortAccountRatio` | `/v5/market/account-ratio` |
+| Channel | How | Binance | Bybit | OKX |
+|---|---|:---:|:---:|:---:|
+| `Funding` | subscribe | `@markPrice` | `tickers` | `funding-rate` ¹ |
+| `MarkIndex` | subscribe | `@markPrice` | `tickers` | — refused ² |
+| `Liquidations` | subscribe | `@forceOrder` | `allLiquidation` | `liquidation-orders` ³ |
+| `open_interest()` | read | `/fapi/v1/openInterest` | `/v5/market/open-interest` | `/api/v5/public/open-interest` |
+| `long_short_ratio()` | read | `/futures/data/globalLongShortAccountRatio` | `/v5/market/account-ratio` | `/api/v5/rubik/stat/contracts/long-short-account-ratio` ⁴ |
+
+1. OKX's funding frame carries the rate and no price, so the `mark_price` on the
+   print is zero rather than a mark taken from another frame at another moment.
+2. **OKX publishes no combined mark/index frame.** The mark price is on
+   `mark-price` and the index price on `index-tickers`, under different
+   instrument ids (`BTC-USDT-SWAP` against `BTC-USDT`). Joining them would report
+   two prices observed at different moments as one simultaneous reading, so the
+   subscription is refused instead — the caller learns at the call rather than
+   from a number that looks more precise than it is.
+3. Subscribed by instrument *type*, not instrument: OKX publishes one stream of
+   forced orders per product. The client drops frames for markets that were not
+   asked for, so a caller watching BTC is not handed the venue's entire forced
+   flow.
+4. OKX publishes the *ratio* of long accounts to short accounts where Binance
+   publishes the two proportions. With two categories the conversion is exact —
+   a ratio `r` gives `r / (1 + r)` and `1 / (1 + r)`, which sum to one as
+   Binance's pair does — so the feed type carries proportions from every venue.
 
 Two things about that table are worth knowing before relying on it.
 
