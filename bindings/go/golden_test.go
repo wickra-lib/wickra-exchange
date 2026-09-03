@@ -17,6 +17,7 @@ package wickraexchange
 
 import (
 	"encoding/json"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -42,9 +43,33 @@ type goldenExpected struct {
 	Usdt         float64 `json:"usdt"`
 }
 
+// goldenPath resolves a tape for either layout this file is compiled in.
+//
+// In this repository the package sits at bindings/go and the tapes are two
+// directories up. In the published wickra-exchange-go module the package is the
+// module root and the tapes are staged beside it, so the repository-relative
+// path points outside the module and does not exist. Trying both keeps one copy
+// of these tests running in both places, rather than shipping a test that can
+// only fail for whoever runs `go test ./...` after `go get`.
+func goldenPath(kind, name string) (string, error) {
+	candidates := []string{
+		filepath.Join("..", "..", "golden", kind, name+".json"),
+		filepath.Join("golden", kind, name+".json"),
+	}
+	for _, path := range candidates {
+		if _, err := os.Stat(path); err == nil {
+			return path, nil
+		}
+	}
+	return "", fmt.Errorf("no golden tape %s/%s.json in %v", kind, name, candidates)
+}
+
 func readGolden(t *testing.T, kind, name string, into any) {
 	t.Helper()
-	path := filepath.Join("..", "..", "golden", kind, name+".json")
+	path, err := goldenPath(kind, name)
+	if err != nil {
+		t.Fatalf("locating golden tape: %v", err)
+	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("reading %s: %v", path, err)

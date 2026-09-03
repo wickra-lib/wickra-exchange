@@ -38,6 +38,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   while Scorecard reported Signed-Releases green regardless — it looks for a
   provenance file on the release, not for coverage of what the release contains.
 
+### Fixed
+
+- **The mirrored Go module shipped a test that could not pass.** `go-mirror`
+  copies `bindings/go/*.go` into the published `wickra-exchange-go`, which
+  includes `golden_test.go` — and that file read its replay tapes from
+  `../../golden`, two directories above the package. That path exists in this
+  repository and nowhere in the module a consumer gets, so `go test ./...`
+  after `go get` failed on a fresh checkout of a released module. The tapes now
+  travel with the module and the test resolves either layout.
+
+  The reason this stayed invisible is the more useful half: the release job's
+  verification step ran `go test -run TestAssembledModuleSmoke`, one test **by
+  name**, so the mirrored tests were compiled and never run. It now runs
+  `go test ./...` against the assembled tree, which makes a module whose tests
+  cannot run fail the release rather than the consumer's first command.
+
 ### Changed
 
 - **`wickra-core` moved from the `0.9` line to `1.0`.** The pin admitted only
