@@ -185,7 +185,7 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
           count=0
-          for f in examples/node/*.js; do
+          for f in examples/node/*.js benchmarks/node/*.js; do
             echo "node --check $f"
             node --check "$f"
             count=$((count + 1))
@@ -214,7 +214,7 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
           count=0
-          for f in examples/python/*.py; do
+          for f in examples/python/*.py benchmarks/python/*.py; do
             echo "py_compile $f"
             python -m py_compile "$f"
             count=$((count + 1))
@@ -230,7 +230,7 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
           count=0
-          for f in examples/r/*.R; do
+          for f in examples/r/*.R benchmarks/r/*.R; do
             echo "parse $f"
             Rscript -e "invisible(parse('$f'))"
             count=$((count + 1))
@@ -240,8 +240,10 @@ jobs:
       # The one that matters: this compiles against the binding project, so a
       # method the binding does not have fails here rather than in a reader's
       # editor.
-      - name: C# example — build
-        run: dotnet build examples/csharp/PaperTrade.csproj -c Release
+      - name: C# example and benchmark — build
+        run: |
+          dotnet build examples/csharp/PaperTrade.csproj -c Release
+          dotnet build benchmarks/csharp/BindingCost.csproj -c Release
 
       # The example is written to be run from a module that requires the
       # published Go module, which does not exist until a release. A throwaway
@@ -266,6 +268,17 @@ jobs:
           go vet ./...
           echo "go example vets against the binding in this tree"
 
+      # The benchmark is its own module (it has a `main` of its own, so it
+      # cannot share one with the example) and carries a committed go.mod whose
+      # `replace` already points at this tree.
+      - name: Go benchmark — vet against the binding in this tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd benchmarks/go
+          go vet ./...
+          echo "go benchmark vets against the binding in this tree"
+
       # javac against the binding jar: same reasoning as C#. -DskipTests because
       # compiling is the point, not exercising.
       - name: Java example — compile against the binding jar
@@ -280,8 +293,8 @@ jobs:
             exit 1
           fi
           echo "compiling against $jar"
-          javac -cp "$jar" -d "$(mktemp -d)" examples/java/*.java
-          echo "java example compiles against the binding in this tree"
+          javac -cp "$jar" -d "$(mktemp -d)" examples/java/*.java benchmarks/java/*.java
+          echo "java example and benchmark compile against the binding in this tree"
 
   # The Linux wheels are the two artefacts CI never touched: the python job
   # builds a wheel for the runner's own glibc, while release.yml builds
@@ -700,6 +713,14 @@ jobs:
           cmake -S examples/c -B examples/c/build
           cmake --build examples/c/build --config Release
           ctest --test-dir examples/c/build -C Release --output-on-failure
+
+      # Built, not run: the benchmark is code that calls the ABI, so it rots the
+      # same way an example does, and timing on a shared runner would be noise.
+      - name: Build the C benchmark (CMake)
+        shell: bash
+        run: |
+          cmake -S benchmarks/c -B benchmarks/c/build
+          cmake --build benchmarks/c/build --config Release
 
   csharp:
     name: C# on ${{ matrix.os }}

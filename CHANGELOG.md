@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **What each binding costs to cross, measured.** The benchmark crate measured
+  the library's own work — signing, parsing, filter rounding — and nothing
+  measured what it costs to *reach* that work from another language. A binding
+  is a boundary, and the bindings were described as thin without a number.
+
+  `benchmarks/` now runs the same two operations in every language against the
+  same offline paper account: `ticker`, which is almost entirely the crossing
+  itself, and `place_order`, which is real work on both sides of it. The Rust
+  program is the same two calls in-process, so the difference is the overhead.
+
+  | Language | `ticker` | `place_order` |
+  |----------|---------:|--------------:|
+  | Rust (in-process) | 62 ns | 824 ns |
+  | C (the ABI itself) | 188 ns | 1 254 ns |
+  | C# | 448 ns | 1 385 ns |
+  | Go | 400 ns | 1 553 ns |
+  | Python | 556 ns | 1 533 ns |
+  | Node.js | 1 467 ns | 2 669 ns |
+  | R | 1 373 ns | 3 203 ns |
+  | Java | 1 471 ns | 3 150 ns |
+
+  The answer is that no binding adds more than about three microseconds to an
+  order — against a round trip of roughly a millisecond, and rate limits far
+  below what the slowest of them can produce. That is the point of measuring it:
+  the choice of language is a choice about the code you want to write.
+
+  CI compiles every one of these programs beside the examples. They are code that
+  calls the binding, so they rot the way an example would; nothing is *run*
+  there, because timing on a shared runner is noise.
+
 - **An order number can now cross every binding boundary exactly.** The core
   holds every order number in a `Decimal` — that is the point of it — and
   all seven bindings then sent it through a `double`, which holds about fifteen
