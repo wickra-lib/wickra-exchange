@@ -31,6 +31,8 @@
 //! batch cancel (`/0/private/CancelOrderBatch`). Kraken has no OCO order-list (it
 //! uses conditional-close orders), so `place_oco` is a documented gap.
 
+use std::collections::HashMap;
+
 use crate::clock::{NonceGenerator, ServerClock, TokenTtl};
 use crate::credentials::Credentials;
 use crate::error::{Error, Result};
@@ -87,6 +89,13 @@ pub struct Kraken {
     nonces: NonceGenerator,
     connection: Option<Box<dyn WsConnection>>,
     sub_messages: Vec<String>,
+    /// `product_id` -> canonical symbol, for the futures stream.
+    ///
+    /// The spot v2 frames carry the canonical slash symbol and need no
+    /// mapping. Futures frames carry `PF_XBTUSD`, which cannot be turned
+    /// back into `BTC/USDT` without knowing what was asked for: the quote
+    /// is folded to USD on the way out, and `XBT` is Kraken's own spelling.
+    futures_subscriptions: Vec<(String, Symbol)>,
     /// Leverage applied on Kraken Futures (`maxLeverage` preference), recorded so
     /// [`positions`](Self::positions) can report it (the venue omits per-position
     /// leverage in `openpositions`).
@@ -160,6 +169,7 @@ impl Kraken {
             nonces: NonceGenerator::new(0),
             connection: None,
             sub_messages: Vec::new(),
+            futures_subscriptions: Vec::new(),
             leverage: Cell::new(1),
             private_connection: None,
             user_data_active: false,
@@ -420,17 +430,8 @@ impl Kraken {
     }
 
     fn subscribe(&mut self, symbol: &Symbol, channel: &str) -> Result<()> {
-        // The socket below is the venue's *spot* stream. A futures client
-        // reading futures over REST would be handed the spot book, the spot
-        // trades and the spot quote -- a different instrument at a different
-        // price, with nothing to say so. Refused until this client speaks the
-        // venue's futures stream.
         if self.is_futures() {
-            return Err(Error::unsupported_field(
-                "Kraken",
-                "a market-data subscription on a futures client",
-                "Kraken Futures streams from `futures.kraken.com`, a separate API this client does not implement",
-            ));
+            return self.subscribe_futures(symbol, channel);
         }
 
         if self.connection.is_none() {
@@ -452,12 +453,48 @@ impl Kraken {
         Ok(())
     }
 
+    /// Subscribe on Kraken Futures, which is a different service from the spot
+    /// v2 socket rather than the same one with other names.
+    ///
+    /// `{"event":"subscribe","feed":..,"product_ids":[..]}` against
+    /// `futures.kraken.com`, keyed by `PF_XBTUSD`. The three feeds happen to be
+    /// spelled the same as the spot channels -- `trade`, `book`, `ticker` --
+    /// which is the only thing the two protocols share.
+    fn subscribe_futures(&mut self, symbol: &Symbol, feed: &str) -> Result<()> {
+        let product = Self::futures_symbol(symbol);
+        if self.connection.is_none() {
+            let ws = self.ws.as_ref().ok_or(Error::NotConnected)?;
+            let connection = ws.connect(FUTURES_WS_URL)?;
+            self.connection = Some(connection);
+        }
+        let message =
+            format!(r#"{{"event":"subscribe","feed":"{feed}","product_ids":["{product}"]}}"#);
+        self.connection
+            .as_mut()
+            .expect("connection just ensured")
+            .send(&message)?;
+        if !self.sub_messages.contains(&message) {
+            self.sub_messages.push(message);
+        }
+        if !self
+            .futures_subscriptions
+            .iter()
+            .any(|(p, _)| p == &product)
+        {
+            self.futures_subscriptions.push((product, symbol.clone()));
+        }
+        Ok(())
+    }
+
     /// Drain all stream events available since the last call. Non-blocking.
     pub fn poll_events(&mut self) -> Vec<Event> {
+        let products: HashMap<String, Symbol> =
+            self.futures_subscriptions.iter().cloned().collect();
+        let resolve = |product: &str| products.get(product).cloned();
         let mut events = Vec::new();
         if let Some(connection) = self.connection.as_mut() {
             while let Ok(Some(frame)) = connection.recv() {
-                if let Ok(mut parsed) = parse_ws_message(&frame) {
+                if let Ok(mut parsed) = parse_ws_message(&frame, &resolve) {
                     events.append(&mut parsed);
                 }
             }
@@ -471,7 +508,7 @@ impl Kraken {
                 let parsed = if futures {
                     parse_futures_private(&frame)
                 } else {
-                    parse_ws_message(&frame)
+                    parse_ws_message(&frame, &resolve)
                 };
                 if let Ok(mut parsed) = parsed {
                     events.append(&mut parsed);
@@ -1980,9 +2017,154 @@ fn order_from_value(symbol: Symbol, id: &str, order: &serde_json::Value) -> Resu
     })
 }
 
-fn parse_ws_message(text: &str) -> Result<Vec<Event>> {
+/// The Kraken Futures WebSocket URL.
+const FUTURES_WS_URL: &str = "wss://futures.kraken.com/ws/v1";
+
+/// A number field from a futures frame.
+///
+/// Kraken Futures sends prices and sizes as JSON *numbers*, where the spot v2
+/// socket sends strings. Going through the string form keeps the decimal exact:
+/// parsing `81234.0` as `f64` and converting would introduce the binary
+/// rounding the order layer exists to avoid.
+fn futures_decimal(value: &serde_json::Value, key: &str) -> Option<Decimal> {
+    let raw = value.get(key)?;
+    if let Some(text) = raw.as_str() {
+        return parse_decimal(text).ok();
+    }
+    parse_decimal(&raw.as_number()?.to_string()).ok()
+}
+
+fn futures_levels(value: &serde_json::Value, key: &str) -> Vec<BookLevel> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| {
+                    Some(BookLevel {
+                        price: futures_decimal(row, "price")?,
+                        quantity: futures_decimal(row, "qty")?,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// One trade frame, or one entry of a `trade_snapshot`.
+fn futures_trade(value: &serde_json::Value, symbol: &Symbol) -> Option<Event> {
+    Some(Event::Trade(TradePrint {
+        symbol: symbol.clone(),
+        price: futures_decimal(value, "price")?,
+        quantity: futures_decimal(value, "qty")?,
+        aggressor: parse_side(value.get("side")?.as_str()?).ok()?,
+        timestamp: value
+            .get("time")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0),
+    }))
+}
+
+/// Turn a Kraken Futures frame into events.
+///
+/// The feeds are `trade` / `trade_snapshot`, `book` / `book_snapshot` and
+/// `ticker`. A frame for a product that was never subscribed to is dropped: one
+/// connection carries every subscription, and a caller watching BTC should not
+/// be handed another market's book.
+fn parse_futures_frame(
+    feed: &str,
+    value: &serde_json::Value,
+    resolve: &impl Fn(&str) -> Option<Symbol>,
+) -> Vec<Event> {
+    let Some(product) = value.get("product_id").and_then(serde_json::Value::as_str) else {
+        return Vec::new(); // subscription ack, info frame
+    };
+    let Some(symbol) = resolve(product) else {
+        return Vec::new();
+    };
+
+    match feed {
+        "trade" => futures_trade(value, &symbol).into_iter().collect(),
+        "trade_snapshot" => value
+            .get("trades")
+            .and_then(serde_json::Value::as_array)
+            .map(|trades| {
+                trades
+                    .iter()
+                    .filter_map(|trade| futures_trade(trade, &symbol))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        "book_snapshot" => vec![Event::BookSnapshot(OrderBookSnapshot {
+            symbol,
+            last_update_id: value
+                .get("seq")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            bids: futures_levels(value, "bids"),
+            asks: futures_levels(value, "asks"),
+            timestamp: value
+                .get("timestamp")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0),
+        })],
+        // An incremental book frame is one level, on one side, at its new size;
+        // a size of zero removes it, which is what the delta type already means.
+        "book" => {
+            let (Some(price), Some(quantity)) = (
+                futures_decimal(value, "price"),
+                futures_decimal(value, "qty"),
+            ) else {
+                return Vec::new();
+            };
+            let level = vec![BookLevel { price, quantity }];
+            let (bids, asks) = match value.get("side").and_then(serde_json::Value::as_str) {
+                Some("buy") => (level, Vec::new()),
+                Some("sell") => (Vec::new(), level),
+                _ => return Vec::new(),
+            };
+            let seq = value
+                .get("seq")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            vec![Event::BookDelta(BookDelta {
+                symbol,
+                first_update_id: seq,
+                final_update_id: seq,
+                bids,
+                asks,
+                timestamp: value
+                    .get("timestamp")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0),
+            })]
+        }
+        "ticker" => {
+            let Some(last) = futures_decimal(value, "last") else {
+                return Vec::new();
+            };
+            vec![Event::Ticker(Ticker {
+                symbol,
+                last,
+                bid: futures_decimal(value, "bid").unwrap_or_default(),
+                ask: futures_decimal(value, "ask").unwrap_or_default(),
+                volume: futures_decimal(value, "volume").unwrap_or_default(),
+                timestamp: value
+                    .get("time")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0),
+            })]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Option<Symbol>) -> Result<Vec<Event>> {
     let value: serde_json::Value =
         serde_json::from_str(text).map_err(|e| Error::Deserialization(e.to_string()))?;
+    if let Some(feed) = value.get("feed").and_then(serde_json::Value::as_str) {
+        return Ok(parse_futures_frame(feed, &value, resolve));
+    }
     let Some(channel) = value.get("channel").and_then(serde_json::Value::as_str) else {
         return Ok(Vec::new()); // status/heartbeat/ack
     };
@@ -2521,6 +2703,152 @@ mod tests {
         .with_ws(Box::new(ArcWs(Arc::clone(&ws))))
         .with_clock(Box::new(move || now_ms));
         (kraken, ws)
+    }
+
+    /// A futures client with a mock socket.
+    fn futures_ws_client() -> (Kraken, Arc<MockWsTransport>) {
+        let http = Arc::new(MockHttpTransport::new());
+        let ws = Arc::new(MockWsTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::UsdMFutures);
+        let kraken = Kraken::with_http(Box::new(ArcTransport(http)), &opts)
+            .with_ws(Box::new(ArcWs(Arc::clone(&ws))));
+        (kraken, ws)
+    }
+
+    /// Kraken Futures is a different service, not the spot socket with other
+    /// names: another host, another subscribe shape, another frame shape.
+    #[test]
+    fn a_futures_client_subscribes_on_the_futures_service() {
+        let (mut kraken, ws) = futures_ws_client();
+        Kraken::subscribe_trades(&mut kraken, &symbol()).unwrap();
+        Kraken::subscribe_book(&mut kraken, &symbol()).unwrap();
+
+        assert_eq!(ws.connected_urls()[0], "wss://futures.kraken.com/ws/v1");
+        assert!(ws.sent()[0].contains(r#""event":"subscribe""#));
+        assert!(ws.sent()[0].contains(r#""feed":"trade""#));
+        assert!(ws.sent()[0].contains(r#""product_ids":["PF_XBTUSD"]"#));
+        assert!(ws.sent()[1].contains(r#""feed":"book""#));
+        // The spot protocol must not leak into it.
+        assert!(!ws.sent()[0].contains(r#""method":"subscribe""#));
+    }
+
+    /// The trade frame, as `futures.kraken.com` sends it: JSON numbers, `qty`
+    /// in base units, `time` in milliseconds.
+    #[test]
+    fn a_futures_trade_frame_parses() {
+        let (mut kraken, ws) = futures_ws_client();
+        ws.push_connection(vec![Ok(Some(
+            r#"{"product_id":"PF_XBTUSD","feed":"trade","uid":"066870ad","side":"buy",
+            "type":"fill","time":1788462443224,"qty":0.0012,"price":81234.0,"seq":131499}"#
+                .to_string(),
+        ))]);
+        Kraken::subscribe_trades(&mut kraken, &symbol()).unwrap();
+
+        let events = Kraken::poll_events(&mut kraken);
+        let Event::Trade(trade) = &events[0] else {
+            panic!("expected a trade, got {:?}", events[0]);
+        };
+        assert_eq!(trade.symbol, symbol());
+        assert_eq!(trade.price, dec!(81234.0));
+        assert_eq!(trade.quantity, dec!(0.0012));
+        assert_eq!(trade.aggressor, OrderSide::Buy);
+        assert_eq!(trade.timestamp, 1_788_462_443_224);
+    }
+
+    /// The book snapshot, with levels as `{price, qty}` objects of numbers.
+    #[test]
+    fn a_futures_book_snapshot_parses() {
+        let (mut kraken, ws) = futures_ws_client();
+        ws.push_connection(vec![Ok(Some(
+            r#"{"feed":"book_snapshot","product_id":"PF_XBTUSD","timestamp":1788462442376,
+            "seq":48891892,"tickSize":null,
+            "bids":[{"price":81233.0,"qty":1.1465},{"price":81232.0,"qty":0.0124}],
+            "asks":[{"price":81234.0,"qty":0.0012}]}"#
+                .to_string(),
+        ))]);
+        Kraken::subscribe_book(&mut kraken, &symbol()).unwrap();
+
+        let events = Kraken::poll_events(&mut kraken);
+        let Event::BookSnapshot(book) = &events[0] else {
+            panic!("expected a snapshot, got {:?}", events[0]);
+        };
+        assert_eq!(book.bids.len(), 2);
+        assert_eq!(book.bids[0].price, dec!(81233.0));
+        assert_eq!(book.asks[0].quantity, dec!(0.0012));
+        assert_eq!(book.timestamp, 1_788_462_442_376);
+        assert_eq!(book.last_update_id, 48_891_892);
+    }
+
+    /// An incremental book frame is one level on one side at its new size.
+    #[test]
+    fn a_futures_book_delta_carries_one_side() {
+        let (mut kraken, ws) = futures_ws_client();
+        ws.push_connection(vec![Ok(Some(
+            r#"{"feed":"book","product_id":"PF_XBTUSD","side":"sell","seq":48891893,
+            "price":81270.0,"qty":3.1591,"timestamp":1788462442378}"#
+                .to_string(),
+        ))]);
+        Kraken::subscribe_book(&mut kraken, &symbol()).unwrap();
+
+        let events = Kraken::poll_events(&mut kraken);
+        let Event::BookDelta(delta) = &events[0] else {
+            panic!("expected a delta, got {:?}", events[0]);
+        };
+        assert!(delta.bids.is_empty());
+        assert_eq!(delta.asks.len(), 1);
+        assert_eq!(delta.asks[0].price, dec!(81270.0));
+        assert_eq!(delta.asks[0].quantity, dec!(3.1591));
+    }
+
+    /// The prices are exact, not routed through `f64`.
+    ///
+    /// Kraken Futures sends numbers where the spot socket sends strings. Going
+    /// through the binary form would introduce the rounding the order layer
+    /// keeps `Decimal` to avoid, and `0.1 + 0.2` is the standing reminder.
+    #[test]
+    fn futures_numbers_stay_exact() {
+        let (mut kraken, ws) = futures_ws_client();
+        ws.push_connection(vec![Ok(Some(
+            r#"{"product_id":"PF_XBTUSD","feed":"trade","side":"buy","time":1,
+            "qty":0.1,"price":0.3}"#
+                .to_string(),
+        ))]);
+        Kraken::subscribe_trades(&mut kraken, &symbol()).unwrap();
+
+        let events = Kraken::poll_events(&mut kraken);
+        let Event::Trade(trade) = &events[0] else {
+            panic!("expected a trade");
+        };
+        assert_eq!(trade.price, dec!(0.3));
+        assert_eq!(trade.quantity, dec!(0.1));
+    }
+
+    /// One connection carries every subscription, so a product that was never
+    /// asked for is dropped rather than delivered.
+    #[test]
+    fn a_futures_frame_for_an_unsubscribed_product_is_dropped() {
+        let (mut kraken, ws) = futures_ws_client();
+        ws.push_connection(vec![Ok(Some(
+            r#"{"product_id":"PF_ETHUSD","feed":"trade","side":"buy","time":1,
+            "qty":1.0,"price":3000.0}"#
+                .to_string(),
+        ))]);
+        Kraken::subscribe_trades(&mut kraken, &symbol()).unwrap();
+
+        assert!(Kraken::poll_events(&mut kraken).is_empty());
+    }
+
+    /// The spot client is untouched by any of it.
+    #[test]
+    fn a_spot_client_still_speaks_the_v2_protocol() {
+        let ws = Arc::new(MockWsTransport::new());
+        let http = Arc::new(MockHttpTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::Spot);
+        let mut kraken = Kraken::with_http(Box::new(ArcTransport(http)), &opts)
+            .with_ws(Box::new(ArcWs(Arc::clone(&ws))));
+        Kraken::subscribe_trades(&mut kraken, &symbol()).unwrap();
+        assert_eq!(ws.connected_urls()[0], "wss://ws.kraken.com/v2");
+        assert!(ws.sent()[0].contains(r#""method":"subscribe""#));
     }
 
     #[test]

@@ -388,7 +388,7 @@ impl Htx {
     /// # Errors
     /// Returns [`Error::NotConnected`] if no WebSocket transport is configured.
     pub fn subscribe_trades(&mut self, symbol: &Symbol) -> Result<()> {
-        let topic = format!("market.{}.trade.detail", Self::wire_symbol(symbol));
+        let topic = format!("market.{}.trade.detail", self.stream_symbol(symbol));
         self.subscribe(symbol, &topic)
     }
 
@@ -397,7 +397,7 @@ impl Htx {
     /// # Errors
     /// See [`subscribe_trades`](Self::subscribe_trades).
     pub fn subscribe_book(&mut self, symbol: &Symbol) -> Result<()> {
-        let topic = format!("market.{}.depth.step0", Self::wire_symbol(symbol));
+        let topic = format!("market.{}.depth.step0", self.stream_symbol(symbol));
         self.subscribe(symbol, &topic)
     }
 
@@ -406,28 +406,40 @@ impl Htx {
     /// # Errors
     /// See [`subscribe_trades`](Self::subscribe_trades).
     pub fn subscribe_ticker(&mut self, symbol: &Symbol) -> Result<()> {
-        let topic = format!("market.{}.ticker", Self::wire_symbol(symbol));
+        // The futures quote channel is `detail`; the spot one is `ticker`.
+        let channel = if self.is_futures() {
+            "detail"
+        } else {
+            "ticker"
+        };
+        let topic = format!("market.{}.{channel}", self.stream_symbol(symbol));
         self.subscribe(symbol, &topic)
     }
 
-    fn subscribe(&mut self, symbol: &Symbol, topic: &str) -> Result<()> {
-        // The socket below is the venue's *spot* stream. A futures client
-        // reading futures over REST would be handed the spot book, the spot
-        // trades and the spot quote -- a different instrument at a different
-        // price, with nothing to say so. Refused until this client speaks the
-        // venue's futures stream.
+    /// The symbol form the stream uses: `BTC-USDT` on futures, `btcusdt` on
+    /// spot. The REST paths already make the same distinction through
+    /// [`contract_code`](Self::contract_code).
+    fn stream_symbol(&self, symbol: &Symbol) -> String {
         if self.is_futures() {
-            return Err(Error::unsupported_field(
-                "HTX",
-                "a market-data subscription on a futures client",
-                "HTX's futures stream is `api.hbdm.com/linear-swap-ws`, which this client does not implement",
-            ));
+            Self::contract_code(symbol)
+        } else {
+            Self::wire_symbol(symbol)
         }
+    }
 
-        let wire = Self::wire_symbol(symbol);
+    fn subscribe(&mut self, symbol: &Symbol, topic: &str) -> Result<()> {
+        // The frames come back keyed by whatever form the topic used, so the
+        // resolve table has to be keyed the same way: `BTC-USDT` on futures,
+        // `btcusdt` on spot. Keying it on the spot form would leave every
+        // futures frame unresolvable.
+        let wire = self.stream_symbol(symbol);
         if self.connection.is_none() {
             let ws = self.ws.as_ref().ok_or(Error::NotConnected)?;
-            let connection = ws.connect("wss://api.huobi.pro/ws")?;
+            let connection = ws.connect(if self.is_futures() {
+                FUTURES_WS_URL
+            } else {
+                "wss://api.huobi.pro/ws"
+            })?;
             self.connection = Some(connection);
         }
         let message = format!(r#"{{"sub":"{topic}","id":"{wire}"}}"#);
@@ -1497,6 +1509,22 @@ fn ws_balance_from_data(data: &serde_json::Value) -> Result<Balance> {
     })
 }
 
+/// HTX's USDⓈ-M linear-swap WebSocket.
+const FUTURES_WS_URL: &str = "wss://api.hbdm.com/linear-swap-ws";
+
+/// The price out of a `[price, size]` pair, or zero.
+///
+/// The futures quote channel publishes its top of book as two-element arrays
+/// where the spot one publishes scalars.
+fn level_price(tick: &serde_json::Value, key: &str) -> Decimal {
+    tick.get(key)
+        .and_then(serde_json::Value::as_array)
+        .and_then(|pair| pair.first())
+        .and_then(serde_json::Value::as_f64)
+        .and_then(|price| parse_decimal(&price.to_string()).ok())
+        .unwrap_or(Decimal::ZERO)
+}
+
 /// The reply HTX's heartbeat asks for, or `None` if this frame is not one.
 ///
 /// Two shapes, because HTX runs two protocols: the public market socket sends
@@ -1580,6 +1608,20 @@ fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Vec
             bid: decimal_field(tick, "bid").unwrap_or(Decimal::ZERO),
             ask: decimal_field(tick, "ask").unwrap_or(Decimal::ZERO),
             volume: decimal_field(tick, "vol").unwrap_or(Decimal::ZERO),
+            timestamp: value
+                .get("ts")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0),
+        })]),
+        // The futures quote channel. Its top of book arrives as `[price, size]`
+        // pairs rather than scalars, so the spot arm's `bid` / `ask` reads would
+        // silently fall back to zero here.
+        "detail" => Ok(vec![Event::Ticker(Ticker {
+            symbol,
+            last: decimal_field(tick, "close")?,
+            bid: level_price(tick, "bid"),
+            ask: level_price(tick, "ask"),
+            volume: decimal_field(tick, "amount").unwrap_or(Decimal::ZERO),
             timestamp: value
                 .get("ts")
                 .and_then(serde_json::Value::as_i64)
@@ -1974,6 +2016,93 @@ mod tests {
         .with_ws(Box::new(ArcWs(Arc::clone(&ws))))
         .with_clock(Box::new(move || now_ms));
         (htx, ws)
+    }
+
+    fn futures_ws_client() -> (Htx, Arc<MockWsTransport>) {
+        let http = Arc::new(MockHttpTransport::new());
+        let ws = Arc::new(MockWsTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::UsdMFutures);
+        let htx = Htx::with_http(Box::new(ArcTransport(http)), &opts)
+            .with_ws(Box::new(ArcWs(Arc::clone(&ws))));
+        (htx, ws)
+    }
+
+    /// Host, symbol form and quote channel all follow the market.
+    #[test]
+    fn a_futures_client_subscribes_on_the_linear_swap_host() {
+        let (mut htx, ws) = futures_ws_client();
+        Htx::subscribe_trades(&mut htx, &symbol()).unwrap();
+        Htx::subscribe_ticker(&mut htx, &symbol()).unwrap();
+
+        assert_eq!(ws.connected_urls()[0], "wss://api.hbdm.com/linear-swap-ws");
+        assert!(ws.sent()[0].contains("market.BTC-USDT.trade.detail"));
+        // The futures quote channel is `detail`, not `ticker`.
+        assert!(ws.sent()[1].contains("market.BTC-USDT.detail"));
+        assert!(ws.sent().iter().all(|f| !f.contains("btcusdt")));
+    }
+
+    /// A real linear-swap trade frame. `amount` is the contract count, which is
+    /// the unit the futures order path takes, so the arm needs no special case.
+    #[test]
+    fn a_futures_trade_frame_parses() {
+        let (mut htx, ws) = futures_ws_client();
+        ws.push_connection(vec![Ok(Some(
+            r#"{"ch":"market.BTC-USDT.trade.detail","ts":1788462493057,"tick":{
+            "id":100127722487328,"ts":1788462493055,"data":[{"amount":2,"quantity":0.002,
+            "trade_turnover":162.4354,"ts":1788462493055,"id":1001277224873280000,
+            "price":81217.7,"direction":"buy"}]}}"#
+                .to_string(),
+        ))]);
+        Htx::subscribe_trades(&mut htx, &symbol()).unwrap();
+
+        let events = Htx::poll_events(&mut htx);
+        let Event::Trade(trade) = &events[0] else {
+            panic!("expected a trade, got {:?}", events[0]);
+        };
+        assert_eq!(trade.price, dec!(81217.7));
+        assert_eq!(trade.quantity, dec!(2));
+        assert_eq!(trade.aggressor, OrderSide::Buy);
+    }
+
+    /// The futures quote publishes its top of book as `[price, size]` pairs.
+    ///
+    /// Read as scalars they would fall back to zero, so a futures ticker would
+    /// have reported a market with no bid and no ask -- a book that looks empty
+    /// rather than one that was misread.
+    #[test]
+    fn a_futures_detail_frame_reads_its_paired_top_of_book() {
+        let (mut htx, ws) = futures_ws_client();
+        ws.push_connection(vec![Ok(Some(
+            r#"{"ch":"market.BTC-USDT.detail","ts":1788462493057,"tick":{"id":1788462480,
+            "mrid":100127722487328,"open":81302.8,"close":81217.7,"high":81641.3,
+            "low":80588,"amount":7221.06,"vol":7221060,"trade_turnover":571116798.5342,
+            "count":67882,"ask":[81217.7,2514],"bid":[81217.6,767]}}"#
+                .to_string(),
+        ))]);
+        Htx::subscribe_ticker(&mut htx, &symbol()).unwrap();
+
+        let events = Htx::poll_events(&mut htx);
+        let Event::Ticker(ticker) = &events[0] else {
+            panic!("expected a ticker, got {:?}", events[0]);
+        };
+        assert_eq!(ticker.last, dec!(81217.7));
+        assert_eq!(ticker.bid, dec!(81217.6));
+        assert_eq!(ticker.ask, dec!(81217.7));
+        assert_eq!(ticker.volume, dec!(7221.06));
+    }
+
+    /// The spot client keeps its own host, symbol form and quote channel.
+    #[test]
+    fn a_spot_client_still_subscribes_to_the_spot_stream() {
+        let ws = Arc::new(MockWsTransport::new());
+        let http = Arc::new(MockHttpTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::Spot);
+        let mut htx = Htx::with_http(Box::new(ArcTransport(http)), &opts)
+            .with_ws(Box::new(ArcWs(Arc::clone(&ws))));
+        Htx::subscribe_ticker(&mut htx, &symbol()).unwrap();
+
+        assert_eq!(ws.connected_urls()[0], "wss://api.huobi.pro/ws");
+        assert!(ws.sent()[0].contains("market.btcusdt.ticker"));
     }
 
     /// HTX closes a stream that does not answer its heartbeat.

@@ -9,6 +9,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **HTX futures market data streams**, the fourth and last. HTX is the one
+  venue whose two streams share a protocol: the topics are spelled the same and
+  the frames carry the same envelope, so only the host, the symbol form
+  (`BTC-USDT` rather than `btcusdt`) and the quote channel differ. `amount` is
+  already the contract count, which is the unit its futures order path takes.
+
+  The quote channel is `detail` rather than `ticker`, and publishes its top of
+  book as `[price, size]` pairs where the spot one sends scalars — read as
+  scalars they fall back to zero, so a futures ticker would have reported a
+  market with no bid and no ask: a book that looks empty rather than one that
+  was misread.
+
+  **With this, `a_futures_client_never_subscribes_to_a_spot_stream` has no
+  refusals left.** All eight futures venues reach their own market.
+
+- **KuCoin futures market data streams.** The third of the four: host, topic and
+  symbol all follow the market — `ws-api-futures.kucoin.com` with
+  `/contractMarket` topics and `XBTUSDTM` rather than `BTC-USDT`.
+
+  Three shapes differ from spot. Stamps arrive in **nanoseconds**, so carrying
+  them through unchanged would put every futures event some 56,000 years into
+  the future and take every staleness check with it. The book channel sends one
+  level as the string `"81385.8,sell,0"` instead of a bids/asks object. And
+  sizes are integer contract counts, which is the unit this client's futures
+  order path already takes.
+
+- **Gate futures market data streams.** The second of the four. Both the host
+  and the channel prefix follow the market: `fx-ws.gateio.ws` with `futures.`
+  channels rather than `api.gateio.ws` with `spot.` ones, and the book channel
+  takes an interval and a depth beside the contract where the spot one takes the
+  pair alone.
+
+  A futures trade carries **no side field** — its `size` is signed, and negative
+  means the aggressor sold. The quantity reported is the magnitude, since a
+  quantity is not negative, and the side comes from the sign. Sizes stay in
+  contracts, which is the unit this client's futures order path already takes.
+
+  The futures ticker publishes no top of book, so bid and ask stay zero rather
+  than being invented from the last price. The book channel is where those live.
+
+- **Kraken Futures market data streams.** The first of the four venues #206 left
+  refusing rather than serving spot. Kraken Futures is not the spot v2 socket
+  with different names — it is a different service: another host, `{"event":
+  "subscribe","feed":..,"product_ids":[..]}` instead of `{"method":"subscribe",
+  "params":{..}}`, frames keyed by `feed` rather than `channel`, `PF_XBTUSD`
+  rather than `BTC/USD`, and values as JSON numbers where spot sends strings.
+
+  Those numbers go through their string form on the way to `Decimal`. Parsing
+  `0.3` as `f64` first would introduce exactly the binary rounding the order
+  layer keeps `Decimal` to avoid, and a test pins it.
+
+  Frames for a product that was never subscribed to are dropped: one connection
+  carries every subscription. The spot client is untouched, and a test says so —
+  a fix that moved every client to the futures service would otherwise pass.
+
 - **Bitget subscribes to the derivatives channels it publishes.** The fourth of
   the eight futures venues. Its mix `ticker` frame carries the funding rate, the
   mark price and the index price beside the quote, all read at one moment, so
