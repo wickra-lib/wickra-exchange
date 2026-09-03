@@ -37,6 +37,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reach the caller as `Error::Network`, so logging them would repeat what the
   return value says rather than recover something lost.
 
+- **The README's test count is derived rather than maintained.** It had
+  advertised 534 unit tests against 540, and before that 441 against 513: a
+  hand-kept number drifts the moment someone adds a test without thinking of it,
+  and nothing fails when it does — the suite passing says nothing about a
+  sentence in another file. Both drifts were found by someone counting.
+  `scripts/check_test_count.py` counts the test attributes in the crate, which is
+  exactly the set `cargo test --lib` runs, and holds the README to it in CI. The
+  sixth check script, and the third time this number had gone stale.
+
 ### Fixed
 
 - **A reduce-only close sent over Binance's WebSocket opened a position.** The
