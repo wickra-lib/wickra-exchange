@@ -833,6 +833,22 @@ fn reduce_only_is_carried_on_a_derivatives_client_and_refused_on_a_spot_one() {
         matches!(outcome, Err(Error::Exchange { code, .. }) if code == "unsupported")
     }
 
+    /// A word for what happened, for the failure message.
+    ///
+    /// The outcome itself is not printed. It is the client's answer, and a
+    /// client's answer can carry a signed request or a credential back with it;
+    /// `CodeQL` reads a `Debug`-formatted one in a panic message as cleartext
+    /// logging, and it is right to -- a failing test in CI prints to a log that
+    /// outlives it. What the assertion needs is which of three things happened,
+    /// and the wire is printed separately where it matters.
+    fn verdict(outcome: &Result<wickra_exchange_core::Order>) -> &'static str {
+        match outcome {
+            Ok(_) => "accepted",
+            Err(Error::Exchange { code, .. }) if code == "unsupported" => "refused",
+            Err(_) => "failed for some other reason",
+        }
+    }
+
     let market = market();
     let creds = || {
         Credentials::new("APIKEY", "c2VjcmV0")
@@ -860,8 +876,9 @@ fn reduce_only_is_carried_on_a_derivatives_client_and_refused_on_a_spot_one() {
                 .to_lowercase();
             assert!(
                 !wire.is_empty(),
-                "{}: futures client sent no order at all ({outcome:?})",
-                $name
+                "{}: futures client sent no order at all ({})",
+                $name,
+                verdict(&outcome)
             );
             assert!(
                 CARRIED.iter().any(|s| wire.contains(s)),
@@ -892,8 +909,9 @@ fn reduce_only_is_carried_on_a_derivatives_client_and_refused_on_a_spot_one() {
             let outcome = client.place_order(&reducing());
             assert!(
                 refused(&outcome),
-                "{}: spot accepted reduce_only, which it cannot honour ({outcome:?})",
-                $name
+                "{}: spot accepted reduce_only, which it cannot honour ({})",
+                $name,
+                verdict(&outcome)
             );
             assert!(
                 mock.recorded_requests().is_empty(),
@@ -928,7 +946,8 @@ fn reduce_only_is_carried_on_a_derivatives_client_and_refused_on_a_spot_one() {
                 && results.iter().all(|r| matches!(r, Err(Error::Exchange { code, .. }) if code == "unsupported")));
             assert!(
                 whole || per_leg,
-                "{}: spot batch accepted reduce_only ({outcome:?})",
+                "{}: spot batch neither refused reduce_only outright nor rejected \
+                 every leg carrying it",
                 $name
             );
             assert!(
@@ -958,8 +977,9 @@ fn reduce_only_is_carried_on_a_derivatives_client_and_refused_on_a_spot_one() {
             let outcome = WsExecution::place_order_ws(&mut client, &reducing());
             assert!(
                 refused(&outcome),
-                "{}: spot ws accepted reduce_only ({outcome:?})",
-                $name
+                "{}: spot ws accepted reduce_only ({})",
+                $name,
+                verdict(&outcome)
             );
             assert!(
                 ws.sent().is_empty(),
