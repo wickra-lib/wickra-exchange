@@ -178,6 +178,22 @@ pub struct WickraOrderRequest {
     pub post_only: bool,
     /// `WICKRA_STP_*`.
     pub stp: i32,
+    /// Exact decimal text for `quantity`, or `NULL` to use the double.
+    ///
+    /// A `double` holds about fifteen significant digits, and the core keeps
+    /// every order number in an exact decimal. Passing `"12345678.90123456789"`
+    /// here places that order; passing it as `quantity` places
+    /// `12345678.90123457`, which is a different order and says nothing. Where
+    /// the caller's language has an exact decimal of its own -- C#'s `decimal`,
+    /// Java's `BigDecimal` -- this is the field that carries it across intact.
+    ///
+    /// When set, it wins over the double beside it, which may be left at any
+    /// value.
+    pub quantity_text: *const c_char,
+    /// Exact decimal text for `price`, or `NULL` to use the double.
+    pub price_text: *const c_char,
+    /// Exact decimal text for `stop_price`, or `NULL` to use the double.
+    pub stop_price_text: *const c_char,
 }
 
 /// A single stream event (C-ABI projection of `Event`).
@@ -605,29 +621,65 @@ unsafe fn request_from_c(raw: &WickraOrderRequest) -> Option<OrderRequest> {
         WICKRA_STP_EXPIRE_BOTH => SelfTradePrevention::ExpireBoth,
         _ => return None,
     };
+    // Exact text wins over the double beside it: it is the only one of the two
+    // that can carry more than about fifteen significant digits, and a caller
+    // who set it meant that number rather than the nearest double to it.
+    let quantity = match unsafe { opt_str(raw.quantity_text) } {
+        Some(exact) => exact.parse().ok()?,
+        None => Decimal::from_f64(raw.quantity)?,
+    };
+    // An unreadable price refuses the whole request rather than placing an
+    // order at a price the caller did not write.
+    let price = match exact_or_double(raw.price_text, raw.price) {
+        OptionalPrice::Given(price) => Some(price),
+        OptionalPrice::Unset => None,
+        OptionalPrice::Unreadable => return None,
+    };
+    let stop_price = match exact_or_double(raw.stop_price_text, raw.stop_price) {
+        OptionalPrice::Given(price) => Some(price),
+        OptionalPrice::Unset => None,
+        OptionalPrice::Unreadable => return None,
+    };
     Some(OrderRequest {
         symbol,
         side,
         order_type,
-        quantity: Decimal::from_f64(raw.quantity)?,
+        quantity,
         // `NaN` is the "unset" marker; any other value must convert, so a price
         // the caller passed is never silently dropped for being unrepresentable.
-        price: if raw.price.is_nan() {
-            None
-        } else {
-            Some(Decimal::from_f64(raw.price)?)
-        },
-        stop_price: if raw.stop_price.is_nan() {
-            None
-        } else {
-            Some(Decimal::from_f64(raw.stop_price)?)
-        },
+        price,
+        stop_price,
         time_in_force,
         client_order_id: unsafe { opt_str(raw.client_order_id) }.map(str::to_string),
         reduce_only: raw.reduce_only,
         post_only: raw.post_only,
         stp,
     })
+}
+
+/// How an optional order price arrived, or that it did not arrive at all.
+enum OptionalPrice {
+    /// The price the caller wrote.
+    Given(Decimal),
+    /// No price: `NULL` text and a `NaN` double.
+    Unset,
+    /// Text that is not a decimal, or a double with no decimal form. An
+    /// unparsable price is a refused order rather than an order at a price the
+    /// caller did not write.
+    Unreadable,
+}
+
+/// Read an optional order price: exact text if given, else the double.
+fn exact_or_double(exact: *const c_char, value: f64) -> OptionalPrice {
+    if let Some(text) = unsafe { opt_str(exact) } {
+        return text
+            .parse()
+            .map_or(OptionalPrice::Unreadable, OptionalPrice::Given);
+    }
+    if value.is_nan() {
+        return OptionalPrice::Unset;
+    }
+    Decimal::from_f64(value).map_or(OptionalPrice::Unreadable, OptionalPrice::Given)
 }
 
 fn parse_symbol(market: &str) -> Option<Symbol> {
@@ -2243,6 +2295,9 @@ mod tests {
             reduce_only: false,
             post_only: false,
             stp: WICKRA_STP_NONE,
+            quantity_text: core::ptr::null(),
+            price_text: core::ptr::null(),
+            stop_price_text: core::ptr::null(),
         }
     }
 
@@ -2301,7 +2356,7 @@ mod tests {
     fn the_request_layout_is_what_the_bindings_assume() {
         use core::mem::{align_of, offset_of, size_of};
 
-        assert_eq!(size_of::<WickraOrderRequest>(), 64);
+        assert_eq!(size_of::<WickraOrderRequest>(), 88);
         assert_eq!(align_of::<WickraOrderRequest>(), 8);
         assert_eq!(offset_of!(WickraOrderRequest, market), 0);
         assert_eq!(offset_of!(WickraOrderRequest, side), 8);
@@ -2314,6 +2369,83 @@ mod tests {
         assert_eq!(offset_of!(WickraOrderRequest, reduce_only), 56);
         assert_eq!(offset_of!(WickraOrderRequest, post_only), 57);
         assert_eq!(offset_of!(WickraOrderRequest, stp), 60);
+        // The exact-decimal fields are appended, so every offset above is the
+        // one the bindings already assumed.
+        assert_eq!(offset_of!(WickraOrderRequest, quantity_text), 64);
+        assert_eq!(offset_of!(WickraOrderRequest, price_text), 72);
+        assert_eq!(offset_of!(WickraOrderRequest, stop_price_text), 80);
+    }
+
+    /// An order number wider than a double survives the crossing.
+    ///
+    /// The core keeps every order number in an exact decimal; a `double` holds
+    /// about fifteen significant digits. Sent as a double,
+    /// `12345678.90123456789` arrives as `12345678.90123457` -- a different
+    /// order, placed without a word. The text field is the one that carries it.
+    #[test]
+    fn an_order_number_wider_than_a_double_crosses_the_abi_intact() {
+        let market = cstr("BTC/USDT");
+        let exact = cstr("12345678.90123456789");
+        let mut request = plain_request(market.as_ptr(), WICKRA_SIDE_BUY, WICKRA_ORDER_LIMIT);
+        request.price = 12_345_678.901_234_568;
+        request.price_text = exact.as_ptr();
+
+        let converted = unsafe { request_from_c(&request) }.unwrap();
+        assert_eq!(
+            converted.price,
+            Some("12345678.90123456789".parse::<Decimal>().unwrap())
+        );
+        // What the same number becomes through the double beside it.
+        let mut through_double =
+            plain_request(market.as_ptr(), WICKRA_SIDE_BUY, WICKRA_ORDER_LIMIT);
+        through_double.price = 12_345_678.901_234_568;
+        let lossy = unsafe { request_from_c(&through_double) }.unwrap();
+        assert_ne!(lossy.price, converted.price);
+    }
+
+    /// Text wins over the double beside it, which the caller may leave at
+    /// anything.
+    #[test]
+    fn exact_text_wins_over_the_double_beside_it() {
+        let market = cstr("BTC/USDT");
+        let quantity = cstr("0.000000012345678901234567");
+        let mut request = plain_request(market.as_ptr(), WICKRA_SIDE_SELL, WICKRA_ORDER_MARKET);
+        request.quantity = 999.0;
+        request.quantity_text = quantity.as_ptr();
+
+        let converted = unsafe { request_from_c(&request) }.unwrap();
+        assert_eq!(
+            converted.quantity,
+            "0.000000012345678901234567".parse::<Decimal>().unwrap()
+        );
+    }
+
+    /// Text that is not a decimal is a refused order, not an order at some
+    /// other number.
+    #[test]
+    fn unparsable_exact_text_refuses_the_order() {
+        let market = cstr("BTC/USDT");
+        let nonsense = cstr("nineteen thousand");
+        let mut request = plain_request(market.as_ptr(), WICKRA_SIDE_BUY, WICKRA_ORDER_LIMIT);
+        request.price = 19_000.0;
+        request.price_text = nonsense.as_ptr();
+        assert!(unsafe { request_from_c(&request) }.is_none());
+
+        let mut sized = plain_request(market.as_ptr(), WICKRA_SIDE_BUY, WICKRA_ORDER_MARKET);
+        sized.quantity_text = nonsense.as_ptr();
+        assert!(unsafe { request_from_c(&sized) }.is_none());
+    }
+
+    /// A `NULL` text field leaves the double in charge, so every caller that
+    /// zero-fills the struct keeps the behaviour it had.
+    #[test]
+    fn a_null_text_field_leaves_the_double_in_charge() {
+        let market = cstr("BTC/USDT");
+        let mut request = plain_request(market.as_ptr(), WICKRA_SIDE_BUY, WICKRA_ORDER_LIMIT);
+        request.price = 19_000.5;
+        let converted = unsafe { request_from_c(&request) }.unwrap();
+        assert_eq!(converted.price, Some("19000.5".parse::<Decimal>().unwrap()));
+        assert_eq!(converted.stop_price, None);
     }
 
     #[test]
