@@ -271,7 +271,15 @@ x
             // Enough of a response that a client which *accepts* the order gets
             // far enough to have sent its request; the contract is about what
             // went out, not about what came back.
-            mock.push_json(200, "{}");
+            //
+            // Twice, because a client may have to ask the venue something before
+            // it can build the order at all -- HTX fetches its spot account id
+            // first, and would otherwise fail on the lookup and never reach the
+            // order. The payload doubles as that account list; the others ignore
+            // it.
+            let reply = r#"{"status":"ok","data":[{"id":1,"type":"spot","state":"working"}]}"#;
+            mock.push_json(200, reply);
+            mock.push_json(200, reply);
             let client = $venue::with_credentials(
                 Box::new(ArcTransport(Arc::clone(&mock))),
                 &options,
