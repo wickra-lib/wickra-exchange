@@ -290,6 +290,7 @@ impl Binance {
                 bid: parse_decimal(&book.bid_price)?,
                 ask: parse_decimal(&book.ask_price)?,
                 volume: parse_decimal(&stats.volume)?,
+                timestamp: stats.close_time,
             });
         }
         let raw: RawTicker = deserialize(&self.get("/api/v3/ticker/24hr", &query)?)?;
@@ -299,6 +300,7 @@ impl Binance {
             bid: parse_decimal(&raw.bid_price)?,
             ask: parse_decimal(&raw.ask_price)?,
             volume: parse_decimal(&raw.volume)?,
+            timestamp: raw.close_time,
         })
     }
 
@@ -339,6 +341,7 @@ impl Binance {
             last_update_id: raw.last_update_id,
             bids: parse_levels(&raw.bids)?,
             asks: parse_levels(&raw.asks)?,
+            timestamp: raw.transaction_time,
         })
     }
 
@@ -1788,6 +1791,10 @@ fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Opt
                 .unwrap_or(0),
             bids: parse_ws_levels(data.get("b"))?,
             asks: parse_ws_levels(data.get("a"))?,
+            timestamp: data
+                .get("E")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0),
         }))),
         "24hrTicker" => Ok(Some(Event::Ticker(Ticker {
             symbol: resolve(field_str(data, "s")?),
@@ -1795,6 +1802,10 @@ fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Opt
             bid: parse_decimal(field_str(data, "b")?)?,
             ask: parse_decimal(field_str(data, "a")?)?,
             volume: parse_decimal(field_str(data, "v")?)?,
+            timestamp: data
+                .get("E")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0),
         }))),
         // Private user-data frames. The wire symbol is split directly (the
         // user-data stream carries no public subscription to resolve against).
@@ -1942,6 +1953,9 @@ struct RawTicker {
     #[serde(rename = "askPrice")]
     ask_price: String,
     volume: String,
+    /// Close time of the rolling window, which is the venue's own "as of".
+    #[serde(rename = "closeTime", default)]
+    close_time: i64,
 }
 
 #[derive(Deserialize)]
@@ -1950,6 +1964,10 @@ struct RawDepth {
     last_update_id: u64,
     bids: Vec<[String; 2]>,
     asks: Vec<[String; 2]>,
+    /// Futures depth carries the venue's transaction time; spot depth carries
+    /// no timestamp at all, so it stays `0` rather than being invented here.
+    #[serde(rename = "T", default)]
+    transaction_time: i64,
 }
 
 #[derive(Deserialize)]
@@ -1998,6 +2016,8 @@ struct RawFuturesTicker {
     #[serde(rename = "lastPrice")]
     last_price: String,
     volume: String,
+    #[serde(rename = "closeTime", default)]
+    close_time: i64,
 }
 
 #[derive(Deserialize)]
@@ -3403,6 +3423,7 @@ mod tests {
                 bid: dec!(99),
                 ask: dec!(101),
                 volume: dec!(1234),
+                timestamp: 0,
             })
         );
     }

@@ -809,12 +809,35 @@ jobs:
         with:
           tool: cargo-llvm-cov
       - name: Generate coverage (lcov)
-        # Only the core is measured: the facade crate holds the thin real-socket
-        # transport adapters, which are exercised by gated integration tests, not
-        # the offline unit suite.
+        # The core *and* the facade. The facade used to be excluded wholesale,
+        # on the grounds that it holds the real-socket transport adapters, which
+        # only live tests exercise. That was true of `net.rs` and not of
+        # `factory.rs` beside it: the `connect*` dispatch is ordinary offline
+        # logic with its own unit tests, and leaving it unmeasured left the very
+        # place a defect had already hidden -- no binding could reach a futures
+        # market, because the factory built every client with `MarketType::Spot`
+        # hardcoded, and nothing measured whether that path was tested.
+        #
+        # So the exclusion is narrowed from "the crate" to "the file that is
+        # genuinely untestable offline". `net.rs` is the only module here that
+        # opens sockets; its behaviour is checked by the gated suite in
+        # `.github/workflows/testnet.yml`, which now drives all ten venue
+        # clients against their real public endpoints rather than just the
+        # transport.
+        #
+        # The binding crates stay out for a different reason, and it is not
+        # "they don't matter": their tests are not cargo tests. Python, Node and
+        # WASM are exercised by pytest and node:test in their own jobs, so
+        # measuring them here would compile their Rust and never run it,
+        # reporting a zero that means "not measured" while looking like "not
+        # tested". The C ABI is the exception -- its tests *are* cargo tests --
+        # and it is measured.
         run: >
           cargo llvm-cov --all-features
           -p wickra-exchange-core
+          -p wickra-exchange
+          -p wickra-exchange-c
+          --ignore-filename-regex 'crates/wickra-exchange/src/net\.rs'
           --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0

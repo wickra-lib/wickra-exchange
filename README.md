@@ -252,7 +252,7 @@ touch mainnet with real keys. Fuzzing requires a nightly toolchain — see
 Run the suites with the commands in
 [Building everything from source](#building-everything-from-source).
 
-- **`wickra-exchange-core`** — 513 unit tests. Every venue client is generic over
+- **`wickra-exchange-core`** — 534 unit tests. Every venue client is generic over
   an injected transport, so its request-build, signing, parse and normalise path
   is exercised offline against `MockHttpTransport` / `MockWsTransport`: queued
   responses in, recorded requests out.
@@ -264,6 +264,16 @@ Run the suites with the commands in
   filter rounding stays on the step/tick grid, and decimal and symbol
   parse/format round-trips.
 - **`tests/golden.rs`** — the recorded scenarios under [`golden/`](golden/).
+- **`crates/wickra-exchange/tests/live_public.rs`** — the other half of the
+  offline suite, and the reason it is not enough on its own. A mock-transport
+  test proves the parser reads what the author believed; it cannot prove that
+  belief matched the venue, because the fixture and the parser were written by
+  the same hand from the same reading. This suite asks the real venue and hands
+  the answer to the real parser — all ten clients, through `ticker`, `klines`
+  and `order_book`, with no credentials. It is `#[ignore]`d and runs nightly
+  from `testnet.yml`, never on a push. A failure means the venue answered and
+  the parser could not read the reply; network errors, geo-blocks and auth
+  errors are skipped out loud, because they say nothing about the code.
 - **`fuzz/`** — five `cargo-fuzz` targets over everything a remote server can put
   on the wire: JSON responses, WebSocket frames, order-book diffs, filter
   rounding and credential/symbol parsing. Nothing may panic, because a panic

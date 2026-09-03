@@ -87,6 +87,91 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`Ticker`, `OrderBookSnapshot` and `BookDelta` carry the venue's timestamp.**
+  Only `TradePrint` did, so a consumer could see how old a trade was and not how
+  old the quote or the book was — the difference between acting on the market
+  and acting on a memory of it. `Health.last_message_ms` could likewise only be
+  fed from trades.
+
+  Every expression was verified against the venue's real response, fetched from
+  the same endpoint the client calls, rather than read out of documentation:
+
+  | | ticker | book |
+  |---|---|---|
+  | Binance | `closeTime` | futures `T`; spot publishes none |
+  | OKX, Bitget | `ts` | `ts` |
+  | HTX | envelope `ts` | `tick.ts` |
+  | KuCoin | `data.time` | `data.time` |
+  | Upbit | `trade_timestamp` | `timestamp` |
+  | Gate | — | `update` |
+  | Bybit | — | `ts` |
+  | Kraken, Coinbase | — | — |
+
+  A venue that publishes none reports `0`, never the local clock: a
+  locally-stamped quote looks fresh by construction, which is the one thing a
+  staleness check must never be told. Kraken stamps individual depth levels but
+  never the book as a whole, and Coinbase's market endpoints need a key.
+
+  The field is appended at the end of `WickraTicker`, so every C-ABI offset
+  before it is unchanged, and it reaches all nine languages. The gated live
+  suite now asserts *presence* per venue as well, so a venue that stops sending
+  a stamp — or a parser that stops reading one — fails nightly rather than
+  quietly reporting zero.
+
+- **`tracing` is wired, having been declared and unused.** It sat in
+  `workspace.dependencies` with no crate depending on it and not one log
+  statement in the codebase. `ThrottledTransport` now traces its decisions,
+  which is where they were least visible: a caller that waited two seconds could
+  not tell whether the request budget held it, the venue refused it, or the
+  network dropped it, and those three call for different fixes. Retries, venue
+  cool-offs and budget waits log at `debug`; a repeat refused because the method
+  is not safe to repeat logs at `warn`, since that is the case where a caller is
+  left holding an order it cannot account for.
+
+- **The venue clients are now checked against the venues.** The offline suite
+  drives every client over a mock transport with hand-written JSON. It proves
+  the parser reads what the author believed, and it cannot prove that belief
+  matched the venue: the fixture and the parser were written by the same hand,
+  from the same reading of the same documentation, so they agree whether or not
+  the reading was right. That is not hypothetical — it is how seven clients came
+  to never send `time_in_force` under a green suite, because the fixtures did
+  not expect it either.
+
+  `crates/wickra-exchange/tests/live_public.rs` asks the real venue instead. All
+  ten clients, through `ticker`, `klines` and `order_book`, against the live
+  public API with no credentials. It runs from the existing nightly
+  `testnet.yml`, never on a push.
+
+  A failure means one thing: the venue answered and the parser could not read
+  the reply. Network errors, timeouts, rate limits, HTTP 451/403 geo-blocks and
+  auth errors are skipped out loud, because they say nothing about the code —
+  and because a nightly job that failed on a blocked runner IP would be switched
+  off within a week, taking the drift detection with it.
+
+  First run: nine of the ten venues verified end to end. Coinbase is skipped —
+  its Advanced Trade market endpoints require an EC key, so there is nothing to
+  read anonymously.
+
+### Changed
+
+- **Coverage measures the facade and the C ABI, not just the core.** The facade
+  was excluded wholesale on the grounds that it holds the real-socket transport
+  adapters. That was true of `net.rs` and not of `factory.rs` beside it: the
+  `connect*` dispatch is ordinary offline logic with its own unit tests, and
+  leaving it unmeasured left unmeasured the exact place a defect had already
+  hidden — no binding could reach a futures market, because the factory built
+  every client with `MarketType::Spot` hardcoded.
+
+  The exclusion is now the file that is genuinely untestable offline (`net.rs`)
+  rather than the crate around it. The C ABI joins too, since its tests are
+  cargo tests. Python, Node and WASM stay out for a different reason and not
+  because they do not matter: their tests are pytest and node:test, so measuring
+  them here would compile their Rust and never run it — reporting a zero that
+  means "not measured" while looking like "not tested".
+
+  The reported project percentage will move when this lands. That is more code
+  being measured, not less being tested.
+
 - **The derivatives feeds have producers.** `feeds.rs` carried `FundingRate`,
   `OpenInterest`, `Liquidation`, `LongShortRatio`, `MarkIndex`,
   `DerivativesFeed` and `DerivativesTickBuilder` — 471 lines of public API that
@@ -218,6 +303,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     on so a test can read four numbers and one array would be a poor trade.
 
 ### Fixed
+
+- **A coin-margined or margin client traded the wrong market, silently.**
+  `MarketType` has four variants and most clients distinguish two. What the rest
+  did was not reject the market -- it was to fall through to a path built for a
+  different one.
+
+  On Binance, `is_futures()` tests `UsdMFutures` alone, so a `CoinMFutures`
+  client took the *spot* base URL and the spot order path: an order meant for a
+  coin-margined contract went to spot, was accepted there, and traded the wrong
+  instrument. On Bitget, KuCoin, Gate, HTX and Kraken the mirror image happened
+  -- `is_derivatives()` is true for both futures variants, so inverse contracts
+  were routed to the USDⓈ-margined endpoints (Gate's `/futures/usdt/`, HTX's
+  `/linear-swap-api/`). And `MarketType::Margin` resolved to spot on all ten:
+  no client signs a margin-account order anywhere.
+
+  This is the shape of #192, where every binding built a spot client and no
+  caller could reach futures at all: a market type accepted, ignored, and
+  quietly replaced. The factory now refuses what a client does not route, which
+  covers all nine languages in one place because every binding reaches the
+  library through it. Bybit (`inverse`) and OKX (`SWAP`, where linear and
+  inverse differ by instrument id rather than endpoint) do route coin-margined
+  contracts and are not refused.
 
 - **The binding-surface check could delete whole functions as if they were
   prose.** Its string-literal regex escaped `\\.`, and `.` does not match a

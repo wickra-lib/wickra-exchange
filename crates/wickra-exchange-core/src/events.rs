@@ -42,6 +42,15 @@ pub struct OrderBookSnapshot {
     pub bids: Vec<BookLevel>,
     /// Ask levels, best (lowest price) first.
     pub asks: Vec<BookLevel>,
+    /// Venue timestamp (milliseconds since the Unix epoch), or `0` when the
+    /// venue did not supply one.
+    ///
+    /// Without this a consumer cannot tell how old a quote is, which is the
+    /// difference between acting on the market and acting on a memory of it. A
+    /// venue that publishes no timestamp reports `0` rather than the local
+    /// clock: a locally-stamped quote looks fresh by construction, which is the
+    /// one thing a staleness check must never be told.
+    pub timestamp: i64,
 }
 
 impl OrderBookSnapshot {
@@ -89,6 +98,15 @@ pub struct BookDelta {
     pub bids: Vec<BookLevel>,
     /// Changed ask levels (quantity zero = remove).
     pub asks: Vec<BookLevel>,
+    /// Venue timestamp (milliseconds since the Unix epoch), or `0` when the
+    /// venue did not supply one.
+    ///
+    /// Without this a consumer cannot tell how old a quote is, which is the
+    /// difference between acting on the market and acting on a memory of it. A
+    /// venue that publishes no timestamp reports `0` rather than the local
+    /// clock: a locally-stamped quote looks fresh by construction, which is the
+    /// one thing a staleness check must never be told.
+    pub timestamp: i64,
 }
 
 /// A single executed public trade.
@@ -155,6 +173,7 @@ mod tests {
                 BookLevel::new(dec!(101), dec!(1)),
                 BookLevel::new(dec!(102), dec!(3)),
             ],
+            timestamp: 0,
         }
     }
 
@@ -174,6 +193,7 @@ mod tests {
             last_update_id: 0,
             bids: vec![],
             asks: vec![],
+            timestamp: 0,
         };
         assert!(empty.best_bid().is_none());
         assert!(empty.best_ask().is_none());

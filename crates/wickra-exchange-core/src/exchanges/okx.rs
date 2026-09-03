@@ -262,6 +262,7 @@ impl Okx {
             bid: parse_decimal(&entry.bid_px)?,
             ask: parse_decimal(&entry.ask_px)?,
             volume: parse_decimal(&entry.vol24h)?,
+            timestamp: entry.ts.parse().unwrap_or(0),
         })
     }
 
@@ -303,6 +304,7 @@ impl Okx {
             last_update_id: raw.ts.parse().unwrap_or(0),
             bids: parse_levels(&raw.bids)?,
             asks: parse_levels(&raw.asks)?,
+            timestamp: raw.ts.parse().unwrap_or(0),
         })
     }
 
@@ -1111,6 +1113,7 @@ fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Vec
                     bid: dec_or_zero(opt_str(t, "bidPx")),
                     ask: dec_or_zero(opt_str(t, "askPx")),
                     volume: dec_or_zero(opt_str(t, "vol24h")),
+                    timestamp: opt_str(t, "ts").parse().unwrap_or(0),
                 }))
             })
             .collect()
@@ -1128,6 +1131,7 @@ fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Vec
                         last_update_id: update_id,
                         bids,
                         asks,
+                        timestamp: i64::try_from(update_id).unwrap_or(0),
                     }))
                 } else {
                     Ok(Event::BookDelta(BookDelta {
@@ -1136,6 +1140,7 @@ fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Vec
                         final_update_id: update_id,
                         bids,
                         asks,
+                        timestamp: i64::try_from(update_id).unwrap_or(0),
                     }))
                 }
             })
@@ -1201,6 +1206,9 @@ struct RawTicker {
     #[serde(rename = "askPx")]
     ask_px: String,
     vol24h: String,
+    /// OKX stamps every ticker; verified against the live endpoint.
+    #[serde(default)]
+    ts: String,
 }
 
 #[derive(Deserialize)]
@@ -1814,6 +1822,28 @@ mod tests {
 
     /// `post_only` is an OKX order *type*, so it cannot ride on a market order:
     /// the two would need the one `ordType` slot at once.
+    /// OKX stamps both public reads, and the client reports the venue's stamp
+    /// rather than the moment the reply was parsed. Payloads captured from the
+    /// live endpoints.
+    #[test]
+    fn the_public_reads_carry_the_venue_stamp() {
+        let (okx, mock) = signed_client(1000);
+        mock.push_json(
+            200,
+            r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT","last":"77099.1","askPx":"77106.2","bidPx":"77106.1","vol24h":"5065.45","ts":"1788396634670"}]}"#,
+        );
+        let ticker = okx.ticker(&symbol()).unwrap();
+        assert_eq!(ticker.timestamp, 1_788_396_634_670);
+
+        let (okx, mock) = signed_client(1000);
+        mock.push_json(
+            200,
+            r#"{"code":"0","msg":"","data":[{"asks":[["77095.6","0.54"]],"bids":[["77095.5","0.17"]],"ts":"1788396635256"}]}"#,
+        );
+        let book = okx.order_book(&symbol(), 5).unwrap();
+        assert_eq!(book.timestamp, 1_788_396_635_256);
+    }
+
     #[test]
     fn a_market_order_cannot_also_be_post_only() {
         let (okx, mock) = signed_client(1000);

@@ -262,6 +262,7 @@ impl Bitget {
             bid: parse_decimal(&entry.bid_pr)?,
             ask: parse_decimal(&entry.ask_pr)?,
             volume: parse_decimal(&entry.base_volume)?,
+            timestamp: entry.ts.parse().unwrap_or(0),
         })
     }
 
@@ -312,6 +313,7 @@ impl Bitget {
             last_update_id: raw.ts.parse().unwrap_or(0),
             bids: parse_levels(&raw.bids)?,
             asks: parse_levels(&raw.asks)?,
+            timestamp: raw.ts.parse().unwrap_or(0),
         })
     }
 
@@ -1002,6 +1004,7 @@ fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Vec
                     bid: dec_or_zero(opt_str(t, "bidPr")),
                     ask: dec_or_zero(opt_str(t, "askPr")),
                     volume: dec_or_zero(opt_str(t, "baseVolume")),
+                    timestamp: opt_str(t, "ts").parse().unwrap_or(0),
                 }))
             })
             .collect()
@@ -1018,6 +1021,7 @@ fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Vec
                         last_update_id: update_id,
                         bids,
                         asks,
+                        timestamp: i64::try_from(update_id).unwrap_or(0),
                     }))
                 } else {
                     Ok(Event::BookDelta(BookDelta {
@@ -1026,6 +1030,7 @@ fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Vec
                         final_update_id: update_id,
                         bids,
                         asks,
+                        timestamp: i64::try_from(update_id).unwrap_or(0),
                     }))
                 }
             })
@@ -1081,6 +1086,9 @@ struct RawTicker {
     ask_pr: String,
     #[serde(rename = "baseVolume")]
     base_volume: String,
+    /// Bitget stamps every ticker; verified against the live endpoint.
+    #[serde(default)]
+    ts: String,
 }
 
 #[derive(Deserialize)]
@@ -1971,6 +1979,27 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains(r#""marginMode":"isolated""#));
+    }
+
+    /// Bitget stamps both public reads. Payloads captured from the live
+    /// endpoints.
+    #[test]
+    fn the_public_reads_carry_the_venue_stamp() {
+        let (bitget, mock) = signed_client(1000);
+        mock.push_json(
+            200,
+            r#"{"code":"00000","msg":"success","data":[{"symbol":"BTCUSDT","lastPr":"77100.52","bidPr":"77100.51","askPr":"77100.52","baseVolume":"2886.70","ts":"1788396650211"}]}"#,
+        );
+        let ticker = bitget.ticker(&symbol()).unwrap();
+        assert_eq!(ticker.timestamp, 1_788_396_650_211);
+
+        let (bitget, mock) = signed_client(1000);
+        mock.push_json(
+            200,
+            r#"{"code":"00000","msg":"success","data":{"asks":[["77100.52","0.56"]],"bids":[["77100.51","0.37"]],"ts":"1788396651599"}}"#,
+        );
+        let book = bitget.order_book(&symbol(), 5).unwrap();
+        assert_eq!(book.timestamp, 1_788_396_651_599);
     }
 
     #[test]

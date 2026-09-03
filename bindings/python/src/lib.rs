@@ -552,6 +552,9 @@ impl PyExchange {
         dict.set_item("bid", to_float(ticker.bid))?;
         dict.set_item("ask", to_float(ticker.ask))?;
         dict.set_item("volume", to_float(ticker.volume))?;
+        // The venue's own stamp, or 0 when it published none. Never the local
+        // clock: a locally stamped quote looks fresh by construction.
+        dict.set_item("timestamp", ticker.timestamp)?;
         Ok(dict)
     }
 

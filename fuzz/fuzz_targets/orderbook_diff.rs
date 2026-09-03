@@ -20,11 +20,16 @@ struct RawDelta {
     final_update_id: u32,
     bids: Vec<RawLevel>,
     asks: Vec<RawLevel>,
+    /// Fuzzed rather than pinned: the builder carries the stamp forward from
+    /// whichever frame it last folded in, so a sequence that jumps backwards, or
+    /// sits at the extremes, is part of what this target should explore.
+    timestamp: i64,
 }
 
 #[derive(Arbitrary, Debug)]
 struct Input {
     snapshot_id: u32,
+    snapshot_timestamp: i64,
     snapshot_bids: Vec<RawLevel>,
     snapshot_asks: Vec<RawLevel>,
     deltas: Vec<RawDelta>,
@@ -45,6 +50,7 @@ fuzz_target!(|input: Input| {
         last_update_id: u64::from(input.snapshot_id),
         bids: levels(&input.snapshot_bids),
         asks: levels(&input.snapshot_asks),
+        timestamp: input.snapshot_timestamp,
     };
     book.apply_snapshot(&snapshot);
 
@@ -55,6 +61,7 @@ fuzz_target!(|input: Input| {
             final_update_id: u64::from(delta.final_update_id),
             bids: levels(&delta.bids),
             asks: levels(&delta.asks),
+            timestamp: delta.timestamp,
         };
         let _ = book.apply_delta(&diff);
     }

@@ -303,6 +303,10 @@ impl Htx {
             bid: decimal_at(tick, "bid", 0)?,
             ask: decimal_at(tick, "ask", 0)?,
             volume: decimal_field(tick, "vol")?,
+            timestamp: value
+                .get("ts")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0),
         })
     }
 
@@ -372,6 +376,10 @@ impl Htx {
                 .unwrap_or(0),
             bids: num_levels(tick.get("bids"))?,
             asks: num_levels(tick.get("asks"))?,
+            timestamp: tick
+                .get("ts")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0),
         })
     }
 
@@ -1493,6 +1501,10 @@ fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Vec
             bid: decimal_field(tick, "bid").unwrap_or(Decimal::ZERO),
             ask: decimal_field(tick, "ask").unwrap_or(Decimal::ZERO),
             volume: decimal_field(tick, "vol").unwrap_or(Decimal::ZERO),
+            timestamp: value
+                .get("ts")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0),
         })]),
         "depth" => {
             let update_id = tick
@@ -1505,6 +1517,10 @@ fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Vec
                 final_update_id: update_id,
                 bids: num_levels(tick.get("bids"))?,
                 asks: num_levels(tick.get("asks"))?,
+                timestamp: tick
+                    .get("ts")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0),
             })])
         }
         _ => Ok(Vec::new()),
@@ -1995,6 +2011,29 @@ mod tests {
             htx.cancel_order_ws(&symbol(), "1").unwrap_err(),
             Error::Exchange { .. }
         ));
+    }
+
+    /// HTX stamps the envelope for the ticker and the `tick` for depth.
+    /// Payloads captured from the live endpoints.
+    #[test]
+    fn the_public_reads_carry_the_venue_stamp() {
+        let (htx, mock) = signed_client(1000);
+        mock.push_json(
+            200,
+            r#"{"ch":"market.btcusdt.detail.merged","status":"ok","ts":1788396667304,"tick":{"close":77072.07,"bid":[77072.06,0.0009],"ask":[77072.07,0.019],"vol":95769370.0}}"#,
+        );
+        let ticker = htx.ticker(&symbol()).unwrap();
+        assert_eq!(ticker.timestamp, 1_788_396_667_304);
+
+        let (htx, mock) = signed_client(1000);
+        mock.push_json(
+            200,
+            r#"{"ch":"market.btcusdt.depth.step0","status":"ok","ts":1788396667785,"tick":{"ts":1788396667002,"version":193172167185,"bids":[[77072.06,0.0009]],"asks":[[77072.07,0.019]]}}"#,
+        );
+        let book = htx.order_book(&symbol(), 5).unwrap();
+        // The `tick`'s own stamp, not the envelope's: the envelope says when the
+        // server replied, the tick says when the book was true.
+        assert_eq!(book.timestamp, 1_788_396_667_002);
     }
 
     #[test]

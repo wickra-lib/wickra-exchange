@@ -366,6 +366,7 @@ mod tests {
                 BookLevel::new(dec!(101), dec!(1)),
                 BookLevel::new(dec!(102), dec!(4)),
             ],
+            timestamp: 0,
         };
         let book = order_book_from_snapshot(&snapshot).unwrap();
         assert!((book.best_bid().unwrap().price - 100.0).abs() < 1e-9);
@@ -380,6 +381,7 @@ mod tests {
             last_update_id: 0,
             bids: vec![BookLevel::new(dec!(102), dec!(1))],
             asks: vec![BookLevel::new(dec!(101), dec!(1))],
+            timestamp: 0,
         };
         assert!(matches!(
             order_book_from_snapshot(&snapshot).unwrap_err(),

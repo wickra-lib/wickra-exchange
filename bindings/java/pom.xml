@@ -13,11 +13,38 @@
   <description>Streaming-native, unified connectivity for the ten largest crypto exchanges, with paper and replay simulators — for the JVM over the Wickra C ABI (FFM/Panama).</description>
   <url>https://github.com/wickra-lib/wickra-exchange</url>
 
+  <!-- Maven Central rejects a POM without a license URL, a developer and an
+       scm block, so these are required metadata rather than decoration. The
+       dual licence is expressed as two entries because the schema has no way to
+       say "or": a consumer may take either. -->
   <licenses>
     <license>
-      <name>MIT OR Apache-2.0</name>
+      <name>MIT</name>
+      <url>https://opensource.org/licenses/MIT</url>
+      <distribution>repo</distribution>
+    </license>
+    <license>
+      <name>Apache License, Version 2.0</name>
+      <url>https://www.apache.org/licenses/LICENSE-2.0</url>
+      <distribution>repo</distribution>
     </license>
   </licenses>
+
+  <developers>
+    <developer>
+      <id>kingchenc</id>
+      <name>kingchenc</name>
+      <email>support@wickra.org</email>
+      <url>https://github.com/kingchenc</url>
+    </developer>
+  </developers>
+
+  <scm>
+    <connection>scm:git:https://github.com/wickra-lib/wickra-exchange.git</connection>
+    <developerConnection>scm:git:ssh://git@github.com/wickra-lib/wickra-exchange.git</developerConnection>
+    <url>https://github.com/wickra-lib/wickra-exchange</url>
+    <tag>HEAD</tag>
+  </scm>
 
   <properties>
     <maven.compiler.release>22</maven.compiler.release>
@@ -60,4 +87,91 @@
       </plugin>
     </plugins>
   </build>
+
+  <!-- `release.yml` deploys with `mvn -Prelease deploy`, and this is the profile
+       it names. Without it the deploy produced a bare jar: Maven Central rejects
+       an upload with no sources, no javadoc and no signature, so the job would
+       have failed at the last step of a tag that had already published to
+       crates.io, PyPI and npm.
+
+       It is a profile rather than the default build because signing needs a key
+       that only CI has; an ordinary `mvn test` must not ask for one. -->
+  <profiles>
+    <profile>
+      <id>release</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-source-plugin</artifactId>
+            <version>3.3.1</version>
+            <executions>
+              <execution>
+                <id>attach-sources</id>
+                <goals>
+                  <goal>jar-no-fork</goal>
+                </goals>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-javadoc-plugin</artifactId>
+            <version>3.11.2</version>
+            <executions>
+              <execution>
+                <id>attach-javadocs</id>
+                <goals>
+                  <goal>jar</goal>
+                </goals>
+              </execution>
+            </executions>
+            <configuration>
+              <!-- The FFM API is preview-free on 22+, but javadoc still needs to
+                   be told which release it is documenting. -->
+              <release>${maven.compiler.release}</release>
+              <doclint>all,-missing</doclint>
+            </configuration>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-gpg-plugin</artifactId>
+            <version>3.2.7</version>
+            <executions>
+              <execution>
+                <id>sign-artifacts</id>
+                <phase>verify</phase>
+                <goals>
+                  <goal>sign</goal>
+                </goals>
+                <configuration>
+                  <!-- The key arrives through the agent that
+                       actions/setup-java configures; asking for a passphrase on
+                       a terminal would hang the job forever rather than fail. -->
+                  <gpgArguments>
+                    <arg>--pinentry-mode</arg>
+                    <arg>loopback</arg>
+                  </gpgArguments>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.sonatype.central</groupId>
+            <artifactId>central-publishing-maven-plugin</artifactId>
+            <version>0.7.0</version>
+            <extensions>true</extensions>
+            <configuration>
+              <!-- Matches `server-id: central` in the workflow's setup-java
+                   step, which is what binds CENTRAL_USERNAME/CENTRAL_PASSWORD to
+                   this upload. -->
+              <publishingServerId>central</publishingServerId>
+              <autoPublish>true</autoPublish>
+              <waitUntil>published</waitUntil>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
 </project>

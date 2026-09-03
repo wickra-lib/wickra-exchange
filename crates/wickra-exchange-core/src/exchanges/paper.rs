@@ -286,6 +286,9 @@ impl MarketData for PaperExchange {
             bid: mark,
             ask: mark,
             volume: Decimal::ZERO,
+            // A paper price was set by the caller, not published by a venue,
+            // so there is no venue timestamp to report and none is invented.
+            timestamp: 0,
         })
     }
 

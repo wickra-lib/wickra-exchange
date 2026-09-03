@@ -211,6 +211,8 @@ impl Coinbase {
             bid: parse_decimal(str_field(&value, "best_bid")?)?,
             ask: parse_decimal(str_field(&value, "best_ask")?)?,
             volume: Decimal::ZERO,
+            // Advanced Trade's product ticker carries no timestamp.
+            timestamp: 0,
         })
     }
 
@@ -256,6 +258,7 @@ impl Coinbase {
             last_update_id: 0,
             bids: object_levels(book.get("bids"))?,
             asks: object_levels(book.get("asks"))?,
+            timestamp: 0,
         })
     }
 
@@ -820,6 +823,7 @@ fn parse_ws_message(text: &str) -> Result<Vec<Event>> {
                         bid: opt_dec(ticker, "best_bid"),
                         ask: opt_dec(ticker, "best_ask"),
                         volume: opt_dec(ticker, "volume_24_h"),
+                        timestamp: 0,
                     }));
                 }
             }
@@ -852,6 +856,7 @@ fn parse_ws_message(text: &str) -> Result<Vec<Event>> {
                     final_update_id: 0,
                     bids,
                     asks,
+                    timestamp: 0,
                 }));
             }
             Ok(out)

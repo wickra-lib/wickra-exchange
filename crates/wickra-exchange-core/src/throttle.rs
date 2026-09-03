@@ -37,6 +37,21 @@
 //! plus a code in their JSON envelope, which only the venue client can read —
 //! for those, the reactive cool-off below does not engage, and the proactive
 //! budget is what protects them.
+//!
+//! # What it says while doing it
+//!
+//! Everything above is invisible from outside: a caller that waited two seconds
+//! cannot tell whether the budget held it, the venue refused it, or the network
+//! dropped it, and those three call for different fixes. So each decision is
+//! traced through the [`tracing`] facade, on the `wickra_exchange_core::throttle`
+//! target:
+//!
+//! * `debug` — a budget wait, a venue cool-off, a retry and its delay
+//! * `warn` — a repeat refused because the method is not safe to repeat, which
+//!   is the case where a caller is left holding an order it cannot account for
+//!
+//! `tracing` costs a relaxed atomic load when no subscriber is installed, so a
+//! consumer that wants none pays for none.
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -49,6 +64,17 @@ use crate::transport::{HttpMethod, HttpRequest, HttpResponse, HttpTransport};
 /// HTTP statuses that mean "you are over the limit": 429 is standard, 418 is
 /// Binance's escalation for an IP that ignored a 429.
 const RATE_LIMIT_STATUSES: [u16; 2] = [429, 418];
+
+/// The tracing target for this layer, so a consumer can filter it on its own.
+///
+/// Each call below is written on one line: `llvm-cov` attributes a multi-line
+/// macro invocation with expression arguments across several lines and marks the
+/// continuation lines uncovered even when the call runs.
+///
+/// The request URL is deliberately not logged. Every field here already
+/// identifies the decision, and a signed URL carries its signature in the query
+/// string -- a log line is the last place that should end up.
+const TARGET: &str = "wickra_exchange_core::throttle";
 
 /// The cool-off applied when a venue rate-limits without saying for how long.
 const DEFAULT_COOL_OFF: Duration = Duration::from_secs(1);
@@ -148,6 +174,7 @@ impl ThrottledTransport {
             match advice {
                 Acquire::Allowed => return,
                 Acquire::Throttled { retry_after_ms } => {
+                    tracing::debug!(target: TARGET, retry_after_ms, "budget exhausted; waiting");
                     (self.sleep)(millis(retry_after_ms));
                 }
             }
@@ -219,12 +246,19 @@ impl HttpTransport for ThrottledTransport {
             };
 
             if let Some(wait) = cool_off {
+                tracing::debug!(target: TARGET, wait_ms = wait.as_millis(), "venue rate-limited; cooling off");
                 self.note_cool_off(wait);
             }
 
-            if !may_repeat(request.method, cool_off.is_some())
-                || !self.backoff.should_retry(attempt)
-            {
+            if !may_repeat(request.method, cool_off.is_some()) {
+                // The distinction that matters most in a log: this request may
+                // already have been executed, so it is not repeated, and the
+                // caller is left to reconcile.
+                tracing::warn!(target: TARGET, method = ?request.method, "not repeating a request the venue may have executed; reconcile the order state");
+                return outcome;
+            }
+            if !self.backoff.should_retry(attempt) {
+                tracing::debug!(target: TARGET, attempt, "retry budget exhausted; returning the outcome");
                 return outcome;
             }
 
@@ -233,6 +267,7 @@ impl HttpTransport for ThrottledTransport {
             let delay = cool_off.unwrap_or_else(|| {
                 Duration::from_millis(self.backoff.jittered_delay_ms(attempt, (self.jitter)()))
             });
+            tracing::debug!(target: TARGET, attempt, delay_ms = delay.as_millis(), venue_advised = cool_off.is_some(), "retrying after delay");
             (self.sleep)(delay);
             attempt += 1;
         }

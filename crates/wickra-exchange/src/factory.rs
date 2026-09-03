@@ -12,7 +12,7 @@
 use crate::{ReqwestHttpTransport, TungsteniteWsTransport};
 use wickra_exchange_core::{
     AdvancedOrders, Backoff, Binance, Bitget, Bybit, Coinbase, Credentials, Derivatives, Error,
-    Exchange, ExchangeOptions, Gate, HttpTransport, Htx, Kraken, KuCoin, Okx, Result,
+    Exchange, ExchangeOptions, Gate, HttpTransport, Htx, Kraken, KuCoin, MarketType, Okx, Result,
     ThrottledTransport, Upbit, WsExecution, WsTransport, WsUserData,
 };
 
@@ -36,6 +36,57 @@ const RETRY_POLICY: Backoff = Backoff::new(250, 8_000, 3);
 /// `Retry-After` still applies, because that number comes from the venue.
 /// Callers who know their account's limits can wrap a transport themselves and
 /// pass it to a client's `with_http` constructor.
+/// Refuse a market a venue's client does not actually route to.
+///
+/// `MarketType` has four variants and most clients distinguish two. What the
+/// rest do is not "reject the market" -- it is to fall through to a path built
+/// for a different one, silently:
+///
+/// * Binance's `is_futures()` tests `UsdMFutures` alone, so a `CoinMFutures`
+///   client takes the spot base URL and the spot order path. It would place spot
+///   orders for a caller who asked for coin-margined futures.
+/// * Bitget, KuCoin, Gate, HTX and Kraken test `is_derivatives()`, which is true
+///   for both futures variants, so a `CoinMFutures` client is routed to the
+///   USDⓈ-margined endpoints -- Gate's `/futures/usdt/`, HTX's
+///   `/linear-swap-api/`. Inverse contracts live elsewhere on those venues.
+/// * `Margin` resolves to spot on every client here. None of them signs a
+///   margin-account order.
+///
+/// This is the shape of #192, where every binding built a spot client and no
+/// caller could reach futures at all: a market type that is accepted, ignored,
+/// and quietly replaced with a different one. The order goes out, it is
+/// accepted, and it is against the wrong instrument.
+///
+/// Bybit routes `CoinMFutures` to its `inverse` category and OKX to `SWAP`
+/// (where linear and inverse differ by instrument id, not by endpoint), so those
+/// two carry it and are not refused.
+///
+/// Refusing here rather than in each client is deliberate: every binding reaches
+/// the library through this factory, so one guard covers all nine languages.
+fn ensure_market_supported(name: &str, market: MarketType) -> Result<()> {
+    let supported = match market {
+        // Every venue here trades spot.
+        MarketType::Spot => true,
+        // The eight futures venues; Coinbase and Upbit are spot-only.
+        MarketType::UsdMFutures => !matches!(name, "coinbase" | "upbit"),
+        // Only these two route inverse contracts to an inverse endpoint.
+        MarketType::CoinMFutures => matches!(name, "bybit" | "okx"),
+        // No client signs a margin-account order on any venue.
+        MarketType::Margin => false,
+    };
+    if supported {
+        return Ok(());
+    }
+    Err(Error::Exchange {
+        code: "unsupported".to_string(),
+        message: format!(
+            "{name}: {market:?} is not routed by this client; it would fall \
+             through to a different market's endpoints and trade the wrong \
+             instrument"
+        ),
+    })
+}
+
 fn transports(options: &ExchangeOptions) -> Result<(Box<dyn HttpTransport>, Box<dyn WsTransport>)> {
     let socket = Box::new(ReqwestHttpTransport::new(options)?) as Box<dyn HttpTransport>;
     let http = Box::new(ThrottledTransport::new(socket, RETRY_POLICY)) as Box<dyn HttpTransport>;
@@ -61,6 +112,7 @@ pub fn connect(
     credentials: Credentials,
     options: &ExchangeOptions,
 ) -> Result<Box<dyn Exchange>> {
+    ensure_market_supported(&name.to_ascii_lowercase(), options.market_type)?;
     let (http, ws) = transports(options)?;
 
     let exchange: Box<dyn Exchange> = match name.to_ascii_lowercase().as_str() {
@@ -96,6 +148,7 @@ pub fn connect_derivatives(
     credentials: Credentials,
     options: &ExchangeOptions,
 ) -> Result<Box<dyn Derivatives>> {
+    ensure_market_supported(&name.to_ascii_lowercase(), options.market_type)?;
     let (http, ws) = transports(options)?;
 
     let client: Box<dyn Derivatives> = match name.to_ascii_lowercase().as_str() {
@@ -133,6 +186,7 @@ pub fn connect_advanced(
     credentials: Credentials,
     options: &ExchangeOptions,
 ) -> Result<Box<dyn AdvancedOrders>> {
+    ensure_market_supported(&name.to_ascii_lowercase(), options.market_type)?;
     let (http, ws) = transports(options)?;
 
     let client: Box<dyn AdvancedOrders> = match name.to_ascii_lowercase().as_str() {
@@ -171,6 +225,7 @@ pub fn connect_user_data(
     credentials: Credentials,
     options: &ExchangeOptions,
 ) -> Result<Box<dyn WsUserData>> {
+    ensure_market_supported(&name.to_ascii_lowercase(), options.market_type)?;
     let (http, ws) = transports(options)?;
 
     let client: Box<dyn WsUserData> = match name.to_ascii_lowercase().as_str() {
@@ -211,6 +266,7 @@ pub fn connect_ws_execution(
     credentials: Credentials,
     options: &ExchangeOptions,
 ) -> Result<Box<dyn WsExecution>> {
+    ensure_market_supported(&name.to_ascii_lowercase(), options.market_type)?;
     let (http, ws) = transports(options)?;
 
     let client: Box<dyn WsExecution> = match name.to_ascii_lowercase().as_str() {
@@ -274,6 +330,73 @@ mod tests {
 
     fn futures_opts() -> ExchangeOptions {
         ExchangeOptions::mainnet(MarketType::UsdMFutures)
+    }
+
+    /// A market a client does not route is refused, not quietly replaced.
+    ///
+    /// This is the contract the guard exists for. Before it, a `CoinMFutures`
+    /// client on Binance took the *spot* base URL and the spot order path,
+    /// because `is_futures()` tests `UsdMFutures` alone -- so an order meant for
+    /// a coin-margined contract went to spot, was accepted there, and traded the
+    /// wrong instrument. On Bitget, KuCoin, Gate, HTX and Kraken the same
+    /// request was routed to the USDⓈ-margined endpoints instead, for the
+    /// mirror-image reason: `is_derivatives()` is true for both futures
+    /// variants.
+    #[test]
+    fn a_market_the_client_does_not_route_is_refused() {
+        const COIN_M_ROUTED: [&str; 2] = ["bybit", "okx"];
+        const FUTURES_VENUES: [&str; 8] = [
+            "binance", "bybit", "okx", "bitget", "kucoin", "gateio", "htx", "kraken",
+        ];
+
+        for name in FUTURES_VENUES {
+            let options = ExchangeOptions::mainnet(MarketType::CoinMFutures);
+            let routed = COIN_M_ROUTED.contains(&name);
+            assert_eq!(
+                connect(name, creds(), &options).is_ok(),
+                routed,
+                "{name}: coin-margined futures should be {}",
+                if routed { "routed" } else { "refused" }
+            );
+        }
+
+        // No client signs a margin-account order on any venue, so none accepts
+        // the market. Accepting it meant trading spot under a margin label.
+        for name in FUTURES_VENUES {
+            let options = ExchangeOptions::mainnet(MarketType::Margin);
+            assert!(
+                connect(name, creds(), &options).is_err(),
+                "{name}: margin is not routed by any client and must be refused"
+            );
+        }
+    }
+
+    /// The spot-only venues refuse futures rather than serving spot under a
+    /// futures label.
+    #[test]
+    fn the_spot_only_venues_refuse_futures() {
+        for name in ["coinbase", "upbit"] {
+            let options = ExchangeOptions::mainnet(MarketType::UsdMFutures);
+            assert!(
+                connect(name, creds(), &options).is_err(),
+                "{name} is spot-only and must refuse a futures market"
+            );
+            // Spot still works, which is the point of refusing only the rest.
+            assert!(connect(name, creds(), &opts()).is_ok());
+        }
+    }
+
+    /// The guard covers every entry point, not just `connect`: a caller reaching
+    /// the derivatives, advanced, user-data or ws-execution surface would
+    /// otherwise walk straight past it.
+    #[test]
+    fn every_entry_point_carries_the_guard() {
+        let margin = ExchangeOptions::mainnet(MarketType::Margin);
+        assert!(connect("binance", creds(), &margin).is_err());
+        assert!(connect_derivatives("binance", creds(), &margin).is_err());
+        assert!(connect_advanced("binance", creds(), &margin).is_err());
+        assert!(connect_user_data("binance", creds(), &margin).is_err());
+        assert!(connect_ws_execution("binance", creds(), &margin).is_err());
     }
 
     #[test]

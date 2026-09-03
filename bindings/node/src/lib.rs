@@ -233,6 +233,10 @@ pub struct TickerInfo {
     pub bid: f64,
     pub ask: f64,
     pub volume: f64,
+    /// The venue's own stamp in milliseconds since the Unix epoch, or 0 when
+    /// the venue published none -- never the local clock, since a locally
+    /// stamped quote looks fresh by construction.
+    pub timestamp: i64,
 }
 
 /// A single OHLCV candle.
@@ -645,6 +649,7 @@ impl Exchange {
             bid: to_float(ticker.bid),
             ask: to_float(ticker.ask),
             volume: to_float(ticker.volume),
+            timestamp: ticker.timestamp,
         })
     }
 
