@@ -26,9 +26,9 @@ use rust_decimal::Decimal;
 use wickra_exchange::{
     connect, connect_advanced, connect_derivatives, connect_user_data, connect_ws_execution,
     AdvancedOrders, BookLevel, Credentials, Derivatives, Event, Exchange, ExchangeOptions,
-    MarginMode, MarketType, OcoRequest, Order, OrderRequest, OrderSide, OrderStatus, PaperExchange,
-    Position, PositionMode, PositionSide, ReplayExchange, SelfTradePrevention, Symbol, Ticker,
-    TimeInForce, TradePrint, WsExecution, WsUserData,
+    MarginMode, MarketType, OcoRequest, Order, OrderRequest, OrderSide, OrderStatus, OrderType,
+    PaperExchange, Position, PositionMode, PositionSide, ReplayExchange, SelfTradePrevention,
+    Symbol, Ticker, TimeInForce, TradePrint, WsExecution, WsUserData,
 };
 
 /// Parse a `"BASE/QUOTE"` market string into a [`Symbol`].
@@ -49,9 +49,120 @@ fn to_decimal(value: f64) -> PyResult<Decimal> {
         .ok_or_else(|| PyValueError::new_err(format!("{value} is not a finite number")))
 }
 
+/// A number an order carries, taken exactly wherever Python can be exact.
+///
+/// A `float` holds about fifteen significant digits, and the core holds every
+/// order number in an exact decimal: sent as a float, `12345678.90123456789`
+/// arrives as `12345678.90123457`, which is a different order placed without a
+/// word. Python has `decimal.Decimal` in its standard library and `int` is
+/// unbounded, so both are read exactly, and a `str` is accepted for the same
+/// reason -- it is the one spelling that cannot round on the way in.
+///
+/// A `float` is still accepted, because it is what most callers write and it is
+/// exact for the numbers most callers write. It is converted the way it always
+/// was.
+#[derive(Debug, Clone, Copy)]
+struct OrderNumber(Decimal);
+
+impl<'a, 'py> FromPyObject<'a, 'py> for OrderNumber {
+    type Error = PyErr;
+
+    fn extract(object: pyo3::Borrowed<'a, 'py, PyAny>) -> Result<Self, Self::Error> {
+        let object = &*object;
+        // `bool` is an `int` in Python, and a quantity of `True` is a mistake
+        // rather than a quantity of one.
+        if object.is_instance_of::<pyo3::types::PyBool>() {
+            return Err(PyValueError::new_err(
+                "expected a number, not a bool".to_string(),
+            ));
+        }
+        if let Ok(text) = object.extract::<String>() {
+            return text
+                .parse()
+                .map(OrderNumber)
+                .map_err(|_| PyValueError::new_err(format!("{text:?} is not a decimal number")));
+        }
+        // An `int` is exact and unbounded in Python; a float is neither.
+        if let Ok(integer) = object.extract::<i128>() {
+            return Decimal::from_i128(integer)
+                .map(OrderNumber)
+                .ok_or_else(|| PyValueError::new_err(format!("{integer} does not fit a decimal")));
+        }
+        if let Ok(value) = object.extract::<f64>() {
+            // `decimal.Decimal` also converts to a float, so it is caught
+            // before this by its exact text below -- this is the float path.
+            if !is_python_decimal(object) {
+                return to_decimal(value).map(OrderNumber);
+            }
+        }
+        if is_python_decimal(object) {
+            let text = object.str()?.to_string();
+            return text
+                .parse()
+                .map(OrderNumber)
+                .map_err(|_| PyValueError::new_err(format!("{text:?} is not a finite decimal")));
+        }
+        Err(PyValueError::new_err(
+            "expected a float, int, str or decimal.Decimal".to_string(),
+        ))
+    }
+}
+
+/// Whether this object is a `decimal.Decimal`.
+///
+/// Matched on the type rather than on whether it converts to a float, because
+/// `Decimal` converts to a float perfectly well -- that conversion is the
+/// rounding this exists to avoid.
+fn is_python_decimal(object: &Bound<'_, PyAny>) -> bool {
+    object
+        .get_type()
+        .fully_qualified_name()
+        .is_ok_and(|name| name.to_string_lossy() == "decimal.Decimal")
+}
+
 /// Convert a [`Decimal`] to a Python-facing float.
 fn to_float(value: Decimal) -> f64 {
     value.to_f64().unwrap_or(f64::NAN)
+}
+
+/// The three enums the repr prints, each as the name Python callers pass in.
+///
+/// Wrappers rather than `{:?}`, which would be a `format!` inside a `format!`
+/// and would print the Rust spelling of a value the caller wrote in Python's.
+struct OrderTypeName(OrderType);
+struct TimeInForceName(TimeInForce);
+struct StpName(SelfTradePrevention);
+
+impl fmt::Display for OrderTypeName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self.0 {
+            OrderType::Market => "market",
+            OrderType::Limit => "limit",
+            OrderType::StopMarket => "stop_market",
+            OrderType::StopLimit => "stop_limit",
+        })
+    }
+}
+
+impl fmt::Display for TimeInForceName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self.0 {
+            TimeInForce::Gtc => "GTC",
+            TimeInForce::Ioc => "IOC",
+            TimeInForce::Fok => "FOK",
+        })
+    }
+}
+
+impl fmt::Display for StpName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self.0 {
+            SelfTradePrevention::None => "none",
+            SelfTradePrevention::ExpireMaker => "expire_maker",
+            SelfTradePrevention::ExpireTaker => "expire_taker",
+            SelfTradePrevention::ExpireBoth => "expire_both",
+        })
+    }
 }
 
 fn side_str(side: OrderSide) -> &'static str {
@@ -262,38 +373,30 @@ pub struct PyOrderRequest {
 #[pymethods]
 impl PyOrderRequest {
     #[staticmethod]
-    fn market_buy(market: &str, quantity: f64) -> PyResult<Self> {
+    fn market_buy(market: &str, quantity: OrderNumber) -> PyResult<Self> {
         Ok(Self {
-            inner: OrderRequest::market_buy(parse_symbol(market)?, to_decimal(quantity)?),
+            inner: OrderRequest::market_buy(parse_symbol(market)?, quantity.0),
         })
     }
 
     #[staticmethod]
-    fn market_sell(market: &str, quantity: f64) -> PyResult<Self> {
+    fn market_sell(market: &str, quantity: OrderNumber) -> PyResult<Self> {
         Ok(Self {
-            inner: OrderRequest::market_sell(parse_symbol(market)?, to_decimal(quantity)?),
+            inner: OrderRequest::market_sell(parse_symbol(market)?, quantity.0),
         })
     }
 
     #[staticmethod]
-    fn limit_buy(market: &str, quantity: f64, price: f64) -> PyResult<Self> {
+    fn limit_buy(market: &str, quantity: OrderNumber, price: OrderNumber) -> PyResult<Self> {
         Ok(Self {
-            inner: OrderRequest::limit_buy(
-                parse_symbol(market)?,
-                to_decimal(quantity)?,
-                to_decimal(price)?,
-            ),
+            inner: OrderRequest::limit_buy(parse_symbol(market)?, quantity.0, price.0),
         })
     }
 
     #[staticmethod]
-    fn limit_sell(market: &str, quantity: f64, price: f64) -> PyResult<Self> {
+    fn limit_sell(market: &str, quantity: OrderNumber, price: OrderNumber) -> PyResult<Self> {
         Ok(Self {
-            inner: OrderRequest::limit_sell(
-                parse_symbol(market)?,
-                to_decimal(quantity)?,
-                to_decimal(price)?,
-            ),
+            inner: OrderRequest::limit_sell(parse_symbol(market)?, quantity.0, price.0),
         })
     }
 
@@ -303,10 +406,10 @@ impl PyOrderRequest {
     /// a stop-limit. Without it the four constructors above were the whole
     /// surface, so a stop order -- the one the core has carried since #190 --
     /// could not be expressed from Python at all.
-    fn with_stop_price(&self, stop_price: f64) -> PyResult<Self> {
-        Ok(Self {
-            inner: self.inner.clone().with_stop_price(to_decimal(stop_price)?),
-        })
+    fn with_stop_price(&self, stop_price: OrderNumber) -> Self {
+        Self {
+            inner: self.inner.clone().with_stop_price(stop_price.0),
+        }
     }
 
     /// `"GTC"` (rest until cancelled), `"IOC"` (fill what is possible now,
@@ -374,6 +477,34 @@ impl PyOrderRequest {
         Ok(Self {
             inner: self.inner.clone().with_stp(stp),
         })
+    }
+    /// The request, with its numbers written exactly.
+    ///
+    /// Every other number this binding reports is a `float`, which is the right
+    /// shape for market data and the wrong one for answering "which number is
+    /// in this order". An order kept in an exact decimal that can only be read
+    /// back through a float cannot be checked, so this reads it back as text.
+    fn __repr__(&self) -> String {
+        let request = &self.inner;
+        let optional = |value: Option<Decimal>| {
+            value.map_or_else(|| "None".to_string(), |number| number.to_string())
+        };
+        format!(
+            "OrderRequest(market={}, side={}, type={}, quantity={}, price={}, \
+             stop_price={}, time_in_force={}, client_order_id={:?}, \
+             reduce_only={}, post_only={}, stp={})",
+            request.symbol,
+            side_str(request.side),
+            OrderTypeName(request.order_type),
+            request.quantity,
+            optional(request.price),
+            optional(request.stop_price),
+            TimeInForceName(request.time_in_force),
+            request.client_order_id,
+            request.reduce_only,
+            request.post_only,
+            StpName(request.stp),
+        )
     }
 }
 
@@ -882,20 +1013,20 @@ impl PyAdvancedOrders {
         py: Python<'py>,
         market: &str,
         side: &str,
-        quantity: f64,
-        price: f64,
-        stop_price: f64,
-        stop_limit_price: Option<f64>,
+        quantity: OrderNumber,
+        price: OrderNumber,
+        stop_price: OrderNumber,
+        stop_limit_price: Option<OrderNumber>,
     ) -> PyResult<Vec<Bound<'py, PyDict>>> {
         let mut request = OcoRequest::new(
             parse_symbol(market)?,
             side_from_str(side)?,
-            to_decimal(quantity)?,
-            to_decimal(price)?,
-            to_decimal(stop_price)?,
+            quantity.0,
+            price.0,
+            stop_price.0,
         );
-        if let Some(slp) = stop_limit_price {
-            request = request.with_stop_limit_price(to_decimal(slp)?);
+        if let Some(limit) = stop_limit_price {
+            request = request.with_stop_limit_price(limit.0);
         }
         self.inner
             .place_oco(&request)

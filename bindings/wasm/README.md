@@ -48,6 +48,9 @@ await init();
 const ex = Exchange.paper({ USDT: 100_000 }, 1, 5, 10); // maker/taker/slippage bps
 ex.setPrice("BTC/USDT", 20_000);
 
+// A number is fine; a string is exact, which is what a size with more than
+// about fifteen significant digits needs -- JS has one number type and it is a
+// double.
 const order = ex.placeOrder(OrderRequest.marketBuy("BTC/USDT", 1));
 console.log(order.status, order.averagePrice); // "filled" 20020
 

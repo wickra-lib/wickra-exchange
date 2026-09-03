@@ -13,9 +13,14 @@
 # The order type is derived from which prices are set, so a caller never names
 # it and cannot name one that contradicts the prices given. A stop price
 # promotes the order into its trigger form, matching the Rust builder.
-.wkex_order_type <- function(price, stop_price) {
-  limit <- !is.na(price)
-  if (!is.na(stop_price)) {
+.wkex_order_type <- function(price, stop_price,
+                             price_text = NA_character_,
+                             stop_price_text = NA_character_) {
+  # A price given only as exact text still counts as set: reading the numeric
+  # alone would turn a limit order with an exact price into a *market* order,
+  # which takes whatever the book offers.
+  limit <- !is.na(price) || !is.na(price_text)
+  if (!is.na(stop_price) || !is.na(stop_price_text)) {
     return(if (limit) 3L else 2L)
   }
   if (limit) 1L else 0L
@@ -211,19 +216,33 @@ wkex_place_limit <- function(ex, market, side, quantity, price) {
 #' @param post_only Maker-only: cancelled rather than crossing the spread.
 #' @param stp "none" (the default), "expire_maker", "expire_taker" or
 #'   "expire_both".
+#' @param quantity_text Exact quantity as a string, or `NA` to use `quantity`.
+#'
+#'   R's numeric is a double and holds about fifteen significant digits, where
+#'   this library holds every order number in an exact decimal. Written as a
+#'   number, `12345678.90123456789` becomes `12345678.90123457` -- a different
+#'   order, placed without a word. A string reaches the venue as written.
+#' @param price_text Exact limit price as a string, or `NA` to use `price`.
+#' @param stop_price_text Exact trigger price as a string, or `NA` to use
+#'   `stop_price`.
 #' @return The resulting order as a list.
 #' @export
 wkex_place_order <- function(ex, market, side, quantity,
                              price = NA_real_, stop_price = NA_real_,
                              time_in_force = "gtc", client_order_id = NULL,
                              reduce_only = FALSE, post_only = FALSE,
-                             stp = "none") {
+                             stp = "none", quantity_text = NA_character_,
+                             price_text = NA_character_,
+                             stop_price_text = NA_character_) {
   .wkex_order(.Call(
     C_wkex_place_order, ex$handle, market, .wkex_side(side),
-    .wkex_order_type(price, stop_price), as.numeric(quantity),
+    .wkex_order_type(price, stop_price, price_text, stop_price_text),
+    as.numeric(quantity),
     as.numeric(price), as.numeric(stop_price),
     .wkex_tif(time_in_force), client_order_id,
-    isTRUE(reduce_only), isTRUE(post_only), .wkex_stp(stp)
+    isTRUE(reduce_only), isTRUE(post_only), .wkex_stp(stp),
+    as.character(quantity_text), as.character(price_text),
+    as.character(stop_price_text)
   ))
 }
 
@@ -516,6 +535,11 @@ wkex_place_batch <- function(adv, markets, sides, quantities, prices) {
 #' @param post_onlys Logical vector: maker-only.
 #' @param stps Character vector: "none", "expire_maker", "expire_taker" or
 #'   "expire_both".
+#' @param quantity_texts Character vector of exact quantities, or `NA` per
+#'   element to use the numeric beside it. R's numeric is a double and holds
+#'   about fifteen significant digits; a string reaches the venue as written.
+#' @param price_texts Character vector of exact limit prices, or `NA`.
+#' @param stop_price_texts Character vector of exact trigger prices, or `NA`.
 #' @return A list of results, each `list(order = , error = )`: `order` on success
 #'   or `error` (an integer status code) on a per-order rejection.
 #' @export
@@ -523,14 +547,21 @@ wkex_place_batch_full <- function(adv, markets, sides, quantities,
                                   prices = NA_real_, stop_prices = NA_real_,
                                   times_in_force = "gtc", client_order_ids = NULL,
                                   reduce_onlys = FALSE, post_onlys = FALSE,
-                                  stps = "none") {
+                                  stps = "none", quantity_texts = NA_character_,
+                                  price_texts = NA_character_,
+                                  stop_price_texts = NA_character_) {
   markets <- as.character(markets)
   n <- length(markets)
   rep_to_n <- function(x) rep_len(x, n)
   sides_int <- vapply(rep_to_n(sides), .wkex_side, integer(1), USE.NAMES = FALSE)
   prices <- as.numeric(rep_to_n(prices))
   stop_prices <- as.numeric(rep_to_n(stop_prices))
-  types <- vapply(seq_len(n), function(i) .wkex_order_type(prices[i], stop_prices[i]),
+  quantity_texts <- as.character(rep_to_n(quantity_texts))
+  price_texts <- as.character(rep_to_n(price_texts))
+  stop_price_texts <- as.character(rep_to_n(stop_price_texts))
+  types <- vapply(seq_len(n),
+                  function(i) .wkex_order_type(prices[i], stop_prices[i],
+                                               price_texts[i], stop_price_texts[i]),
                   integer(1), USE.NAMES = FALSE)
   tifs <- vapply(rep_to_n(times_in_force), .wkex_tif, integer(1), USE.NAMES = FALSE)
   stps_int <- vapply(rep_to_n(stps), .wkex_stp, integer(1), USE.NAMES = FALSE)
@@ -540,7 +571,7 @@ wkex_place_batch_full <- function(adv, markets, sides, quantities,
                    as.numeric(rep_to_n(quantities)), prices, stop_prices,
                    as.integer(tifs), ids,
                    as.logical(rep_to_n(reduce_onlys)), as.logical(rep_to_n(post_onlys)),
-                   as.integer(stps_int))
+                   as.integer(stps_int), quantity_texts, price_texts, stop_price_texts)
   lapply(results, function(r) {
     if (!is.null(r$order)) {
       r$order <- .wkex_order(r$order)
@@ -643,19 +674,33 @@ wkex_ws_place_order <- function(wse, market, side, quantity, price = NA_real_) {
 #' @param post_only Maker-only: cancelled rather than crossing the spread.
 #' @param stp "none" (the default), "expire_maker", "expire_taker" or
 #'   "expire_both".
+#' @param quantity_text Exact quantity as a string, or `NA` to use `quantity`.
+#'
+#'   R's numeric is a double and holds about fifteen significant digits, where
+#'   this library holds every order number in an exact decimal. Written as a
+#'   number, `12345678.90123456789` becomes `12345678.90123457` -- a different
+#'   order, placed without a word. A string reaches the venue as written.
+#' @param price_text Exact limit price as a string, or `NA` to use `price`.
+#' @param stop_price_text Exact trigger price as a string, or `NA` to use
+#'   `stop_price`.
 #' @return The resulting order as a list.
 #' @export
 wkex_ws_place_order_full <- function(wse, market, side, quantity,
                                      price = NA_real_, stop_price = NA_real_,
                                      time_in_force = "gtc", client_order_id = NULL,
                                      reduce_only = FALSE, post_only = FALSE,
-                                     stp = "none") {
+                                     stp = "none", quantity_text = NA_character_,
+                                     price_text = NA_character_,
+                                     stop_price_text = NA_character_) {
   .wkex_order(.Call(
     C_wkex_ws_place_order_full, wse$handle, market, .wkex_side(side),
-    .wkex_order_type(price, stop_price), as.numeric(quantity),
+    .wkex_order_type(price, stop_price, price_text, stop_price_text),
+    as.numeric(quantity),
     as.numeric(price), as.numeric(stop_price),
     .wkex_tif(time_in_force), client_order_id,
-    isTRUE(reduce_only), isTRUE(post_only), .wkex_stp(stp)
+    isTRUE(reduce_only), isTRUE(post_only), .wkex_stp(stp),
+    as.character(quantity_text), as.character(price_text),
+    as.character(stop_price_text)
   ))
 }
 

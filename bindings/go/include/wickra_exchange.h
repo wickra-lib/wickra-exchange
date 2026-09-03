@@ -293,6 +293,28 @@ typedef struct {
      * `WICKRA_STP_*`.
      */
     int32_t stp;
+    /**
+     * Exact decimal text for `quantity`, or `NULL` to use the double.
+     *
+     * A `double` holds about fifteen significant digits, and the core keeps
+     * every order number in an exact decimal. Passing `"12345678.90123456789"`
+     * here places that order; passing it as `quantity` places
+     * `12345678.90123457`, which is a different order and says nothing. Where
+     * the caller's language has an exact decimal of its own -- C#'s `decimal`,
+     * Java's `BigDecimal` -- this is the field that carries it across intact.
+     *
+     * When set, it wins over the double beside it, which may be left at any
+     * value.
+     */
+    const char *quantity_text;
+    /**
+     * Exact decimal text for `price`, or `NULL` to use the double.
+     */
+    const char *price_text;
+    /**
+     * Exact decimal text for `stop_price`, or `NULL` to use the double.
+     */
+    const char *stop_price_text;
 } WickraOrderRequest;
 
 /**

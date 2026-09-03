@@ -236,6 +236,25 @@ public final class Exchange implements AutoCloseable {
         req.set(Native.C_BOOL, Native.R_REDUCE_ONLY, (byte) (request.reduceOnly() ? 1 : 0));
         req.set(Native.C_BOOL, Native.R_POST_ONLY, (byte) (request.postOnly() ? 1 : 0));
         req.set(Native.C_INT, Native.R_STP, request.stp().code());
+        // Exact text where the caller gave a BigDecimal, NULL otherwise: the
+        // ABI reads the double beside it when the pointer is null, so a request
+        // built without one behaves exactly as it did.
+        req.set(Native.C_PTR, Native.R_QUANTITY_TEXT,
+                exactText(arena, request.exactQuantity()));
+        req.set(Native.C_PTR, Native.R_PRICE_TEXT, exactText(arena, request.exactPrice()));
+        req.set(Native.C_PTR, Native.R_STOP_PRICE_TEXT,
+                exactText(arena, request.exactStopPrice()));
+    }
+
+    /**
+     * A {@link java.math.BigDecimal} as the text the C ABI reads, or NULL.
+     *
+     * <p>{@code toPlainString} rather than {@code toString}: the latter writes
+     * an exponent for small and large values ({@code 1E-8}), and the ABI reads
+     * a plain decimal.
+     */
+    private static MemorySegment exactText(Arena arena, java.math.BigDecimal value) {
+        return value == null ? MemorySegment.NULL : arena.allocateFrom(value.toPlainString());
     }
 
     public OrderInfo placeOrder(OrderRequest request) {

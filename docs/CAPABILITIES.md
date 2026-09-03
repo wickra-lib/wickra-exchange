@@ -171,6 +171,38 @@ Kraken's trigger rides in a field every limit order also has, so no list of
 spellings could tell the two apart. A venue that gains native trigger orders
 later moves from one branch to the other without the test changing.
 
+### The number an order carries
+
+The core holds every order number in a `Decimal`, which is the point of it: a
+price is the price the caller wrote. All seven bindings then sent it through a
+`double`, which holds about fifteen significant digits. Measured:
+
+| written | arrived as |
+|---------|------------|
+| `12345678.90123456789` | `12345678.90123457` |
+| `123456789012345678` | `123456789012345680` |
+| `0.000000012345678901234567` | `0.00000001234567890123457` |
+
+A different limit, or a different size, placed without a word.
+
+Each binding now takes the exact spelling its own language has — Python's
+`decimal.Decimal`, C#'s `decimal`, Java's `BigDecimal`, and text everywhere
+else, which is what every exchange's own API takes for the same reason. The
+double stays: it is what most callers write, and it is exact for the numbers
+most callers write. Where both are given the exact one wins; where the exact one
+is not a decimal the **order is refused** rather than placed at some other
+number.
+
+`scripts/check_binding_surface.py` holds all seven to it as a fifth axis, beside
+the verbs, the constructors, the configuration and the order paths.
+
+**The way back is still a double.** An order's filled quantity, a ticker, a
+candle, a book level all cross as `f64`. Venues quote well inside fifteen
+significant digits, so this is a bound rather than a loss anyone has measured
+here — but it is a bound, and it is stated rather than left to be found. The
+asymmetry is deliberate: the inbound number is one this library *decides* to
+send, and the outbound one is a report of what the venue already did.
+
 ### The markets a client refuses
 
 `MarketType` names four markets and no client here routes all four. Until

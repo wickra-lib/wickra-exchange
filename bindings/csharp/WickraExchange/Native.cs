@@ -96,6 +96,13 @@ internal static unsafe class Native
         [MarshalAs(UnmanagedType.U1)]
         public bool PostOnly;
         public int Stp;
+        // Exact decimal text, or null to use the double beside it. A double
+        // holds about fifteen significant digits and the core holds every order
+        // number exactly, so these are how a C# `decimal` -- which holds
+        // twenty-eight -- reaches the venue without being rounded on the way.
+        public byte* QuantityText;
+        public byte* PriceText;
+        public byte* StopPriceText;
     }
 
     [StructLayout(LayoutKind.Sequential)]

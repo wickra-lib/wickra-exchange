@@ -79,6 +79,25 @@ fn parse_symbol(market: &str) -> Result<Symbol, JsValue> {
     }
 }
 
+/// An order number, written as a JS number or as an exact string.
+///
+/// JavaScript has one number type and it is a double, which holds about fifteen
+/// significant digits; the core holds every order number in an exact decimal.
+/// Written as a number, `12345678.90123456789` becomes `12345678.90123457` --
+/// a different order. A string is the spelling that reaches it intact, and the
+/// one every exchange's own API uses for the same reason.
+fn order_number(value: &JsValue) -> Result<Decimal, JsValue> {
+    if let Some(text) = value.as_string() {
+        return text
+            .parse()
+            .map_err(|_| err(format!("{text:?} is not a decimal number")));
+    }
+    match value.as_f64() {
+        Some(number) => to_decimal(number),
+        None => Err(err("expected a number or a decimal string".to_string())),
+    }
+}
+
 fn to_decimal(value: f64) -> Result<Decimal, JsValue> {
     Decimal::from_f64(value).ok_or_else(|| err(format!("{value} is not a finite number")))
 }
@@ -247,37 +266,45 @@ pub struct OrderRequest {
 #[wasm_bindgen]
 impl OrderRequest {
     #[wasm_bindgen(js_name = marketBuy)]
-    pub fn market_buy(market: &str, quantity: f64) -> Result<OrderRequest, JsValue> {
+    pub fn market_buy(market: &str, quantity: &JsValue) -> Result<OrderRequest, JsValue> {
         Ok(Self {
-            inner: CoreOrderRequest::market_buy(parse_symbol(market)?, to_decimal(quantity)?),
+            inner: CoreOrderRequest::market_buy(parse_symbol(market)?, order_number(quantity)?),
         })
     }
 
     #[wasm_bindgen(js_name = marketSell)]
-    pub fn market_sell(market: &str, quantity: f64) -> Result<OrderRequest, JsValue> {
+    pub fn market_sell(market: &str, quantity: &JsValue) -> Result<OrderRequest, JsValue> {
         Ok(Self {
-            inner: CoreOrderRequest::market_sell(parse_symbol(market)?, to_decimal(quantity)?),
+            inner: CoreOrderRequest::market_sell(parse_symbol(market)?, order_number(quantity)?),
         })
     }
 
     #[wasm_bindgen(js_name = limitBuy)]
-    pub fn limit_buy(market: &str, quantity: f64, price: f64) -> Result<OrderRequest, JsValue> {
+    pub fn limit_buy(
+        market: &str,
+        quantity: &JsValue,
+        price: &JsValue,
+    ) -> Result<OrderRequest, JsValue> {
         Ok(Self {
             inner: CoreOrderRequest::limit_buy(
                 parse_symbol(market)?,
-                to_decimal(quantity)?,
-                to_decimal(price)?,
+                order_number(quantity)?,
+                order_number(price)?,
             ),
         })
     }
 
     #[wasm_bindgen(js_name = limitSell)]
-    pub fn limit_sell(market: &str, quantity: f64, price: f64) -> Result<OrderRequest, JsValue> {
+    pub fn limit_sell(
+        market: &str,
+        quantity: &JsValue,
+        price: &JsValue,
+    ) -> Result<OrderRequest, JsValue> {
         Ok(Self {
             inner: CoreOrderRequest::limit_sell(
                 parse_symbol(market)?,
-                to_decimal(quantity)?,
-                to_decimal(price)?,
+                order_number(quantity)?,
+                order_number(price)?,
             ),
         })
     }
@@ -285,9 +312,12 @@ impl OrderRequest {
     /// Rest until the market reaches `stopPrice`, then fire: a market order
     /// becomes a stop-loss, a limit order a stop-limit.
     #[wasm_bindgen(js_name = withStopPrice)]
-    pub fn with_stop_price(&self, stop_price: f64) -> Result<OrderRequest, JsValue> {
+    pub fn with_stop_price(&self, stop_price: &JsValue) -> Result<OrderRequest, JsValue> {
         Ok(Self {
-            inner: self.inner.clone().with_stop_price(to_decimal(stop_price)?),
+            inner: self
+                .inner
+                .clone()
+                .with_stop_price(order_number(stop_price)?),
         })
     }
 

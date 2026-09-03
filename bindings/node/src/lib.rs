@@ -18,7 +18,7 @@
 
 use std::collections::HashMap;
 
-use napi::bindgen_prelude::{ClassInstance, Error as NapiError, Status};
+use napi::bindgen_prelude::{ClassInstance, Either, Error as NapiError, Status};
 use napi_derive::napi;
 use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::prelude::ToPrimitive;
@@ -360,6 +360,23 @@ impl Credentials {
 }
 
 /// An order request, built with the market/limit factory methods.
+/// An order number, written as a JS number or as an exact string.
+///
+/// JavaScript has one number type and it is a double, which holds about fifteen
+/// significant digits; the core holds every order number in an exact decimal.
+/// Written as a number, `12345678.90123456789` arrives as `12345678.90123457`,
+/// which is a different order placed without a word. A string is the spelling
+/// that reaches it intact -- and the spelling every exchange's own API uses for
+/// the same reason.
+fn order_number(value: &Either<f64, String>) -> napi::Result<Decimal> {
+    match value {
+        Either::A(number) => to_decimal(*number),
+        Either::B(text) => text
+            .parse()
+            .map_err(|_| napi::Error::from_reason(format!("{text:?} is not a decimal number"))),
+    }
+}
+
 #[napi]
 pub struct OrderRequest {
     inner: CoreOrderRequest,
@@ -368,37 +385,45 @@ pub struct OrderRequest {
 #[napi]
 impl OrderRequest {
     #[napi(factory)]
-    pub fn market_buy(market: String, quantity: f64) -> napi::Result<Self> {
+    pub fn market_buy(market: String, quantity: Either<f64, String>) -> napi::Result<Self> {
         Ok(Self {
-            inner: CoreOrderRequest::market_buy(parse_symbol(&market)?, to_decimal(quantity)?),
+            inner: CoreOrderRequest::market_buy(parse_symbol(&market)?, order_number(&quantity)?),
         })
     }
 
     #[napi(factory)]
-    pub fn market_sell(market: String, quantity: f64) -> napi::Result<Self> {
+    pub fn market_sell(market: String, quantity: Either<f64, String>) -> napi::Result<Self> {
         Ok(Self {
-            inner: CoreOrderRequest::market_sell(parse_symbol(&market)?, to_decimal(quantity)?),
+            inner: CoreOrderRequest::market_sell(parse_symbol(&market)?, order_number(&quantity)?),
         })
     }
 
     #[napi(factory)]
-    pub fn limit_buy(market: String, quantity: f64, price: f64) -> napi::Result<Self> {
+    pub fn limit_buy(
+        market: String,
+        quantity: Either<f64, String>,
+        price: Either<f64, String>,
+    ) -> napi::Result<Self> {
         Ok(Self {
             inner: CoreOrderRequest::limit_buy(
                 parse_symbol(&market)?,
-                to_decimal(quantity)?,
-                to_decimal(price)?,
+                order_number(&quantity)?,
+                order_number(&price)?,
             ),
         })
     }
 
     #[napi(factory)]
-    pub fn limit_sell(market: String, quantity: f64, price: f64) -> napi::Result<Self> {
+    pub fn limit_sell(
+        market: String,
+        quantity: Either<f64, String>,
+        price: Either<f64, String>,
+    ) -> napi::Result<Self> {
         Ok(Self {
             inner: CoreOrderRequest::limit_sell(
                 parse_symbol(&market)?,
-                to_decimal(quantity)?,
-                to_decimal(price)?,
+                order_number(&quantity)?,
+                order_number(&price)?,
             ),
         })
     }
@@ -409,9 +434,12 @@ impl OrderRequest {
     /// a stop-limit. Without it the four factories above were the whole surface,
     /// so a stop order could not be expressed from Node at all.
     #[napi]
-    pub fn with_stop_price(&self, stop_price: f64) -> napi::Result<Self> {
+    pub fn with_stop_price(&self, stop_price: Either<f64, String>) -> napi::Result<Self> {
         Ok(Self {
-            inner: self.inner.clone().with_stop_price(to_decimal(stop_price)?),
+            inner: self
+                .inner
+                .clone()
+                .with_stop_price(order_number(&stop_price)?),
         })
     }
 
@@ -447,6 +475,37 @@ impl OrderRequest {
         }
     }
 
+    /// The request with its numbers written exactly.
+    ///
+    /// Every other number this binding reports is a JS number, which is the
+    /// right shape for market data and the wrong one for answering "which
+    /// number is in this order". An order kept in an exact decimal that can
+    /// only be read back through a double cannot be checked, so this reads it
+    /// back as text.
+    #[napi]
+    #[must_use]
+    pub fn describe(&self) -> String {
+        let request = &self.inner;
+        let optional = |value: Option<Decimal>| {
+            value.map_or_else(|| "None".to_string(), |number| number.to_string())
+        };
+        format!(
+            "OrderRequest(market={}, side={}, type={:?}, quantity={}, price={}, \
+             stopPrice={}, timeInForce={:?}, clientOrderId={:?}, reduceOnly={}, \
+             postOnly={}, stp={:?})",
+            request.symbol,
+            side_str(request.side),
+            request.order_type,
+            request.quantity,
+            optional(request.price),
+            optional(request.stop_price),
+            request.time_in_force,
+            request.client_order_id,
+            request.reduce_only,
+            request.post_only,
+            request.stp,
+        )
+    }
     /// Close-only: the order may not increase a position.
     #[napi]
     #[must_use]
