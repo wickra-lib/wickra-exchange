@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **An order number can now cross every binding boundary exactly.** The core
+  holds every order number in a `Decimal` — that is the point of it — and
+  all seven bindings then sent it through a `double`, which holds about fifteen
+  significant digits.
+
+  Measured: `12345678.90123456789` arrived as `12345678.90123457`, and
+  `123456789012345678` as `123456789012345680`. That is a different order,
+  placed without a word — a different limit, or a different size.
+
+  Each language gets the exact spelling it actually has:
+
+  | Binding | exact spelling |
+  |---------|----------------|
+  | Python | `decimal.Decimal`, `int` (unbounded) or `str`, beside `float` |
+  | Node | a string, beside a number — JS has one number type and it is a double |
+  | C ABI | `quantity_text` / `price_text` / `stop_price_text`, `NULL` to use the double |
+  | C# | `ExactQuantity` / `ExactPrice` / `ExactStopPrice` as `decimal` (28 digits) |
+  | Java | `withExactQuantity` / `withExactPrice` / `withExactStopPrice` as `BigDecimal` |
+  | Go | `QuantityText` / `PriceText` / `StopPriceText` |
+  | R | `quantity_text` / `price_text` / `stop_price_text` |
+
+  Nothing that exists today changes: a request built without them behaves
+  exactly as it did, and the ABI reads the double beside a null pointer. Text
+  that is not a decimal **refuses the order** rather than placing one at some
+  other number.
+
+  Two smaller things fell out of it. Go and R derive the order *type* from which
+  prices are set, and a price given only as exact text has to count as set —
+  otherwise a limit order with an exact price becomes a **market** order, which
+  takes whatever the book offers. And `scripts/check_binding_surface.py` gained
+  a fifth axis, so a binding that cannot say a number exactly fails the check
+  rather than passing quietly.
+
+  **What still crosses as a double:** every number on the way *back* — an
+  order's filled quantity, a ticker, a candle, a book level. Venues quote well
+  inside fifteen digits, so this is a bound rather than an observed loss, and it
+  is stated in `docs/CAPABILITIES.md` rather than left to be discovered.
+
 - **The futures private stream on KuCoin, Gate and HTX.** All three refused it
   rather than watching the wrong account — the honest answer while the stream
   was unimplemented, and the last of those refusals. A futures client now
@@ -256,6 +294,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   return value says rather than recover something lost.
 
 ### Fixed
+
+- **C#'s single-order path built the native struct itself.** `ToNative` says
+  every path that sends an order goes through it, so the fields a batch or a
+  socket frame carries cannot drift from the fields a single order carries —
+  and `PlaceOrder` filled the struct inline instead. Nothing was wrong with what
+  it filled in; it was one edit away from being wrong, which is what the shared
+  seam exists to prevent.
 
 - **HTX's derivatives stream closed itself after thirty seconds.** The
   notification socket pings every five seconds in a form the client did not

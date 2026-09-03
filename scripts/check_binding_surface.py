@@ -396,6 +396,30 @@ CONSTRUCTOR_SIGNATURE = {
     "r": r"wkex_connect <- function\(([^()]*)\)\s*\{",
 }
 
+# The three order numbers, and how each binding spells the exact form of them.
+#
+# The axes above ask whether a field can be named, a path reached, a market
+# chosen. None asks whether the *number* that arrives is the number the caller
+# wrote -- and every binding was sending order numbers through a double, which
+# holds about fifteen significant digits where the core holds an exact decimal.
+# `12345678.90123456789` arrived as `12345678.90123457`: a different order,
+# placed without a word.
+#
+# What "exact" means differs by language and the spellings say so. Python has
+# `decimal.Decimal` and an unbounded `int`; C# has `decimal`; Java has
+# `BigDecimal`; C, Go and R have nothing, so the exact spelling is text. Node
+# has one number type and it is a double, so it is text there too -- which is
+# what every exchange's own API takes, for this reason.
+EXACT_NUMBER_SPELLINGS = {
+    "python": ("ordernumber",),
+    "node": ("order_number", "either<f64, string>"),
+    "c": ("quantity_text", "price_text"),
+    "csharp": ("exactquantity", "exactprice"),
+    "go": ("quantitytext", "pricetext"),
+    "java": ("exactquantity", "exactprice"),
+    "r": ("quantity_text", "price_text"),
+}
+
 AXIS_SPELLINGS = {
     "market": ("market_type", "markettype", "market"),
     "margin_mode": ("margin_mode", "marginmode"),
@@ -467,6 +491,13 @@ def main() -> int:
 
         paths_absent = order_paths(label, haystack, source)
 
+        exact_spellings = EXACT_NUMBER_SPELLINGS[label]
+        exact_absent = (
+            []
+            if present(haystack, exact_spellings)
+            else [f"an exact order number (as {'/'.join(exact_spellings)})"]
+        )
+
         params = constructor_params(label, source)
         if params is None:
             config_absent = ["the exchange constructor could not be located"]
@@ -477,7 +508,8 @@ def main() -> int:
                 if not any(s in params for s in AXIS_SPELLINGS[axis])
             ]
 
-        if absent or ctor_absent or config_absent or fields_absent or paths_absent:
+        if absent or ctor_absent or config_absent or fields_absent or paths_absent \
+                or exact_absent:
             detail = []
             if absent:
                 detail.append("verbs: " + ", ".join(absent))
@@ -489,19 +521,23 @@ def main() -> int:
                 detail.append("order fields: " + ", ".join(fields_absent))
             if paths_absent:
                 detail.append("order paths: " + ", ".join(paths_absent))
+            if exact_absent:
+                detail.append("exact numbers: " + ", ".join(exact_absent))
             failures.append(f"{label}: missing {'; '.join(detail)}")
             print(f"  {label:<8} {len(contract) - len(absent)}/{len(contract)} verbs, "
                   f"{len(CONSTRUCTORS) - len(ctor_absent)}/{len(CONSTRUCTORS)} constructors, "
                   f"{len(CONFIGURATION) - len(config_absent)}/{len(CONFIGURATION)} config, "
                   f"{len(fields) - len(fields_absent)}/{len(fields)} order fields, "
-                  f"{len(ORDER_PATH_SPELLINGS) - len(paths_absent)}/{len(ORDER_PATH_SPELLINGS)} order paths"
+                  f"{len(ORDER_PATH_SPELLINGS) - len(paths_absent)}/{len(ORDER_PATH_SPELLINGS)} order paths, "
+                  f"{1 - len(exact_absent)}/1 exact numbers"
                   f"  MISSING: {'; '.join(detail)}")
         else:
             print(f"  {label:<8} {len(contract)}/{len(contract)} verbs, "
                   f"{len(CONSTRUCTORS)}/{len(CONSTRUCTORS)} constructors, "
                   f"{len(CONFIGURATION)}/{len(CONFIGURATION)} config, "
                   f"{len(fields)}/{len(fields)} order fields, "
-                  f"{len(ORDER_PATH_SPELLINGS)}/{len(ORDER_PATH_SPELLINGS)} order paths")
+                  f"{len(ORDER_PATH_SPELLINGS)}/{len(ORDER_PATH_SPELLINGS)} order paths, "
+                  f"1/1 exact numbers")
 
     if failures:
         print("\nbindings have drifted from the trait contract:", file=sys.stderr)
