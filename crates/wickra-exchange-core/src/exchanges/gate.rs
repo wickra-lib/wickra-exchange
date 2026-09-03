@@ -826,12 +826,121 @@ impl Gate {
         Ok(())
     }
 
+    /// Place a trigger order through Gate's price-order endpoint.
+    ///
+    /// Gate calls these *price* orders and nests them: a `trigger` says when to
+    /// act and a `put` says what to place. Spot and futures use different
+    /// shapes for both halves.
+    ///
+    /// `rule` is the comparison, and Gate will not infer it: `2` is "at or
+    /// below", which is what protects a long, and `1` is "at or above", which
+    /// covers a short. The wrong rule arms the order on the side that never
+    /// comes.
+    ///
+    /// **Gate's spot price order can only place a limit.** A stop-market is
+    /// refused rather than sent with an invented limit price, since that price
+    /// decides how much slippage the caller's stop may take. Futures has no such
+    /// limit: a `price` of `0` there means "take the market".
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the trigger price is missing, if a spot
+    /// stop-market is asked for, or if the request fails.
+    fn place_price_order(&self, request: &OrderRequest) -> Result<Order> {
+        let stop = request
+            .stop_price
+            .ok_or(Error::InvalidOrder("a trigger order requires a stop price"))?;
+        // Selling to protect a long fires on the way down; buying to cover a
+        // short fires on the way up.
+        let rule = match request.side {
+            OrderSide::Sell => 2,
+            OrderSide::Buy => 1,
+        };
+        let (path, body) = if self.is_futures() {
+            let size = decimal_to_contracts(request.quantity)?;
+            let size = match request.side {
+                OrderSide::Buy => size,
+                OrderSide::Sell => -size,
+            };
+            (
+                "/api/v4/futures/usdt/price_orders",
+                serde_json::json!({
+                    "initial": {
+                        "contract": Self::wire_symbol(&request.symbol),
+                        "size": size,
+                        // `0` is Gate's "take the market" on a futures price
+                        // order; a limit is sent as itself.
+                        "price": request.price.map_or_else(
+                            || "0".to_string(),
+                            format_decimal,
+                        ),
+                    },
+                    "trigger": {
+                        "strategy_type": 0,
+                        // 0 is the last traded price; 1 the mark, 2 the index.
+                        "price_type": 0,
+                        "price": format_decimal(stop),
+                        "rule": rule,
+                    },
+                }),
+            )
+        } else {
+            let Some(price) = request.price else {
+                return Err(Error::unsupported_field(
+                    "Gate.io",
+                    "a spot stop-market order",
+                    "Gate's spot price order can only place a limit, and choosing \
+                     one here would decide how much slippage the caller's stop may take",
+                ));
+            };
+            (
+                "/api/v4/spot/price_orders",
+                serde_json::json!({
+                    "market": Self::wire_symbol(&request.symbol),
+                    "trigger": {
+                        "price": format_decimal(stop),
+                        "rule": if rule == 2 { "<=" } else { ">=" },
+                        // Zero is Gate's "no expiry" on a spot price order.
+                        "expiration": 0,
+                    },
+                    "put": {
+                        "type": "limit",
+                        "side": side_str(request.side),
+                        "price": format_decimal(price),
+                        "amount": format_decimal(request.quantity),
+                        "account": "normal",
+                        "time_in_force": "gtc",
+                    },
+                }),
+            )
+        };
+        let value = self.signed_request(HttpMethod::Post, path, "", &body.to_string())?;
+        Ok(Order {
+            id: value
+                .get("id")
+                .map(|id| match id.as_str() {
+                    Some(text) => text.to_string(),
+                    None => id.to_string(),
+                })
+                .unwrap_or_default(),
+            client_order_id: request.client_order_id.clone(),
+            symbol: request.symbol.clone(),
+            side: request.side,
+            order_type: request.order_type,
+            status: OrderStatus::New,
+            quantity: request.quantity,
+            filled_quantity: Decimal::ZERO,
+            price: request.price,
+            average_price: None,
+        })
+    }
+
     pub fn place_order(&self, request: &OrderRequest) -> Result<Order> {
-        if request.order_type.is_trigger() {
-            return Err(Error::unsupported_trigger("Gate.io"));
-        }
         self.ensure_reduce_only_is_reducible(request)?;
         request.validate()?;
+        // A trigger is a different endpoint here, with a different body shape.
+        if request.order_type.is_trigger() {
+            return self.place_price_order(request);
+        }
         if self.is_futures() {
             return self.place_futures_order(request);
         }
@@ -2699,6 +2808,102 @@ mod tests {
         )
         .with_clock(Box::new(move || now_ms));
         (gate, mock)
+    }
+
+    /// A spot trigger goes to the price-order endpoint, whose body nests a
+    /// `trigger` (when to act) inside a `put` (what to place).
+    ///
+    /// `rule` is the comparison and Gate will not infer it: `<=` protects a
+    /// long, `>=` covers a short. The wrong one arms the order on the side that
+    /// never comes.
+    #[test]
+    fn a_spot_trigger_goes_to_the_price_order_endpoint_with_its_rule() {
+        for (side, rule) in [(OrderSide::Sell, "<="), (OrderSide::Buy, ">=")] {
+            let (gate, mock) = signed_client(1_000_000);
+            mock.push_json(200, r#"{"id":77}"#);
+            let request = OrderRequest {
+                order_type: OrderType::StopLimit,
+                stop_price: Some(dec!(19000)),
+                side,
+                ..OrderRequest::limit_sell(symbol(), dec!(1), dec!(18900))
+            };
+            let order = gate.place_order(&request).unwrap();
+            assert_eq!(order.id, "77");
+
+            let sent = &mock.recorded_requests()[0];
+            assert!(
+                sent.url.contains("/api/v4/spot/price_orders"),
+                "{}",
+                sent.url
+            );
+            let body = sent.body.clone().unwrap();
+            assert!(body.contains(r#""price":"19000""#), "{body}");
+            assert!(
+                body.contains(&format!(r#""rule":"{rule}""#)),
+                "a {side:?} stop fires the other way: {body}"
+            );
+            // The limit that gets placed once it fires, not the trigger.
+            assert!(body.contains(r#""price":"18900""#), "{body}");
+        }
+    }
+
+    /// Gate's spot price order can only place a limit.
+    ///
+    /// A stop-market is refused rather than sent with an invented limit price:
+    /// that price is exactly how much slippage the caller's stop is allowed to
+    /// take, and it is not this library's to choose.
+    #[test]
+    fn a_spot_stop_market_is_refused_rather_than_given_an_invented_price() {
+        let (gate, mock) = signed_client(1_000_000);
+        let request = OrderRequest {
+            order_type: OrderType::StopMarket,
+            stop_price: Some(dec!(19000)),
+            ..OrderRequest::market_sell(symbol(), dec!(1))
+        };
+        let err = gate.place_order(&request).unwrap_err();
+        assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
+        assert!(mock.recorded_requests().is_empty());
+    }
+
+    /// Futures has no such limit: `0` there means "take the market", so a
+    /// stop-market is carried rather than refused. Size sits on the initial
+    /// order and is signed by side, the way every other Gate futures order is.
+    #[test]
+    fn a_futures_stop_market_takes_the_market_and_signs_its_size() {
+        let (gate, mock) = signed_futures_client(1_000_000);
+        mock.push_json(200, r#"{"id":78}"#);
+        let request = OrderRequest {
+            order_type: OrderType::StopMarket,
+            stop_price: Some(dec!(19000)),
+            ..OrderRequest::market_sell(symbol(), dec!(1))
+        };
+        gate.place_order(&request).unwrap();
+
+        let sent = &mock.recorded_requests()[0];
+        assert!(
+            sent.url.contains("/api/v4/futures/usdt/price_orders"),
+            "{}",
+            sent.url
+        );
+        let body = sent.body.clone().unwrap();
+        assert!(body.contains(r#""price":"0""#), "{body}");
+        assert!(
+            body.contains(r#""size":-1"#),
+            "a sell is a negative size: {body}"
+        );
+        assert!(body.contains(r#""rule":2"#), "{body}");
+    }
+
+    #[test]
+    fn a_gate_trigger_without_a_stop_price_is_refused() {
+        let (gate, mock) = signed_futures_client(1_000_000);
+        let request = OrderRequest {
+            order_type: OrderType::StopMarket,
+            stop_price: None,
+            ..OrderRequest::market_sell(symbol(), dec!(1))
+        };
+        assert!(gate.place_order(&request).is_err());
+        assert!(mock.recorded_requests().is_empty());
     }
 
     const GATE_ORDER: &str = r#"{"id":"1","text":"","side":"buy","type":"limit","status":"open",

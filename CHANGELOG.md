@@ -9,10 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Native trigger orders on Bybit, Kraken and Coinbase.** Four of the ten
-  venues now carry a stop-loss to the venue instead of refusing it; the other
-  six still refuse rather than flatten, which is the contract that has held
-  since #190.
+- **Native trigger orders on nine of the ten venues.** A stop-loss now reaches
+  every venue that has one, instead of being refused; Upbit, whose order API
+  exposes limit and market only, still refuses rather than flattens — the
+  contract that has held since #190.
 
   Each venue asks for something it will not infer, and each failure is quiet:
 
@@ -30,6 +30,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   * **Coinbase** has no stop-*market*, and this client will not invent the limit
     price one would need — that choice decides how much slippage the caller's
     stop may take. It is refused, and says why.
+
+  Five more place triggers through an endpoint of their own, so the order does
+  not merely gain a field — it goes somewhere else, and comes back shaped
+  differently:
+
+  * **OKX** posts to `order-algo` and answers with an `algoId`, not an `ordId`:
+    a different handle, and the one that has to be given back to cancel it.
+    `slOrdPx` of `-1` is its spelling of "take the market".
+  * **Bitget** names which price arms the order and will not infer it — futures
+    watch `mark_price`, the price a position is liquidated against; spot
+    watches `fill_price`, having no mark.
+  * **KuCoin**'s `stop` is `loss` or `entry`, and they are different orders that
+    happen to share a price: `loss` fires when the market moves against the
+    side, `entry` when it moves with it. Spot serves them from their own path,
+    futures from the ordinary one with a `stopPriceType` of `MP`.
+  * **Gate** nests a `trigger` inside a `put`, with `rule` as the comparison.
+    Its spot price order can only place a limit, so a spot stop-*market* is
+    refused for the same reason Coinbase's is. Futures has no such limit: a
+    price of `0` there means "take the market".
+  * **HTX** splits across endpoint *and* envelope. Spot posts to `/v2/algo-orders`
+    and is addressed by a client order id, so this client always sends one — an
+    unnamed algo order could not be cancelled afterwards. The swap posts to
+    `swap_trigger_order` and spells "take the market" as an order price *type*.
 
   **These are the only wire shapes in this repository not read off the venue.**
   Every other one was; an order body cannot be, since placing one needs
@@ -207,6 +230,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   return value says rather than recover something lost.
 
 ### Fixed
+
+- **HTX read only one of the venue's two response envelopes.** Its v1 and swap
+  endpoints answer `status: ok`; its v2 endpoints answer `code: 200` and carry
+  no `status` at all. Every v2 success was therefore reported as an error with
+  an empty code and an empty message — which is how a successfully placed
+  trigger order looked like a failed one.
 
 - **HTX's WebSocket stream had never delivered a single event.** Every frame HTX
   sends — spot and futures, public and private — is gzip-compressed, and the

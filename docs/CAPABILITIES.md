@@ -85,9 +85,10 @@ drift, and every round of this has found them drifted: the batch path dropping
 what the single path carried, and the WebSocket frame dropping what both
 carried. Each path is now held to the same table rather than to its own.
 
-**Trigger (stop) orders now reach four venues.** `OrderType::StopMarket` and
-`StopLimit` rest until the market reaches `stop_price`, which every venue
-expresses differently and several through a separate endpoint entirely. A venue
+**Trigger (stop) orders now reach nine of the ten venues.**
+`OrderType::StopMarket` and `StopLimit` rest until the market reaches
+`stop_price`, which every venue expresses differently and five of them through a
+separate endpoint entirely. A venue
 that cannot carry the trigger **refuses the order** with `Error::Exchange` code
 `unsupported`, rather than dropping the trigger and placing the plain order
 underneath it — a stop-loss without its trigger executes at once, at the price it
@@ -99,8 +100,12 @@ existed to protect against.
 | Bybit | ✅ `triggerPrice` + `triggerDirection` ¹ | — refused | — refused |
 | Kraken | ✅ `stop-loss` / `stop-loss-limit` ² | — refused | — refused |
 | Coinbase | ✅ `stop_limit_stop_limit_gtc` ³ | n/a | n/a |
-| OKX, Bitget, KuCoin, Gate.io, HTX | — refused ⁴ | — refused | — refused |
-| Upbit | — refused ⁵ | n/a | n/a |
+| OKX | ✅ `order-algo` + `slTriggerPx` ⁴ | — refused | — refused |
+| Bitget | ✅ `place-plan-order` + `triggerType` ⁵ | — refused | — refused |
+| KuCoin | ✅ `stop-order` / `stopPriceType` ⁶ | — refused | — refused |
+| Gate.io | ✅ `price_orders` + `rule` ⁷ | — refused | — refused |
+| HTX | ✅ `algo-orders` / `swap_trigger_order` ⁸ | — refused | — refused |
+| Upbit | — refused ⁹ | n/a | n/a |
 | `PaperExchange` | refused (`Error::InvalidOrder`) | | |
 
 1. Bybit will not infer which way the market must cross the trigger:
@@ -119,10 +124,37 @@ existed to protect against.
    stop-market. A `StopMarket` is refused rather than sent as a stop-limit at an
    invented price, since choosing that price would decide how much slippage the
    caller's stop may take. `stop_direction` is not inferred either.
-4. These five place triggers through a **separate endpoint** — OKX's
-   `order-algo`, Bitget's `place-plan-order`, KuCoin's `stop-order`, Gate's
-   `price_orders`, HTX's `algo-orders` — which this client does not yet call.
-5. Upbit's order API exposes limit and market order types only.
+4. OKX places triggers through `/api/v5/trade/order-algo` as an `ordType` of
+   `conditional`, and answers with an `algoId` rather than an `ordId` — a
+   different handle, from a different endpoint, which is what has to be given
+   back to cancel it. `slOrdPx` of `-1` is OKX's spelling of "take the market",
+   so a stop-market sends that sentinel rather than a price.
+5. Bitget's plan orders name **which price arms them**, and will not infer it:
+   futures watch `mark_price`, the price a position is liquidated against, and
+   spot watches `fill_price`, since spot has no mark. `planType` is
+   `normal_plan` — the other plan types belong to an already-open position
+   rather than to this request.
+6. KuCoin's `stop` says which way the market has to cross the trigger: `loss`
+   fires when the market moves against the side, which is what a stop-loss
+   means, and `entry` fires the other way, which is a breakout entry — a
+   different order that happens to use the same price. Spot serves these from
+   `/api/v1/stop-order`; futures takes them on the ordinary order path with a
+   `stopPriceType` of `MP`, the mark.
+7. Gate nests a `trigger` (when to act) inside a `put` (what to place), and
+   `rule` is the comparison: `<=` protects a long, `>=` covers a short. Its
+   **spot** price order can only place a limit, so a spot stop-market is
+   refused rather than sent with an invented limit price — that price is how
+   much slippage the caller's stop is allowed to take. Futures has no such
+   limit: a price of `0` there means "take the market".
+8. HTX splits them across both endpoint *and* envelope: spot posts to
+   `/v2/algo-orders` and is addressed by a client order id (so one is always
+   sent, since an unnamed algo order could not be cancelled), while the swap
+   posts to `swap_trigger_order` with a `trigger_type` of `le`/`ge` and spells
+   "take the market" as an order price *type* (`optimal_5`) rather than as a
+   price. The v2 endpoints answer `code: 200` and carry no `status` at all —
+   a client reading only the v1 envelope reports every placed algo order as a
+   failure with an empty code and an empty message.
+9. Upbit's order API exposes limit and market order types only.
 
 > **A note on how these were built.** Every other wire shape in this repository
 > was read off the venue's own socket or endpoint. An *order body* cannot be:

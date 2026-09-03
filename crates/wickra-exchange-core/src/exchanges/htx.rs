@@ -34,6 +34,7 @@ use crate::events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
 use crate::feeds::{
     DerivativesChannel, DerivativesFeed, FundingRate, Liquidation, LongShortRatio, OpenInterest,
 };
+use crate::idempotency::ClientIdGenerator;
 use crate::normalize::{format_decimal, parse_decimal};
 use crate::options::{ExchangeOptions, MarginMode, MarketType, SelfTradePrevention};
 use crate::positions::{Position, PositionSide};
@@ -127,6 +128,12 @@ pub struct Htx {
     market_type: MarketType,
     credentials: Option<Credentials>,
     now_ms: Box<dyn Fn() -> i64 + Send + Sync>,
+    /// Client order ids for orders the caller did not name.
+    ///
+    /// A spot algo order is addressed by its client order id -- that is how it
+    /// is cancelled -- so one is always sent, seeded from the clock and
+    /// monotonic from there.
+    client_ids: ClientIdGenerator,
     /// Offset between this machine's clock and the venue's, applied to every
     /// signed timestamp. Zero until [`sync_time`](Self::sync_time) is called.
     clock: ServerClock,
@@ -195,6 +202,10 @@ impl Htx {
             market_type: options.market_type,
             credentials,
             now_ms: Box::new(system_now_ms),
+            client_ids: ClientIdGenerator::with_seed(
+                "wkalgo",
+                u64::try_from(system_now_ms()).unwrap_or(0),
+            ),
             clock: ServerClock::new(),
             connection: None,
             sub_messages: Vec::new(),
@@ -829,12 +840,122 @@ impl Htx {
         Ok(())
     }
 
-    pub fn place_order(&self, request: &OrderRequest) -> Result<Order> {
-        if request.order_type.is_trigger() {
-            return Err(Error::unsupported_trigger("HTX"));
+    /// Place a trigger order through HTX's algo endpoints.
+    ///
+    /// Spot uses `/v2/algo-orders` and the swap `swap_trigger_order`; neither
+    /// takes a trigger on the ordinary order call.
+    ///
+    /// `trigger_type` is the comparison and HTX will not infer it: `le` fires at
+    /// or below the trigger, which protects a long, and `ge` at or above, which
+    /// covers a short. The wrong one arms the order on the side that never
+    /// comes.
+    ///
+    /// The swap path spells "take the market" as an order price type
+    /// (`optimal_5`) rather than as a price, so a stop-market sends that and a
+    /// stop-limit sends `limit` with its price. Spot's algo endpoint takes an
+    /// `orderType` the same way.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the trigger price is missing or the request
+    /// fails.
+    fn place_trigger_order(&self, request: &OrderRequest) -> Result<Order> {
+        let stop = request
+            .stop_price
+            .ok_or(Error::InvalidOrder("a trigger order requires a stop price"))?;
+        let (path, mut body) = if self.is_futures() {
+            let volume = decimal_to_contracts(request.quantity)?;
+            (
+                "/linear-swap-api/v1/swap_trigger_order",
+                serde_json::json!({
+                    "contract_code": Self::contract_code(&request.symbol),
+                    // Selling to protect a long fires on the way down; buying to
+                    // cover a short fires on the way up. The swap asks for the
+                    // comparison outright and will not infer it.
+                    "trigger_type": match request.side {
+                        OrderSide::Sell => "le",
+                        OrderSide::Buy => "ge",
+                    },
+                    "trigger_price": format_decimal(stop),
+                    "volume": volume,
+                    "direction": side_str(request.side),
+                    "offset": if request.reduce_only { "close" } else { "open" },
+                    "lever_rate": self.leverage.get(),
+                    // "Take the market" is an order *price type* here, not a
+                    // price: `optimal_5` sweeps the best five levels.
+                    "order_price_type": if request.price.is_some() {
+                        "limit"
+                    } else {
+                        "optimal_5"
+                    },
+                }),
+            )
+        } else {
+            (
+                "/v2/algo-orders",
+                serde_json::json!({
+                    "accountId": self.account_id()?,
+                    "symbol": Self::wire_symbol(&request.symbol),
+                    // Spot reads the direction off the side rather than taking a
+                    // comparison of its own.
+                    "orderSide": side_str(request.side),
+                    "orderType": order_type_str(request.order_type),
+                    "orderSize": format_decimal(request.quantity),
+                    "stopPrice": format_decimal(stop),
+                    // Mandatory: a spot algo order is cancelled by this id, not
+                    // by an exchange-assigned one, so an unnamed order would be
+                    // unreachable afterwards.
+                    "clientOrderId": request
+                        .client_order_id
+                        .clone()
+                        .unwrap_or_else(|| self.client_ids.next_id()),
+                }),
+            )
+        };
+        // Only a limit trigger has a price. An empty string in the price slot is
+        // not "no price" to either endpoint -- it is a rejected order.
+        if let Some(price) = request.price {
+            let key = if self.is_futures() {
+                "order_price"
+            } else {
+                "orderPrice"
+            };
+            body[key] = serde_json::json!(format_decimal(price));
         }
+        let value = self.signed_request(HttpMethod::Post, path, &[], &body.to_string())?;
+        let data = value
+            .get("data")
+            .ok_or_else(|| Error::Deserialization("missing order data".to_string()))?;
+        // The swap answers with an exchange order id; the spot algo endpoint
+        // echoes back the client order id, which is the only handle it has.
+        let id = data
+            .get("order_id_str")
+            .or_else(|| data.get("order_id"))
+            .or_else(|| data.get("clientOrderId"))
+            .map_or_else(
+                || data.as_str().unwrap_or_default().to_string(),
+                |id| id.as_str().map_or_else(|| id.to_string(), str::to_string),
+            );
+        Ok(Order {
+            id,
+            client_order_id: request.client_order_id.clone(),
+            symbol: request.symbol.clone(),
+            side: request.side,
+            order_type: request.order_type,
+            status: OrderStatus::New,
+            quantity: request.quantity,
+            filled_quantity: Decimal::ZERO,
+            price: request.price,
+            average_price: None,
+        })
+    }
+
+    pub fn place_order(&self, request: &OrderRequest) -> Result<Order> {
         self.ensure_reduce_only_is_reducible(request)?;
         request.validate()?;
+        // A trigger is a different endpoint on both markets.
+        if request.order_type.is_trigger() {
+            return self.place_trigger_order(request);
+        }
         if self.is_futures() {
             return self.place_futures_order(request);
         }
@@ -1287,11 +1408,27 @@ fn map_period(interval: &str) -> String {
     .to_string()
 }
 
+/// Unwrap either of HTX's two response envelopes.
+///
+/// The v1 and swap endpoints answer `{"status":"ok",...}`; the v2 endpoints --
+/// among them the spot algo orders a trigger is placed through -- answer
+/// `{"code":200,"message":"...",...}` and carry no `status` at all. Reading only
+/// the first turns every v2 success into an error with an empty code and an
+/// empty message, which is how a placed trigger order looks like a failed one.
 fn unwrap_status(body: &str) -> Result<serde_json::Value> {
     let value: serde_json::Value =
         serde_json::from_str(body).map_err(|e| Error::Deserialization(e.to_string()))?;
     if value.get("status").and_then(serde_json::Value::as_str) == Some("ok") {
         Ok(value)
+    } else if let Some(code) = value.get("code").and_then(serde_json::Value::as_u64) {
+        if code == 200 {
+            return Ok(value);
+        }
+        let message = value
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        Err(map_error(&code.to_string(), message))
     } else {
         let code = value
             .get("err-code")
@@ -2282,6 +2419,102 @@ mod tests {
         )
         .with_clock(Box::new(move || now_ms));
         (htx, mock)
+    }
+
+    /// A spot trigger goes to the algo endpoint, which is a different path than
+    /// an ordinary spot order and a different envelope in the answer.
+    ///
+    /// It is addressed by its client order id, so one is always sent -- an
+    /// unnamed algo order could not be cancelled afterwards. There is no
+    /// comparison field here: spot reads the direction off the side.
+    #[test]
+    fn a_spot_trigger_goes_to_the_algo_endpoint_and_is_named() {
+        let (htx, mock) = signed_client(1_700_000_000_000);
+        // The account lookup first: a spot algo order carries the account id.
+        mock.push_json(200, r#"{"status":"ok","data":[{"id":42,"type":"spot"}]}"#);
+        // The v2 envelope, which says `code`, not `status`.
+        mock.push_json(200, r#"{"code":200,"data":{"clientOrderId":"a-1"}}"#);
+        let request = OrderRequest {
+            order_type: OrderType::StopMarket,
+            stop_price: Some(dec!(19000)),
+            ..OrderRequest::market_sell(symbol(), dec!(1))
+        };
+        let order = htx.place_order(&request).unwrap();
+        assert_eq!(order.id, "a-1");
+
+        let sent = mock.recorded_requests();
+        let placed = sent.last().unwrap();
+        assert!(placed.url.contains("/v2/algo-orders"), "{}", placed.url);
+        let body = placed.body.clone().unwrap();
+        assert!(body.contains(r#""stopPrice":"19000""#), "{body}");
+        assert!(body.contains(r#""accountId":"42""#), "{body}");
+        assert!(body.contains(r#""orderSide":"sell""#), "{body}");
+        assert!(body.contains(r#""orderType":"market""#), "{body}");
+        assert!(body.contains(r#""clientOrderId":"wkalgo"#), "{body}");
+        // A market trigger has no limit price, and an empty one is not a price.
+        assert!(!body.contains("orderPrice"), "{body}");
+    }
+
+    /// The v2 endpoints answer `code: 200` and carry no `status` at all, so a
+    /// client that reads only the v1 envelope reports every placed algo order as
+    /// a failure with an empty code and an empty message.
+    #[test]
+    fn the_v2_envelope_is_read_as_success_and_its_errors_as_errors() {
+        assert!(unwrap_status(r#"{"code":200,"data":{"clientOrderId":"a"}}"#).is_ok());
+        let err = unwrap_status(r#"{"code":2002,"message":"invalid parameter"}"#).unwrap_err();
+        assert!(matches!(err, Error::Exchange { ref code, .. } if code == "2002"));
+    }
+
+    /// The swap trigger goes to its own endpoint, and spells "take the market"
+    /// as an order price type rather than as a price.
+    #[test]
+    fn a_swap_trigger_goes_to_the_trigger_endpoint_and_names_its_comparison() {
+        let (htx, mock) = signed_futures_client(1_700_000_000_000);
+        mock.push_json(200, r#"{"status":"ok","data":{"order_id":7}}"#);
+        let request = OrderRequest {
+            order_type: OrderType::StopMarket,
+            stop_price: Some(dec!(19000)),
+            ..OrderRequest::market_sell(symbol(), dec!(1))
+        };
+        htx.place_order(&request).unwrap();
+
+        let sent = &mock.recorded_requests()[0];
+        assert!(sent.url.contains("swap_trigger_order"), "{}", sent.url);
+        let body = sent.body.clone().unwrap();
+        assert!(body.contains(r#""trigger_price":"19000""#), "{body}");
+        // Selling to protect a long fires on the way down.
+        assert!(body.contains(r#""trigger_type":"le""#), "{body}");
+        // No price, so the order takes the market -- said as a price *type*.
+        assert!(body.contains(r#""order_price_type":"optimal_5""#), "{body}");
+    }
+
+    /// A limit trigger sends its limit price, and says so.
+    #[test]
+    fn a_swap_stop_limit_carries_its_limit_price() {
+        let (htx, mock) = signed_futures_client(1_700_000_000_000);
+        mock.push_json(200, r#"{"status":"ok","data":{"order_id":8}}"#);
+        let request = OrderRequest {
+            order_type: OrderType::StopLimit,
+            stop_price: Some(dec!(19000)),
+            ..OrderRequest::limit_sell(symbol(), dec!(1), dec!(18900))
+        };
+        htx.place_order(&request).unwrap();
+
+        let body = mock.recorded_requests()[0].body.clone().unwrap();
+        assert!(body.contains(r#""order_price_type":"limit""#), "{body}");
+        assert!(body.contains(r#""order_price":"18900""#), "{body}");
+    }
+
+    #[test]
+    fn an_htx_trigger_without_a_stop_price_is_refused() {
+        let (htx, mock) = signed_futures_client(1_700_000_000_000);
+        let request = OrderRequest {
+            order_type: OrderType::StopMarket,
+            stop_price: None,
+            ..OrderRequest::market_sell(symbol(), dec!(1))
+        };
+        assert!(htx.place_order(&request).is_err());
+        assert!(mock.recorded_requests().is_empty());
     }
 
     fn signed_ws_client(now_ms: i64) -> (Htx, Arc<MockWsTransport>) {

@@ -636,12 +636,84 @@ impl Bitget {
         Ok(())
     }
 
-    pub fn place_order(&self, request: &OrderRequest) -> Result<Order> {
-        if request.order_type.is_trigger() {
-            return Err(Error::unsupported_trigger("Bitget"));
+    /// Place a trigger order through Bitget's plan-order endpoint.
+    ///
+    /// Bitget calls a conditional order a *plan* order and serves it from its
+    /// own path -- `/api/v2/spot/trade/place-plan-order` or the mix equivalent
+    /// -- so the trigger is not a field on the ordinary call.
+    ///
+    /// `triggerType` names **which price arms the stop**, and Bitget will not
+    /// choose: `fill_price` watches the last trade, `mark_price` the mark. On a
+    /// futures position the mark is what liquidates it, so that is what a stop
+    /// there is meant to watch; on spot there is no mark, so the traded price is
+    /// the only honest answer. Leaving it out would take whichever default the
+    /// venue happens to hold.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the trigger price is missing or the request
+    /// fails.
+    fn place_plan_order(&self, request: &OrderRequest) -> Result<Order> {
+        let stop = request
+            .stop_price
+            .ok_or(Error::InvalidOrder("a trigger order requires a stop price"))?;
+        let futures = self.is_futures();
+        let mut body = serde_json::json!({
+            "symbol": Self::wire_symbol(&request.symbol),
+            "side": side_str(request.side),
+            "orderType": order_type_str(request.order_type),
+            "size": format_decimal(request.quantity),
+            "triggerPrice": format_decimal(stop),
+            // The price that arms the stop: the mark on futures, because that
+            // is what a position is liquidated against; the traded price on
+            // spot, where no mark exists.
+            "triggerType": if futures { "mark_price" } else { "fill_price" },
+        });
+        if let Some(price) = request.price {
+            body["executePrice"] = serde_json::json!(format_decimal(price));
         }
+        if let Some(id) = &request.client_order_id {
+            body["clientOid"] = serde_json::json!(id.clone());
+        }
+        let path = if futures {
+            body["productType"] = serde_json::json!("USDT-FUTURES");
+            body["marginCoin"] = serde_json::json!("USDT");
+            body["marginMode"] = serde_json::json!(margin_wire(self.margin_mode));
+            // `normal_plan` is the ordinary trigger. The other plan types are
+            // the position-attached take-profit and stop-loss, which belong to
+            // an open position rather than to this request.
+            body["planType"] = serde_json::json!("normal_plan");
+            if self.position_mode == PositionMode::Hedge {
+                body["tradeSide"] = serde_json::json!(trade_side(request));
+            } else if request.reduce_only {
+                body["reduceOnly"] = serde_json::json!("YES");
+            }
+            "/api/v2/mix/order/place-plan-order"
+        } else {
+            "/api/v2/spot/trade/place-plan-order"
+        };
+        let data = self.signed_request(HttpMethod::Post, path, "", &body.to_string())?;
+        let placed: PlaceResult = parse_json(data)?;
+        Ok(Order {
+            id: placed.order_id,
+            client_order_id: request.client_order_id.clone(),
+            symbol: request.symbol.clone(),
+            side: request.side,
+            order_type: request.order_type,
+            status: OrderStatus::New,
+            quantity: request.quantity,
+            filled_quantity: Decimal::ZERO,
+            price: request.price,
+            average_price: None,
+        })
+    }
+
+    pub fn place_order(&self, request: &OrderRequest) -> Result<Order> {
         self.ensure_reduce_only_is_reducible(request)?;
         request.validate()?;
+        // A trigger is a different endpoint here, not a field on this one.
+        if request.order_type.is_trigger() {
+            return self.place_plan_order(request);
+        }
         let force = force_for(request)?;
         let mut body = serde_json::json!({
             "symbol": Self::wire_symbol(&request.symbol),
@@ -2176,6 +2248,78 @@ mod tests {
         )
         .with_clock(Box::new(move || now_ms));
         (bitget, mock)
+    }
+
+    /// A trigger goes to the plan-order endpoint, and names which price arms it.
+    ///
+    /// `triggerType` is not inferred by the venue. On futures the mark is what
+    /// a position is liquidated against, so that is what a stop there watches;
+    /// on spot there is no mark, so the traded price is the only honest answer.
+    /// Leaving it out would take whichever default the venue happens to hold.
+    #[test]
+    fn a_spot_trigger_goes_to_the_plan_endpoint_and_watches_the_traded_price() {
+        let (bitget, mock) = signed_client(1_700_000_000_000);
+        mock.push_json(
+            200,
+            r#"{"code":"00000","msg":"success","data":{"orderId":"p-1","clientOid":""}}"#,
+        );
+        let request = OrderRequest {
+            order_type: OrderType::StopMarket,
+            stop_price: Some(dec!(19000)),
+            ..OrderRequest::market_sell(symbol(), dec!(1))
+        };
+        Bitget::place_order(&bitget, &request).unwrap();
+
+        let sent = &mock.recorded_requests()[0];
+        assert!(
+            sent.url.contains("/api/v2/spot/trade/place-plan-order"),
+            "{}",
+            sent.url
+        );
+        let body = sent.body.clone().unwrap();
+        assert!(body.contains(r#""triggerPrice":"19000""#), "{body}");
+        assert!(body.contains(r#""triggerType":"fill_price""#), "{body}");
+    }
+
+    #[test]
+    fn a_futures_trigger_watches_the_mark_and_names_its_plan_type() {
+        let (bitget, mock) = signed_futures_client(1_700_000_000_000);
+        mock.push_json(
+            200,
+            r#"{"code":"00000","msg":"success","data":{"orderId":"p-2","clientOid":""}}"#,
+        );
+        let request = OrderRequest {
+            order_type: OrderType::StopLimit,
+            stop_price: Some(dec!(19000)),
+            ..OrderRequest::limit_sell(symbol(), dec!(1), dec!(18900))
+        };
+        Bitget::place_order(&bitget, &request).unwrap();
+
+        let sent = &mock.recorded_requests()[0];
+        assert!(
+            sent.url.contains("/api/v2/mix/order/place-plan-order"),
+            "{}",
+            sent.url
+        );
+        let body = sent.body.clone().unwrap();
+        assert!(body.contains(r#""triggerType":"mark_price""#), "{body}");
+        // `normal_plan` is the ordinary trigger; the other plan types belong to
+        // an already-open position rather than to this request.
+        assert!(body.contains(r#""planType":"normal_plan""#), "{body}");
+        assert!(body.contains(r#""executePrice":"18900""#), "{body}");
+        assert!(body.contains(r#""productType":"USDT-FUTURES""#), "{body}");
+    }
+
+    #[test]
+    fn a_bitget_trigger_without_a_stop_price_is_refused() {
+        let (bitget, mock) = signed_client(1_700_000_000_000);
+        let request = OrderRequest {
+            order_type: OrderType::StopMarket,
+            stop_price: None,
+            ..OrderRequest::market_sell(symbol(), dec!(1))
+        };
+        assert!(Bitget::place_order(&bitget, &request).is_err());
+        assert!(mock.recorded_requests().is_empty());
     }
 
     const MIX_POSITIONS: &str = r#"{"code":"00000","msg":"success","data":[
