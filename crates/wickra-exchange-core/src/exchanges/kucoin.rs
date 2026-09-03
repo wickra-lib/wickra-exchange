@@ -565,8 +565,11 @@ impl KuCoin {
     /// Open the private user-data stream. Negotiates a bullet-private token over
     /// REST (`POST /api/v1/bullet-private`, signed), connects the returned
     /// instance endpoint (`<endpoint>?token=<token>&connectId=<id>`), then
-    /// subscribes to the `/spotMarket/tradeOrders` and `/account/balance` private
-    /// channels. Afterwards [`poll_events`](Self::poll_events) also surfaces the
+    /// subscribes to the account's own order and balance channels -- on spot
+    /// `/spotMarket/tradeOrders` and `/account/balance`, on futures
+    /// `/contractMarket/tradeOrders` and `/contractAccount/wallet`. A futures
+    /// client negotiates its token against the futures host, which serves the
+    /// same `/api/v1/bullet-private` path. Afterwards [`poll_events`](Self::poll_events) also surfaces the
     /// account's own [`Event::OrderUpdate`] and [`Event::BalanceUpdate`].
     ///
     /// The bullet token expires;
@@ -580,18 +583,15 @@ impl KuCoin {
     /// [`Error`] if the token negotiation or subscription fails.
     pub fn subscribe_user_data(&mut self) -> Result<()> {
         self.ensure_market_is_routed()?;
-        // The stream below is the venue's *spot* private feed. A futures client
-        // would watch the spot account, where its own futures orders never
-        // appear -- so it would wait for fills that cannot arrive, with nothing
-        // to say why. Refused until this client speaks the venue's futures
-        // private stream.
-        if self.is_futures() {
-            return Err(Error::unsupported_field(
-                "KuCoin",
-                "a private user-data stream on a futures client",
-                "KuCoin Futures streams private events from `ws-api-futures.kucoin.com` with `/contractAccount` topics, which this client does not implement",
-            ));
-        }
+        // Spot and futures are separate accounts on separate hosts: a futures
+        // order never appears in the spot account, so watching the wrong one is
+        // waiting for a fill that cannot arrive. `rest_base` already points at
+        // the market's host, and both serve the same negotiation path.
+        let (orders_topic, account_topic) = if self.is_futures() {
+            ("/contractMarket/tradeOrders", "/contractAccount/wallet")
+        } else {
+            ("/spotMarket/tradeOrders", "/account/balance")
+        };
         let data = self.signed_request(HttpMethod::Post, "/api/v1/bullet-private", "", "")?;
         let bullet: BulletToken = parse_json(data)?;
         let server = bullet.instance_servers.into_iter().next().ok_or_else(|| {
@@ -603,10 +603,10 @@ impl KuCoin {
             server.endpoint, bullet.token
         );
         let orders = format!(
-            r#"{{"id":"{connect_id}","type":"subscribe","topic":"/spotMarket/tradeOrders","privateChannel":true,"response":true}}"#
+            r#"{{"id":"{connect_id}","type":"subscribe","topic":"{orders_topic}","privateChannel":true,"response":true}}"#
         );
         let account = format!(
-            r#"{{"id":"{}","type":"subscribe","topic":"/account/balance","privateChannel":true,"response":true}}"#,
+            r#"{{"id":"{}","type":"subscribe","topic":"{account_topic}","privateChannel":true,"response":true}}"#,
             connect_id + 1
         );
         let ws = self.ws.as_ref().ok_or(Error::NotConnected)?;
@@ -1268,6 +1268,17 @@ fn parse_ws_message(
         })))
     } else if topic == "/spotMarket/tradeOrders" {
         Ok(Some(Event::OrderUpdate(ws_order_from_data(data)?)))
+    } else if topic == "/contractMarket/tradeOrders" {
+        Ok(Some(Event::OrderUpdate(futures_order_from_data(data)?)))
+    } else if topic == "/contractAccount/wallet" {
+        // One currency per frame, the way the spot balance channel sends it.
+        // `holdBalance` is the margin already committed to open orders and
+        // positions, which is what `locked` means everywhere else here.
+        Ok(Some(Event::BalanceUpdate(vec![Balance {
+            asset: field_str(data, "currency")?.to_string(),
+            free: dec_or_zero(opt_str(data, "availableBalance")),
+            locked: dec_or_zero(opt_str(data, "holdBalance")),
+        }])))
     } else if topic == "/account/balance" {
         Ok(Some(Event::BalanceUpdate(vec![Balance {
             asset: field_str(data, "currency")?.to_string(),
@@ -1277,6 +1288,73 @@ fn parse_ws_message(
     } else {
         Ok(None)
     }
+}
+
+/// Turn a KuCoin **futures** contract symbol back into a [`Symbol`].
+///
+/// `XBTUSDTM` -> `BTC/USDT`: KuCoin spells Bitcoin `XBT` and marks the
+/// perpetual with a trailing `M`. The private order stream carries this form
+/// and is not subscribed per symbol, so there is no subscription to look the
+/// symbol up in -- it has to be read back out of the wire name.
+fn futures_symbol_from_wire(wire: &str) -> Symbol {
+    let stem = wire.strip_suffix('M').unwrap_or(wire);
+    // Longest first: `USDT` and `USDC` both end in a quote that is also a quote.
+    let quote = ["USDT", "USDC", "USD"]
+        .into_iter()
+        .find(|q| stem.len() > q.len() && stem.ends_with(q));
+    let Some(quote) = quote else {
+        return Symbol::new(stem, "");
+    };
+    let base = &stem[..stem.len() - quote.len()];
+    let base = if base == "XBT" { "BTC" } else { base };
+    Symbol::new(base, quote)
+}
+
+/// Map a `/contractMarket/tradeOrders` status to an [`OrderStatus`].
+///
+/// The futures channel says less than the spot one: `done` covers both a fill
+/// and a cancel, and only the event `type` separates them. Reading `status`
+/// alone would report every cancelled order as filled.
+fn futures_order_status(status: &str, event_type: &str) -> OrderStatus {
+    match (status, event_type) {
+        (_, "canceled") => OrderStatus::Canceled,
+        ("match", _) => OrderStatus::PartiallyFilled,
+        ("done", _) | (_, "filled") => OrderStatus::Filled,
+        _ => OrderStatus::New,
+    }
+}
+
+/// Build an [`Order`] from a `/contractMarket/tradeOrders` message payload.
+fn futures_order_from_data(data: &serde_json::Value) -> Result<Order> {
+    let client_oid = opt_str(data, "clientOid");
+    Ok(Order {
+        id: field_str(data, "orderId")?.to_string(),
+        client_order_id: (!client_oid.is_empty()).then(|| client_oid.to_string()),
+        symbol: futures_symbol_from_wire(field_str(data, "symbol")?),
+        side: parse_side(field_str(data, "side")?)?,
+        order_type: parse_order_type(field_str(data, "orderType")?)?,
+        status: futures_order_status(opt_str(data, "status"), opt_str(data, "type")),
+        // Futures sizes are contract counts and arrive as numbers, not strings.
+        quantity: number_or_string(data, "size"),
+        filled_quantity: number_or_string(data, "filledSize"),
+        price: nonzero_decimal(opt_str(data, "price")),
+        average_price: None,
+    })
+}
+
+/// Read a field the futures stream may send as either a number or a string.
+fn number_or_string(data: &serde_json::Value, key: &str) -> Decimal {
+    data.get(key).map_or(Decimal::ZERO, |value| {
+        value.as_str().map_or_else(
+            || {
+                value
+                    .as_i64()
+                    .and_then(|n| parse_decimal(&n.to_string()).ok())
+                    .unwrap_or(Decimal::ZERO)
+            },
+            |text| parse_decimal(text).unwrap_or(Decimal::ZERO),
+        )
+    })
 }
 
 /// Map a `/spotMarket/tradeOrders` status (with the event `type` disambiguating a
@@ -2188,6 +2266,141 @@ mod tests {
         .with_ws(Box::new(ArcWs(Arc::clone(&ws))))
         .with_clock(Box::new(move || now_ms));
         (kucoin, http, ws)
+    }
+
+    /// The same client on the futures host, which is a separate account with
+    /// separate topics.
+    fn signed_futures_ws_client(
+        now_ms: i64,
+    ) -> (KuCoin, Arc<MockHttpTransport>, Arc<MockWsTransport>) {
+        let http = Arc::new(MockHttpTransport::new());
+        let ws = Arc::new(MockWsTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::UsdMFutures);
+        let kucoin = KuCoin::with_credentials(
+            Box::new(ArcTransport(Arc::clone(&http))),
+            &opts,
+            Credentials::new("APIKEY", "SECRET").with_passphrase("PASS"),
+        )
+        .with_ws(Box::new(ArcWs(Arc::clone(&ws))))
+        .with_clock(Box::new(move || now_ms));
+        (kucoin, http, ws)
+    }
+    /// A futures client watches the futures account, not the spot one.
+    ///
+    /// Its own orders never appear in the spot account, so subscribing there is
+    /// waiting for a fill that cannot arrive. The negotiation is the same call
+    /// on the futures host, which was verified live: `bullet-public` on
+    /// `api-futures.kucoin.com` answers with an instance server.
+    #[test]
+    fn a_futures_client_subscribes_to_the_contract_account_not_the_spot_one() {
+        let (mut kucoin, http, ws) = signed_futures_ws_client(1_700_000_000_000);
+        http.push_json(
+            200,
+            r#"{"code":"200000","data":{"token":"t","instanceServers":[{"endpoint":"wss://ws-api-futures.kucoin.com/"}]}}"#,
+        );
+        kucoin.subscribe_user_data().unwrap();
+
+        let negotiated = &http.recorded_requests()[0];
+        assert!(
+            negotiated.url.starts_with("https://api-futures.kucoin.com"),
+            "{}",
+            negotiated.url
+        );
+        assert!(negotiated.url.contains("/api/v1/bullet-private"));
+        let sent = ws.sent();
+        assert!(
+            sent[0].contains("/contractMarket/tradeOrders"),
+            "{}",
+            sent[0]
+        );
+        assert!(sent[1].contains("/contractAccount/wallet"), "{}", sent[1]);
+        assert!(
+            !sent.iter().any(|frame| frame.contains("/spotMarket/")),
+            "a futures client subscribed to a spot topic: {sent:?}"
+        );
+    }
+
+    /// The futures order frame names the contract, not the pair, and says less
+    /// than the spot one: `done` covers a fill and a cancel alike.
+    #[test]
+    fn a_contract_order_frame_becomes_an_order_update() {
+        let (mut kucoin, http, ws) = signed_futures_ws_client(1_700_000_000_000);
+        http.push_json(
+            200,
+            r#"{"code":"200000","data":{"token":"t","instanceServers":[{"endpoint":"wss://ws-api-futures.kucoin.com/"}]}}"#,
+        );
+        ws.push_connection(vec![Ok(Some(
+            r#"{"type":"message","topic":"/contractMarket/tradeOrders","subject":"symbolOrderChange",
+                "data":{"orderId":"f-1","symbol":"XBTUSDTM","type":"canceled","status":"done",
+                        "side":"sell","orderType":"limit","size":3,"filledSize":1,
+                        "price":"19000","clientOid":"mine"}}"#
+                .to_string(),
+        ))]);
+        kucoin.subscribe_user_data().unwrap();
+
+        let events = kucoin.poll_events();
+        let Some(Event::OrderUpdate(order)) = events.first() else {
+            panic!("expected an order update, got {events:?}");
+        };
+        assert_eq!(order.id, "f-1");
+        // `XBTUSDTM` is BTC/USDT: KuCoin spells Bitcoin XBT and marks the
+        // perpetual with a trailing M.
+        assert_eq!(order.symbol, Symbol::new("BTC", "USDT"));
+        // `done` with a `canceled` type is a cancel; reading the status alone
+        // would report it as filled.
+        assert_eq!(order.status, OrderStatus::Canceled);
+        assert_eq!(order.quantity, dec!(3));
+        assert_eq!(order.filled_quantity, dec!(1));
+        assert_eq!(order.client_order_id.as_deref(), Some("mine"));
+    }
+
+    #[test]
+    fn a_contract_wallet_frame_becomes_a_balance_update() {
+        let (mut kucoin, http, ws) = signed_futures_ws_client(1_700_000_000_000);
+        http.push_json(
+            200,
+            r#"{"code":"200000","data":{"token":"t","instanceServers":[{"endpoint":"wss://ws-api-futures.kucoin.com/"}]}}"#,
+        );
+        ws.push_connection(vec![Ok(Some(
+            r#"{"type":"message","topic":"/contractAccount/wallet","subject":"availableBalance.change",
+                "data":{"currency":"USDT","availableBalance":"120.5","holdBalance":"9.5"}}"#
+                .to_string(),
+        ))]);
+        kucoin.subscribe_user_data().unwrap();
+
+        let events = kucoin.poll_events();
+        let Some(Event::BalanceUpdate(balances)) = events.first() else {
+            panic!("expected a balance update, got {events:?}");
+        };
+        assert_eq!(balances[0].asset, "USDT");
+        assert_eq!(balances[0].free, dec!(120.5));
+        // Margin committed to open orders and positions is locked, not free.
+        assert_eq!(balances[0].locked, dec!(9.5));
+    }
+
+    /// A futures contract name maps back to the pair it was built from, and an
+    /// unknown one is not silently turned into a pair that does not exist.
+    #[test]
+    fn a_contract_name_maps_back_to_its_pair() {
+        assert_eq!(
+            futures_symbol_from_wire("XBTUSDTM"),
+            Symbol::new("BTC", "USDT")
+        );
+        assert_eq!(
+            futures_symbol_from_wire("ETHUSDCM"),
+            Symbol::new("ETH", "USDC")
+        );
+        assert_eq!(
+            futures_symbol_from_wire("XBTUSDM"),
+            Symbol::new("BTC", "USD")
+        );
+        // Round-trips with the name the client sends.
+        assert_eq!(
+            futures_symbol_from_wire(&KuCoin::futures_symbol(&Symbol::new("SOL", "USDT"))),
+            Symbol::new("SOL", "USDT")
+        );
+        // Nothing recognisable: kept whole rather than split at a guess.
+        assert_eq!(futures_symbol_from_wire("WEIRD"), Symbol::new("WEIRD", ""));
     }
 
     #[test]
