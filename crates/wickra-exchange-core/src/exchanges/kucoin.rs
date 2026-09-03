@@ -439,6 +439,18 @@ impl KuCoin {
     /// [`Error::NotConnected`] without a WebSocket transport, or another
     /// [`Error`] if the token negotiation or subscription fails.
     pub fn subscribe_user_data(&mut self) -> Result<()> {
+        // The stream below is the venue's *spot* private feed. A futures client
+        // would watch the spot account, where its own futures orders never
+        // appear -- so it would wait for fills that cannot arrive, with nothing
+        // to say why. Refused until this client speaks the venue's futures
+        // private stream.
+        if self.is_futures() {
+            return Err(Error::unsupported_field(
+                "KuCoin",
+                "a private user-data stream on a futures client",
+                "KuCoin Futures streams private events from `ws-api-futures.kucoin.com` with `/contractAccount` topics, which this client does not implement",
+            ));
+        }
         let data = self.signed_request(HttpMethod::Post, "/api/v1/bullet-private", "", "")?;
         let bullet: BulletToken = parse_json(data)?;
         let server = bullet.instance_servers.into_iter().next().ok_or_else(|| {

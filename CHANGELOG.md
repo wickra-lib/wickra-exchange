@@ -96,6 +96,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "not implemented here" can fall back to the REST reads, while a caller handed
   the wrong market's book has no way to tell.
 
+  **The private stream had the same defect**, on KuCoin, Gate and HTX: a futures
+  client watching its own fills subscribed to the spot account, where a futures
+  order never appears. It would have waited for fills that could not arrive,
+  with nothing reporting an error. Those three refuse too. Kraken was already
+  correct — `subscribe_user_data` dispatches to `subscribe_user_data_futures` —
+  and Bitget's now names its market.
+
   `a_futures_client_never_subscribes_to_a_spot_stream` holds all eight to it —
   carried on the market the client is on, or refused, never quietly something
   else. That is the trigger contract applied to the streams, and no test had

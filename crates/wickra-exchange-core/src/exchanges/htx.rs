@@ -512,6 +512,18 @@ impl Htx {
     /// [`Error::NotConnected`] without a WebSocket transport, or another
     /// [`Error`] if the request fails.
     pub fn subscribe_user_data(&mut self) -> Result<()> {
+        // The stream below is the venue's *spot* private feed. A futures client
+        // would watch the spot account, where its own futures orders never
+        // appear -- so it would wait for fills that cannot arrive, with nothing
+        // to say why. Refused until this client speaks the venue's futures
+        // private stream.
+        if self.is_futures() {
+            return Err(Error::unsupported_field(
+                "HTX",
+                "a private user-data stream on a futures client",
+                "HTX's futures private stream is `api.hbdm.com/linear-swap-notification`, which this client does not implement",
+            ));
+        }
         let creds = self.credentials.as_ref().ok_or(Error::InvalidCredentials(
             "user-data stream requires credentials",
         ))?;

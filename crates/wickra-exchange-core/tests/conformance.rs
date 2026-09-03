@@ -1190,6 +1190,48 @@ fn a_futures_client_never_subscribes_to_a_spot_stream() {
             frame: None
         }
     );
+
+    // The private stream has the same rule, and was wrong on the same venues. A
+    // futures client watching the spot account waits for fills that cannot
+    // arrive: its own orders never appear there, and nothing reports an error.
+    macro_rules! private {
+        ($name:literal, $venue:ident, $refuses:literal) => {{
+            let http = Arc::new(MockHttpTransport::new());
+            let ws = Arc::new(MockWsTransport::new());
+            let mut client = $venue::with_credentials(
+                Box::new(ArcTransport(Arc::clone(&http))),
+                &options,
+                Credentials::new("APIKEY", "c2VjcmV0").with_passphrase("PASS"),
+            )
+            .with_ws(Box::new(ArcWs(Arc::clone(&ws))));
+            let outcome = WsUserData::subscribe_user_data(&mut client);
+            let refused = matches!(
+                &outcome,
+                Err(Error::Exchange { code, .. }) if code == "unsupported"
+            );
+            assert_eq!(
+                refused, $refuses,
+                "{}: a futures client's private stream must {} here",
+                $name,
+                if $refuses { "refuse" } else { "reach the futures account" }
+            );
+            if refused {
+                assert!(
+                    ws.sent().is_empty(),
+                    "{}: refused, yet sent a subscribe frame",
+                    $name
+                );
+            }
+        }};
+    }
+
+    private!("KuCoin", KuCoin, true);
+    private!("Gate.io", Gate, true);
+    private!("HTX", Htx, true);
+    // Kraken already routes here: `subscribe_user_data` dispatches to
+    // `subscribe_user_data_futures`, which is the rule being kept rather than
+    // an exception to it.
+    private!("Kraken", Kraken, false);
 }
 
 /// Two fields that a venue spells in *one* slot are refused together, never
