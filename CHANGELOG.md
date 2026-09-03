@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Gate futures market data streams.** The second of the four. Both the host
+  and the channel prefix follow the market: `fx-ws.gateio.ws` with `futures.`
+  channels rather than `api.gateio.ws` with `spot.` ones, and the book channel
+  takes an interval and a depth beside the contract where the spot one takes the
+  pair alone.
+
+  A futures trade carries **no side field** — its `size` is signed, and negative
+  means the aggressor sold. The quantity reported is the magnitude, since a
+  quantity is not negative, and the side comes from the sign. Sizes stay in
+  contracts, which is the unit this client's futures order path already takes.
+
+  The futures ticker publishes no top of book, so bid and ask stay zero rather
+  than being invented from the last price. The book channel is where those live.
+
 - **Kraken Futures market data streams.** The first of the four venues #206 left
   refusing rather than serving spot. Kraken Futures is not the spot v2 socket
   with different names — it is a different service: another host, `{"event":

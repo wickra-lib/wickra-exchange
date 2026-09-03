@@ -1170,7 +1170,7 @@ fn a_futures_client_never_subscribes_to_a_spot_stream() {
         "Gate.io",
         Gate,
         Expected {
-            url: None,
+            url: Some("fx-ws.gateio.ws"),
             frame: None
         }
     );

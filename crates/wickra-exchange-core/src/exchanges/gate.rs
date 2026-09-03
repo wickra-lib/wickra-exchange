@@ -346,28 +346,37 @@ impl Gate {
     }
 
     fn subscribe(&mut self, symbol: &Symbol, channel: &str) -> Result<()> {
-        // The socket below is the venue's *spot* stream. A futures client
-        // reading futures over REST would be handed the spot book, the spot
-        // trades and the spot quote -- a different instrument at a different
-        // price, with nothing to say so. Refused until this client speaks the
-        // venue's futures stream.
-        if self.is_futures() {
-            return Err(Error::unsupported_field(
-                "Gate.io",
-                "a market-data subscription on a futures client",
-                "Gate's futures stream is `fx-ws.gateio.ws` with `futures.` channels, which this client does not implement",
-            ));
-        }
-
+        // Gate serves spot and futures from different hosts with differently
+        // named channels, so both follow the market the client is on. The
+        // channel arrives spelled `spot.<name>`; on a futures client the prefix
+        // is swapped rather than the call sites being duplicated.
+        let futures = self.is_futures();
+        let channel = if futures {
+            &channel.replace("spot.", "futures.")
+        } else {
+            channel
+        };
         let wire = Self::wire_symbol(symbol);
         if self.connection.is_none() {
             let ws = self.ws.as_ref().ok_or(Error::NotConnected)?;
-            let connection = ws.connect("wss://api.gateio.ws/ws/v4/")?;
+            let url = if futures {
+                FUTURES_WS_URL
+            } else {
+                "wss://api.gateio.ws/ws/v4/"
+            };
+            let connection = ws.connect(url)?;
             self.connection = Some(connection);
         }
         let time = self.signed_now_ms() / 1000;
+        // `futures.order_book_update` needs an interval and a depth beside the
+        // contract; the other channels take the contract alone.
+        let payload = if channel == "futures.order_book_update" {
+            format!(r#""{wire}","100ms","20""#)
+        } else {
+            format!(r#""{wire}""#)
+        };
         let message = format!(
-            r#"{{"time":{time},"channel":"{channel}","event":"subscribe","payload":["{wire}"]}}"#
+            r#"{{"time":{time},"channel":"{channel}","event":"subscribe","payload":[{payload}]}}"#
         );
         self.connection
             .as_mut()
@@ -1246,6 +1255,54 @@ fn parse_ws_levels(value: Option<&serde_json::Value>) -> Result<Vec<BookLevel>> 
         .collect()
 }
 
+/// Gate's futures WebSocket.
+const FUTURES_WS_URL: &str = "wss://fx-ws.gateio.ws/v4/ws/usdt";
+
+/// A signed contract size from a futures frame.
+///
+/// Gate's futures trades carry no side field: the size is signed, and negative
+/// means the aggressor sold. Sizes are in contracts, which is the unit this
+/// client's futures order path already takes -- `decimal_to_contracts` rounds a
+/// quantity to whole contracts rather than converting from base units, so the
+/// stream and the order path speak the same number.
+fn futures_signed_size(value: &serde_json::Value, key: &str) -> Option<(Decimal, OrderSide)> {
+    let raw = value.get(key)?;
+    let text = raw
+        .as_str()
+        .map(ToString::to_string)
+        .or_else(|| raw.as_i64().map(|n| n.to_string()))?;
+    let size = parse_decimal(&text).ok()?;
+    let side = if size.is_sign_negative() {
+        OrderSide::Sell
+    } else {
+        OrderSide::Buy
+    };
+    Some((size.abs(), side))
+}
+
+/// `[{p, s}]` levels from a futures book frame. A size of zero removes the
+/// level, which is what the delta type already means.
+fn futures_levels(value: Option<&serde_json::Value>) -> Vec<BookLevel> {
+    value
+        .and_then(serde_json::Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| {
+                    let size = row.get("s")?;
+                    let size = size
+                        .as_str()
+                        .map(ToString::to_string)
+                        .or_else(|| size.as_i64().map(|n| n.to_string()))?;
+                    Some(BookLevel {
+                        price: parse_decimal(row.get("p")?.as_str()?).ok()?,
+                        quantity: parse_decimal(&size).ok()?,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Vec<Event>> {
     let value: serde_json::Value =
         serde_json::from_str(text).map_err(|e| Error::Deserialization(e.to_string()))?;
@@ -1259,6 +1316,79 @@ fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Vec
     let result = value.get("result").unwrap_or(&null);
 
     match channel {
+        // A futures trade frame is a list, and its size is signed rather than
+        // carrying a side.
+        "futures.trades" => Ok(result
+            .as_array()
+            .map(|trades| {
+                trades
+                    .iter()
+                    .filter_map(|trade| {
+                        let (quantity, aggressor) = futures_signed_size(trade, "size")?;
+                        Some(Event::Trade(TradePrint {
+                            symbol: resolve(trade.get("contract")?.as_str()?),
+                            price: parse_decimal(trade.get("price")?.as_str()?).ok()?,
+                            quantity,
+                            aggressor,
+                            timestamp: trade
+                                .get("create_time_ms")
+                                .and_then(serde_json::Value::as_i64)
+                                .unwrap_or(0),
+                        }))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()),
+        "futures.order_book_update" => {
+            let Some(contract) = result.get("s").and_then(serde_json::Value::as_str) else {
+                return Ok(Vec::new());
+            };
+            Ok(vec![Event::BookDelta(BookDelta {
+                symbol: resolve(contract),
+                first_update_id: result
+                    .get("U")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                final_update_id: result
+                    .get("u")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                bids: futures_levels(result.get("b")),
+                asks: futures_levels(result.get("a")),
+                timestamp: result
+                    .get("t")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0),
+            })])
+        }
+        "futures.tickers" => Ok(result
+            .as_array()
+            .map(|tickers| {
+                tickers
+                    .iter()
+                    .filter_map(|ticker| {
+                        Some(Event::Ticker(Ticker {
+                            symbol: resolve(ticker.get("contract")?.as_str()?),
+                            last: parse_decimal(ticker.get("last")?.as_str()?).ok()?,
+                            // The futures ticker publishes no top of book; the
+                            // book channel is where those live, and inventing
+                            // them from the last price would be a fabrication.
+                            bid: Decimal::ZERO,
+                            ask: Decimal::ZERO,
+                            volume: ticker
+                                .get("volume_24h_base")
+                                .and_then(serde_json::Value::as_str)
+                                .and_then(|v| parse_decimal(v).ok())
+                                .unwrap_or_default(),
+                            timestamp: ticker
+                                .get("t")
+                                .and_then(serde_json::Value::as_i64)
+                                .unwrap_or(0),
+                        }))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()),
         "spot.trades" => Ok(vec![Event::Trade(TradePrint {
             symbol: resolve(field_str(result, "currency_pair")?),
             price: parse_decimal(field_str(result, "price")?)?,
@@ -1836,6 +1966,133 @@ mod tests {
             Gate::with_http(Box::new(ArcTransport(Arc::clone(&mock))), &opts),
             mock,
         )
+    }
+
+    fn futures_ws_client() -> (Gate, Arc<MockWsTransport>) {
+        let http = Arc::new(MockHttpTransport::new());
+        let ws = Arc::new(MockWsTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::UsdMFutures);
+        let gate = Gate::with_http(Box::new(ArcTransport(http)), &opts)
+            .with_ws(Box::new(ArcWs(Arc::clone(&ws))));
+        (gate, ws)
+    }
+
+    /// Both the host and the channel prefix follow the market.
+    #[test]
+    fn a_futures_client_subscribes_on_the_futures_host() {
+        let (mut gate, ws) = futures_ws_client();
+        Gate::subscribe_trades(&mut gate, &symbol()).unwrap();
+        Gate::subscribe_book(&mut gate, &symbol()).unwrap();
+
+        assert_eq!(ws.connected_urls()[0], "wss://fx-ws.gateio.ws/v4/ws/usdt");
+        assert!(ws.sent()[0].contains(r#""channel":"futures.trades""#));
+        assert!(!ws.sent()[0].contains("spot."));
+        // The book channel needs an interval and a depth beside the contract.
+        assert!(ws.sent()[1].contains(r#""channel":"futures.order_book_update""#));
+        assert!(ws.sent()[1].contains(r#""payload":["BTC_USDT","100ms","20"]"#));
+    }
+
+    /// A futures trade carries no side: the size is signed, and negative means
+    /// the aggressor sold.
+    #[test]
+    fn a_futures_trade_takes_its_side_from_the_sign_of_the_size() {
+        let (mut gate, ws) = futures_ws_client();
+        ws.push_connection(vec![
+            Ok(Some(
+                r#"{"time":1788462378,"time_ms":1788462378855,"channel":"futures.trades",
+                "event":"update","result":[{"id":826990332,"size":14372,
+                "create_time":1788462378,"create_time_ms":1788462378855,
+                "price":"81231.4","contract":"BTC_USDT"}]}"#
+                    .to_string(),
+            )),
+            Ok(Some(
+                r#"{"time":1788462379,"channel":"futures.trades","event":"update",
+                "result":[{"id":826990333,"size":-25,"create_time_ms":1788462379000,
+                "price":"81230.0","contract":"BTC_USDT"}]}"#
+                    .to_string(),
+            )),
+        ]);
+        Gate::subscribe_trades(&mut gate, &symbol()).unwrap();
+
+        let events = Gate::poll_events(&mut gate);
+        let Event::Trade(bought) = &events[0] else {
+            panic!("expected a trade, got {:?}", events[0]);
+        };
+        assert_eq!(bought.aggressor, OrderSide::Buy);
+        assert_eq!(bought.quantity, dec!(14372));
+        assert_eq!(bought.price, dec!(81231.4));
+        assert_eq!(bought.timestamp, 1_788_462_378_855);
+
+        let Event::Trade(sold) = &events[1] else {
+            panic!("expected a trade, got {:?}", events[1]);
+        };
+        assert_eq!(sold.aggressor, OrderSide::Sell);
+        // The magnitude, not the signed figure: a quantity is not negative.
+        assert_eq!(sold.quantity, dec!(25));
+    }
+
+    #[test]
+    fn a_futures_book_update_parses_both_sides() {
+        let (mut gate, ws) = futures_ws_client();
+        ws.push_connection(vec![Ok(Some(
+            r#"{"time":1788462378,"channel":"futures.order_book_update","event":"update",
+            "result":{"t":1788462378780,"U":124074489866,"u":124074489905,"s":"BTC_USDT",
+            "a":[{"p":"81231.4","s":4572},{"p":"81239.3","s":0}],
+            "b":[{"p":"81230.0","s":12}],"l":"20"}}"#
+                .to_string(),
+        ))]);
+        Gate::subscribe_book(&mut gate, &symbol()).unwrap();
+
+        let events = Gate::poll_events(&mut gate);
+        let Event::BookDelta(delta) = &events[0] else {
+            panic!("expected a delta, got {:?}", events[0]);
+        };
+        assert_eq!(delta.asks.len(), 2);
+        assert_eq!(delta.asks[0].price, dec!(81231.4));
+        // A size of zero removes the level, which the delta type already means.
+        assert_eq!(delta.asks[1].quantity, Decimal::ZERO);
+        assert_eq!(delta.bids.len(), 1);
+        assert_eq!(delta.first_update_id, 124_074_489_866);
+        assert_eq!(delta.final_update_id, 124_074_489_905);
+    }
+
+    /// The futures ticker publishes no top of book, so those stay zero rather
+    /// than being invented from the last price.
+    #[test]
+    fn a_futures_ticker_reports_no_top_of_book() {
+        let (mut gate, ws) = futures_ws_client();
+        ws.push_connection(vec![Ok(Some(
+            r#"{"time":1788462378,"channel":"futures.tickers","event":"update",
+            "result":[{"contract":"BTC_USDT","last":"81231.4","mark_price":"81238.4",
+            "index_price":"81271.1","funding_rate":"0.000073","volume_24h_base":"81628.265",
+            "t":1788462378855}]}"#
+                .to_string(),
+        ))]);
+        Gate::subscribe_ticker(&mut gate, &symbol()).unwrap();
+
+        let events = Gate::poll_events(&mut gate);
+        let Event::Ticker(ticker) = &events[0] else {
+            panic!("expected a ticker, got {:?}", events[0]);
+        };
+        assert_eq!(ticker.last, dec!(81231.4));
+        assert_eq!(ticker.volume, dec!(81628.265));
+        assert_eq!(ticker.bid, Decimal::ZERO);
+        assert_eq!(ticker.ask, Decimal::ZERO);
+        assert_eq!(ticker.timestamp, 1_788_462_378_855);
+    }
+
+    /// The spot client keeps its own host and channels.
+    #[test]
+    fn a_spot_client_still_subscribes_to_spot_channels() {
+        let ws = Arc::new(MockWsTransport::new());
+        let http = Arc::new(MockHttpTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::Spot);
+        let mut gate = Gate::with_http(Box::new(ArcTransport(http)), &opts)
+            .with_ws(Box::new(ArcWs(Arc::clone(&ws))));
+        Gate::subscribe_trades(&mut gate, &symbol()).unwrap();
+
+        assert_eq!(ws.connected_urls()[0], "wss://api.gateio.ws/ws/v4/");
+        assert!(ws.sent()[0].contains(r#""channel":"spot.trades""#));
     }
 
     fn signed_client(now_ms: i64) -> (Gate, Arc<MockHttpTransport>) {
