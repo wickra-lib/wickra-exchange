@@ -52,11 +52,6 @@ TOUCHPOINTS: list[tuple[str, str, str, int]] = [
         r"<Version>@V@</Version>",
         1,
     ),
-    # The citation names the release it belongs to. The bump moves the
-    # `date-released` beside it, so a stale `version` here is not merely absent
-    # -- the two lines disagree, and GitHub's citation box and Zenodo both read
-    # them. Nothing else in CI touches this file.
-    ("CITATION.cff", "citation version", r'(?m)^version: "@V@"$', 1),
     # npm records the package's own version twice in the lockfile: once at the
     # top level and once in the `packages[""]` entry. Only the first is what
     # `npm version` rewrites, so the second goes stale on its own. Both are ours
@@ -126,6 +121,30 @@ def workspace_version() -> str:
     return match.group(1)
 
 
+def citation_failures(version: str) -> list[str]:
+    """`CITATION.cff` carries the version only once a release exists.
+
+    `version` and `date-released` name the *cited release*, so before the first
+    tag they would date something that never happened. They belong to the file
+    as a pair: absent together until a version is cut, present together
+    afterwards. A declared touchpoint cannot express that -- it demanded the
+    version unconditionally and failed on a file that was correct. What is left
+    to check is that a version present here is *this* one: the file is outside
+    every package manager's reach, so nothing else would notice it going stale.
+    """
+    text = read("CITATION.cff")
+    if text is None:
+        return ["CITATION.cff: missing"]
+    declared = [
+        line.split(":", 1)[1].strip().strip('"')
+        for line in text.splitlines()
+        if line.startswith("version:")
+    ]
+    if declared and declared[0] != version:
+        return [f"CITATION.cff: cites {declared[0]}, the workspace is at {version}"]
+    return []
+
+
 def check(version: str, previous: str | None) -> int:
     failures: list[str] = []
     checked = 0
@@ -141,6 +160,8 @@ def check(version: str, previous: str | None) -> int:
             failures.append(
                 f"{rel}: {what} -- expected {expected} occurrence(s) of {version}, found {found}"
             )
+
+    failures += citation_failures(version)
 
     minor = ".".join(version.split(".")[:2])
     for rel, what, pattern, expected in MINOR_LINE:
