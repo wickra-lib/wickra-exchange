@@ -195,6 +195,21 @@ impl Bitget {
         self.market_type.is_derivatives()
     }
 
+    /// The `instType` every WebSocket subscription is keyed by.
+    ///
+    /// Bitget v2 serves one socket URL for every product and distinguishes them
+    /// here, exactly as the REST paths distinguish them with `productType`. Both
+    /// subscribe paths hardcoded `SPOT`, so a futures client streamed the spot
+    /// book, the spot trades and -- through the private stream -- the spot
+    /// account, while its REST calls read futures. The two now agree.
+    fn inst_type(&self) -> &'static str {
+        if self.is_futures() {
+            "USDT-FUTURES"
+        } else {
+            "SPOT"
+        }
+    }
+
     /// Build a public Bitget client.
     #[must_use]
     pub fn with_http(http: Box<dyn HttpTransport>, options: &ExchangeOptions) -> Self {
@@ -349,7 +364,8 @@ impl Bitget {
             self.connection = Some(connection);
         }
         let message = format!(
-            r#"{{"op":"subscribe","args":[{{"instType":"SPOT","channel":"{channel}","instId":"{wire}"}}]}}"#
+            r#"{{"op":"subscribe","args":[{{"instType":"{}","channel":"{channel}","instId":"{wire}"}}]}}"#,
+            self.inst_type()
         );
         self.connection
             .as_mut()
@@ -447,7 +463,10 @@ impl Bitget {
             r#"{{"op":"login","args":[{{"apiKey":"{}","passphrase":"{passphrase}","timestamp":"{timestamp}","sign":"{sign}"}}]}}"#,
             creds.api_key
         );
-        let subscribe = r#"{"op":"subscribe","args":[{"instType":"SPOT","channel":"orders","instId":"default"},{"instType":"SPOT","channel":"account","coin":"default"}]}"#.to_string();
+        let inst_type = self.inst_type();
+        let subscribe = format!(
+            r#"{{"op":"subscribe","args":[{{"instType":"{inst_type}","channel":"orders","instId":"default"}},{{"instType":"{inst_type}","channel":"account","coin":"default"}}]}}"#
+        );
         let ws = self.ws.as_ref().ok_or(Error::NotConnected)?;
         let mut connection = ws.connect("wss://ws.bitget.com/v2/ws/private")?;
         connection.send(&login)?;
@@ -1658,6 +1677,70 @@ mod tests {
         .with_ws(Box::new(ArcWs(Arc::clone(&ws))))
         .with_clock(Box::new(move || now_ms));
         (bitget, ws)
+    }
+
+    /// A futures client with a mock socket.
+    fn futures_ws_client(now_ms: i64) -> (Bitget, Arc<MockWsTransport>) {
+        let http = Arc::new(MockHttpTransport::new());
+        let ws = Arc::new(MockWsTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::UsdMFutures);
+        let bitget = Bitget::with_credentials(
+            Box::new(ArcTransport(http)),
+            &opts,
+            Credentials::new("APIKEY", "SECRET").with_passphrase("PASS"),
+        )
+        .with_ws(Box::new(ArcWs(Arc::clone(&ws))))
+        .with_clock(Box::new(move || now_ms));
+        (bitget, ws)
+    }
+
+    /// Every WebSocket subscription names the market the client is on.
+    ///
+    /// Bitget v2 serves one socket URL for every product and tells them apart by
+    /// `instType`, the way the REST paths tell them apart by `productType`. Both
+    /// subscribe paths hardcoded `SPOT`, so a futures client streamed the spot
+    /// book and the spot trades while its REST calls read futures -- and its
+    /// private stream watched the spot account, where a futures order never
+    /// appears. Nothing failed: the venue answers a spot subscription perfectly
+    /// well, with the wrong market's data.
+    #[test]
+    fn a_futures_client_subscribes_to_futures_streams_not_spot() {
+        let (mut bitget, ws) = futures_ws_client(1_700_000_000_000);
+        Bitget::subscribe_trades(&mut bitget, &symbol()).unwrap();
+        Bitget::subscribe_book(&mut bitget, &symbol()).unwrap();
+
+        for frame in ws.sent() {
+            assert!(
+                frame.contains(r#""instType":"USDT-FUTURES""#),
+                "a futures client subscribed to something else: {frame}"
+            );
+            assert!(!frame.contains(r#""instType":"SPOT""#));
+        }
+
+        // And the private stream, which is where the wrong market is quietest:
+        // a spot account simply never reports a futures order.
+        let (mut bitget, ws) = futures_ws_client(1_700_000_000_000);
+        ws.push_connection(vec![Ok(Some(
+            r#"{"event":"login","code":"0"}"#.to_string(),
+        ))]);
+        Bitget::subscribe_user_data(&mut bitget).unwrap();
+        let subscribe = ws
+            .sent()
+            .into_iter()
+            .find(|frame| frame.contains("\"channel\":\"orders\""))
+            .expect("the user-data stream subscribes to orders");
+        assert!(
+            subscribe.contains(r#""instType":"USDT-FUTURES""#),
+            "{subscribe}"
+        );
+    }
+
+    /// The spot client is unchanged, which is the other half of the contract.
+    #[test]
+    fn a_spot_client_still_subscribes_to_spot_streams() {
+        let (mut bitget, ws) = signed_ws_client(1_700_000_000_000);
+        Bitget::subscribe_trades(&mut bitget, &symbol()).unwrap();
+        assert!(ws.sent()[0].contains(r#""instType":"SPOT""#));
     }
 
     #[test]

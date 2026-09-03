@@ -70,6 +70,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A Bitget futures client streamed spot.** Bitget v2 serves one WebSocket URL
+  for every product and tells them apart by `instType`, the way its REST paths
+  tell them apart by `productType`. The REST paths did; both subscribe paths
+  hardcoded `SPOT`. So a futures client read futures over REST and watched the
+  **spot** book and the **spot** trades over the socket — and its private
+  user-data stream watched the spot account, where a futures order never
+  appears at all.
+
+  Nothing failed while it was wrong, which is why it lasted: the venue answers a
+  spot subscription perfectly well, with the wrong market's data. Every
+  subscription now names the client's own market, and a test pins both
+  directions.
+
 - **A reduce-only close sent over Binance's WebSocket opened a position.** The
   REST body and the WebSocket frame each resolved the position fields for
   themselves, and the frame only ever spelled the hedged `positionSide`: on a
