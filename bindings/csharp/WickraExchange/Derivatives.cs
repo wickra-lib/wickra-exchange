@@ -373,6 +373,64 @@ public sealed unsafe class AdvancedOrders : IDisposable
         }
     }
 
+    /// <summary>
+    /// Place several full orders in one request: every field the library
+    /// supports, not just a market, a side, a quantity and a price.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="PlaceBatch(IReadOnlyList{BatchOrderRequest})"/> remains as the
+    /// shortest spelling of the common case. This is the one that can batch a
+    /// stop-loss, an immediate-or-cancel or a post-only: a
+    /// <see cref="BatchOrderRequest"/> has nowhere to put them, so until now a
+    /// batched order from this binding could only ever be a plain market or
+    /// limit, however carefully the venue clients carried the rest.
+    /// </remarks>
+    public IReadOnlyList<BatchResult> PlaceBatch(IReadOnlyList<OrderRequest> requests)
+    {
+        int n = requests.Count;
+        if (n == 0)
+        {
+            return Array.Empty<BatchResult>();
+        }
+        var natives = new Native.OrderRequest[n];
+        for (int i = 0; i < n; i++)
+        {
+            natives[i] = Exchange.ToNative(requests[i]);
+        }
+        try
+        {
+            var outBuf = new Native.Order[n];
+            var codes = new int[n];
+            int count;
+            fixed (Native.OrderRequest* rp = natives)
+            fixed (Native.Order* op = outBuf)
+            fixed (int* cp = codes)
+            {
+                count = Native.wickra_advanced_place_batch_full(
+                    _handle, rp, (nuint)n, op, cp, (nuint)n);
+            }
+            if (count < 0)
+            {
+                throw new WickraException($"place_batch failed with code {count}");
+            }
+            var result = new List<BatchResult>(count);
+            for (int i = 0; i < count; i++)
+            {
+                result.Add(codes[i] == Native.Ok
+                    ? new BatchResult(Exchange.ReadOrder(outBuf[i]), null)
+                    : new BatchResult(null, $"order rejected with code {codes[i]}"));
+            }
+            return result;
+        }
+        finally
+        {
+            foreach (var native in natives)
+            {
+                Exchange.FreeNative(native);
+            }
+        }
+    }
+
     public void Dispose()
     {
         if (_handle != 0)
@@ -532,6 +590,32 @@ public sealed unsafe class WsExecution : IDisposable
             Exchange.Check(Native.wickra_ws_place_order(_handle, mp, (int)side, quantity, price, &order));
         }
         return Exchange.ReadOrder(order);
+    }
+
+    /// <summary>
+    /// Place a full order over the WebSocket order API: every field the library
+    /// supports, not just a market, a side, a quantity and a price.
+    /// </summary>
+    /// <remarks>
+    /// The <see cref="OrderRequest"/> form of
+    /// <see cref="PlaceOrderWs(string, Side, double, double)"/>, for the same
+    /// reason the REST path has one: the narrow call cannot carry a trigger
+    /// price, a time-in-force, or any of the flags that decide what the order
+    /// actually is.
+    /// </remarks>
+    public OrderInfo PlaceOrderWsFull(OrderRequest request)
+    {
+        var native = Exchange.ToNative(request);
+        try
+        {
+            Native.Order order;
+            Exchange.Check(Native.wickra_ws_place_order_full(_handle, &native, &order));
+            return Exchange.ReadOrder(order);
+        }
+        finally
+        {
+            Exchange.FreeNative(native);
+        }
     }
 
     /// <summary>Cancel an order over the WebSocket order API by venue id.</summary>

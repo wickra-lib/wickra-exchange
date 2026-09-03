@@ -46,6 +46,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   spell that key ten ways, and a list of ten spellings is a list to keep in step
   with ten clients, while the id itself is on the wire whichever key carries it.
 
+- **A batched or socket-sent order carries every field in C#, Java and R.** The
+  C ABI has offered `wickra_advanced_place_batch_full` and
+  `wickra_ws_place_order_full` since `WickraOrderRequest` arrived, and only Go
+  called them. The other three reached the narrow four-argument forms on both
+  paths, so a batched or WebSocket order from those languages could be a market
+  or a limit and nothing else — no trigger price, no time-in-force, none of the
+  flags that decide what the order is — while their single-order path carried
+  all six fields.
+
+  C# gains a `PlaceBatch(IReadOnlyList<OrderRequest>)` overload and
+  `PlaceOrderWsFull`; Java gains `placeBatchFull` and `placeOrderWsFull`; R
+  gains `wkex_place_batch_full` and `wkex_ws_place_order_full`. The narrow forms
+  remain as the shortest spelling of the common case. Each language now builds
+  the request struct in one place rather than once per path, which is what let
+  the paths differ to begin with.
+
+- **`check_binding_surface.py` checks per order path, not just per field.** It
+  asked whether a binding could name a field *anywhere*, and answered yes for
+  all seven while three of them could not put that field in a batch — the same
+  shape as the check that once counted verbs without asking what a verb could
+  express. The fourth axis reports `3/3 order paths`, and a binding that reaches
+  a field on one path but not another now fails rather than averaging out.
+  `check_r_abi_skew.py` goes from 43 of 45 C ABI symbols reached to 45 of 45.
+
 ### Security
 
 - **Two credentials were being printed by `Debug`.** The hand-written

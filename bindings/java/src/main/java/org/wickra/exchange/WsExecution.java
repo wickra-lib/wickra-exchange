@@ -50,6 +50,27 @@ public final class WsExecution implements AutoCloseable {
         }
     }
 
+    /**
+     * Place a full order over the WebSocket order API: every field the library
+     * supports, not just a market, a side, a quantity and a price.
+     *
+     * <p>The {@link OrderRequest} form of {@link #placeOrderWs}, for the same
+     * reason the REST path has one: the narrow call cannot carry a trigger
+     * price, a time-in-force, or any of the flags that decide what the order
+     * actually is.
+     */
+    public Exchange.OrderInfo placeOrderWsFull(OrderRequest request) {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment req = arena.allocate(Native.REQUEST_SIZE, 8);
+            Exchange.writeRequest(arena, req, 0, request);
+            MemorySegment out = arena.allocate(Native.ORDER_SIZE, 8);
+            Exchange.check((int) Native.WS_PLACE_ORDER_FULL.invokeExact(handle, req, out));
+            return Exchange.readOrder(out);
+        } catch (Throwable t) {
+            throw new RuntimeException(t);
+        }
+    }
+
     /** Cancel an order over the WebSocket order API by venue id. */
     public void cancelOrderWs(String market, String orderId) {
         try (Arena arena = Arena.ofConfined()) {

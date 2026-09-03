@@ -495,6 +495,60 @@ wkex_place_batch <- function(adv, markets, sides, quantities, prices) {
   })
 }
 
+#' Place several full orders in one request.
+#'
+#' [wkex_place_batch()] can say only market, side, quantity and price, so a
+#' batched order from R could never be a stop-loss, an immediate-or-cancel or a
+#' post-only, however carefully the venue clients carried them. This takes the
+#' whole request, as parallel vectors: one element of each per order.
+#'
+#' Scalars are recycled to the number of markets, so the common case of "same
+#' time-in-force for every leg" needs one value rather than a repeated vector.
+#' @param adv A `wickra_advanced` object.
+#' @param markets Character vector of market symbols.
+#' @param sides Character or integer vector of sides ("buy"/"sell").
+#' @param quantities Numeric vector of quantities.
+#' @param prices Numeric vector of limit prices (`NA` for a market order).
+#' @param stop_prices Numeric vector of trigger prices (`NA` for none).
+#' @param times_in_force Character vector: "gtc", "ioc" or "fok".
+#' @param client_order_ids Character vector of ids, or `NULL` for none.
+#' @param reduce_onlys Logical vector: close-only.
+#' @param post_onlys Logical vector: maker-only.
+#' @param stps Character vector: "none", "expire_maker", "expire_taker" or
+#'   "expire_both".
+#' @return A list of results, each `list(order = , error = )`: `order` on success
+#'   or `error` (an integer status code) on a per-order rejection.
+#' @export
+wkex_place_batch_full <- function(adv, markets, sides, quantities,
+                                  prices = NA_real_, stop_prices = NA_real_,
+                                  times_in_force = "gtc", client_order_ids = NULL,
+                                  reduce_onlys = FALSE, post_onlys = FALSE,
+                                  stps = "none") {
+  markets <- as.character(markets)
+  n <- length(markets)
+  rep_to_n <- function(x) rep_len(x, n)
+  sides_int <- vapply(rep_to_n(sides), .wkex_side, integer(1), USE.NAMES = FALSE)
+  prices <- as.numeric(rep_to_n(prices))
+  stop_prices <- as.numeric(rep_to_n(stop_prices))
+  types <- vapply(seq_len(n), function(i) .wkex_order_type(prices[i], stop_prices[i]),
+                  integer(1), USE.NAMES = FALSE)
+  tifs <- vapply(rep_to_n(times_in_force), .wkex_tif, integer(1), USE.NAMES = FALSE)
+  stps_int <- vapply(rep_to_n(stps), .wkex_stp, integer(1), USE.NAMES = FALSE)
+  ids <- if (is.null(client_order_ids)) NULL else as.character(rep_to_n(client_order_ids))
+  results <- .Call(C_wkex_advanced_place_batch_full, adv$handle, markets,
+                   as.integer(sides_int), as.integer(types),
+                   as.numeric(rep_to_n(quantities)), prices, stop_prices,
+                   as.integer(tifs), ids,
+                   as.logical(rep_to_n(reduce_onlys)), as.logical(rep_to_n(post_onlys)),
+                   as.integer(stps_int))
+  lapply(results, function(r) {
+    if (!is.null(r$order)) {
+      r$order <- .wkex_order(r$order)
+    }
+    r
+  })
+}
+
 #' Connect a live private user-data client.
 #'
 #' After [wkex_subscribe_user_data()], [wkex_user_data_poll()] surfaces the
@@ -570,6 +624,39 @@ wkex_ws_execution <- function(name, api_key, api_secret,
 wkex_ws_place_order <- function(wse, market, side, quantity, price = NA_real_) {
   .wkex_order(.Call(C_wkex_ws_place_order, wse$handle, market, .wkex_side(side),
                     as.numeric(quantity), as.numeric(price)))
+}
+
+#' Place a full order over the WebSocket order API.
+#'
+#' The [wkex_place_order()] form of [wkex_ws_place_order()], for the same reason
+#' the REST path has one: the narrow call cannot carry a trigger price, a
+#' time-in-force, or any of the flags that decide what the order actually is.
+#' @param wse A `wickra_ws_execution` object.
+#' @param market Market string.
+#' @param side "buy" or "sell".
+#' @param quantity Order quantity.
+#' @param price Limit price, or `NA` for a market order.
+#' @param stop_price Trigger price, or `NA` for a non-trigger order.
+#' @param time_in_force "gtc" (the default), "ioc" or "fok".
+#' @param client_order_id An id of your choosing, or `NULL`.
+#' @param reduce_only Close-only: the order may not increase a position.
+#' @param post_only Maker-only: cancelled rather than crossing the spread.
+#' @param stp "none" (the default), "expire_maker", "expire_taker" or
+#'   "expire_both".
+#' @return The resulting order as a list.
+#' @export
+wkex_ws_place_order_full <- function(wse, market, side, quantity,
+                                     price = NA_real_, stop_price = NA_real_,
+                                     time_in_force = "gtc", client_order_id = NULL,
+                                     reduce_only = FALSE, post_only = FALSE,
+                                     stp = "none") {
+  .wkex_order(.Call(
+    C_wkex_ws_place_order_full, wse$handle, market, .wkex_side(side),
+    .wkex_order_type(price, stop_price), as.numeric(quantity),
+    as.numeric(price), as.numeric(stop_price),
+    .wkex_tif(time_in_force), client_order_id,
+    isTRUE(reduce_only), isTRUE(post_only), .wkex_stp(stp)
+  ))
 }
 
 #' Cancel an order over the WebSocket order API by venue id.

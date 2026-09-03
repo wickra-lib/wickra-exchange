@@ -135,6 +135,36 @@ of the common case.
 itself and holds every binding to it, as a third axis beside verbs and
 configuration. A field added to the core is a field the check demands.
 
+### The path a binding can build it on
+
+A field the caller can *name* is not yet a field that reaches the venue: it also
+has to reach it on the path the caller chose. Three of them send an order, and
+they were not equal.
+
+| | single | batch | WebSocket |
+|---|:---:|:---:|:---:|
+| Rust | ✅ | ✅ | ✅ |
+| Python, Node | ✅ | ✅ | ✅ |
+| Go | ✅ | ✅ | ✅ |
+| C#, Java, R | ✅ | ✅ | ✅ |
+| WASM | ✅ | — ¹ | — ¹ |
+| C / C++ | ✅ | ✅ | ✅ |
+
+1. WASM targets `wasm32-unknown-unknown`, which has no sockets, so it carries
+   the offline subset on purpose and has neither path.
+
+The C ABI has carried `wickra_advanced_place_batch_full` and
+`wickra_ws_place_order_full` since the `WickraOrderRequest` struct arrived —
+and until now **only Go called them**. C#, Java and R each reached the narrow
+four-argument forms on both paths, so a batched or socket-sent order from those
+three could be a market or a limit and nothing else, while their single-order
+path carried all six fields and the surface check reported the contract whole.
+
+That is the same shape twice over: the check counted whether a field appeared
+*anywhere* in a binding, the way it once counted whether a verb appeared without
+asking what the verb could express. It now checks per path, so a binding that
+reaches a field on one path and not another fails rather than averaging out.
+
 > **Full read/execution surface in every binding.** The complete `MarketData`
 > surface (`ticker`, `klines`, `order_book`, `subscribe_trades` /
 > `subscribe_book` / `subscribe_ticker`, `poll_events`) and `Execution` surface

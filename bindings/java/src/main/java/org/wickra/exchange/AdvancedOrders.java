@@ -155,6 +155,53 @@ public final class AdvancedOrders implements AutoCloseable {
         }
     }
 
+    /**
+     * Place several full orders in one request: every field the library
+     * supports, not just a market, a side, a quantity and a price.
+     *
+     * <p>{@link #placeBatch(List)} remains as the shortest spelling of the
+     * common case. This is the one that can batch a stop-loss, an
+     * immediate-or-cancel or a post-only: a {@link BatchOrderRequest} has
+     * nowhere to put them, so until now a batched order from this binding could
+     * only ever be a plain market or limit, however carefully the venue clients
+     * carried the rest.
+     *
+     * <p>Named separately rather than overloaded because both take a
+     * {@code List} and erasure would make them the same method.
+     */
+    public List<BatchResult> placeBatchFull(List<OrderRequest> requests) {
+        int n = requests.size();
+        if (n == 0) {
+            return List.of();
+        }
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment reqs = arena.allocate(Native.REQUEST_SIZE * n, 8);
+            for (int i = 0; i < n; i++) {
+                Exchange.writeRequest(arena, reqs, (long) i * Native.REQUEST_SIZE, requests.get(i));
+            }
+            MemorySegment out = arena.allocate(Native.ORDER_SIZE * n, 8);
+            MemorySegment codes = arena.allocate((long) Native.C_INT.byteSize() * n, 8);
+            int count = (int) Native.ADVANCED_PLACE_BATCH_FULL.invokeExact(
+                    handle, reqs, (long) n, out, codes, (long) n);
+            if (count < 0) {
+                throw new RuntimeException("place_batch_full failed with code " + count);
+            }
+            java.util.List<BatchResult> result = new java.util.ArrayList<>(count);
+            for (int i = 0; i < count; i++) {
+                int code = codes.getAtIndex(Native.C_INT, i);
+                if (code == Native.OK) {
+                    result.add(new BatchResult(
+                            Exchange.readOrder(out.asSlice((long) i * Native.ORDER_SIZE, Native.ORDER_SIZE)), null));
+                } else {
+                    result.add(new BatchResult(null, "order rejected with code " + code));
+                }
+            }
+            return result;
+        } catch (Throwable t) {
+            throw new RuntimeException(t);
+        }
+    }
+
     @Override
     public void close() {
         if (handle != null && !handle.equals(MemorySegment.NULL)) {

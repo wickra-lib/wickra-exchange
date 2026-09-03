@@ -202,6 +202,8 @@ final class Native {
             FunctionDescriptor.of(C_INT, C_PTR, C_PTR, C_INT, C_DOUBLE, C_DOUBLE, C_DOUBLE, C_DOUBLE, C_PTR, C_SIZE));
     static final MethodHandle ADVANCED_PLACE_BATCH = handle("wickra_advanced_place_batch",
             FunctionDescriptor.of(C_INT, C_PTR, C_PTR, C_PTR, C_PTR, C_PTR, C_SIZE, C_PTR, C_PTR, C_SIZE));
+    static final MethodHandle ADVANCED_PLACE_BATCH_FULL = handle("wickra_advanced_place_batch_full",
+            FunctionDescriptor.of(C_INT, C_PTR, C_PTR, C_SIZE, C_PTR, C_PTR, C_SIZE));
 
     static final MethodHandle CONNECT_USER_DATA = handle("wickra_connect_user_data",
             FunctionDescriptor.of(C_PTR, C_PTR, C_PTR, C_PTR, C_PTR, C_PTR, C_BOOL, C_BOOL,
@@ -222,6 +224,8 @@ final class Native {
             FunctionDescriptor.ofVoid(C_PTR));
     static final MethodHandle WS_PLACE_ORDER = handle("wickra_ws_place_order",
             FunctionDescriptor.of(C_INT, C_PTR, C_PTR, C_INT, C_DOUBLE, C_DOUBLE, C_PTR));
+    static final MethodHandle WS_PLACE_ORDER_FULL = handle("wickra_ws_place_order_full",
+            FunctionDescriptor.of(C_INT, C_PTR, C_PTR, C_PTR));
     static final MethodHandle WS_CANCEL_ORDER = handle("wickra_ws_cancel_order",
             FunctionDescriptor.of(C_INT, C_PTR, C_PTR, C_PTR));
 

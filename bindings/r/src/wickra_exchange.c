@@ -223,29 +223,50 @@ SEXP wkex_place(SEXP ext, SEXP market, SEXP side, SEXP quantity, SEXP price) {
  * through. An R NA is "unset" and becomes the NaN the ABI reads as absent; a
  * NULL or NA client order id becomes a null pointer.
  */
+/* Build one WickraOrderRequest from element `i` of the argument vectors.
+ *
+ * Shared by every R path that sends a full order -- single, batch and the
+ * WebSocket frame -- so a batched order carries the same fields a single one
+ * does. They did not: the batch and WebSocket wrappers took market, side,
+ * quantity and price and had nowhere to put the rest, so a stop-loss could be
+ * placed from R only one order at a time and only over REST.
+ *
+ * The strings point into the R vectors, which the caller keeps alive for the
+ * duration of the call.
+ */
+static WickraOrderRequest request_at(SEXP markets, SEXP sides, SEXP order_types, SEXP quantities,
+                                     SEXP prices, SEXP stop_prices, SEXP times_in_force,
+                                     SEXP client_order_ids, SEXP reduce_onlys, SEXP post_onlys,
+                                     SEXP stps, R_xlen_t i) {
+    double p = REAL(prices)[i];
+    double sp = REAL(stop_prices)[i];
+    const char *coid = NULL;
+    if (client_order_ids != R_NilValue && STRING_ELT(client_order_ids, i) != NA_STRING) {
+        coid = CHAR(STRING_ELT(client_order_ids, i));
+    }
+    WickraOrderRequest request = {
+        CHAR(STRING_ELT(markets, i)),
+        INTEGER(sides)[i],
+        INTEGER(order_types)[i],
+        REAL(quantities)[i],
+        ISNA(p) ? NAN : p,
+        ISNA(sp) ? NAN : sp,
+        INTEGER(times_in_force)[i],
+        coid,
+        (bool)LOGICAL(reduce_onlys)[i],
+        (bool)LOGICAL(post_onlys)[i],
+        INTEGER(stps)[i],
+    };
+    return request;
+}
+
 SEXP wkex_place_order(SEXP ext, SEXP market, SEXP side, SEXP order_type, SEXP quantity,
                       SEXP price, SEXP stop_price, SEXP time_in_force, SEXP client_order_id,
                       SEXP reduce_only, SEXP post_only, SEXP stp) {
     WickraOrder order;
-    double p = Rf_asReal(price);
-    double sp = Rf_asReal(stop_price);
-    const char *coid = NULL;
-    if (client_order_id != R_NilValue && STRING_ELT(client_order_id, 0) != NA_STRING) {
-        coid = CHAR(STRING_ELT(client_order_id, 0));
-    }
-    WickraOrderRequest request = {
-        CHAR(STRING_ELT(market, 0)),
-        Rf_asInteger(side),
-        Rf_asInteger(order_type),
-        Rf_asReal(quantity),
-        ISNA(p) ? NAN : p,
-        ISNA(sp) ? NAN : sp,
-        Rf_asInteger(time_in_force),
-        coid,
-        (bool)Rf_asLogical(reduce_only),
-        (bool)Rf_asLogical(post_only),
-        Rf_asInteger(stp),
-    };
+    WickraOrderRequest request = request_at(market, side, order_type, quantity, price, stop_price,
+                                            time_in_force, client_order_id, reduce_only, post_only,
+                                            stp, 0);
     int rc = wickra_exchange_place_order(handle_of(ext), &request, &order);
     if (rc != WICKRA_OK) {
         Rf_error("wickra: order failed with code %d", rc);
@@ -599,6 +620,51 @@ SEXP wkex_advanced_place_batch(SEXP ext, SEXP markets, SEXP sides,
     return result;
 }
 
+/* Place several full orders in one request: every field WickraOrderRequest
+ * carries, one element of each vector per order.
+ *
+ * wkex_advanced_place_batch beside it can say only market, side, quantity and
+ * price, so a batched order from R could never be a stop-loss, an
+ * immediate-or-cancel or a post-only, however carefully the venue clients
+ * carried them.
+ */
+SEXP wkex_advanced_place_batch_full(SEXP ext, SEXP markets, SEXP sides, SEXP order_types,
+                                    SEXP quantities, SEXP prices, SEXP stop_prices,
+                                    SEXP times_in_force, SEXP client_order_ids,
+                                    SEXP reduce_onlys, SEXP post_onlys, SEXP stps) {
+    R_xlen_t n = Rf_xlength(markets);
+    WickraOrderRequest *requests =
+        (WickraOrderRequest *)R_alloc(n, sizeof(WickraOrderRequest));
+    for (R_xlen_t i = 0; i < n; i++) {
+        requests[i] = request_at(markets, sides, order_types, quantities, prices, stop_prices,
+                                 times_in_force, client_order_ids, reduce_onlys, post_onlys,
+                                 stps, i);
+    }
+    WickraOrder *out = (WickraOrder *)R_alloc(n, sizeof(WickraOrder));
+    int *codes = (int *)R_alloc(n, sizeof(int));
+    int count = wickra_advanced_place_batch_full(adv_of(ext), requests, (size_t)n, out, codes,
+                                                 (size_t)n);
+    if (count < 0) {
+        Rf_error("wickra: place_batch_full failed with code %d", count);
+    }
+    const char *rnames[] = {"order", "error", ""};
+    SEXP result = PROTECT(Rf_allocVector(VECSXP, count));
+    for (int i = 0; i < count; i++) {
+        SEXP entry = PROTECT(Rf_mkNamed(VECSXP, rnames));
+        if (codes[i] == WICKRA_OK) {
+            SET_VECTOR_ELT(entry, 0, order_to_list(&out[i]));
+            SET_VECTOR_ELT(entry, 1, R_NilValue);
+        } else {
+            SET_VECTOR_ELT(entry, 0, R_NilValue);
+            SET_VECTOR_ELT(entry, 1, Rf_ScalarInteger(codes[i]));
+        }
+        SET_VECTOR_ELT(result, i, entry);
+        UNPROTECT(1);
+    }
+    UNPROTECT(1);
+    return result;
+}
+
 /* --- user data ----------------------------------------------------------- */
 
 static void wkex_user_data_finalize(SEXP ext) {
@@ -701,6 +767,23 @@ SEXP wkex_ws_place_order(SEXP ext, SEXP market, SEXP side, SEXP quantity, SEXP p
     return order_to_list(&order);
 }
 
+/* Place a full order over the WebSocket order API: every field
+ * WickraOrderRequest carries, for the reason the REST path has one.
+ */
+SEXP wkex_ws_place_order_full(SEXP ext, SEXP market, SEXP side, SEXP order_type, SEXP quantity,
+                              SEXP price, SEXP stop_price, SEXP time_in_force,
+                              SEXP client_order_id, SEXP reduce_only, SEXP post_only, SEXP stp) {
+    WickraOrder order;
+    WickraOrderRequest request = request_at(market, side, order_type, quantity, price, stop_price,
+                                            time_in_force, client_order_id, reduce_only, post_only,
+                                            stp, 0);
+    int rc = wickra_ws_place_order_full(ws_execution_of(ext), &request, &order);
+    if (rc != WICKRA_OK) {
+        Rf_error("wickra: ws place_order_full failed with code %d", rc);
+    }
+    return order_to_list(&order);
+}
+
 SEXP wkex_ws_cancel_order(SEXP ext, SEXP market, SEXP order_id) {
     int rc = wickra_ws_cancel_order(ws_execution_of(ext), CHAR(STRING_ELT(market, 0)),
                                     CHAR(STRING_ELT(order_id, 0)));
@@ -740,12 +823,14 @@ static const R_CallMethodDef CallEntries[] = {
     {"wkex_advanced_cancel_batch", (DL_FUNC)&wkex_advanced_cancel_batch, 3},
     {"wkex_advanced_place_oco", (DL_FUNC)&wkex_advanced_place_oco, 7},
     {"wkex_advanced_place_batch", (DL_FUNC)&wkex_advanced_place_batch, 5},
+    {"wkex_advanced_place_batch_full", (DL_FUNC)&wkex_advanced_place_batch_full, 12},
     {"wkex_connect_user_data", (DL_FUNC)&wkex_connect_user_data, 7},
     {"wkex_user_data_subscribe", (DL_FUNC)&wkex_user_data_subscribe, 1},
     {"wkex_user_data_keepalive", (DL_FUNC)&wkex_user_data_keepalive, 1},
     {"wkex_user_data_poll", (DL_FUNC)&wkex_user_data_poll, 2},
     {"wkex_connect_ws_execution", (DL_FUNC)&wkex_connect_ws_execution, 7},
     {"wkex_ws_place_order", (DL_FUNC)&wkex_ws_place_order, 5},
+    {"wkex_ws_place_order_full", (DL_FUNC)&wkex_ws_place_order_full, 12},
     {"wkex_ws_cancel_order", (DL_FUNC)&wkex_ws_cancel_order, 3},
     {NULL, NULL, 0}};
 

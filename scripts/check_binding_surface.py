@@ -292,6 +292,66 @@ ORDER_FIELD_SPELLINGS = {
 }
 
 
+# The three builders that send an order, and how each binding reaches the form
+# of it that carries a whole `OrderRequest`.
+#
+# The field axis above asks whether a binding can *name* a field anywhere. That
+# is not the same question as whether the field can reach the venue on the path
+# the caller chose, and the difference was a real gap: C#, Java and R each
+# scored a full six order fields while their batch and WebSocket calls took
+# market, side, quantity and price and had nowhere to put the rest. The C ABI
+# had carried `_full` forms of both since #196; only Go called them. A batched
+# stop-loss was unplaceable from three languages, and this check said the
+# contract was whole.
+#
+# So the axis is per path. Python and Node take the request type directly and
+# are matched on that; the four C-ABI languages are matched on the `_full`
+# symbols, which is the only way through for them.
+ORDER_PATH_SPELLINGS = {
+    "single": {
+        "python": ("place_order",),
+        "node": ("place_order",),
+        "*": ("exchange_place_order", "place_order"),
+    },
+    "batch": {
+        "python": ("place_batch",),
+        "node": ("place_batch",),
+        "*": ("advanced_place_batch_full", "place_batch_full"),
+    },
+    "websocket": {
+        "python": ("place_order_ws",),
+        "node": ("place_order_ws",),
+        "*": ("ws_place_order_full", "place_order_ws_full"),
+    },
+}
+
+# Python and Node hold `OrderRequest` itself, so their batch and socket calls
+# take one by construction and there is no narrow twin to confuse them with.
+# The check still has to prove it rather than assume it: these patterns say the
+# request type appears in that method's own signature.
+NATIVE_PATH_SIGNATURE = {
+    ("python", "batch"): r"fn place_batch[^{]{0,300}?PyOrderRequest",
+    ("python", "websocket"): r"fn place_order_ws[^{]{0,300}?PyOrderRequest",
+    ("node", "batch"): r"fn place_batch[^{]{0,300}?OrderRequest",
+    ("node", "websocket"): r"fn place_order_ws[^{]{0,300}?OrderRequest",
+}
+
+
+def order_paths(label: str, haystack: str, source: str) -> list[str]:
+    """The order paths this binding cannot send a full request on."""
+    absent = []
+    for path, spellings in ORDER_PATH_SPELLINGS.items():
+        signature = NATIVE_PATH_SIGNATURE.get((label, path))
+        if signature is not None:
+            if re.search(signature, source, re.S) is None:
+                absent.append(f"{path} (no `OrderRequest` in its signature)")
+            continue
+        forms = spellings.get(label, spellings["*"])
+        if not present(haystack, forms):
+            absent.append(f"{path} (as {'/'.join(forms)})")
+    return absent
+
+
 def order_fields():
     """The fields of `OrderRequest`, read from the core rather than listed."""
     source = read(ORDER_REQUEST)
@@ -405,6 +465,8 @@ def main() -> int:
             if not present(haystack, ORDER_FIELD_SPELLINGS[field])
         ]
 
+        paths_absent = order_paths(label, haystack, source)
+
         params = constructor_params(label, source)
         if params is None:
             config_absent = ["the exchange constructor could not be located"]
@@ -415,7 +477,7 @@ def main() -> int:
                 if not any(s in params for s in AXIS_SPELLINGS[axis])
             ]
 
-        if absent or ctor_absent or config_absent or fields_absent:
+        if absent or ctor_absent or config_absent or fields_absent or paths_absent:
             detail = []
             if absent:
                 detail.append("verbs: " + ", ".join(absent))
@@ -425,17 +487,21 @@ def main() -> int:
                 detail.append("configuration: " + ", ".join(config_absent))
             if fields_absent:
                 detail.append("order fields: " + ", ".join(fields_absent))
+            if paths_absent:
+                detail.append("order paths: " + ", ".join(paths_absent))
             failures.append(f"{label}: missing {'; '.join(detail)}")
             print(f"  {label:<8} {len(contract) - len(absent)}/{len(contract)} verbs, "
                   f"{len(CONSTRUCTORS) - len(ctor_absent)}/{len(CONSTRUCTORS)} constructors, "
                   f"{len(CONFIGURATION) - len(config_absent)}/{len(CONFIGURATION)} config, "
-                  f"{len(fields) - len(fields_absent)}/{len(fields)} order fields"
+                  f"{len(fields) - len(fields_absent)}/{len(fields)} order fields, "
+                  f"{len(ORDER_PATH_SPELLINGS) - len(paths_absent)}/{len(ORDER_PATH_SPELLINGS)} order paths"
                   f"  MISSING: {'; '.join(detail)}")
         else:
             print(f"  {label:<8} {len(contract)}/{len(contract)} verbs, "
                   f"{len(CONSTRUCTORS)}/{len(CONSTRUCTORS)} constructors, "
                   f"{len(CONFIGURATION)}/{len(CONFIGURATION)} config, "
-                  f"{len(fields)}/{len(fields)} order fields")
+                  f"{len(fields)}/{len(fields)} order fields, "
+                  f"{len(ORDER_PATH_SPELLINGS)}/{len(ORDER_PATH_SPELLINGS)} order paths")
 
     if failures:
         print("\nbindings have drifted from the trait contract:", file=sys.stderr)

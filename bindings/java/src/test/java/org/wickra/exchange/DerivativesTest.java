@@ -48,6 +48,33 @@ class DerivativesTest {
     }
 
     @Test
+    void placeBatchFullEmptyIsNoop() {
+        // The full-request batch, which is the one that can carry a stop-loss.
+        // Empty returns without opening a socket, like its narrow sibling.
+        try (AdvancedOrders a = AdvancedOrders.connect("binance", "k", "s", null, null, false, false)) {
+            List<AdvancedOrders.BatchResult> results = a.placeBatchFull(List.of());
+            assertTrue(results.isEmpty());
+        }
+    }
+
+    @Test
+    void aBatchedOrderCanCarryEveryField() {
+        // The shape BatchOrderRequest has no room for. Nothing is sent here --
+        // what this pins is that the binding can express it at all, which it
+        // could not: a batched order from Java was a market or a limit and
+        // nothing else, whatever the venue clients supported.
+        OrderRequest request = OrderRequest.stopLimit("BTC/USDT", Exchange.Side.BUY, 1.0, 100.0, 95.0)
+                .withTimeInForce(TimeInForce.IOC)
+                .withClientOrderId("batch-1")
+                .withReduceOnly()
+                .withPostOnly();
+        assertEquals(95.0, request.stopPrice());
+        assertEquals(TimeInForce.IOC, request.timeInForce());
+        assertEquals("batch-1", request.clientOrderId());
+        assertTrue(request.reduceOnly() && request.postOnly());
+    }
+
+    @Test
     void userDataAndWsExecutionRejectSpotOnly() {
         for (String name : new String[] {"coinbase", "upbit", "ftx"}) {
             assertThrows(RuntimeException.class,
