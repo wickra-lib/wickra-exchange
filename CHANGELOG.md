@@ -37,15 +37,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reach the caller as `Error::Network`, so logging them would repeat what the
   return value says rather than recover something lost.
 
-- **The README's test count is derived rather than maintained.** It had
-  advertised 534 unit tests against 540, and before that 441 against 513: a
-  hand-kept number drifts the moment someone adds a test without thinking of it,
-  and nothing fails when it does — the suite passing says nothing about a
-  sentence in another file. Both drifts were found by someone counting.
-  `scripts/check_test_count.py` counts the test attributes in the crate, which is
-  exactly the set `cargo test --lib` runs, and holds the README to it in CI. The
-  sixth check script, and the third time this number had gone stale.
-
 ### Fixed
 
 - **A reduce-only close sent over Binance's WebSocket opened a position.** The
@@ -66,6 +57,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and WebSocket paths alike.
 
 ### Added
+
+- **The README's test count is derived rather than maintained.** It had
+  advertised 534 unit tests against 540, and before that 441 against 513: a
+  hand-kept number drifts the moment someone adds a test without thinking of it,
+  and nothing fails when it does — the suite passing says nothing about a
+  sentence in another file. Both drifts were found by someone counting.
+  `scripts/check_test_count.py` counts the test attributes in the crate, which is
+  exactly the set `cargo test --lib` runs, and holds the README to it in CI. The
+  sixth check script, and the third time this number had gone stale.
+
+- **Every venue's parser is now checked against that venue's own recorded
+  answer.** `testdata/` holds 27 replies — a ticker, some candles and a book
+  from each of nine venues — exactly as they came off the wire, and
+  `tests/recorded.rs` replays them offline in every CI run.
+
+  The offline suite proves a parser reads what its author believed the venue
+  sends; it cannot prove the belief was right, because the fixture and the
+  parser were written by the same hand from the same reading. The live suite
+  asks the real venue but needs a network and skips out loud when the runner is
+  blocked, so it cannot be the only proof either. These recordings are the
+  reproducible half.
+
+  The recorder names no URL. It builds each venue's real client over a transport
+  that wraps the real one and writes down whatever came back, so the endpoint
+  recorded is the endpoint the client asks for — writing the URLs down would
+  record what the author believes the client does, which is the failure the
+  fixtures exist to rule out. A non-2xx reply is never recorded, so a geo-block
+  cannot overwrite a good fixture.
+
+  Coinbase is absent: its market endpoints are signed, so there is no public
+  recording to take. The nine that are present are asserted as a list, so a
+  fixture that vanishes fails rather than shrinking the check in silence.
 
 - **The order-field contract covers all six fields and all three paths.** It
   held four fields on two paths: `time_in_force`, `post_only` and `stp` on the
