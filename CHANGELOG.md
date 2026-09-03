@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **All eight futures venues now subscribe to the derivatives channels they
+  publish.** Kraken, KuCoin, Gate and HTX join the four that already did; these
+  were blocked behind the futures streams, since without a futures socket there
+  is no funding frame to parse.
+
+  What each venue actually publishes differs enough that a uniform-looking API
+  would be a lie, so the differences are visible in what the client does:
+
+  * **Kraken** carries funding, mark, index *and* open interest in one ticker
+    frame. The rate taken is `relative_funding_rate` — `funding_rate` beside it
+    is that proportion times the index, an absolute amount per contract, and
+    reporting it as a rate would be wrong by four orders of magnitude.
+  * **KuCoin** publishes both channels on one topic under two subjects. Its open
+    interest is in contracts with the `multiplier` in the same reply, so the
+    base-currency figure is arithmetic on one reading.
+  * **Gate** answers both from its futures ticker. Its `contract_stats` row
+    stamps in **seconds**, where every other stamp in this crate is
+    milliseconds.
+  * **HTX** needs a *second public socket* — `linear-swap-notification` serves
+    funding and forced orders from a different host than its market data.
+
+  Four refusals, each for a checked reason rather than an assumption: Kraken and
+  KuCoin publish no public forced-order feed and no positioning figure; Gate's
+  `futures.liquidates` answers an anonymous subscribe with *"authentication
+  required"* and reports the caller's own liquidations, not the venue's flow;
+  and HTX publishes mark and index as separate kline channels, never together —
+  the same reason OKX's combined channel is refused.
+
+  One trap is worth naming: HTX's field names invert between endpoints.
+  `volume` is the contract count and `amount` is base currency on the
+  open-interest endpoint, while on the trade stream `amount` *is* the contract
+  count. Reading `amount` in both places would silently switch units.
+
 - **HTX futures market data streams**, the fourth and last. HTX is the one
   venue whose two streams share a protocol: the topics are spelled the same and
   the frames carry the same envelope, so only the host, the symbol form

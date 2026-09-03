@@ -222,55 +222,62 @@ cadence over REST. Presenting them as subscriptions would have made this surface
 look symmetric and the data arrive never, so they are methods that return a
 value.
 
-| Channel | How | Binance | Bybit | OKX | Bitget |
-|---|---|:---:|:---:|:---:|:---:|
-| `Funding` | subscribe | `@markPrice` | `tickers` | `funding-rate` ¹ | `ticker` ⁵ |
-| `MarkIndex` | subscribe | `@markPrice` | `tickers` | — refused ² | `ticker` ⁵ |
-| `Liquidations` | subscribe | `@forceOrder` | `allLiquidation` | `liquidation-orders` ³ | — refused ⁶ |
-| `open_interest()` | read | `/fapi/v1/openInterest` | `/v5/market/open-interest` | `/api/v5/public/open-interest` | `/api/v2/mix/market/open-interest` |
-| `long_short_ratio()` | read | `/futures/data/globalLongShortAccountRatio` | `/v5/market/account-ratio` | `/api/v5/rubik/stat/contracts/long-short-account-ratio` ⁴ | `/api/v2/mix/market/account-long-short` ⁷ |
+| Venue | `Funding` | `MarkIndex` | `Liquidations` | `open_interest()` | `long_short_ratio()` |
+|---|---|---|---|---|---|
+| Binance | `@markPrice` | `@markPrice` | `@forceOrder` | `/fapi/v1/openInterest` | `/futures/data/globalLongShortAccountRatio` |
+| Bybit | `tickers` | `tickers` | `allLiquidation` | `/v5/market/open-interest` | `/v5/market/account-ratio` |
+| OKX | `funding-rate` ¹ | — refused ² | `liquidation-orders` ³ | `/api/v5/public/open-interest` | `/api/v5/rubik/.../long-short-account-ratio` ⁴ |
+| Bitget | `ticker` ⁵ | `ticker` ⁵ | — refused ⁶ | `/api/v2/mix/market/open-interest` | `/api/v2/mix/market/account-long-short` ⁷ |
+| Kraken | `ticker` ⁸ | `ticker` ⁸ | — refused ⁹ | `/derivatives/api/v3/tickers` | — refused ⁹ |
+| KuCoin | `/contract/instrument` ¹⁰ | `/contract/instrument` ¹⁰ | — refused ⁶ | `/api/v1/contracts/<c>` ¹¹ | — refused ⁶ |
+| Gate.io | `futures.tickers` ⁵ | `futures.tickers` ⁵ | — refused ¹² | `/futures/usdt/contract_stats` ¹³ | `/futures/usdt/contract_stats` ⁴ |
+| HTX | `public.<c>.funding_rate` ¹⁴ | — refused ² | `public.<c>.liquidation_orders` ¹⁴ | `/linear-swap-api/v1/swap_open_interest` ¹⁵ | `.../swap_elite_account_ratio` ¹⁶ |
 
-1. OKX's funding frame carries the rate and no price, so the `mark_price` on the
-   print is zero rather than a mark taken from another frame at another moment.
-2. **OKX publishes no combined mark/index frame.** The mark price is on
-   `mark-price` and the index price on `index-tickers`, under different
-   instrument ids (`BTC-USDT-SWAP` against `BTC-USDT`). Joining them would report
-   two prices observed at different moments as one simultaneous reading, so the
-   subscription is refused instead — the caller learns at the call rather than
-   from a number that looks more precise than it is.
-3. Subscribed by instrument *type*, not instrument: OKX publishes one stream of
-   forced orders per product. The client drops frames for markets that were not
-   asked for, so a caller watching BTC is not handed the venue's entire forced
-   flow.
-4. OKX publishes the *ratio* of long accounts to short accounts where Binance
+1. The funding frame carries the rate and no price, so the print reports a mark
+   of zero rather than one taken from another frame at another moment.
+2. **No combined mark/index frame exists.** OKX publishes mark on `mark-price`
+   and index on `index-tickers` under different instrument ids; HTX publishes
+   them as separate kline channels. Joining either pair would report two prices
+   observed at different moments as one simultaneous reading.
+3. Subscribed by instrument *type*: one stream carries every liquidation on the
+   product, and frames for markets that were not asked for are dropped.
+4. The venue publishes the *ratio* of long accounts to short ones where Binance
    publishes the two proportions. With two categories the conversion is exact —
-   a ratio `r` gives `r / (1 + r)` and `1 / (1 + r)`, which sum to one as
-   Binance's pair does — so the feed type carries proportions from every venue.
-5. Bitget's mix `ticker` carries the funding rate, the mark price and the index
-   price beside the quote, all read at one moment. A `MarkIndex` from it is one
-   observation rather than two stitched together, and the same frame answers a
-   funding subscription.
-6. **Bitget publishes no public stream of forced orders.** Accepting the
-   subscription and delivering nothing would be the worse answer.
-7. Bitget publishes both proportions directly, as Binance does, so nothing is
-   derived.
-
-1. OKX's funding frame carries the rate and no price, so the `mark_price` on the
-   print is zero rather than a mark taken from another frame at another moment.
-2. **OKX publishes no combined mark/index frame.** The mark price is on
-   `mark-price` and the index price on `index-tickers`, under different
-   instrument ids (`BTC-USDT-SWAP` against `BTC-USDT`). Joining them would report
-   two prices observed at different moments as one simultaneous reading, so the
-   subscription is refused instead — the caller learns at the call rather than
-   from a number that looks more precise than it is.
-3. Subscribed by instrument *type*, not instrument: OKX publishes one stream of
-   forced orders per product. The client drops frames for markets that were not
-   asked for, so a caller watching BTC is not handed the venue's entire forced
-   flow.
-4. OKX publishes the *ratio* of long accounts to short accounts where Binance
-   publishes the two proportions. With two categories the conversion is exact —
-   a ratio `r` gives `r / (1 + r)` and `1 / (1 + r)`, which sum to one as
-   Binance's pair does — so the feed type carries proportions from every venue.
+   `r / (1 + r)` and `1 / (1 + r)` — so the feed type means the same thing
+   everywhere.
+5. One frame carries the funding rate, the mark price and the index beside the
+   quote, all read at one moment, so `Funding` and `MarkIndex` are one
+   subscription seen two ways and the pair is a single observation.
+6. **The venue publishes no public feed of forced orders**, and KuCoin publishes
+   no positioning figure either. Accepting a subscription that will never
+   deliver would be the worse answer.
+7. Both proportions are published directly, so nothing is derived.
+8. Kraken's futures ticker carries the funding rate, the mark price, the index
+   *and* the open interest together. The rate carried is
+   `relative_funding_rate`, the proportion charged for the interval;
+   `funding_rate` beside it is that proportion times the index, an absolute
+   amount per contract, and reporting it as a rate would be wrong by four orders
+   of magnitude.
+9. Kraken Futures publishes no public forced-order feed and no account
+   positioning.
+10. One topic, two subjects: `funding.rate` and `mark.index.price`. The funding
+    subject carries no price, hence the zero mark.
+11. Reported in contracts with the contract `multiplier` in the same reply, so
+    the base-currency figure is arithmetic on one reading.
+12. Gate has a `futures.liquidates` channel, but an anonymous subscribe is
+    answered *"authentication required"*: it reports the caller's own
+    liquidations, not the venue's forced flow.
+13. In contracts, the unit Gate's futures order path takes. The row's `time` is
+    in **seconds**, where every other stamp in this crate is milliseconds.
+14. On `linear-swap-notification`, a second public socket — HTX serves these from
+    a different host than its market data.
+15. `volume` is the contract count and `amount` is base currency **on this
+    endpoint**, while on the trade stream `amount` is the contract count. The
+    contract count is carried; taking `amount` here would silently switch units.
+16. HTX's **elite** ratio: the positioning of its top traders, the only
+    positioning figure it publishes. `buy_ratio` and `sell_ratio` do not sum to
+    one — `locked_ratio` holds the remainder — and they are carried as given
+    rather than rescaled.
 
 Two things about that table are worth knowing before relying on it.
 

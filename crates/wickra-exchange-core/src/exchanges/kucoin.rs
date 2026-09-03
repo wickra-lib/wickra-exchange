@@ -17,6 +17,9 @@ use crate::clock::ServerClock;
 use crate::credentials::Credentials;
 use crate::error::{Error, Result};
 use crate::events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
+use crate::feeds::{
+    DerivativesChannel, DerivativesFeed, FundingRate, LongShortRatio, MarkIndex, OpenInterest,
+};
 use crate::idempotency::ClientIdGenerator;
 use crate::normalize::{format_decimal, parse_decimal};
 use crate::options::{ExchangeOptions, MarginMode, MarketType, PositionMode, SelfTradePrevention};
@@ -24,7 +27,8 @@ use crate::positions::{Position, PositionSide};
 use crate::signing::hmac_sha256_base64;
 use crate::symbol::Symbol;
 use crate::traits::{
-    AdvancedOrders, Derivatives, Exchange, Execution, MarketData, WsExecution, WsUserData,
+    AdvancedOrders, Derivatives, DerivativesStream, Exchange, Execution, MarketData, WsExecution,
+    WsUserData,
 };
 use crate::transport::{HttpMethod, HttpRequest, HttpTransport, WsConnection, WsTransport};
 use crate::types::{
@@ -72,6 +76,11 @@ pub struct KuCoin {
     connection: Option<Box<dyn WsConnection>>,
     sub_messages: Vec<String>,
     subscriptions: Vec<(String, Symbol)>,
+    /// Which derivatives channels are subscribed, per contract.
+    ///
+    /// `/contract/instrument` carries both subjects, so one subscription
+    /// delivers frames for the other; only what was asked for is emitted.
+    derivatives_channels: Vec<(String, DerivativesChannel)>,
     /// Leverage applied to futures orders. KuCoin sets leverage per order rather
     /// than per account, so [`set_leverage`](Self::set_leverage) records it here.
     leverage: u32,
@@ -134,6 +143,7 @@ impl KuCoin {
             connection: None,
             sub_messages: Vec::new(),
             subscriptions: Vec::new(),
+            derivatives_channels: Vec::new(),
             leverage: 1,
             private_connection: None,
             user_data_active: false,
@@ -308,6 +318,119 @@ impl KuCoin {
         })
     }
 
+    /// Subscribe to a pushed derivatives channel.
+    ///
+    /// KuCoin publishes both on `/contract/instrument`, under two subjects:
+    /// `funding.rate` and `mark.index.price`. The funding subject carries no
+    /// price, so a funding print reports a mark of zero rather than one taken
+    /// from the other subject at another moment.
+    ///
+    /// `Liquidations` is refused: KuCoin publishes no public stream of forced
+    /// orders.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] on a spot client, for `Liquidations`, or if the
+    /// subscription fails.
+    pub fn subscribe_derivatives(
+        &mut self,
+        symbol: &Symbol,
+        channel: DerivativesChannel,
+    ) -> Result<()> {
+        if !self.is_futures() {
+            return Err(Error::unsupported_field(
+                "KuCoin",
+                "a derivatives channel on a spot client",
+                "funding and mark/index exist only on KuCoin Futures",
+            ));
+        }
+        if channel == DerivativesChannel::Liquidations {
+            return Err(Error::unsupported_field(
+                "KuCoin",
+                "a liquidations channel",
+                "KuCoin publishes no public stream of forced orders",
+            ));
+        }
+        let contract = Self::futures_symbol(symbol);
+        if !self
+            .derivatives_channels
+            .iter()
+            .any(|(c, k)| c == &contract && *k == channel)
+        {
+            self.derivatives_channels.push((contract, channel));
+        }
+        self.subscribe_instrument(symbol)
+    }
+
+    /// Subscribe to `/contract/instrument`, which is not a `/market/` topic and
+    /// so does not go through the spot-topic mapping.
+    fn subscribe_instrument(&mut self, symbol: &Symbol) -> Result<()> {
+        let wire = Self::futures_symbol(symbol);
+        if self.connection.is_none() {
+            let ws = self.ws.as_ref().ok_or(Error::NotConnected)?;
+            let connection = ws.connect(FUTURES_WS_URL)?;
+            self.connection = Some(connection);
+        }
+        let id = (self.now_ms)();
+        let message = format!(
+            r#"{{"id":"{id}","type":"subscribe","topic":"/contract/instrument:{wire}","response":true}}"#
+        );
+        self.connection
+            .as_mut()
+            .expect("connection just ensured")
+            .send(&message)?;
+        if !self.sub_messages.contains(&message) {
+            self.sub_messages.push(message);
+        }
+        if !self.subscriptions.iter().any(|(w, _)| w == &wire) {
+            self.subscriptions.push((wire, symbol.clone()));
+        }
+        Ok(())
+    }
+
+    /// The current open interest (`GET /api/v1/contracts/<contract>`).
+    ///
+    /// Polled, not pushed. KuCoin reports it in contracts and publishes the
+    /// contract's `multiplier` in the same reply, so the base-currency figure
+    /// is exact arithmetic on one reading rather than two.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] on a spot client, if the request fails, or if the
+    /// reply carries neither figure.
+    pub fn open_interest(&self, symbol: &Symbol) -> Result<OpenInterest> {
+        if !self.is_futures() {
+            return Err(Error::unsupported_field(
+                "KuCoin",
+                "open interest on a spot client",
+                "open interest is a futures figure",
+            ));
+        }
+        let path = format!("/api/v1/contracts/{}", Self::futures_symbol(symbol));
+        let data = self.get(&path, "")?;
+        let contracts = parse_decimal(field_str(&data, "openInterest")?)?;
+        let multiplier = data
+            .get("multiplier")
+            .and_then(serde_json::Value::as_f64)
+            .and_then(|m| parse_decimal(&m.to_string()).ok())
+            .ok_or_else(|| Error::Deserialization("no contract multiplier".to_string()))?;
+        Ok(OpenInterest {
+            symbol: symbol.clone(),
+            open_interest: contracts * multiplier,
+            timestamp: 0,
+        })
+    }
+
+    /// KuCoin publishes no public long/short positioning figure.
+    ///
+    /// # Errors
+    /// Always returns an [`Error`]: there is nothing to read.
+    pub fn long_short_ratio(&self, _symbol: &Symbol) -> Result<LongShortRatio> {
+        Err(Error::unsupported_field(
+            "KuCoin",
+            "long/short positioning",
+            "KuCoin publishes no public account-positioning figure",
+        ))
+    }
+
     /// Subscribe to the public trade stream for `symbol`.
     ///
     /// # Errors
@@ -380,10 +503,14 @@ impl KuCoin {
                 .cloned()
                 .unwrap_or_else(|| wire.parse().unwrap_or_else(|_| Symbol::new(wire, "")))
         };
+        let channels = self.derivatives_channels.clone();
+        let subscribed = |wire: &str, channel: DerivativesChannel| {
+            channels.iter().any(|(c, k)| c == wire && *k == channel)
+        };
         let mut events = Vec::new();
         if let Some(connection) = self.connection.as_mut() {
             while let Ok(Some(frame)) = connection.recv() {
-                if let Ok(Some(event)) = parse_ws_message(&frame, &resolve) {
+                if let Ok(Some(event)) = parse_ws_message(&frame, &resolve, &subscribed) {
                     events.push(event);
                 }
             }
@@ -391,7 +518,7 @@ impl KuCoin {
         // Drain the private user-data stream (tradeOrders/account.balance), if open.
         if let Some(connection) = self.private_connection.as_mut() {
             while let Ok(Some(frame)) = connection.recv() {
-                if let Ok(Some(event)) = parse_ws_message(&frame, &resolve) {
+                if let Ok(Some(event)) = parse_ws_message(&frame, &resolve, &subscribed) {
                     events.push(event);
                 }
             }
@@ -949,7 +1076,11 @@ fn futures_change(change: &str) -> Option<(BookLevel, OrderSide)> {
     Some((BookLevel { price, quantity }, side))
 }
 
-fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Option<Event>> {
+fn parse_ws_message(
+    text: &str,
+    resolve: &impl Fn(&str) -> Symbol,
+    subscribed: &impl Fn(&str, DerivativesChannel) -> bool,
+) -> Result<Option<Event>> {
     let value: serde_json::Value =
         serde_json::from_str(text).map_err(|e| Error::Deserialization(e.to_string()))?;
     if value.get("type").and_then(serde_json::Value::as_str) != Some("message") {
@@ -964,7 +1095,51 @@ fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Opt
     let data = value.get("data").unwrap_or(&null);
 
     // --- futures ------------------------------------------------------------
-    if topic.starts_with("/contractMarket/execution:") {
+    if topic.starts_with("/contract/instrument:") {
+        // One topic, two subjects. `funding.rate` carries no price, so a
+        // funding print reports a mark of zero rather than one taken from the
+        // other subject at a different moment.
+        return Ok(
+            match value.get("subject").and_then(serde_json::Value::as_str) {
+                Some("funding.rate") if subscribed(wire, DerivativesChannel::Funding) => {
+                    let rate = data
+                        .get("fundingRate")
+                        .and_then(serde_json::Value::as_f64)
+                        .and_then(|r| parse_decimal(&r.to_string()).ok());
+                    rate.map(|rate| {
+                        Event::Derivatives(DerivativesFeed::Funding(FundingRate {
+                            symbol,
+                            rate,
+                            mark_price: Decimal::ZERO,
+                            timestamp: opt_i64(data, "timestamp"),
+                        }))
+                    })
+                }
+                Some("mark.index.price") if subscribed(wire, DerivativesChannel::MarkIndex) => {
+                    let mark = data
+                        .get("markPrice")
+                        .and_then(serde_json::Value::as_f64)
+                        .and_then(|p| parse_decimal(&p.to_string()).ok());
+                    let index = data
+                        .get("indexPrice")
+                        .and_then(serde_json::Value::as_f64)
+                        .and_then(|p| parse_decimal(&p.to_string()).ok());
+                    match (mark, index) {
+                        (Some(mark_price), Some(index_price)) => {
+                            Some(Event::Derivatives(DerivativesFeed::MarkIndex(MarkIndex {
+                                symbol,
+                                mark_price,
+                                index_price,
+                                timestamp: opt_i64(data, "timestamp"),
+                            })))
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            },
+        );
+    } else if topic.starts_with("/contractMarket/execution:") {
         // `size` is an integer contract count and `ts` is in nanoseconds.
         return Ok(Some(Event::Trade(TradePrint {
             symbol,
@@ -1520,6 +1695,22 @@ impl Derivatives for KuCoin {
     }
 }
 
+impl DerivativesStream for KuCoin {
+    fn subscribe_derivatives(
+        &mut self,
+        symbol: &Symbol,
+        channel: DerivativesChannel,
+    ) -> Result<()> {
+        KuCoin::subscribe_derivatives(self, symbol, channel)
+    }
+    fn open_interest(&mut self, symbol: &Symbol) -> Result<OpenInterest> {
+        KuCoin::open_interest(self, symbol)
+    }
+    fn long_short_ratio(&mut self, symbol: &Symbol) -> Result<LongShortRatio> {
+        KuCoin::long_short_ratio(self, symbol)
+    }
+}
+
 /// Reconstruct a canonical [`Symbol`] from a KuCoin futures contract symbol
 /// (`XBTUSDTM` -> `BTC/USDT`): drop the trailing `M`, split off a known quote
 /// suffix, and map `XBT` back to `BTC`.
@@ -1620,6 +1811,186 @@ mod tests {
         let kucoin = KuCoin::with_http(Box::new(ArcTransport(http)), &opts)
             .with_ws(Box::new(ArcWs(Arc::clone(&ws))));
         (kucoin, ws)
+    }
+
+    /// The answers KuCoin gives on a bad day.
+    #[test]
+    fn kucoin_open_interest_reports_what_went_wrong() {
+        let http = Arc::new(MockHttpTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::UsdMFutures);
+        let kucoin = KuCoin::with_http(Box::new(ArcTransport(Arc::clone(&http))), &opts);
+
+        // A contract with no multiplier: the base-currency figure cannot be
+        // derived, and guessing one would be a fabricated size.
+        http.push_json(
+            200,
+            r#"{"code":"200000","data":{"symbol":"XBTUSDTM","openInterest":"100"}}"#,
+        );
+        assert!(matches!(
+            KuCoin::open_interest(&kucoin, &symbol()),
+            Err(Error::Deserialization(_))
+        ));
+    }
+
+    /// Frames the futures parser cannot use are dropped.
+    #[test]
+    fn kucoin_drops_futures_frames_it_cannot_read() {
+        let (mut kucoin, ws) = futures_ws_client();
+        ws.push_connection(vec![
+            // A book change that is not `price,side,size`.
+            Ok(Some(
+                r#"{"topic":"/contractMarket/level2:XBTUSDTM","type":"message",
+                "subject":"level2","data":{"sequence":1,"change":"nonsense"}}"#
+                    .to_string(),
+            )),
+            // A change naming a side the venue does not use.
+            Ok(Some(
+                r#"{"topic":"/contractMarket/level2:XBTUSDTM","type":"message",
+                "subject":"level2","data":{"sequence":1,"change":"1.0,sideways,2"}}"#
+                    .to_string(),
+            )),
+            // An instrument frame with an unknown subject.
+            Ok(Some(
+                r#"{"topic":"/contract/instrument:XBTUSDTM","type":"message",
+                "subject":"something.else","data":{}}"#
+                    .to_string(),
+            )),
+        ]);
+        KuCoin::subscribe_book(&mut kucoin, &symbol()).unwrap();
+        KuCoin::subscribe_derivatives(&mut kucoin, &symbol(), DerivativesChannel::MarkIndex)
+            .unwrap();
+
+        assert!(KuCoin::poll_events(&mut kucoin).is_empty());
+    }
+
+    /// An instrument frame missing its prices is dropped rather than half-read.
+    #[test]
+    fn kucoin_drops_an_instrument_frame_without_prices() {
+        let (mut kucoin, ws) = futures_ws_client();
+        ws.push_connection(vec![
+            Ok(Some(
+                r#"{"topic":"/contract/instrument:XBTUSDTM","type":"message",
+                "subject":"mark.index.price","data":{"markPrice":1.0}}"#
+                    .to_string(),
+            )),
+            Ok(Some(
+                r#"{"topic":"/contract/instrument:XBTUSDTM","type":"message",
+                "subject":"funding.rate","data":{"timestamp":1}}"#
+                    .to_string(),
+            )),
+        ]);
+        KuCoin::subscribe_derivatives(&mut kucoin, &symbol(), DerivativesChannel::MarkIndex)
+            .unwrap();
+        KuCoin::subscribe_derivatives(&mut kucoin, &symbol(), DerivativesChannel::Funding).unwrap();
+
+        assert!(KuCoin::poll_events(&mut kucoin).is_empty());
+    }
+
+    /// Both channels arrive on one topic, under two subjects.
+    #[test]
+    fn the_instrument_topic_answers_funding_and_mark_index() {
+        let (mut kucoin, ws) = futures_ws_client();
+        ws.push_connection(vec![
+            Ok(Some(
+                r#"{"topic":"/contract/instrument:XBTUSDTM","type":"message",
+                "subject":"mark.index.price","data":{"markPrice":81316.40,
+                "indexPrice":81334.48,"granularity":1000,"timestamp":1788462351000}}"#
+                    .to_string(),
+            )),
+            Ok(Some(
+                r#"{"topic":"/contract/instrument:XBTUSDTM","type":"message",
+                "subject":"funding.rate","data":{"period":1,"granularity":60000,
+                "fundingRate":0.000021,"timestamp":1788464640000}}"#
+                    .to_string(),
+            )),
+        ]);
+        KuCoin::subscribe_derivatives(&mut kucoin, &symbol(), DerivativesChannel::MarkIndex)
+            .unwrap();
+        KuCoin::subscribe_derivatives(&mut kucoin, &symbol(), DerivativesChannel::Funding).unwrap();
+        // One subscription frame: the second channel is on the same topic.
+        assert!(ws.sent()[0].contains("/contract/instrument:XBTUSDTM"));
+
+        let events = KuCoin::poll_events(&mut kucoin);
+        let Event::Derivatives(DerivativesFeed::MarkIndex(mark)) = &events[0] else {
+            panic!("expected mark/index, got {:?}", events[0]);
+        };
+        assert_eq!(mark.mark_price, dec!(81316.40));
+        assert_eq!(mark.index_price, dec!(81334.48));
+        assert_eq!(mark.timestamp, 1_788_462_351_000);
+
+        let Event::Derivatives(DerivativesFeed::Funding(funding)) = &events[1] else {
+            panic!("expected funding, got {:?}", events[1]);
+        };
+        assert_eq!(funding.rate, dec!(0.000021));
+        // The funding subject carries no price, so the mark is zero rather than
+        // one borrowed from the other subject at another moment.
+        assert_eq!(funding.mark_price, Decimal::ZERO);
+    }
+
+    /// A frame for a channel that was not subscribed to is not emitted.
+    #[test]
+    fn an_unsubscribed_instrument_subject_is_dropped() {
+        let (mut kucoin, ws) = futures_ws_client();
+        ws.push_connection(vec![Ok(Some(
+            r#"{"topic":"/contract/instrument:XBTUSDTM","type":"message",
+            "subject":"funding.rate","data":{"fundingRate":0.000021,
+            "timestamp":1788464640000}}"#
+                .to_string(),
+        ))]);
+        KuCoin::subscribe_derivatives(&mut kucoin, &symbol(), DerivativesChannel::MarkIndex)
+            .unwrap();
+
+        assert!(KuCoin::poll_events(&mut kucoin).is_empty());
+    }
+
+    /// Open interest is in contracts; the multiplier arrives in the same reply,
+    /// so the base-currency figure is arithmetic on one reading.
+    #[test]
+    fn open_interest_multiplies_contracts_by_the_contract_size() {
+        let http = Arc::new(MockHttpTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::UsdMFutures);
+        let kucoin = KuCoin::with_http(Box::new(ArcTransport(Arc::clone(&http))), &opts);
+        http.push_json(
+            200,
+            r#"{"code":"200000","data":{"symbol":"XBTUSDTM","baseCurrency":"XBT",
+            "multiplier":0.001,"openInterest":"16731943","lotSize":1}}"#,
+        );
+        let open_interest = KuCoin::open_interest(&kucoin, &symbol()).unwrap();
+        assert_eq!(open_interest.open_interest, dec!(16731.943));
+        assert!(http.recorded_requests()[0]
+            .url
+            .contains("/contracts/XBTUSDTM"));
+    }
+
+    /// KuCoin publishes neither forced orders nor a positioning figure.
+    #[test]
+    fn kucoin_refuses_what_it_does_not_publish() {
+        let (mut kucoin, ws) = futures_ws_client();
+        let err =
+            KuCoin::subscribe_derivatives(&mut kucoin, &symbol(), DerivativesChannel::Liquidations)
+                .expect_err("KuCoin has no public liquidation stream");
+        assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
+        assert!(ws.sent().is_empty());
+
+        let (kucoin, _) = futures_ws_client();
+        assert!(KuCoin::long_short_ratio(&kucoin, &symbol()).is_err());
+    }
+
+    #[test]
+    fn a_spot_client_refuses_the_kucoin_derivatives_surface() {
+        let ws = Arc::new(MockWsTransport::new());
+        let http = Arc::new(MockHttpTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::Spot);
+        let mut kucoin = KuCoin::with_http(Box::new(ArcTransport(Arc::clone(&http))), &opts)
+            .with_ws(Box::new(ArcWs(Arc::clone(&ws))));
+        for channel in [
+            DerivativesChannel::Funding,
+            DerivativesChannel::MarkIndex,
+            DerivativesChannel::Liquidations,
+        ] {
+            assert!(KuCoin::subscribe_derivatives(&mut kucoin, &symbol(), channel).is_err());
+        }
+        assert!(KuCoin::open_interest(&kucoin, &symbol()).is_err());
     }
 
     /// Host, topic and symbol all follow the market.

@@ -37,13 +37,17 @@ use crate::clock::{NonceGenerator, ServerClock, TokenTtl};
 use crate::credentials::Credentials;
 use crate::error::{Error, Result};
 use crate::events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
+use crate::feeds::{
+    DerivativesChannel, DerivativesFeed, FundingRate, LongShortRatio, MarkIndex, OpenInterest,
+};
 use crate::normalize::{format_decimal, parse_decimal};
 use crate::options::{ExchangeOptions, MarginMode, MarketType, PositionMode, SelfTradePrevention};
 use crate::positions::{Position, PositionSide};
 use crate::signing::{hmac_sha512_base64_with_b64_secret, sha256};
 use crate::symbol::Symbol;
 use crate::traits::{
-    AdvancedOrders, Derivatives, Exchange, Execution, MarketData, WsExecution, WsUserData,
+    AdvancedOrders, Derivatives, DerivativesStream, Exchange, Execution, MarketData, WsExecution,
+    WsUserData,
 };
 use crate::transport::{HttpMethod, HttpRequest, HttpTransport, WsConnection, WsTransport};
 use crate::types::{
@@ -96,6 +100,12 @@ pub struct Kraken {
     /// back into `BTC/USDT` without knowing what was asked for: the quote
     /// is folded to USD on the way out, and `XBT` is Kraken's own spelling.
     futures_subscriptions: Vec<(String, Symbol)>,
+    /// Which derivatives channels are subscribed, per product.
+    ///
+    /// Kraken's futures `ticker` frame carries the funding rate, the mark
+    /// price and the index together, so one frame can answer three
+    /// subscriptions. Only what was asked for is emitted.
+    derivatives_channels: Vec<(String, DerivativesChannel)>,
     /// Leverage applied on Kraken Futures (`maxLeverage` preference), recorded so
     /// [`positions`](Self::positions) can report it (the venue omits per-position
     /// leverage in `openpositions`).
@@ -170,6 +180,7 @@ impl Kraken {
             connection: None,
             sub_messages: Vec::new(),
             futures_subscriptions: Vec::new(),
+            derivatives_channels: Vec::new(),
             leverage: Cell::new(1),
             private_connection: None,
             user_data_active: false,
@@ -486,15 +497,113 @@ impl Kraken {
         Ok(())
     }
 
+    /// Subscribe to a pushed derivatives channel.
+    ///
+    /// Kraken Futures publishes the funding rate, the mark price and the index
+    /// in its `ticker` feed -- one reading, one moment -- so `Funding` and
+    /// `MarkIndex` are the same subscription seen two ways.
+    ///
+    /// The rate carried is `relative_funding_rate`, the proportion charged for
+    /// the interval. `funding_rate` beside it is that proportion times the
+    /// index, an absolute amount per contract, and reporting it as a rate would
+    /// be off by four orders of magnitude.
+    ///
+    /// `Liquidations` is refused: Kraken Futures publishes no public feed of
+    /// forced orders.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] on a spot client, for `Liquidations`, or if the
+    /// subscription fails.
+    pub fn subscribe_derivatives(
+        &mut self,
+        symbol: &Symbol,
+        channel: DerivativesChannel,
+    ) -> Result<()> {
+        if !self.is_futures() {
+            return Err(Error::unsupported_field(
+                "Kraken",
+                "a derivatives channel on a spot client",
+                "funding and mark/index exist only on Kraken Futures",
+            ));
+        }
+        if channel == DerivativesChannel::Liquidations {
+            return Err(Error::unsupported_field(
+                "Kraken",
+                "a liquidations channel",
+                "Kraken Futures publishes no public feed of forced orders",
+            ));
+        }
+        let product = Self::futures_symbol(symbol);
+        if !self
+            .derivatives_channels
+            .iter()
+            .any(|(p, c)| p == &product && *c == channel)
+        {
+            self.derivatives_channels.push((product, channel));
+        }
+        self.subscribe_futures(symbol, "ticker")
+    }
+
+    /// The current open interest (`GET /derivatives/api/v3/tickers`).
+    ///
+    /// Polled, not pushed. Kraken publishes one row per product and the figure
+    /// is in base units, as its `PF_` contracts quote.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] on a spot client, if the request fails, or if the
+    /// product is not in the reply.
+    pub fn open_interest(&self, symbol: &Symbol) -> Result<OpenInterest> {
+        if !self.is_futures() {
+            return Err(Error::unsupported_field(
+                "Kraken",
+                "open interest on a spot client",
+                "open interest is a futures figure",
+            ));
+        }
+        let product = Self::futures_symbol(symbol);
+        let value = self.futures_get("/derivatives/api/v3/tickers", "")?;
+        let row = value
+            .get("tickers")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|rows| {
+                rows.iter().find(|row| {
+                    row.get("symbol").and_then(serde_json::Value::as_str) == Some(&product)
+                })
+            })
+            .ok_or_else(|| Error::NotFound(format!("{product} is not in the ticker list")))?;
+        Ok(OpenInterest {
+            symbol: symbol.clone(),
+            open_interest: futures_decimal(row, "openInterest")
+                .ok_or_else(|| Error::Deserialization("no openInterest".to_string()))?,
+            timestamp: 0,
+        })
+    }
+
+    /// Kraken publishes no long/short positioning figure.
+    ///
+    /// # Errors
+    /// Always returns an [`Error`]: there is nothing to read.
+    pub fn long_short_ratio(&self, _symbol: &Symbol) -> Result<LongShortRatio> {
+        Err(Error::unsupported_field(
+            "Kraken",
+            "long/short positioning",
+            "Kraken publishes no public account-positioning figure",
+        ))
+    }
+
     /// Drain all stream events available since the last call. Non-blocking.
     pub fn poll_events(&mut self) -> Vec<Event> {
         let products: HashMap<String, Symbol> =
             self.futures_subscriptions.iter().cloned().collect();
         let resolve = |product: &str| products.get(product).cloned();
+        let channels = self.derivatives_channels.clone();
+        let subscribed = |product: &str, channel: DerivativesChannel| {
+            channels.iter().any(|(p, c)| p == product && *c == channel)
+        };
         let mut events = Vec::new();
         if let Some(connection) = self.connection.as_mut() {
             while let Ok(Some(frame)) = connection.recv() {
-                if let Ok(mut parsed) = parse_ws_message(&frame, &resolve) {
+                if let Ok(mut parsed) = parse_ws_message(&frame, &resolve, &subscribed) {
                     events.append(&mut parsed);
                 }
             }
@@ -508,7 +617,7 @@ impl Kraken {
                 let parsed = if futures {
                     parse_futures_private(&frame)
                 } else {
-                    parse_ws_message(&frame, &resolve)
+                    parse_ws_message(&frame, &resolve, &subscribed)
                 };
                 if let Ok(mut parsed) = parsed {
                     events.append(&mut parsed);
@@ -2075,6 +2184,7 @@ fn parse_futures_frame(
     feed: &str,
     value: &serde_json::Value,
     resolve: &impl Fn(&str) -> Option<Symbol>,
+    subscribed: &impl Fn(&str, DerivativesChannel) -> bool,
 ) -> Vec<Event> {
     let Some(product) = value.get("product_id").and_then(serde_json::Value::as_str) else {
         return Vec::new(); // subscription ack, info frame
@@ -2140,30 +2250,65 @@ fn parse_futures_frame(
             })]
         }
         "ticker" => {
-            let Some(last) = futures_decimal(value, "last") else {
-                return Vec::new();
-            };
-            vec![Event::Ticker(Ticker {
-                symbol,
-                last,
-                bid: futures_decimal(value, "bid").unwrap_or_default(),
-                ask: futures_decimal(value, "ask").unwrap_or_default(),
-                volume: futures_decimal(value, "volume").unwrap_or_default(),
-                timestamp: value
-                    .get("time")
-                    .and_then(serde_json::Value::as_i64)
-                    .unwrap_or(0),
-            })]
+            let timestamp = value
+                .get("time")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            let mut out = Vec::new();
+            if let Some(last) = futures_decimal(value, "last") {
+                out.push(Event::Ticker(Ticker {
+                    symbol: symbol.clone(),
+                    last,
+                    bid: futures_decimal(value, "bid").unwrap_or_default(),
+                    ask: futures_decimal(value, "ask").unwrap_or_default(),
+                    volume: futures_decimal(value, "volume").unwrap_or_default(),
+                    timestamp,
+                }));
+            }
+            let mark = futures_decimal(value, "markPrice");
+            if subscribed(product, DerivativesChannel::Funding) {
+                // `relative_funding_rate` is the proportion charged for the
+                // interval. `funding_rate` beside it is that proportion times
+                // the index -- an absolute amount per contract -- and reporting
+                // it as a rate would be wrong by four orders of magnitude.
+                if let (Some(rate), Some(mark_price)) =
+                    (futures_decimal(value, "relative_funding_rate"), mark)
+                {
+                    out.push(Event::Derivatives(DerivativesFeed::Funding(FundingRate {
+                        symbol: symbol.clone(),
+                        rate,
+                        mark_price,
+                        timestamp,
+                    })));
+                }
+            }
+            if subscribed(product, DerivativesChannel::MarkIndex) {
+                if let (Some(mark_price), Some(index_price)) =
+                    (mark, futures_decimal(value, "index"))
+                {
+                    out.push(Event::Derivatives(DerivativesFeed::MarkIndex(MarkIndex {
+                        symbol,
+                        mark_price,
+                        index_price,
+                        timestamp,
+                    })));
+                }
+            }
+            out
         }
         _ => Vec::new(),
     }
 }
 
-fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Option<Symbol>) -> Result<Vec<Event>> {
+fn parse_ws_message(
+    text: &str,
+    resolve: &impl Fn(&str) -> Option<Symbol>,
+    subscribed: &impl Fn(&str, DerivativesChannel) -> bool,
+) -> Result<Vec<Event>> {
     let value: serde_json::Value =
         serde_json::from_str(text).map_err(|e| Error::Deserialization(e.to_string()))?;
     if let Some(feed) = value.get("feed").and_then(serde_json::Value::as_str) {
-        return Ok(parse_futures_frame(feed, &value, resolve));
+        return Ok(parse_futures_frame(feed, &value, resolve, subscribed));
     }
     let Some(channel) = value.get("channel").and_then(serde_json::Value::as_str) else {
         return Ok(Vec::new()); // status/heartbeat/ack
@@ -2403,6 +2548,22 @@ impl Derivatives for Kraken {
     }
     fn close_position(&mut self, symbol: &Symbol) -> Result<Order> {
         Kraken::close_position(self, symbol)
+    }
+}
+
+impl DerivativesStream for Kraken {
+    fn subscribe_derivatives(
+        &mut self,
+        symbol: &Symbol,
+        channel: DerivativesChannel,
+    ) -> Result<()> {
+        Kraken::subscribe_derivatives(self, symbol, channel)
+    }
+    fn open_interest(&mut self, symbol: &Symbol) -> Result<OpenInterest> {
+        Kraken::open_interest(self, symbol)
+    }
+    fn long_short_ratio(&mut self, symbol: &Symbol) -> Result<LongShortRatio> {
+        Kraken::long_short_ratio(self, symbol)
     }
 }
 
@@ -2713,6 +2874,178 @@ mod tests {
         let kraken = Kraken::with_http(Box::new(ArcTransport(http)), &opts)
             .with_ws(Box::new(ArcWs(Arc::clone(&ws))));
         (kraken, ws)
+    }
+
+    /// The answers a venue gives on a bad day: a product that is not in the
+    /// list, and a row without the figure. Neither had ever run.
+    #[test]
+    fn kraken_open_interest_reports_what_went_wrong() {
+        let http = Arc::new(MockHttpTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::UsdMFutures);
+        let kraken = Kraken::with_http(Box::new(ArcTransport(Arc::clone(&http))), &opts);
+
+        http.push_json(200, r#"{"result":"success","tickers":[]}"#);
+        assert!(matches!(
+            Kraken::open_interest(&kraken, &symbol()),
+            Err(Error::NotFound(_))
+        ));
+
+        http.push_json(
+            200,
+            r#"{"result":"success","tickers":[{"symbol":"PF_XBTUSD","last":1.0}]}"#,
+        );
+        assert!(matches!(
+            Kraken::open_interest(&kraken, &symbol()),
+            Err(Error::Deserialization(_))
+        ));
+    }
+
+    /// Frames the futures parser cannot use are dropped, not guessed at.
+    #[test]
+    fn kraken_drops_futures_frames_it_cannot_read() {
+        let (mut kraken, ws) = futures_ws_client();
+        ws.push_connection(vec![
+            // No product id: a subscription ack or an info frame.
+            Ok(Some(r#"{"feed":"ticker_lite"}"#.to_string())),
+            // A book delta with no side.
+            Ok(Some(
+                r#"{"feed":"book","product_id":"PF_XBTUSD","price":1.0,"qty":2.0}"#.to_string(),
+            )),
+            // A trade with no price.
+            Ok(Some(
+                r#"{"feed":"trade","product_id":"PF_XBTUSD","side":"buy","qty":1.0}"#.to_string(),
+            )),
+            // A ticker with no last price.
+            Ok(Some(
+                r#"{"feed":"ticker","product_id":"PF_XBTUSD"}"#.to_string(),
+            )),
+            // A feed this client does not subscribe to.
+            Ok(Some(
+                r#"{"feed":"heartbeat","product_id":"PF_XBTUSD"}"#.to_string(),
+            )),
+        ]);
+        Kraken::subscribe_trades(&mut kraken, &symbol()).unwrap();
+
+        assert!(Kraken::poll_events(&mut kraken).is_empty());
+    }
+
+    /// A trade snapshot replays several trades in one frame.
+    #[test]
+    fn kraken_parses_a_trade_snapshot() {
+        let (mut kraken, ws) = futures_ws_client();
+        ws.push_connection(vec![Ok(Some(
+            r#"{"feed":"trade_snapshot","product_id":"PF_XBTUSD","trades":[
+            {"feed":"trade","product_id":"PF_XBTUSD","side":"sell","time":1788462438934,
+             "qty":0.0062,"price":81229.0},
+            {"feed":"trade","product_id":"PF_XBTUSD","side":"buy","time":1788462438268,
+             "qty":0.0002,"price":81231.0}]}"#
+                .to_string(),
+        ))]);
+        Kraken::subscribe_trades(&mut kraken, &symbol()).unwrap();
+
+        let events = Kraken::poll_events(&mut kraken);
+        assert_eq!(events.len(), 2, "{events:?}");
+    }
+
+    /// One ticker frame answers both subscriptions, because Kraken reads the
+    /// funding rate, the mark price and the index at one moment and sends them
+    /// together.
+    #[test]
+    fn the_futures_ticker_answers_funding_and_mark_index() {
+        let (mut kraken, ws) = futures_ws_client();
+        ws.push_connection(vec![Ok(Some(
+            r#"{"time":1788462442280,"product_id":"PF_XBTUSD","funding_rate":-0.6559492877,
+            "relative_funding_rate":-8.071979166667e-6,"feed":"ticker","bid":81233.0,
+            "ask":81234.0,"volume":8837.1259,"index":81231.21,"last":81229.0,
+            "openInterest":1895.2046,"markPrice":81235.79652525584,"tag":"perpetual"}"#
+                .to_string(),
+        ))]);
+        Kraken::subscribe_derivatives(&mut kraken, &symbol(), DerivativesChannel::Funding).unwrap();
+        Kraken::subscribe_derivatives(&mut kraken, &symbol(), DerivativesChannel::MarkIndex)
+            .unwrap();
+
+        let events = Kraken::poll_events(&mut kraken);
+        assert_eq!(events.len(), 3, "ticker, funding, mark/index: {events:?}");
+
+        let Event::Derivatives(DerivativesFeed::Funding(funding)) = &events[1] else {
+            panic!("expected funding, got {:?}", events[1]);
+        };
+        // The relative rate, not the absolute per-contract amount beside it:
+        // reporting `funding_rate` as a rate would be off by four orders of
+        // magnitude.
+        assert_eq!(funding.rate, dec!(-0.000008071979166667));
+        assert_eq!(funding.mark_price, dec!(81235.79652525584));
+
+        let Event::Derivatives(DerivativesFeed::MarkIndex(mark)) = &events[2] else {
+            panic!("expected mark/index, got {:?}", events[2]);
+        };
+        assert_eq!(mark.index_price, dec!(81231.21));
+    }
+
+    /// A caller watching prices does not start receiving funding prints.
+    #[test]
+    fn an_unsubscribed_derivatives_print_is_not_emitted_by_kraken() {
+        let (mut kraken, ws) = futures_ws_client();
+        ws.push_connection(vec![Ok(Some(
+            r#"{"time":1,"product_id":"PF_XBTUSD","feed":"ticker","bid":1.0,"ask":2.0,
+            "volume":3.0,"index":4.0,"last":5.0,"markPrice":6.0,
+            "relative_funding_rate":-0.00001}"#
+                .to_string(),
+        ))]);
+        Kraken::subscribe_ticker(&mut kraken, &symbol()).unwrap();
+
+        let events = Kraken::poll_events(&mut kraken);
+        assert_eq!(events.len(), 1, "only the ticker was asked for: {events:?}");
+        assert!(matches!(events[0], Event::Ticker(_)));
+    }
+
+    /// Kraken publishes no public feed of forced orders, and no positioning
+    /// figure, so both are refused rather than left to deliver nothing.
+    #[test]
+    fn kraken_refuses_what_it_does_not_publish() {
+        let (mut kraken, ws) = futures_ws_client();
+        let err =
+            Kraken::subscribe_derivatives(&mut kraken, &symbol(), DerivativesChannel::Liquidations)
+                .expect_err("Kraken has no public liquidation feed");
+        assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
+        assert!(ws.sent().is_empty(), "refused, yet subscribed");
+
+        let (kraken, _) = futures_ws_client();
+        assert!(Kraken::long_short_ratio(&kraken, &symbol()).is_err());
+    }
+
+    #[test]
+    fn open_interest_reads_the_products_row() {
+        let http = Arc::new(MockHttpTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::UsdMFutures);
+        let kraken = Kraken::with_http(Box::new(ArcTransport(Arc::clone(&http))), &opts);
+        http.push_json(
+            200,
+            r#"{"result":"success","tickers":[
+            {"symbol":"PF_ETHUSD","openInterest":100.0},
+            {"symbol":"PF_XBTUSD","last":81582,"markPrice":81570.61,"openInterest":1863.9616,
+             "fundingRate":-0.655949}]}"#,
+        );
+        let open_interest = Kraken::open_interest(&kraken, &symbol()).unwrap();
+        assert_eq!(open_interest.open_interest, dec!(1863.9616));
+    }
+
+    /// A spot client has no derivatives surface at all.
+    #[test]
+    fn a_spot_client_refuses_the_kraken_derivatives_surface() {
+        let ws = Arc::new(MockWsTransport::new());
+        let http = Arc::new(MockHttpTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::Spot);
+        let mut kraken = Kraken::with_http(Box::new(ArcTransport(http)), &opts)
+            .with_ws(Box::new(ArcWs(Arc::clone(&ws))));
+        for channel in [
+            DerivativesChannel::Funding,
+            DerivativesChannel::MarkIndex,
+            DerivativesChannel::Liquidations,
+        ] {
+            assert!(Kraken::subscribe_derivatives(&mut kraken, &symbol(), channel).is_err());
+        }
+        assert!(Kraken::open_interest(&kraken, &symbol()).is_err());
     }
 
     /// Kraken Futures is a different service, not the spot socket with other

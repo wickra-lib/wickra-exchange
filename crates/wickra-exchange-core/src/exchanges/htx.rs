@@ -31,13 +31,17 @@ use crate::clock::ServerClock;
 use crate::credentials::Credentials;
 use crate::error::{Error, Result};
 use crate::events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
+use crate::feeds::{
+    DerivativesChannel, DerivativesFeed, FundingRate, Liquidation, LongShortRatio, OpenInterest,
+};
 use crate::normalize::{format_decimal, parse_decimal};
 use crate::options::{ExchangeOptions, MarginMode, MarketType, SelfTradePrevention};
 use crate::positions::{Position, PositionSide};
 use crate::signing::hmac_sha256_base64;
 use crate::symbol::Symbol;
 use crate::traits::{
-    AdvancedOrders, Derivatives, Exchange, Execution, MarketData, WsExecution, WsUserData,
+    AdvancedOrders, Derivatives, DerivativesStream, Exchange, Execution, MarketData, WsExecution,
+    WsUserData,
 };
 use crate::transport::{HttpMethod, HttpRequest, HttpTransport, WsConnection, WsTransport};
 use crate::types::{
@@ -55,6 +59,11 @@ use wickra_core::Candle;
 const HOST: &str = "api.huobi.pro";
 /// USDT-margined swap (futures) API host.
 const FUTURES_HOST: &str = "api.hbdm.com";
+
+/// HTX's public notification socket: funding and forced orders, no
+/// credentials. Its market data comes from a different host, so the two are
+/// separate connections.
+const NOTIFICATION_WS_URL: &str = "wss://api.hbdm.com/linear-swap-notification";
 
 fn system_now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -131,6 +140,12 @@ pub struct Htx {
     /// [`subscribe_user_data`](Self::subscribe_user_data) and drained by
     /// [`poll_events`](Self::poll_events) alongside the public stream.
     private_connection: Option<Box<dyn WsConnection>>,
+    /// The public notification socket, which carries funding and forced
+    /// orders. HTX serves those from a different host than its market data,
+    /// so this is a third connection rather than another topic on the first.
+    notification_connection: Option<Box<dyn WsConnection>>,
+    /// Which derivatives channels are subscribed, per contract code.
+    derivatives_channels: Vec<(String, DerivativesChannel)>,
     /// Set once the private stream is subscribed, so [`poll_events`](Self::poll_events)
     /// re-subscribes it after a drop.
     user_data_active: bool,
@@ -187,6 +202,8 @@ impl Htx {
             account_id: RefCell::new(None),
             leverage: Cell::new(1),
             private_connection: None,
+            notification_connection: None,
+            derivatives_channels: Vec::new(),
             user_data_active: false,
         }
     }
@@ -383,6 +400,164 @@ impl Htx {
         })
     }
 
+    /// Subscribe to a pushed derivatives channel.
+    ///
+    /// HTX serves these from `linear-swap-notification`, a different host from
+    /// its market data, so this opens a second public socket. Both topics are
+    /// anonymous -- no credentials.
+    ///
+    /// The funding frame carries no price, so a funding print reports a mark of
+    /// zero rather than one taken from another channel at another moment.
+    ///
+    /// `MarkIndex` is refused: HTX publishes the mark price and the index as
+    /// separate kline channels, never in one frame, and pairing them would
+    /// present two readings from different moments as one.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] on a spot client, for `MarkIndex`, or if the
+    /// subscription fails.
+    pub fn subscribe_derivatives(
+        &mut self,
+        symbol: &Symbol,
+        channel: DerivativesChannel,
+    ) -> Result<()> {
+        if !self.is_futures() {
+            return Err(Error::unsupported_field(
+                "HTX",
+                "a derivatives channel on a spot client",
+                "funding and forced orders exist only on the swap venue",
+            ));
+        }
+        let topic = match channel {
+            DerivativesChannel::Funding => "funding_rate",
+            DerivativesChannel::Liquidations => "liquidation_orders",
+            DerivativesChannel::MarkIndex => {
+                return Err(Error::unsupported_field(
+                    "HTX",
+                    "a combined mark/index channel",
+                    "HTX publishes mark and index as separate kline channels, never \
+                     in one frame",
+                ))
+            }
+        };
+        let code = Self::contract_code(symbol);
+        if self.notification_connection.is_none() {
+            let ws = self.ws.as_ref().ok_or(Error::NotConnected)?;
+            self.notification_connection = Some(ws.connect(NOTIFICATION_WS_URL)?);
+        }
+        let message = format!(r#"{{"op":"sub","topic":"public.{code}.{topic}","cid":"{code}"}}"#);
+        self.notification_connection
+            .as_mut()
+            .expect("connection just ensured")
+            .send(&message)?;
+        if !self.sub_messages.contains(&message) {
+            self.sub_messages.push(message);
+        }
+        if !self
+            .derivatives_channels
+            .iter()
+            .any(|(c, k)| c == &code && *k == channel)
+        {
+            self.derivatives_channels.push((code.clone(), channel));
+        }
+        if !self.subscriptions.iter().any(|(w, _)| w == &code) {
+            self.subscriptions.push((code, symbol.clone()));
+        }
+        Ok(())
+    }
+
+    /// The current open interest
+    /// (`GET /linear-swap-api/v1/swap_open_interest`).
+    ///
+    /// Polled, not pushed. The figure carried is `volume`, the contract count,
+    /// which is the unit this client's swap stream and order path both use.
+    ///
+    /// HTX's field names invert between endpoints, which is worth knowing
+    /// before reading either: on this endpoint `volume` is contracts and
+    /// `amount` is base currency, while on the trade stream `amount` is the
+    /// contract count. Taking `amount` here would silently switch units.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] on a spot client, if the request fails, or if the
+    /// venue returns no data point.
+    pub fn open_interest(&self, symbol: &Symbol) -> Result<OpenInterest> {
+        if !self.is_futures() {
+            return Err(Error::unsupported_field(
+                "HTX",
+                "open interest on a spot client",
+                "open interest is a swap figure",
+            ));
+        }
+        let query = format!("contract_code={}", Self::contract_code(symbol));
+        let value = self.get("/linear-swap-api/v1/swap_open_interest", &query)?;
+        let point = value
+            .get("data")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|rows: &Vec<serde_json::Value>| rows.first())
+            .ok_or_else(|| Error::NotFound("no open-interest data point".to_string()))?;
+        let contracts = point
+            .get("volume")
+            .and_then(serde_json::Value::as_f64)
+            .and_then(|v| parse_decimal(&v.to_string()).ok())
+            .ok_or_else(|| Error::Deserialization("no open-interest volume".to_string()))?;
+        Ok(OpenInterest {
+            symbol: symbol.clone(),
+            open_interest: contracts,
+            timestamp: value
+                .get("ts")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0),
+        })
+    }
+
+    /// The current long/short positioning
+    /// (`GET /linear-swap-api/v1/swap_elite_account_ratio`), most recent point.
+    ///
+    /// Polled, not pushed. This is HTX's **elite** ratio: the positioning of
+    /// its top traders, not of every account, which is the only positioning
+    /// figure it publishes. `buy_ratio` and `sell_ratio` do not sum to one --
+    /// `locked_ratio` holds the remainder, for accounts holding both sides --
+    /// and they are carried as given rather than rescaled, since rescaling
+    /// would invent proportions the venue did not publish.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] on a spot client, if the request fails, or if the
+    /// venue returns no data point.
+    pub fn long_short_ratio(&self, symbol: &Symbol) -> Result<LongShortRatio> {
+        if !self.is_futures() {
+            return Err(Error::unsupported_field(
+                "HTX",
+                "long/short positioning on a spot client",
+                "positioning is a swap figure",
+            ));
+        }
+        let query = format!("contract_code={}&period=5min", Self::contract_code(symbol));
+        let value = self.get("/linear-swap-api/v1/swap_elite_account_ratio", &query)?;
+        let point = value
+            .get("data")
+            .and_then(|d| d.get("list"))
+            .and_then(serde_json::Value::as_array)
+            .and_then(|rows: &Vec<serde_json::Value>| rows.last())
+            .ok_or_else(|| Error::NotFound("no positioning data point".to_string()))?;
+        let ratio = |key: &str| {
+            point
+                .get(key)
+                .and_then(serde_json::Value::as_f64)
+                .and_then(|v| parse_decimal(&v.to_string()).ok())
+        };
+        Ok(LongShortRatio {
+            symbol: symbol.clone(),
+            long_size: ratio("buy_ratio")
+                .ok_or_else(|| Error::Deserialization("no buy_ratio".to_string()))?,
+            short_size: ratio("sell_ratio")
+                .ok_or_else(|| Error::Deserialization("no sell_ratio".to_string()))?,
+            timestamp: point
+                .get("ts")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0),
+        })
+    }
+
     /// Subscribe to the public trade stream for `symbol`.
     ///
     /// # Errors
@@ -466,6 +641,10 @@ impl Htx {
                 .cloned()
                 .unwrap_or_else(|| Symbol::new(wire, ""))
         };
+        let channels = self.derivatives_channels.clone();
+        let subscribed = |code: &str, channel: DerivativesChannel| {
+            channels.iter().any(|(c, k)| c == code && *k == channel)
+        };
         let mut events = Vec::new();
         if let Some(connection) = self.connection.as_mut() {
             while let Ok(Some(frame)) = connection.recv() {
@@ -480,6 +659,17 @@ impl Htx {
                 if let Ok(mut parsed) = parse_ws_message(&frame, &resolve) {
                     events.append(&mut parsed);
                 }
+            }
+        }
+        // Drain the public notification stream: funding and forced orders. It
+        // has its own heartbeat, in the `{"op":"ping"}` shape.
+        if let Some(connection) = self.notification_connection.as_mut() {
+            while let Ok(Some(frame)) = connection.recv() {
+                if let Some(pong) = pong_for(&frame) {
+                    let _ = connection.send(&pong);
+                    continue;
+                }
+                events.append(&mut parse_notification(&frame, &resolve, &subscribed));
             }
         }
         // Drain the private user-data (v2 `orders`/`accounts.update`) stream, if open.
@@ -1525,6 +1715,80 @@ fn level_price(tick: &serde_json::Value, key: &str) -> Decimal {
         .unwrap_or(Decimal::ZERO)
 }
 
+/// Turn one notification frame into derivatives events.
+///
+/// The topic is `public.<contract>.<channel>`, and a data frame carries
+/// `"op":"notify"`. A subscribe acknowledgement carries `"op":"sub"` and no
+/// data, so it falls through to an empty result rather than being mistaken for
+/// an empty channel.
+fn parse_notification(
+    frame: &str,
+    resolve: &impl Fn(&str) -> Symbol,
+    subscribed: &impl Fn(&str, DerivativesChannel) -> bool,
+) -> Vec<Event> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(frame) else {
+        return Vec::new();
+    };
+    if value.get("op").and_then(serde_json::Value::as_str) != Some("notify") {
+        return Vec::new();
+    }
+    let Some(topic) = value.get("topic").and_then(serde_json::Value::as_str) else {
+        return Vec::new();
+    };
+    let mut parts = topic.split('.');
+    let _public = parts.next();
+    let code = parts.next().unwrap_or("");
+    let channel = parts.next().unwrap_or("");
+    let empty = Vec::new();
+    let rows = value
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or(&empty);
+
+    match channel {
+        "funding_rate" if subscribed(code, DerivativesChannel::Funding) => rows
+            .iter()
+            .filter_map(|row| {
+                Some(Event::Derivatives(DerivativesFeed::Funding(FundingRate {
+                    symbol: resolve(row.get("contract_code")?.as_str()?),
+                    rate: parse_decimal(row.get("funding_rate")?.as_str()?).ok()?,
+                    // The funding frame carries no price; a mark taken from
+                    // another channel would belong to another moment.
+                    mark_price: Decimal::ZERO,
+                    timestamp: row
+                        .get("funding_time")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|t| t.parse().ok())
+                        .unwrap_or(0),
+                })))
+            })
+            .collect(),
+        "liquidation_orders" if subscribed(code, DerivativesChannel::Liquidations) => rows
+            .iter()
+            .filter_map(|row| {
+                // `direction` is the side of the forced order hitting the book:
+                // a liquidated long is sold. `volume` is the contract count,
+                // the unit this client's swap stream uses.
+                let price = row.get("price").and_then(serde_json::Value::as_f64)?;
+                let volume = row.get("volume").and_then(serde_json::Value::as_f64)?;
+                Some(Event::Derivatives(DerivativesFeed::Liquidation(
+                    Liquidation {
+                        symbol: resolve(row.get("contract_code")?.as_str()?),
+                        side: parse_side(row.get("direction")?.as_str()?).ok()?,
+                        price: parse_decimal(&price.to_string()).ok()?,
+                        quantity: parse_decimal(&volume.to_string()).ok()?,
+                        timestamp: row
+                            .get("created_at")
+                            .and_then(serde_json::Value::as_i64)
+                            .unwrap_or(0),
+                    },
+                )))
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// The reply HTX's heartbeat asks for, or `None` if this frame is not one.
 ///
 /// Two shapes, because HTX runs two protocols: the public market socket sends
@@ -1741,6 +2005,22 @@ impl Derivatives for Htx {
     }
     fn close_position(&mut self, symbol: &Symbol) -> Result<Order> {
         Htx::close_position(self, symbol)
+    }
+}
+
+impl DerivativesStream for Htx {
+    fn subscribe_derivatives(
+        &mut self,
+        symbol: &Symbol,
+        channel: DerivativesChannel,
+    ) -> Result<()> {
+        Htx::subscribe_derivatives(self, symbol, channel)
+    }
+    fn open_interest(&mut self, symbol: &Symbol) -> Result<OpenInterest> {
+        Htx::open_interest(self, symbol)
+    }
+    fn long_short_ratio(&mut self, symbol: &Symbol) -> Result<LongShortRatio> {
+        Htx::long_short_ratio(self, symbol)
     }
 }
 
@@ -2025,6 +2305,225 @@ mod tests {
         let htx = Htx::with_http(Box::new(ArcTransport(http)), &opts)
             .with_ws(Box::new(ArcWs(Arc::clone(&ws))));
         (htx, ws)
+    }
+
+    /// The answers HTX gives on a bad day.
+    #[test]
+    fn htx_polled_reads_report_what_went_wrong() {
+        let http = Arc::new(MockHttpTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::UsdMFutures);
+        let htx = Htx::with_http(Box::new(ArcTransport(Arc::clone(&http))), &opts);
+
+        http.push_json(200, r#"{"status":"ok","data":[],"ts":1}"#);
+        assert!(matches!(
+            Htx::open_interest(&htx, &symbol()),
+            Err(Error::NotFound(_))
+        ));
+
+        http.push_json(
+            200,
+            r#"{"status":"ok","data":[{"contract_code":"BTC-USDT"}],"ts":1}"#,
+        );
+        assert!(matches!(
+            Htx::open_interest(&htx, &symbol()),
+            Err(Error::Deserialization(_))
+        ));
+
+        http.push_json(200, r#"{"status":"ok","data":{"list":[]},"ts":1}"#);
+        assert!(matches!(
+            Htx::long_short_ratio(&htx, &symbol()),
+            Err(Error::NotFound(_))
+        ));
+
+        http.push_json(
+            200,
+            r#"{"status":"ok","data":{"list":[{"sell_ratio":0.2,"ts":1}]},"ts":1}"#,
+        );
+        assert!(matches!(
+            Htx::long_short_ratio(&htx, &symbol()),
+            Err(Error::Deserialization(_))
+        ));
+    }
+
+    /// Notification frames the parser cannot use are dropped.
+    #[test]
+    fn htx_drops_notification_frames_it_cannot_read() {
+        let (mut htx, ws) = futures_ws_client();
+        ws.push_connection(vec![
+            Ok(Some("not json".to_string())),
+            // A notify with no topic.
+            Ok(Some(r#"{"op":"notify","data":[]}"#.to_string())),
+            // A channel this client does not subscribe to.
+            Ok(Some(
+                r#"{"op":"notify","topic":"public.BTC-USDT.something","data":[]}"#.to_string(),
+            )),
+            // A funding row with no rate.
+            Ok(Some(
+                r#"{"op":"notify","topic":"public.BTC-USDT.funding_rate",
+                "data":[{"contract_code":"BTC-USDT"}]}"#
+                    .to_string(),
+            )),
+            // A liquidation row with no price.
+            Ok(Some(
+                r#"{"op":"notify","topic":"public.BTC-USDT.liquidation_orders",
+                "data":[{"contract_code":"BTC-USDT","direction":"sell","volume":1}]}"#
+                    .to_string(),
+            )),
+        ]);
+        Htx::subscribe_derivatives(&mut htx, &symbol(), DerivativesChannel::Funding).unwrap();
+        Htx::subscribe_derivatives(&mut htx, &symbol(), DerivativesChannel::Liquidations).unwrap();
+
+        assert!(Htx::poll_events(&mut htx).is_empty());
+    }
+
+    /// The futures quote channel without its paired top of book.
+    #[test]
+    fn htx_detail_without_pairs_reports_no_top_of_book() {
+        let (mut htx, ws) = futures_ws_client();
+        ws.push_connection(vec![Ok(Some(
+            r#"{"ch":"market.BTC-USDT.detail","ts":1,"tick":{"close":81217.7}}"#.to_string(),
+        ))]);
+        Htx::subscribe_ticker(&mut htx, &symbol()).unwrap();
+
+        let events = Htx::poll_events(&mut htx);
+        let Event::Ticker(ticker) = &events[0] else {
+            panic!("expected a ticker, got {:?}", events[0]);
+        };
+        assert_eq!(ticker.bid, Decimal::ZERO);
+        assert_eq!(ticker.ask, Decimal::ZERO);
+    }
+
+    /// Funding and forced orders arrive on a second public socket.
+    #[test]
+    fn the_notification_socket_carries_funding_and_liquidations() {
+        let (mut htx, ws) = futures_ws_client();
+        ws.push_connection(vec![
+            Ok(Some(
+                r#"{"op":"notify","topic":"public.BTC-USDT.funding_rate","ts":1788465096842,
+                "data":[{"symbol":"BTC","contract_code":"BTC-USDT","fee_asset":"USDT",
+                "funding_time":"1788465090000","funding_rate":"0.000035251752528159",
+                "estimated_rate":null,"settlement_time":"1788480000000"}]}"#
+                    .to_string(),
+            )),
+            Ok(Some(
+                r#"{"op":"notify","topic":"public.BTC-USDT.liquidation_orders","ts":1788465321721,
+                "data":[{"symbol":"BTC","contract_code":"BTC-USDT","direction":"sell",
+                "offset":"close","volume":4,"price":81894.5,"created_at":1788465321715,
+                "amount":0.004,"trade_turnover":327.578}]}"#
+                    .to_string(),
+            )),
+        ]);
+        Htx::subscribe_derivatives(&mut htx, &symbol(), DerivativesChannel::Funding).unwrap();
+        Htx::subscribe_derivatives(&mut htx, &symbol(), DerivativesChannel::Liquidations).unwrap();
+
+        assert_eq!(
+            ws.connected_urls()[0],
+            "wss://api.hbdm.com/linear-swap-notification"
+        );
+        assert!(ws.sent()[0].contains("public.BTC-USDT.funding_rate"));
+
+        let events = Htx::poll_events(&mut htx);
+        let Event::Derivatives(DerivativesFeed::Funding(funding)) = &events[0] else {
+            panic!("expected funding, got {:?}", events[0]);
+        };
+        assert_eq!(funding.rate, dec!(0.000035251752528159));
+        // The funding frame carries no price; a mark from another channel would
+        // belong to another moment.
+        assert_eq!(funding.mark_price, Decimal::ZERO);
+        assert_eq!(funding.timestamp, 1_788_465_090_000);
+
+        let Event::Derivatives(DerivativesFeed::Liquidation(liquidation)) = &events[1] else {
+            panic!("expected a liquidation, got {:?}", events[1]);
+        };
+        // A liquidated long is sold, which is the side of the forced order.
+        assert_eq!(liquidation.side, OrderSide::Sell);
+        assert_eq!(liquidation.price, dec!(81894.5));
+        // `volume` is the contract count, the unit the swap stream uses.
+        assert_eq!(liquidation.quantity, dec!(4));
+        assert_eq!(liquidation.timestamp, 1_788_465_321_715);
+    }
+
+    /// A subscribe acknowledgement is not an empty channel.
+    #[test]
+    fn a_subscribe_ack_on_the_notification_socket_is_not_an_event() {
+        let (mut htx, ws) = futures_ws_client();
+        ws.push_connection(vec![Ok(Some(
+            r#"{"op":"sub","cid":"BTC-USDT","topic":"public.BTC-USDT.liquidation_orders",
+            "ts":1788465096842,"err-code":0}"#
+                .to_string(),
+        ))]);
+        Htx::subscribe_derivatives(&mut htx, &symbol(), DerivativesChannel::Liquidations).unwrap();
+
+        assert!(Htx::poll_events(&mut htx).is_empty());
+    }
+
+    /// HTX publishes mark and index as separate kline channels, never together.
+    #[test]
+    fn htx_refuses_a_combined_mark_index_channel() {
+        let (mut htx, ws) = futures_ws_client();
+        let err = Htx::subscribe_derivatives(&mut htx, &symbol(), DerivativesChannel::MarkIndex)
+            .expect_err("HTX publishes no combined mark/index frame");
+        assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
+        assert!(ws.sent().is_empty());
+    }
+
+    /// HTX's field names invert between endpoints: here `volume` is contracts
+    /// and `amount` is base currency, while on the trade stream `amount` is the
+    /// contract count. Taking `amount` would silently switch units.
+    #[test]
+    fn open_interest_reads_the_contract_count_not_the_base_amount() {
+        let http = Arc::new(MockHttpTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::UsdMFutures);
+        let htx = Htx::with_http(Box::new(ArcTransport(Arc::clone(&http))), &opts);
+        http.push_json(
+            200,
+            r#"{"status":"ok","data":[{"volume":29406469,"amount":29406.469,"symbol":"BTC",
+            "value":2397165361.88,"contract_code":"BTC-USDT"}],"ts":1788464583675}"#,
+        );
+        let open_interest = Htx::open_interest(&htx, &symbol()).unwrap();
+        assert_eq!(open_interest.open_interest, dec!(29406469));
+        assert_eq!(open_interest.timestamp, 1_788_464_583_675);
+    }
+
+    /// The elite ratio's two figures do not sum to one: `locked_ratio` holds the
+    /// remainder. They are carried as given rather than rescaled, since
+    /// rescaling would invent proportions the venue did not publish.
+    #[test]
+    fn the_elite_ratio_is_carried_as_published() {
+        let http = Arc::new(MockHttpTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::UsdMFutures);
+        let htx = Htx::with_http(Box::new(ArcTransport(Arc::clone(&http))), &opts);
+        http.push_json(
+            200,
+            r#"{"status":"ok","data":{"list":[
+            {"buy_ratio":0.51,"sell_ratio":0.27,"locked_ratio":0.22,"ts":1788455700000},
+            {"buy_ratio":0.53,"sell_ratio":0.26,"locked_ratio":0.21,"ts":1788456000000}]},
+            "ts":1788464583675}"#,
+        );
+        let ratio = Htx::long_short_ratio(&htx, &symbol()).unwrap();
+        // Oldest first here, so the newest is the last row.
+        assert_eq!(ratio.long_size, dec!(0.53));
+        assert_eq!(ratio.short_size, dec!(0.26));
+        assert_ne!(ratio.long_size + ratio.short_size, Decimal::ONE);
+        assert_eq!(ratio.timestamp, 1_788_456_000_000);
+    }
+
+    #[test]
+    fn a_spot_client_refuses_the_htx_derivatives_surface() {
+        let ws = Arc::new(MockWsTransport::new());
+        let http = Arc::new(MockHttpTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::Spot);
+        let mut htx = Htx::with_http(Box::new(ArcTransport(Arc::clone(&http))), &opts)
+            .with_ws(Box::new(ArcWs(Arc::clone(&ws))));
+        for channel in [
+            DerivativesChannel::Funding,
+            DerivativesChannel::MarkIndex,
+            DerivativesChannel::Liquidations,
+        ] {
+            assert!(Htx::subscribe_derivatives(&mut htx, &symbol(), channel).is_err());
+        }
+        assert!(Htx::open_interest(&htx, &symbol()).is_err());
+        assert!(Htx::long_short_ratio(&htx, &symbol()).is_err());
     }
 
     /// Host, symbol form and quote channel all follow the market.
