@@ -411,6 +411,19 @@ impl Htx {
     }
 
     fn subscribe(&mut self, symbol: &Symbol, topic: &str) -> Result<()> {
+        // The socket below is the venue's *spot* stream. A futures client
+        // reading futures over REST would be handed the spot book, the spot
+        // trades and the spot quote -- a different instrument at a different
+        // price, with nothing to say so. Refused until this client speaks the
+        // venue's futures stream.
+        if self.is_futures() {
+            return Err(Error::unsupported_field(
+                "HTX",
+                "a market-data subscription on a futures client",
+                "HTX's futures stream is `api.hbdm.com/linear-swap-ws`, which this client does not implement",
+            ));
+        }
+
         let wire = Self::wire_symbol(symbol);
         if self.connection.is_none() {
             let ws = self.ws.as_ref().ok_or(Error::NotConnected)?;

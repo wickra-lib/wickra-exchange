@@ -83,6 +83,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **On four venues a futures client watched the spot market.** KuCoin, Gate, HTX
+  and Kraken each opened one hardcoded *spot* socket and sent spot channels,
+  whatever market the client was built for. A futures client therefore read
+  futures over REST and streamed the spot book, the spot trades and the spot
+  quote — a different instrument at a different price, with nothing to say so.
+  Five of the eight futures venues were wrong, counting Bitget above.
+
+  Their futures streams live on a different host with different channel names
+  and a different symbol form, which is a per-venue implementation rather than a
+  parameter. Until that lands the subscription is **refused**: a caller told
+  "not implemented here" can fall back to the REST reads, while a caller handed
+  the wrong market's book has no way to tell.
+
+  `a_futures_client_never_subscribes_to_a_spot_stream` holds all eight to it —
+  carried on the market the client is on, or refused, never quietly something
+  else. That is the trigger contract applied to the streams, and no test had
+  ever driven a futures client through `subscribe` before: all 559 passed
+  throughout.
+
 - **A Bitget futures client streamed spot.** Bitget v2 serves one WebSocket URL
   for every product and tells them apart by `instType`, the way its REST paths
   tell them apart by `productType`. The REST paths did; both subscribe paths

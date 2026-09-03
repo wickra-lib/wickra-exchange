@@ -1033,6 +1033,165 @@ fn reduce_only_is_carried_on_a_derivatives_client_and_refused_on_a_spot_one() {
     futures_ws!("OKX", Okx);
 }
 
+/// A futures client's market-data subscription reaches the futures market, or is
+/// refused. It never quietly reaches spot.
+///
+/// This is [`the trigger contract`](a_trigger_order_is_either_carried_or_refused_but_never_flattened)
+/// applied to the streams: carried, or refused, never silently something else.
+/// The order paths were held to it; the sockets were not, and five of the eight
+/// futures venues failed it.
+///
+/// Each opened one hardcoded **spot** socket and sent spot channels whatever
+/// market the client was built for. So a futures client read futures over REST
+/// and watched the spot book, the spot trades and the spot quote -- a different
+/// instrument at a different price, with no error to say so. Bitget's `instType`
+/// is fixed here; KuCoin, Gate, HTX and Kraken stream from a different host with
+/// different channel names, which is a per-venue implementation rather than a
+/// parameter, so they refuse until that lands.
+///
+/// A caller told "not implemented here" can fall back to the REST reads. A
+/// caller handed the wrong market's book has no way to tell.
+#[test]
+fn a_futures_client_never_subscribes_to_a_spot_stream() {
+    /// What proves a subscription reached the futures market on this venue:
+    /// a marker in the URL it connected to, or in the frame it sent. `None`
+    /// means the venue's futures stream is not implemented, so the only
+    /// acceptable answer is a refusal.
+    struct Expected {
+        url: Option<&'static str>,
+        frame: Option<&'static str>,
+    }
+
+    fn refused(error: &Error) -> bool {
+        matches!(error, Error::Exchange { code, .. } if code == "unsupported")
+    }
+
+    let market = market();
+    let options = ExchangeOptions::mainnet(MarketType::UsdMFutures);
+
+    macro_rules! check {
+        ($name:literal, $venue:ident, $expected:expr) => {{
+            let expected: Expected = $expected;
+            let http = Arc::new(MockHttpTransport::new());
+            let ws = Arc::new(MockWsTransport::new());
+            let mut client = $venue::with_http(Box::new(ArcTransport(Arc::clone(&http))), &options)
+                .with_ws(Box::new(ArcWs(Arc::clone(&ws))));
+
+            match MarketData::subscribe_trades(&mut client, &market) {
+                Err(error) => {
+                    assert!(
+                        refused(&error),
+                        "{}: subscription failed for the wrong reason: {error}",
+                        $name
+                    );
+                    assert!(
+                        expected.url.is_none() && expected.frame.is_none(),
+                        "{}: refused a market it is recorded as streaming",
+                        $name
+                    );
+                    assert!(
+                        ws.sent().is_empty() && ws.connected_urls().is_empty(),
+                        "{}: refused, yet opened a socket",
+                        $name
+                    );
+                }
+                Ok(()) => {
+                    assert!(
+                        expected.url.is_some() || expected.frame.is_some(),
+                        "{}: subscribed on a futures client with no futures stream \
+                         implemented -- this is the spot stream",
+                        $name
+                    );
+                    if let Some(marker) = expected.url {
+                        let urls = ws.connected_urls().join(" ");
+                        assert!(
+                            urls.contains(marker),
+                            "{}: connected to {urls}, which is not the futures stream \
+                             (expected {marker})",
+                            $name
+                        );
+                    }
+                    if let Some(marker) = expected.frame {
+                        let sent = ws.sent().join(" ");
+                        assert!(
+                            sent.contains(marker),
+                            "{}: subscribed with {sent}, which does not name the \
+                             futures market (expected {marker})",
+                            $name
+                        );
+                    }
+                }
+            }
+        }};
+    }
+
+    check!(
+        "Binance",
+        Binance,
+        Expected {
+            url: Some("fstream.binance.com"),
+            frame: None
+        }
+    );
+    check!(
+        "Bybit",
+        Bybit,
+        Expected {
+            url: Some("/v5/public/linear"),
+            frame: None
+        }
+    );
+    check!(
+        "OKX",
+        Okx,
+        Expected {
+            url: None,
+            frame: Some("BTC-USDT-SWAP")
+        }
+    );
+    check!(
+        "Bitget",
+        Bitget,
+        Expected {
+            url: None,
+            frame: Some("\"instType\":\"USDT-FUTURES\"")
+        }
+    );
+    // Not implemented, so refused rather than served from spot.
+    check!(
+        "KuCoin",
+        KuCoin,
+        Expected {
+            url: None,
+            frame: None
+        }
+    );
+    check!(
+        "Gate.io",
+        Gate,
+        Expected {
+            url: None,
+            frame: None
+        }
+    );
+    check!(
+        "HTX",
+        Htx,
+        Expected {
+            url: None,
+            frame: None
+        }
+    );
+    check!(
+        "Kraken",
+        Kraken,
+        Expected {
+            url: None,
+            frame: None
+        }
+    );
+}
+
 /// Two fields that a venue spells in *one* slot are refused together, never
 /// resolved by dropping one.
 ///

@@ -346,6 +346,19 @@ impl Gate {
     }
 
     fn subscribe(&mut self, symbol: &Symbol, channel: &str) -> Result<()> {
+        // The socket below is the venue's *spot* stream. A futures client
+        // reading futures over REST would be handed the spot book, the spot
+        // trades and the spot quote -- a different instrument at a different
+        // price, with nothing to say so. Refused until this client speaks the
+        // venue's futures stream.
+        if self.is_futures() {
+            return Err(Error::unsupported_field(
+                "Gate.io",
+                "a market-data subscription on a futures client",
+                "Gate's futures stream is `fx-ws.gateio.ws` with `futures.` channels, which this client does not implement",
+            ));
+        }
+
         let wire = Self::wire_symbol(symbol);
         if self.connection.is_none() {
             let ws = self.ws.as_ref().ok_or(Error::NotConnected)?;
