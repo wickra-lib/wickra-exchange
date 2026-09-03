@@ -669,6 +669,7 @@ impl Htx {
         let subscribed = |code: &str, channel: DerivativesChannel| {
             channels.iter().any(|(c, k)| c == code && *k == channel)
         };
+        let futures = self.is_futures();
         let mut events = Vec::new();
         if let Some(connection) = self.connection.as_mut() {
             while let Ok(Some(frame)) = connection.recv() {
@@ -696,14 +697,18 @@ impl Htx {
                 events.append(&mut parse_notification(&frame, &resolve, &subscribed));
             }
         }
-        // Drain the private user-data (v2 `orders`/`accounts.update`) stream, if open.
+        // Drain the private user-data stream, if open. A futures client's
+        // frames are the notification socket's `{"op":"notify"}` shape, not the
+        // spot v2 `action`/`ch` one.
         if let Some(connection) = self.private_connection.as_mut() {
             while let Ok(Some(frame)) = connection.recv() {
                 if let Some(pong) = pong_for(&frame) {
                     let _ = connection.send(&pong);
                     continue;
                 }
-                if let Ok(mut parsed) = parse_ws_message(&frame, &resolve) {
+                if futures {
+                    events.append(&mut parse_private_notification(&frame));
+                } else if let Ok(mut parsed) = parse_ws_message(&frame, &resolve) {
                     events.append(&mut parsed);
                 }
             }
@@ -751,17 +756,11 @@ impl Htx {
     /// [`Error`] if the request fails.
     pub fn subscribe_user_data(&mut self) -> Result<()> {
         self.ensure_market_is_routed()?;
-        // The stream below is the venue's *spot* private feed. A futures client
-        // would watch the spot account, where its own futures orders never
-        // appear -- so it would wait for fills that cannot arrive, with nothing
-        // to say why. Refused until this client speaks the venue's futures
-        // private stream.
+        // Spot and futures are separate accounts on separate hosts: a futures
+        // order never appears in the spot account, so watching the wrong one is
+        // waiting for a fill that cannot arrive.
         if self.is_futures() {
-            return Err(Error::unsupported_field(
-                "HTX",
-                "a private user-data stream on a futures client",
-                "HTX's futures private stream is `api.hbdm.com/linear-swap-notification`, which this client does not implement",
-            ));
+            return self.subscribe_futures_user_data();
         }
         let creds = self.credentials.as_ref().ok_or(Error::InvalidCredentials(
             "user-data stream requires credentials",
@@ -791,6 +790,58 @@ impl Htx {
         connection.send(&auth)?;
         connection.send(r#"{"action":"sub","ch":"orders#*"}"#)?;
         connection.send(r#"{"action":"sub","ch":"accounts.update#2"}"#)?;
+        self.private_connection = Some(connection);
+        self.user_data_active = true;
+        Ok(())
+    }
+
+    /// Open the **futures** private stream on the notification socket.
+    ///
+    /// The same host the public derivatives channels use
+    /// (`api.hbdm.com/linear-swap-notification`), separated by authentication
+    /// rather than by URL: an `{"op":"auth"}` frame signed the way a REST call
+    /// is, then `orders_cross.*` and `accounts_cross.*` for every contract and
+    /// every margin account.
+    ///
+    /// The socket pings every five seconds and closes when that goes
+    /// unanswered; [`poll_events`](Self::poll_events) answers it while draining.
+    ///
+    /// # Errors
+    /// Returns [`Error::InvalidCredentials`] without credentials,
+    /// [`Error::NotConnected`] without a WebSocket transport, or another
+    /// [`Error`] if the subscription fails.
+    fn subscribe_futures_user_data(&mut self) -> Result<()> {
+        let creds = self.credentials.as_ref().ok_or(Error::InvalidCredentials(
+            "user-data stream requires credentials",
+        ))?;
+        let timestamp = iso8601_no_millis(self.signed_now_ms());
+        // The futures WS auth signs the same canonical form as a REST call,
+        // over the socket's own path.
+        let mut params = [
+            ("AccessKeyId", creds.api_key.as_str()),
+            ("SignatureMethod", "HmacSHA256"),
+            ("SignatureVersion", "2"),
+            ("Timestamp", timestamp.as_str()),
+        ];
+        params.sort_by(|a, b| a.0.cmp(b.0));
+        let encoded = params
+            .iter()
+            .map(|(key, val)| format!("{}={}", encode(key), encode(val)))
+            .collect::<Vec<_>>()
+            .join("&");
+        let canonical = format!("GET\napi.hbdm.com\n/linear-swap-notification\n{encoded}");
+        let signature = hmac_sha256_base64(creds.api_secret.as_bytes(), canonical.as_bytes());
+        let auth = format!(
+            r#"{{"op":"auth","type":"api","AccessKeyId":"{}","SignatureMethod":"HmacSHA256","SignatureVersion":"2","Timestamp":"{timestamp}","Signature":"{signature}"}}"#,
+            creds.api_key
+        );
+        let ws = self.ws.as_ref().ok_or(Error::NotConnected)?;
+        let mut connection = ws.connect(NOTIFICATION_WS_URL)?;
+        connection.send(&auth)?;
+        // `*` is every contract on the cross-margin account, which is the
+        // account this client's orders are placed on.
+        connection.send(r#"{"op":"sub","topic":"orders_cross.*","cid":"orders"}"#)?;
+        connection.send(r#"{"op":"sub","topic":"accounts_cross.*","cid":"accounts"}"#)?;
         self.private_connection = Some(connection);
         self.user_data_active = true;
         Ok(())
@@ -1874,6 +1925,146 @@ fn level_price(tick: &serde_json::Value, key: &str) -> Decimal {
 /// `"op":"notify"`. A subscribe acknowledgement carries `"op":"sub"` and no
 /// data, so it falls through to an empty result rather than being mistaken for
 /// an empty channel.
+/// Read HTX's futures private frames off the notification socket.
+///
+/// `orders_cross.<contract>` carries one order per frame and
+/// `accounts_cross.<account>` one margin account. Both arrive under the same
+/// `{"op":"notify"}` envelope as the public channels, so the topic's first
+/// segment is what separates them.
+fn parse_private_notification(frame: &str) -> Vec<Event> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(frame) else {
+        return Vec::new();
+    };
+    if value.get("op").and_then(serde_json::Value::as_str) != Some("notify") {
+        return Vec::new();
+    }
+    let Some(topic) = value.get("topic").and_then(serde_json::Value::as_str) else {
+        return Vec::new();
+    };
+    let channel = topic.split('.').next().unwrap_or("");
+    match channel {
+        // One order per frame, at the top level rather than in a list.
+        "orders_cross" => private_order(&value)
+            .map(Event::OrderUpdate)
+            .into_iter()
+            .collect(),
+        "accounts_cross" => {
+            let empty = Vec::new();
+            let rows = value
+                .get("data")
+                .and_then(serde_json::Value::as_array)
+                .unwrap_or(&empty);
+            let balances: Vec<Balance> = rows
+                .iter()
+                .filter_map(|row| {
+                    Some(Balance {
+                        asset: row.get("margin_asset")?.as_str()?.to_string(),
+                        free: notification_decimal(row, "margin_available"),
+                        // Margin committed to open orders and positions.
+                        locked: notification_decimal(row, "margin_frozen"),
+                    })
+                })
+                .collect();
+            if balances.is_empty() {
+                Vec::new()
+            } else {
+                vec![Event::BalanceUpdate(balances)]
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Build an [`Order`] from an `orders_cross` frame.
+fn private_order(value: &serde_json::Value) -> Option<Order> {
+    let contract = value.get("contract_code")?.as_str()?;
+    let direction = value.get("direction")?.as_str()?;
+    let price = notification_decimal(value, "price");
+    let client_id = value.get("client_order_id").and_then(|id| {
+        id.as_str()
+            .map(str::to_string)
+            .or_else(|| id.as_i64().map(|n| n.to_string()))
+    });
+    Some(Order {
+        id: value
+            .get("order_id_str")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                value
+                    .get("order_id")
+                    .and_then(serde_json::Value::as_i64)
+                    .map(|n| n.to_string())
+            })?,
+        client_order_id: client_id,
+        symbol: symbol_from_contract_code(contract),
+        side: if direction == "sell" {
+            OrderSide::Sell
+        } else {
+            OrderSide::Buy
+        },
+        // HTX names the kind by price type, the way its REST order does.
+        order_type: if value
+            .get("order_price_type")
+            .and_then(serde_json::Value::as_str)
+            == Some("limit")
+        {
+            OrderType::Limit
+        } else {
+            OrderType::Market
+        },
+        status: private_order_status(value.get("status").and_then(serde_json::Value::as_i64)),
+        quantity: notification_decimal(value, "volume"),
+        filled_quantity: notification_decimal(value, "trade_volume"),
+        price: (price > Decimal::ZERO).then_some(price),
+        average_price: {
+            let average = notification_decimal(value, "trade_avg_price");
+            (average > Decimal::ZERO).then_some(average)
+        },
+    })
+}
+
+/// Turn an HTX contract code back into a [`Symbol`].
+///
+/// `BTC-USDT` -> `BTC/USDT`. The private stream is not subscribed per symbol,
+/// so there is no subscription to look the pair up in.
+fn symbol_from_contract_code(code: &str) -> Symbol {
+    code.split_once('-').map_or_else(
+        || Symbol::new(code, ""),
+        |(base, quote)| Symbol::new(base, quote),
+    )
+}
+
+/// Map HTX's numeric futures order status to an [`OrderStatus`].
+///
+/// The venue numbers the whole lifecycle -- 1 preparing through 11 cancelling --
+/// and only two of those numbers mean the order is done. A number this client
+/// does not know is reported as still open rather than as filled, because
+/// guessing "filled" ends a position in the caller's own bookkeeping.
+fn private_order_status(status: Option<i64>) -> OrderStatus {
+    match status {
+        Some(4) => OrderStatus::PartiallyFilled,
+        Some(5 | 7) => OrderStatus::Canceled,
+        Some(6) => OrderStatus::Filled,
+        _ => OrderStatus::New,
+    }
+}
+
+/// Read a notification field HTX may send as a number or as a string.
+fn notification_decimal(value: &serde_json::Value, key: &str) -> Decimal {
+    value.get(key).map_or(Decimal::ZERO, |field| {
+        field.as_str().map_or_else(
+            || {
+                field
+                    .as_f64()
+                    .and_then(|n| parse_decimal(&n.to_string()).ok())
+                    .unwrap_or(Decimal::ZERO)
+            },
+            |text| parse_decimal(text).unwrap_or(Decimal::ZERO),
+        )
+    })
+}
+
 fn parse_notification(
     frame: &str,
     resolve: &impl Fn(&str) -> Symbol,
@@ -1954,6 +2145,14 @@ fn pong_for(frame: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(frame).ok()?;
     if let Some(ping) = value.get("ping") {
         return Some(format!(r#"{{"pong":{ping}}}"#));
+    }
+    // The notification socket -- public derivatives *and* the futures private
+    // stream -- pings every five seconds in a third form, and closes the socket
+    // when it is not answered. `ts` comes back as a string there and must be
+    // echoed as it arrived.
+    if value.get("op").and_then(serde_json::Value::as_str) == Some("ping") {
+        let ts = value.get("ts").cloned().unwrap_or(serde_json::Value::Null);
+        return Some(format!(r#"{{"op":"pong","ts":{ts}}}"#));
     }
     if value.get("action").and_then(serde_json::Value::as_str) == Some("ping") {
         let ts = value
@@ -2435,6 +2634,134 @@ mod tests {
         )
         .with_clock(Box::new(move || now_ms));
         (htx, mock)
+    }
+
+    fn signed_futures_ws_client(now_ms: i64) -> (Htx, Arc<MockWsTransport>) {
+        let http = Arc::new(MockHttpTransport::new());
+        let ws = Arc::new(MockWsTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::UsdMFutures);
+        let htx = Htx::with_credentials(
+            Box::new(ArcTransport(http)),
+            &opts,
+            Credentials::new("APIKEY", "SECRET"),
+        )
+        .with_ws(Box::new(ArcWs(Arc::clone(&ws))))
+        .with_clock(Box::new(move || now_ms));
+        (htx, ws)
+    }
+
+    /// A futures client watches the futures account, on the notification socket.
+    ///
+    /// Verified against the live venue: that socket answers
+    /// `{"op":"sub","topic":"orders_cross.*"}` with `err-code 2002,
+    /// Authentication required.` -- an unrecognised topic answers differently.
+    #[test]
+    fn a_futures_client_authenticates_and_subscribes_to_the_cross_topics() {
+        let (mut htx, ws) = signed_futures_ws_client(1_700_000_000_000);
+        htx.subscribe_user_data().unwrap();
+
+        assert_eq!(
+            ws.connected_urls()[0],
+            "wss://api.hbdm.com/linear-swap-notification"
+        );
+        let sent = ws.sent();
+        assert!(sent[0].contains(r#""op":"auth""#), "{}", sent[0]);
+        assert!(sent[0].contains(r#""AccessKeyId":"APIKEY""#), "{}", sent[0]);
+        assert!(
+            sent[1].contains(r#""topic":"orders_cross.*""#),
+            "{}",
+            sent[1]
+        );
+        assert!(
+            sent[2].contains(r#""topic":"accounts_cross.*""#),
+            "{}",
+            sent[2]
+        );
+        // The spot v2 stream is a different host and a different envelope.
+        assert!(
+            !sent.iter().any(|frame| frame.contains("orders#")),
+            "a futures client subscribed to the spot stream: {sent:?}"
+        );
+    }
+
+    /// The notification socket pings in a form neither of the other two matches,
+    /// every five seconds, and closes the socket when it goes unanswered --
+    /// which is what the public derivatives channels were doing.
+    ///
+    /// `ts` arrives as a string here and has to be echoed as it came.
+    #[test]
+    fn the_notification_ping_is_answered_in_its_own_form() {
+        assert_eq!(
+            pong_for(r#"{"op":"ping","ts":"1788470774457"}"#).unwrap(),
+            r#"{"op":"pong","ts":"1788470774457"}"#
+        );
+        // The other two forms still answer as they did.
+        assert_eq!(pong_for(r#"{"ping":123}"#).unwrap(), r#"{"pong":123}"#);
+        assert!(pong_for(r#"{"action":"ping","data":{"ts":9}}"#).is_some());
+        assert!(pong_for(r#"{"op":"notify","topic":"x"}"#).is_none());
+    }
+
+    #[test]
+    fn a_cross_order_frame_becomes_an_order_update() {
+        let (mut htx, ws) = signed_futures_ws_client(1_700_000_000_000);
+        ws.push_connection(vec![Ok(Some(
+            r#"{"op":"notify","topic":"orders_cross.btc-usdt","ts":1700000000000,
+                "symbol":"BTC","contract_code":"BTC-USDT","volume":4,"price":19000,
+                "order_price_type":"limit","direction":"sell","offset":"open","status":4,
+                "order_id_str":"9911","client_order_id":77,"trade_volume":3,
+                "trade_avg_price":19010}"#
+                .to_string(),
+        ))]);
+        htx.subscribe_user_data().unwrap();
+
+        let events = htx.poll_events();
+        let Some(Event::OrderUpdate(order)) = events.first() else {
+            panic!("expected an order update, got {events:?}");
+        };
+        assert_eq!(order.id, "9911");
+        assert_eq!(order.symbol, Symbol::new("BTC", "USDT"));
+        assert_eq!(order.side, OrderSide::Sell);
+        // Status 4 is a partial fill; the venue numbers the whole lifecycle.
+        assert_eq!(order.status, OrderStatus::PartiallyFilled);
+        assert_eq!(order.quantity, dec!(4));
+        assert_eq!(order.filled_quantity, dec!(3));
+        assert_eq!(order.client_order_id.as_deref(), Some("77"));
+        assert_eq!(order.average_price, Some(dec!(19010)));
+    }
+
+    /// HTX numbers the order lifecycle, and only two of those numbers mean the
+    /// order is done. An unknown number is reported as still open: guessing
+    /// "filled" would close a position in the caller's own bookkeeping that the
+    /// venue still has open.
+    #[test]
+    fn an_unknown_order_status_number_is_not_reported_as_filled() {
+        assert_eq!(private_order_status(Some(6)), OrderStatus::Filled);
+        assert_eq!(private_order_status(Some(7)), OrderStatus::Canceled);
+        assert_eq!(private_order_status(Some(5)), OrderStatus::Canceled);
+        assert_eq!(private_order_status(Some(3)), OrderStatus::New);
+        assert_eq!(private_order_status(Some(99)), OrderStatus::New);
+        assert_eq!(private_order_status(None), OrderStatus::New);
+    }
+
+    #[test]
+    fn a_cross_account_frame_becomes_a_balance_update() {
+        let (mut htx, ws) = signed_futures_ws_client(1_700_000_000_000);
+        ws.push_connection(vec![Ok(Some(
+            r#"{"op":"notify","topic":"accounts_cross.USDT","ts":1700000000000,
+                "data":[{"margin_asset":"USDT","margin_balance":1000.5,
+                         "margin_available":900.25,"margin_frozen":100.25}]}"#
+                .to_string(),
+        ))]);
+        htx.subscribe_user_data().unwrap();
+
+        let events = htx.poll_events();
+        let Some(Event::BalanceUpdate(balances)) = events.first() else {
+            panic!("expected a balance update, got {events:?}");
+        };
+        assert_eq!(balances[0].asset, "USDT");
+        assert_eq!(balances[0].free, dec!(900.25));
+        // Margin committed to open orders and positions is locked, not free.
+        assert_eq!(balances[0].locked, dec!(100.25));
     }
 
     /// A spot trigger goes to the algo endpoint, which is a different path than

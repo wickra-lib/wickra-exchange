@@ -45,6 +45,7 @@ use crate::types::{
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::Deserialize;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use wickra_core::Candle;
@@ -74,6 +75,11 @@ pub struct Gate {
     connection: Option<Box<dyn WsConnection>>,
     sub_messages: Vec<String>,
     subscriptions: Vec<(String, Symbol)>,
+    /// The futures account's user id, fetched once for the private stream.
+    ///
+    /// Gate addresses its futures private channels to a user id where the spot
+    /// ones need none, so it is looked up on first subscribe and kept.
+    futures_user_id: RefCell<Option<String>>,
     /// Which derivatives channels are subscribed, per contract.
     ///
     /// `futures.tickers` carries the funding rate, the mark price and the
@@ -149,6 +155,7 @@ impl Gate {
             connection: None,
             sub_messages: Vec::new(),
             subscriptions: Vec::new(),
+            futures_user_id: RefCell::new(None),
             derivatives_channels: Vec::new(),
             leverage: 1,
             private_connection: None,
@@ -612,26 +619,52 @@ impl Gate {
     /// [`Error`] if the request fails.
     pub fn subscribe_user_data(&mut self) -> Result<()> {
         self.ensure_market_is_routed()?;
-        // The stream below is the venue's *spot* private feed. A futures client
-        // would watch the spot account, where its own futures orders never
-        // appear -- so it would wait for fills that cannot arrive, with nothing
-        // to say why. Refused until this client speaks the venue's futures
-        // private stream.
-        if self.is_futures() {
-            return Err(Error::unsupported_field(
-                "Gate.io",
-                "a private user-data stream on a futures client",
-                "Gate's futures private stream is `fx-ws.gateio.ws` with `futures.orders`, which this client does not implement",
-            ));
-        }
+        // Spot and futures are separate accounts on separate hosts: a futures
+        // order never appears in the spot account, so watching the wrong one is
+        // waiting for a fill that cannot arrive.
+        //
+        // The futures channels are addressed to a **user id**, which the spot
+        // ones are not, so it is fetched first -- once, and cached. Subscribing
+        // without it is a subscription to nobody.
+        let futures = self.is_futures();
+        let user_id = if futures {
+            Some(self.futures_user_id()?)
+        } else {
+            None
+        };
         let creds = self.credentials.as_ref().ok_or(Error::InvalidCredentials(
             "user-data stream requires credentials",
         ))?;
         let time = self.signed_now_ms() / 1000;
+        // The futures private channels live on the same socket as the public
+        // futures ones -- Gate separates them by authentication, not by host.
+        let url = if futures {
+            FUTURES_WS_URL
+        } else {
+            "wss://api.gateio.ws/ws/v4/"
+        };
         let ws = self.ws.as_ref().ok_or(Error::NotConnected)?;
-        let mut connection = ws.connect("wss://api.gateio.ws/ws/v4/")?;
-        // `spot.orders` takes `!all` to cover every pair; `spot.balances` takes no payload.
-        for (channel, payload) in [("spot.orders", r#"["!all"]"#), ("spot.balances", "[]")] {
+        let mut connection = ws.connect(url)?;
+        // `spot.orders` takes `!all` to cover every pair; `spot.balances` takes
+        // no payload. The futures pair is addressed to the user id instead, and
+        // `!all` again covers every contract.
+        let futures_orders = user_id
+            .as_ref()
+            .map(|id| format!(r#"["{id}","!all"]"#))
+            .unwrap_or_default();
+        let futures_balances = user_id
+            .as_ref()
+            .map(|id| format!(r#"["{id}"]"#))
+            .unwrap_or_default();
+        let channels: [(&str, &str); 2] = if futures {
+            [
+                ("futures.orders", futures_orders.as_str()),
+                ("futures.balances", futures_balances.as_str()),
+            ]
+        } else {
+            [("spot.orders", r#"["!all"]"#), ("spot.balances", "[]")]
+        };
+        for (channel, payload) in channels {
             let sign_string = format!("channel={channel}&event=subscribe&time={time}");
             let sign = hmac_sha512_hex(creds.api_secret.as_bytes(), sign_string.as_bytes());
             let message = format!(
@@ -1048,6 +1081,31 @@ impl Gate {
         list.iter()
             .map(|raw| order_from_raw(sym.clone(), raw))
             .collect()
+    }
+
+    /// The futures account's user id, fetched once and cached.
+    ///
+    /// Gate's futures private channels are addressed to a user id where the
+    /// spot ones are not: `futures.orders` takes `[user_id, contract]`. The id
+    /// comes back on the account call the balance path already uses.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if credentials are missing or the request fails.
+    fn futures_user_id(&self) -> Result<String> {
+        if let Some(id) = self.futures_user_id.borrow().clone() {
+            return Ok(id);
+        }
+        let value =
+            self.signed_request(HttpMethod::Get, "/api/v4/futures/usdt/accounts", "", "")?;
+        let id = value
+            .get("user")
+            .map(|user| {
+                user.as_str()
+                    .map_or_else(|| user.to_string(), str::to_string)
+            })
+            .ok_or_else(|| Error::Deserialization("futures account has no user id".to_string()))?;
+        *self.futures_user_id.borrow_mut() = Some(id.clone());
+        Ok(id)
     }
 
     /// Spot account balances.
@@ -1743,6 +1801,40 @@ fn parse_ws_message(
                 Ok(Event::OrderUpdate(order_from_raw(symbol, &raw)?))
             })
             .collect(),
+        // The futures private order channel. It says everything the spot one
+        // says, and says all of it differently: the contract instead of the
+        // pair, a *signed* size instead of a side, and a two-part outcome --
+        // `status` only reaches `finished`, and `finish_as` says whether that
+        // was a fill or a cancel. Reading `status` alone reports every
+        // cancelled order as filled.
+        "futures.orders" => result
+            .as_array()
+            .ok_or_else(|| {
+                Error::Deserialization("futures.orders result not an array".to_string())
+            })?
+            .iter()
+            .map(|order| Ok(Event::OrderUpdate(futures_order_from_frame(order)?)))
+            .collect(),
+        // The futures balance channel reports one account currency, and reports
+        // it as a running total rather than as free/locked -- margin in use is
+        // not broken out here, so `locked` is left at zero rather than guessed.
+        "futures.balances" => {
+            let balances = result
+                .as_array()
+                .ok_or_else(|| {
+                    Error::Deserialization("futures.balances result not an array".to_string())
+                })?
+                .iter()
+                .map(|entry| {
+                    Ok(Balance {
+                        asset: field_str(entry, "currency")?.to_string(),
+                        free: number_or_string(entry, "balance"),
+                        locked: Decimal::ZERO,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(vec![Event::BalanceUpdate(balances)])
+        }
         // Private balance channel: `result` is an array of per-currency balances,
         // emitted together as one balance-update snapshot.
         "spot.balances" => {
@@ -1790,6 +1882,85 @@ struct RawDepth {
     update: u64,
     bids: Vec<[String; 2]>,
     asks: Vec<[String; 2]>,
+}
+
+/// Build an [`Order`] from a `futures.orders` frame.
+///
+/// Gate's futures order carries a **signed** size rather than a side -- negative
+/// is a sell -- and reports what is left rather than what filled. The id is a
+/// number here where the spot channel sends a string, and the client's own id
+/// rides in `text`.
+fn futures_order_from_frame(order: &serde_json::Value) -> Result<Order> {
+    let size = order
+        .get("size")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| Error::Deserialization("futures order has no size".to_string()))?;
+    let side = if size < 0 {
+        OrderSide::Sell
+    } else {
+        OrderSide::Buy
+    };
+    let quantity = Decimal::from(size.abs());
+    let left = number_or_string(order, "left").abs();
+    let price = nonzero_decimal(opt_str(order, "price"));
+    let text = opt_str(order, "text");
+    Ok(Order {
+        id: order
+            .get("id")
+            .map(|id| id.as_str().map_or_else(|| id.to_string(), str::to_string))
+            .ok_or_else(|| Error::Deserialization("futures order has no id".to_string()))?,
+        // Gate prefixes a caller's own id with `t-`; an order the caller did not
+        // name carries an id Gate made up, which is not the caller's to match on.
+        client_order_id: text.starts_with("t-").then(|| text.to_string()),
+        symbol: symbol_from_wire(field_str(order, "contract")?),
+        side,
+        // A futures order with no price is a market order; `price` is "0" there.
+        order_type: if price.is_some() {
+            OrderType::Limit
+        } else {
+            OrderType::Market
+        },
+        status: futures_order_status(
+            opt_str(order, "status"),
+            opt_str(order, "finish_as"),
+            (quantity - left).max(Decimal::ZERO),
+        ),
+        quantity,
+        filled_quantity: (quantity - left).max(Decimal::ZERO),
+        price,
+        average_price: nonzero_decimal(opt_str(order, "fill_price")),
+    })
+}
+
+/// Map a `futures.orders` outcome to an [`OrderStatus`].
+///
+/// `status` is only ever `open` or `finished`, and `finish_as` says which kind
+/// of finished -- `filled`, or one of several ways of ending early, all of
+/// which leave the order not filled. A **partial** fill is neither: it is an
+/// order still open that has filled some, which only the amount already filled
+/// can say.
+fn futures_order_status(status: &str, finish_as: &str, filled: Decimal) -> OrderStatus {
+    match status {
+        "finished" if finish_as == "filled" => OrderStatus::Filled,
+        "finished" => OrderStatus::Canceled,
+        _ if filled > Decimal::ZERO => OrderStatus::PartiallyFilled,
+        _ => OrderStatus::New,
+    }
+}
+
+/// Read a field Gate's futures channels may send as a number or as a string.
+fn number_or_string(value: &serde_json::Value, key: &str) -> Decimal {
+    value.get(key).map_or(Decimal::ZERO, |field| {
+        field.as_str().map_or_else(
+            || {
+                field
+                    .as_f64()
+                    .and_then(|n| parse_decimal(&n.to_string()).ok())
+                    .unwrap_or(Decimal::ZERO)
+            },
+            |text| parse_decimal(text).unwrap_or(Decimal::ZERO),
+        )
+    })
 }
 
 #[derive(Deserialize)]
@@ -2920,6 +3091,161 @@ mod tests {
         };
         assert!(gate.place_order(&request).is_err());
         assert!(mock.recorded_requests().is_empty());
+    }
+
+    fn signed_futures_ws_client(
+        now_ms: i64,
+    ) -> (Gate, Arc<MockHttpTransport>, Arc<MockWsTransport>) {
+        let http = Arc::new(MockHttpTransport::new());
+        let ws = Arc::new(MockWsTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::UsdMFutures);
+        let gate = Gate::with_credentials(
+            Box::new(ArcTransport(Arc::clone(&http))),
+            &opts,
+            Credentials::new("APIKEY", "SECRET"),
+        )
+        .with_ws(Box::new(ArcWs(Arc::clone(&ws))))
+        .with_clock(Box::new(move || now_ms));
+        (gate, http, ws)
+    }
+
+    /// A futures client watches the futures account, on the futures socket.
+    ///
+    /// The host and the channel name were verified against the live venue:
+    /// `fx-ws.gateio.ws/v4/ws/usdt` accepts the socket and answers a
+    /// `futures.orders` subscribe with `authentication required` -- an
+    /// unrecognised channel answers differently.
+    ///
+    /// Gate addresses these channels to a **user id**, which the spot channels
+    /// do not take. Subscribing without it is a subscription to nobody, so the
+    /// id is fetched first.
+    #[test]
+    fn a_futures_client_subscribes_to_the_futures_channels_for_its_own_user() {
+        let (mut gate, http, ws) = signed_futures_ws_client(1_700_000_000_000);
+        http.push_json(
+            200,
+            r#"{"user":4242,"currency":"USDT","total":"1","available":"1"}"#,
+        );
+        gate.subscribe_user_data().unwrap();
+
+        let looked_up = &http.recorded_requests()[0];
+        assert!(
+            looked_up.url.contains("/api/v4/futures/usdt/accounts"),
+            "{}",
+            looked_up.url
+        );
+        assert_eq!(ws.connected_urls()[0], "wss://fx-ws.gateio.ws/v4/ws/usdt");
+        let sent = ws.sent();
+        assert!(
+            sent[0].contains(r#""channel":"futures.orders""#),
+            "{}",
+            sent[0]
+        );
+        assert!(
+            sent[0].contains(r#""payload":["4242","!all"]"#),
+            "{}",
+            sent[0]
+        );
+        assert!(
+            sent[1].contains(r#""channel":"futures.balances""#),
+            "{}",
+            sent[1]
+        );
+        assert!(
+            !sent.iter().any(|frame| frame.contains("spot.")),
+            "a futures client subscribed to a spot channel: {sent:?}"
+        );
+    }
+
+    /// The user id is fetched once, not per subscribe.
+    #[test]
+    fn the_futures_user_id_is_looked_up_once() {
+        let (mut gate, http, ws) = signed_futures_ws_client(1_700_000_000_000);
+        http.push_json(
+            200,
+            r#"{"user":4242,"currency":"USDT","total":"1","available":"1"}"#,
+        );
+        gate.subscribe_user_data().unwrap();
+        gate.subscribe_user_data().unwrap();
+        assert_eq!(http.recorded_requests().len(), 1);
+        assert_eq!(ws.sent().len(), 4);
+    }
+
+    /// A futures order frame says everything the spot one says, differently:
+    /// a signed size instead of a side, what is left instead of what filled,
+    /// and a two-part outcome.
+    #[test]
+    fn a_futures_order_frame_becomes_an_order_update() {
+        let (mut gate, http, ws) = signed_futures_ws_client(1_700_000_000_000);
+        http.push_json(
+            200,
+            r#"{"user":1,"currency":"USDT","total":"1","available":"1"}"#,
+        );
+        ws.push_connection(vec![Ok(Some(
+            r#"{"time":1700000000,"channel":"futures.orders","event":"update","result":[
+                {"id":88,"contract":"BTC_USDT","size":-4,"left":1,"price":"19000",
+                 "status":"open","text":"t-mine","fill_price":"19010"}]}"#
+                .to_string(),
+        ))]);
+        gate.subscribe_user_data().unwrap();
+
+        let events = gate.poll_events();
+        let Some(Event::OrderUpdate(order)) = events.first() else {
+            panic!("expected an order update, got {events:?}");
+        };
+        assert_eq!(order.id, "88");
+        assert_eq!(order.symbol, Symbol::new("BTC", "USDT"));
+        // A negative size is a sell; there is no side field to read.
+        assert_eq!(order.side, OrderSide::Sell);
+        assert_eq!(order.quantity, dec!(4));
+        // Three of four contracts filled -- the frame says only that one is left.
+        assert_eq!(order.filled_quantity, dec!(3));
+        assert_eq!(order.status, OrderStatus::PartiallyFilled);
+        assert_eq!(order.client_order_id.as_deref(), Some("t-mine"));
+    }
+
+    /// `status` only ever reaches `finished`; `finish_as` says whether that was
+    /// a fill or a cancel. Reading the status alone reports every cancelled
+    /// order as filled.
+    #[test]
+    fn a_finished_futures_order_is_a_fill_or_a_cancel_by_finish_as() {
+        assert_eq!(
+            futures_order_status("finished", "filled", dec!(4)),
+            OrderStatus::Filled
+        );
+        assert_eq!(
+            futures_order_status("finished", "cancelled", dec!(0)),
+            OrderStatus::Canceled
+        );
+        // Ended early for any other reason: not filled either.
+        assert_eq!(
+            futures_order_status("finished", "reduce_only", dec!(0)),
+            OrderStatus::Canceled
+        );
+        assert_eq!(futures_order_status("open", "", dec!(0)), OrderStatus::New);
+    }
+
+    #[test]
+    fn a_futures_balance_frame_becomes_a_balance_update() {
+        let (mut gate, http, ws) = signed_futures_ws_client(1_700_000_000_000);
+        http.push_json(
+            200,
+            r#"{"user":1,"currency":"USDT","total":"1","available":"1"}"#,
+        );
+        ws.push_connection(vec![Ok(Some(
+            r#"{"time":1700000000,"channel":"futures.balances","event":"update","result":[
+                {"balance":9999.5,"change":"-0.5","currency":"USDT","type":"fee"}]}"#
+                .to_string(),
+        ))]);
+        gate.subscribe_user_data().unwrap();
+
+        let events = gate.poll_events();
+        let Some(Event::BalanceUpdate(balances)) = events.first() else {
+            panic!("expected a balance update, got {events:?}");
+        };
+        assert_eq!(balances[0].asset, "USDT");
+        // The frame carries a number, not a string, and it is the whole balance.
+        assert_eq!(balances[0].free, dec!(9999.5));
     }
 
     const GATE_ORDER: &str = r#"{"id":"1","text":"","side":"buy","type":"limit","status":"open",
