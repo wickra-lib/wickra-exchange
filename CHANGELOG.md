@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Native trigger orders on Bybit, Kraken and Coinbase.** Four of the ten
+  venues now carry a stop-loss to the venue instead of refusing it; the other
+  six still refuse rather than flatten, which is the contract that has held
+  since #190.
+
+  Each venue asks for something it will not infer, and each failure is quiet:
+
+  * **Bybit** needs `triggerDirection` — 1 rises to the trigger, 2 falls to it.
+    The wrong one arms the order on the side that never comes, so the stop never
+    fires, with no error, because the order was accepted. Its **spot** endpoint
+    also needs `orderFilter`, since it serves plain and conditional orders
+    through one call and defaults to the plain one: a trigger without it is
+    placed *immediately*.
+  * **Kraken** moves what `price` means. On `stop-loss-limit`, `price` is the
+    trigger and `price2` the limit, where on a plain limit `price` is the limit.
+    Its futures path needed the same care for the opposite reason: a trigger is
+    its own `orderType` there, so a `StopMarket` falling through to the plain
+    `mkt` arm would go out with no trigger at all.
+  * **Coinbase** has no stop-*market*, and this client will not invent the limit
+    price one would need — that choice decides how much slippage the caller's
+    stop may take. It is refused, and says why.
+
+  **These are the only wire shapes in this repository not read off the venue.**
+  Every other one was; an order body cannot be, since placing one needs
+  credentials and real money. The trigger fields come from each venue's
+  documentation and are pinned by tests against the request this client builds,
+  which proves the client sends what was intended rather than that the venue
+  accepts it. The code and `docs/CAPABILITIES.md` both say so.
+
+### Changed
+
+- **The trigger contract matches on the trigger value, not on field names.** Ten
+  venues spell it ten ways, and Kraken's rides in a field every limit order also
+  has — no list of spellings can tell those apart. The contract's request is a
+  market sell with no limit price, so the value on the wire can only be the
+  trigger.
+
 - **All eight futures venues now subscribe to the derivatives channels they
   publish.** Kraken, KuCoin, Gate and HTX join the four that already did; these
   were blocked behind the futures streams, since without a futures socket there

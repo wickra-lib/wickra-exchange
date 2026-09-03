@@ -85,25 +85,59 @@ drift, and every round of this has found them drifted: the batch path dropping
 what the single path carried, and the WebSocket frame dropping what both
 carried. Each path is now held to the same table rather than to its own.
 
-**Trigger (stop) orders are the exception, and only Binance carries them.**
-`OrderType::StopMarket` and `StopLimit` rest until the market reaches
-`stop_price`, which every venue expresses through a different field and several
-through a separate endpoint entirely. Only the Binance client sends the trigger
-(`stopPrice`, on all three of its order paths). **Every other venue refuses the
-order** with `Error::Exchange` code `unsupported`, rather than dropping the
-trigger and placing the plain order underneath it — a stop-loss without its
-trigger executes at once, at the price it existed to protect against.
+**Trigger (stop) orders now reach four venues.** `OrderType::StopMarket` and
+`StopLimit` rest until the market reaches `stop_price`, which every venue
+expresses differently and several through a separate endpoint entirely. A venue
+that cannot carry the trigger **refuses the order** with `Error::Exchange` code
+`unsupported`, rather than dropping the trigger and placing the plain order
+underneath it — a stop-loss without its trigger executes at once, at the price it
+existed to protect against.
 
-| Venue | trigger orders |
-|-------|----------------|
-| Binance | ✅ `stopPrice` on REST, batch and the WebSocket API |
-| every other venue | refused (`Error::Exchange`, code `unsupported`) |
-| `PaperExchange` | refused (`Error::InvalidOrder`) |
+| Venue | single order | batch | WebSocket |
+|-------|--------------|-------|-----------|
+| Binance | ✅ `stopPrice` | ✅ | ✅ |
+| Bybit | ✅ `triggerPrice` + `triggerDirection` ¹ | — refused | — refused |
+| Kraken | ✅ `stop-loss` / `stop-loss-limit` ² | — refused | — refused |
+| Coinbase | ✅ `stop_limit_stop_limit_gtc` ³ | n/a | n/a |
+| OKX, Bitget, KuCoin, Gate.io, HTX | — refused ⁴ | — refused | — refused |
+| Upbit | — refused ⁵ | n/a | n/a |
+| `PaperExchange` | refused (`Error::InvalidOrder`) | | |
 
-`tests/conformance.rs` holds all ten clients to that contract: a trigger order
-is either sent with its trigger price or refused, never flattened into an
-immediate one. A venue that gains native trigger orders later moves from one
-branch to the other without the test changing.
+1. Bybit will not infer which way the market must cross the trigger:
+   `triggerDirection` is 1 for "rises to" and 2 for "falls to". The wrong one
+   arms the order on the side that never comes, so the stop never fires — with
+   no error, because the order was accepted. A **spot** trigger also needs
+   `orderFilter: "StopOrder"`: the spot endpoint serves plain and conditional
+   orders through one call and defaults to the plain one, so a trigger without
+   it is placed immediately.
+2. Kraken's trigger types **move what `price` means**: on `stop-loss-limit`,
+   `price` is the trigger and `price2` the limit, where on a plain limit `price`
+   *is* the limit. On Kraken Futures the trigger is its own `orderType` (`stp`)
+   and the order names `triggerSignal=mark` — the price a position is liquidated
+   against — rather than inheriting a default that may change.
+3. Coinbase has one trigger configuration and it is a **stop-limit**; there is no
+   stop-market. A `StopMarket` is refused rather than sent as a stop-limit at an
+   invented price, since choosing that price would decide how much slippage the
+   caller's stop may take. `stop_direction` is not inferred either.
+4. These five place triggers through a **separate endpoint** — OKX's
+   `order-algo`, Bitget's `place-plan-order`, KuCoin's `stop-order`, Gate's
+   `price_orders`, HTX's `algo-orders` — which this client does not yet call.
+5. Upbit's order API exposes limit and market order types only.
+
+> **A note on how these were built.** Every other wire shape in this repository
+> was read off the venue's own socket or endpoint. An *order body* cannot be:
+> placing one needs credentials and real money. The trigger fields above come
+> from each venue's API documentation and are pinned by tests against the
+> request this client builds — which proves the client sends what was intended,
+> not that the venue accepts it. They are the only shapes here carrying that
+> weaker guarantee, and they are marked as such in the code.
+
+`tests/conformance.rs` holds all ten clients to the contract: a trigger order is
+either sent with its trigger price or refused, never flattened into an immediate
+one. It matches on the trigger **value** rather than a list of field names —
+Kraken's trigger rides in a field every limit order also has, so no list of
+spellings could tell the two apart. A venue that gains native trigger orders
+later moves from one branch to the other without the test changing.
 
 ### The order a binding can build
 
