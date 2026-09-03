@@ -391,6 +391,13 @@ jobs:
       - name: The R wrapper matches the C ABI in this tree
         run: python3 scripts/check_r_abi_skew.py
 
+      # A hand-maintained number in a README drifts the moment someone adds a
+      # test without thinking of it, and nothing fails when it does: the suite
+      # passing says nothing about a sentence in another file. It had drifted
+      # three times, each caught by someone counting. Derived here instead.
+      - name: The README's test count is the test count
+        run: python3 scripts/check_test_count.py
+
   supply-chain:
     name: Supply-chain (cargo-deny + osv-scanner)
     runs-on: ubuntu-latest
