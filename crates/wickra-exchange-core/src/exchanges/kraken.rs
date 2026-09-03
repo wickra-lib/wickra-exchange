@@ -2876,6 +2876,77 @@ mod tests {
         (kraken, ws)
     }
 
+    /// The answers a venue gives on a bad day: a product that is not in the
+    /// list, and a row without the figure. Neither had ever run.
+    #[test]
+    fn kraken_open_interest_reports_what_went_wrong() {
+        let http = Arc::new(MockHttpTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::UsdMFutures);
+        let kraken = Kraken::with_http(Box::new(ArcTransport(Arc::clone(&http))), &opts);
+
+        http.push_json(200, r#"{"result":"success","tickers":[]}"#);
+        assert!(matches!(
+            Kraken::open_interest(&kraken, &symbol()),
+            Err(Error::NotFound(_))
+        ));
+
+        http.push_json(
+            200,
+            r#"{"result":"success","tickers":[{"symbol":"PF_XBTUSD","last":1.0}]}"#,
+        );
+        assert!(matches!(
+            Kraken::open_interest(&kraken, &symbol()),
+            Err(Error::Deserialization(_))
+        ));
+    }
+
+    /// Frames the futures parser cannot use are dropped, not guessed at.
+    #[test]
+    fn kraken_drops_futures_frames_it_cannot_read() {
+        let (mut kraken, ws) = futures_ws_client();
+        ws.push_connection(vec![
+            // No product id: a subscription ack or an info frame.
+            Ok(Some(r#"{"feed":"ticker_lite"}"#.to_string())),
+            // A book delta with no side.
+            Ok(Some(
+                r#"{"feed":"book","product_id":"PF_XBTUSD","price":1.0,"qty":2.0}"#.to_string(),
+            )),
+            // A trade with no price.
+            Ok(Some(
+                r#"{"feed":"trade","product_id":"PF_XBTUSD","side":"buy","qty":1.0}"#.to_string(),
+            )),
+            // A ticker with no last price.
+            Ok(Some(
+                r#"{"feed":"ticker","product_id":"PF_XBTUSD"}"#.to_string(),
+            )),
+            // A feed this client does not subscribe to.
+            Ok(Some(
+                r#"{"feed":"heartbeat","product_id":"PF_XBTUSD"}"#.to_string(),
+            )),
+        ]);
+        Kraken::subscribe_trades(&mut kraken, &symbol()).unwrap();
+
+        assert!(Kraken::poll_events(&mut kraken).is_empty());
+    }
+
+    /// A trade snapshot replays several trades in one frame.
+    #[test]
+    fn kraken_parses_a_trade_snapshot() {
+        let (mut kraken, ws) = futures_ws_client();
+        ws.push_connection(vec![Ok(Some(
+            r#"{"feed":"trade_snapshot","product_id":"PF_XBTUSD","trades":[
+            {"feed":"trade","product_id":"PF_XBTUSD","side":"sell","time":1788462438934,
+             "qty":0.0062,"price":81229.0},
+            {"feed":"trade","product_id":"PF_XBTUSD","side":"buy","time":1788462438268,
+             "qty":0.0002,"price":81231.0}]}"#
+                .to_string(),
+        ))]);
+        Kraken::subscribe_trades(&mut kraken, &symbol()).unwrap();
+
+        let events = Kraken::poll_events(&mut kraken);
+        assert_eq!(events.len(), 2, "{events:?}");
+    }
+
     /// One ticker frame answers both subscriptions, because Kraken reads the
     /// funding rate, the mark price and the index at one moment and sends them
     /// together.

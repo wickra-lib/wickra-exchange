@@ -2307,6 +2307,92 @@ mod tests {
         (htx, ws)
     }
 
+    /// The answers HTX gives on a bad day.
+    #[test]
+    fn htx_polled_reads_report_what_went_wrong() {
+        let http = Arc::new(MockHttpTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::UsdMFutures);
+        let htx = Htx::with_http(Box::new(ArcTransport(Arc::clone(&http))), &opts);
+
+        http.push_json(200, r#"{"status":"ok","data":[],"ts":1}"#);
+        assert!(matches!(
+            Htx::open_interest(&htx, &symbol()),
+            Err(Error::NotFound(_))
+        ));
+
+        http.push_json(
+            200,
+            r#"{"status":"ok","data":[{"contract_code":"BTC-USDT"}],"ts":1}"#,
+        );
+        assert!(matches!(
+            Htx::open_interest(&htx, &symbol()),
+            Err(Error::Deserialization(_))
+        ));
+
+        http.push_json(200, r#"{"status":"ok","data":{"list":[]},"ts":1}"#);
+        assert!(matches!(
+            Htx::long_short_ratio(&htx, &symbol()),
+            Err(Error::NotFound(_))
+        ));
+
+        http.push_json(
+            200,
+            r#"{"status":"ok","data":{"list":[{"sell_ratio":0.2,"ts":1}]},"ts":1}"#,
+        );
+        assert!(matches!(
+            Htx::long_short_ratio(&htx, &symbol()),
+            Err(Error::Deserialization(_))
+        ));
+    }
+
+    /// Notification frames the parser cannot use are dropped.
+    #[test]
+    fn htx_drops_notification_frames_it_cannot_read() {
+        let (mut htx, ws) = futures_ws_client();
+        ws.push_connection(vec![
+            Ok(Some("not json".to_string())),
+            // A notify with no topic.
+            Ok(Some(r#"{"op":"notify","data":[]}"#.to_string())),
+            // A channel this client does not subscribe to.
+            Ok(Some(
+                r#"{"op":"notify","topic":"public.BTC-USDT.something","data":[]}"#.to_string(),
+            )),
+            // A funding row with no rate.
+            Ok(Some(
+                r#"{"op":"notify","topic":"public.BTC-USDT.funding_rate",
+                "data":[{"contract_code":"BTC-USDT"}]}"#
+                    .to_string(),
+            )),
+            // A liquidation row with no price.
+            Ok(Some(
+                r#"{"op":"notify","topic":"public.BTC-USDT.liquidation_orders",
+                "data":[{"contract_code":"BTC-USDT","direction":"sell","volume":1}]}"#
+                    .to_string(),
+            )),
+        ]);
+        Htx::subscribe_derivatives(&mut htx, &symbol(), DerivativesChannel::Funding).unwrap();
+        Htx::subscribe_derivatives(&mut htx, &symbol(), DerivativesChannel::Liquidations).unwrap();
+
+        assert!(Htx::poll_events(&mut htx).is_empty());
+    }
+
+    /// The futures quote channel without its paired top of book.
+    #[test]
+    fn htx_detail_without_pairs_reports_no_top_of_book() {
+        let (mut htx, ws) = futures_ws_client();
+        ws.push_connection(vec![Ok(Some(
+            r#"{"ch":"market.BTC-USDT.detail","ts":1,"tick":{"close":81217.7}}"#.to_string(),
+        ))]);
+        Htx::subscribe_ticker(&mut htx, &symbol()).unwrap();
+
+        let events = Htx::poll_events(&mut htx);
+        let Event::Ticker(ticker) = &events[0] else {
+            panic!("expected a ticker, got {:?}", events[0]);
+        };
+        assert_eq!(ticker.bid, Decimal::ZERO);
+        assert_eq!(ticker.ask, Decimal::ZERO);
+    }
+
     /// Funding and forced orders arrive on a second public socket.
     #[test]
     fn the_notification_socket_carries_funding_and_liquidations() {

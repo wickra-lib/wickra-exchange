@@ -1813,6 +1813,79 @@ mod tests {
         (kucoin, ws)
     }
 
+    /// The answers KuCoin gives on a bad day.
+    #[test]
+    fn kucoin_open_interest_reports_what_went_wrong() {
+        let http = Arc::new(MockHttpTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::UsdMFutures);
+        let kucoin = KuCoin::with_http(Box::new(ArcTransport(Arc::clone(&http))), &opts);
+
+        // A contract with no multiplier: the base-currency figure cannot be
+        // derived, and guessing one would be a fabricated size.
+        http.push_json(
+            200,
+            r#"{"code":"200000","data":{"symbol":"XBTUSDTM","openInterest":"100"}}"#,
+        );
+        assert!(matches!(
+            KuCoin::open_interest(&kucoin, &symbol()),
+            Err(Error::Deserialization(_))
+        ));
+    }
+
+    /// Frames the futures parser cannot use are dropped.
+    #[test]
+    fn kucoin_drops_futures_frames_it_cannot_read() {
+        let (mut kucoin, ws) = futures_ws_client();
+        ws.push_connection(vec![
+            // A book change that is not `price,side,size`.
+            Ok(Some(
+                r#"{"topic":"/contractMarket/level2:XBTUSDTM","type":"message",
+                "subject":"level2","data":{"sequence":1,"change":"nonsense"}}"#
+                    .to_string(),
+            )),
+            // A change naming a side the venue does not use.
+            Ok(Some(
+                r#"{"topic":"/contractMarket/level2:XBTUSDTM","type":"message",
+                "subject":"level2","data":{"sequence":1,"change":"1.0,sideways,2"}}"#
+                    .to_string(),
+            )),
+            // An instrument frame with an unknown subject.
+            Ok(Some(
+                r#"{"topic":"/contract/instrument:XBTUSDTM","type":"message",
+                "subject":"something.else","data":{}}"#
+                    .to_string(),
+            )),
+        ]);
+        KuCoin::subscribe_book(&mut kucoin, &symbol()).unwrap();
+        KuCoin::subscribe_derivatives(&mut kucoin, &symbol(), DerivativesChannel::MarkIndex)
+            .unwrap();
+
+        assert!(KuCoin::poll_events(&mut kucoin).is_empty());
+    }
+
+    /// An instrument frame missing its prices is dropped rather than half-read.
+    #[test]
+    fn kucoin_drops_an_instrument_frame_without_prices() {
+        let (mut kucoin, ws) = futures_ws_client();
+        ws.push_connection(vec![
+            Ok(Some(
+                r#"{"topic":"/contract/instrument:XBTUSDTM","type":"message",
+                "subject":"mark.index.price","data":{"markPrice":1.0}}"#
+                    .to_string(),
+            )),
+            Ok(Some(
+                r#"{"topic":"/contract/instrument:XBTUSDTM","type":"message",
+                "subject":"funding.rate","data":{"timestamp":1}}"#
+                    .to_string(),
+            )),
+        ]);
+        KuCoin::subscribe_derivatives(&mut kucoin, &symbol(), DerivativesChannel::MarkIndex)
+            .unwrap();
+        KuCoin::subscribe_derivatives(&mut kucoin, &symbol(), DerivativesChannel::Funding).unwrap();
+
+        assert!(KuCoin::poll_events(&mut kucoin).is_empty());
+    }
+
     /// Both channels arrive on one topic, under two subjects.
     #[test]
     fn the_instrument_topic_answers_funding_and_mark_index() {

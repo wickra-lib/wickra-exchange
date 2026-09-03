@@ -2181,6 +2181,82 @@ mod tests {
         (gate, ws)
     }
 
+    /// The answers Gate gives on a bad day.
+    #[test]
+    fn gate_polled_reads_report_what_went_wrong() {
+        let http = Arc::new(MockHttpTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::UsdMFutures);
+        let gate = Gate::with_http(Box::new(ArcTransport(Arc::clone(&http))), &opts);
+
+        http.push_json(200, "[]");
+        assert!(matches!(
+            Gate::open_interest(&gate, &symbol()),
+            Err(Error::NotFound(_))
+        ));
+
+        http.push_json(200, r#"[{"time":1788464400}]"#);
+        assert!(matches!(
+            Gate::open_interest(&gate, &symbol()),
+            Err(Error::Deserialization(_))
+        ));
+
+        http.push_json(200, r#"[{"time":1788464400,"open_interest":1}]"#);
+        assert!(matches!(
+            Gate::long_short_ratio(&gate, &symbol()),
+            Err(Error::Deserialization(_))
+        ));
+
+        // A ratio of -1 has no proportions: 1 + r is zero, and the division
+        // that follows would be by zero.
+        http.push_json(200, r#"[{"time":1788464400,"lsr_account":-1.0}]"#);
+        assert!(matches!(
+            Gate::long_short_ratio(&gate, &symbol()),
+            Err(Error::Deserialization(_))
+        ));
+    }
+
+    /// Frames the futures parser cannot use are dropped.
+    #[test]
+    fn gate_drops_futures_frames_it_cannot_read() {
+        let (mut gate, ws) = futures_ws_client();
+        ws.push_connection(vec![
+            // A book update with no contract.
+            Ok(Some(
+                r#"{"time":1,"channel":"futures.order_book_update","event":"update",
+                "result":{"t":1,"U":1,"u":2,"a":[],"b":[]}}"#
+                    .to_string(),
+            )),
+            // A trade with no price.
+            Ok(Some(
+                r#"{"time":1,"channel":"futures.trades","event":"update",
+                "result":[{"size":1,"contract":"BTC_USDT"}]}"#
+                    .to_string(),
+            )),
+            // A ticker with no last price.
+            Ok(Some(
+                r#"{"time":1,"channel":"futures.tickers","event":"update",
+                "result":[{"contract":"BTC_USDT"}]}"#
+                    .to_string(),
+            )),
+            // A level whose size is missing.
+            Ok(Some(
+                r#"{"time":1,"channel":"futures.order_book_update","event":"update",
+                "result":{"t":1,"U":1,"u":2,"s":"BTC_USDT","a":[{"p":"1.0"}],"b":[]}}"#
+                    .to_string(),
+            )),
+        ]);
+        Gate::subscribe_book(&mut gate, &symbol()).unwrap();
+
+        let events = Gate::poll_events(&mut gate);
+        // Only the last frame produces anything, and its one unreadable level
+        // is dropped rather than defaulted.
+        assert_eq!(events.len(), 1, "{events:?}");
+        let Event::BookDelta(delta) = &events[0] else {
+            panic!("expected a delta");
+        };
+        assert!(delta.asks.is_empty() && delta.bids.is_empty());
+    }
+
     /// One ticker frame answers both subscriptions.
     #[test]
     fn the_futures_ticker_answers_funding_and_mark_index_on_gate() {
