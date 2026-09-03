@@ -308,19 +308,29 @@ jobs:
   # wheel a container produces actually installs and imports under that libc.
   # Building a wheel and importing it are different claims.
   python-wheel-container-smoke:
-    name: Python wheel (${{ matrix.manylinux }} smoke)
+    name: Python wheel (${{ matrix.manylinux }}/${{ matrix.target }} smoke)
     runs-on: ubuntu-latest
     timeout-minutes: 30 # backstop against a hung job, not a budget
     strategy:
       fail-fast: false
       matrix:
         include:
-          - manylinux: auto
-            image: quay.io/pypa/manylinux_2_28_x86_64
-            python: /opt/python/cp312-cp312/bin/python
-          - manylinux: musllinux_1_2
-            image: quay.io/pypa/musllinux_1_2_x86_64
-            python: /opt/python/cp312-cp312/bin/python
+          - { manylinux: auto, target: x86_64, platform: linux/amd64,
+              image: quay.io/pypa/manylinux_2_28_x86_64,
+              python: /opt/python/cp312-cp312/bin/python }
+          - { manylinux: musllinux_1_2, target: x86_64, platform: linux/amd64,
+              image: quay.io/pypa/musllinux_1_2_x86_64,
+              python: /opt/python/cp312-cp312/bin/python }
+          # aarch64 is cross-compiled, and the cross toolchain is a different
+          # toolchain: the glibc one could not assemble `ring` at all, and the
+          # first run that found out was a release tag. Built here on every
+          # pull request instead.
+          - { manylinux: auto, target: aarch64, platform: linux/arm64,
+              image: quay.io/pypa/manylinux_2_28_aarch64,
+              python: /opt/python/cp312-cp312/bin/python }
+          - { manylinux: musllinux_1_2, target: aarch64, platform: linux/arm64,
+              image: quay.io/pypa/musllinux_1_2_aarch64,
+              python: /opt/python/cp312-cp312/bin/python }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -329,18 +339,44 @@ jobs:
       - name: Sync root README into bindings/python so the build matches release
         run: cp README.md bindings/python/README.md
 
+      # Running an aarch64 container on an x86_64 runner needs the emulator. The
+      # wheel is *built* by a cross-compiler either way; this is only so the
+      # import below can run under the libc the wheel was built for.
+      - name: Set up QEMU for the foreign architecture
+        if: matrix.target != 'x86_64'
+        uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
+        with:
+          platforms: arm64
+
       - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        env:
+          CFLAGS_aarch64_unknown_linux_gnu: -D__ARM_ARCH=8
         with:
           working-directory: bindings/python
-          target: x86_64
+          target: ${{ matrix.target }}
           # Keep in sync with release.yml.
           args: --release --strip --out dist
           manylinux: ${{ matrix.manylinux }}
+          # `ring` refuses to assemble unless the assembler defines
+          # `__ARM_ARCH` (Arm C Language Extensions), and the manylinux2014
+          # aarch64 *cross* toolchain does not: the build stops at
+          # `#error "ARM assembler must define __ARM_ARCH"`. The musl cross
+          # image is newer and defines it, which is why only the glibc aarch64
+          # wheel failed. aarch64 is ARMv8-A by definition, so 8 is what a
+          # modern compiler defines there -- this states it rather than picks
+          # it. Exported inside the container as well as set on the step: the
+          # Linux wheels are built in a container the step's own environment
+          # does not necessarily reach, and the native macOS/Windows builds
+          # have no container to export into.
+          before-script-linux: |
+            export CFLAGS_aarch64_unknown_linux_gnu="-D__ARM_ARCH=8"
+
 
       - name: Install and import the wheel under the target libc
         env:
           IMAGE: ${{ matrix.image }}
           PY: ${{ matrix.python }}
+          PLATFORM: ${{ matrix.platform }}
         shell: bash
         run: |
           set -euo pipefail
@@ -348,7 +384,7 @@ jobs:
           # Run inside the same libc the wheel was built for: a musllinux wheel
           # cannot be installed on the glibc runner, so importing it here would
           # prove nothing.
-          docker run --rm -v "$PWD/bindings/python/dist:/dist:ro" "$IMAGE"             "$PY" -c "
+          docker run --rm --platform "$PLATFORM" -v "$PWD/bindings/python/dist:/dist:ro" "$IMAGE"             "$PY" -c "
           import glob, subprocess, sys
           wheels = glob.glob('/dist/*.whl')
           assert wheels, 'no wheel was produced'
