@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>wickra-exchange WASM — paper trade</title>
+  <style>
+    body { font-family: ui-sans-serif, system-ui, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; color: #1d1d1d; }
+    h1 { margin-bottom: .25rem; }
+    .meta { color: #666; margin-top: 0; }
+    table { border-collapse: collapse; width: 100%; margin-top: 1rem; font-variant-numeric: tabular-nums; }
+    th, td { border: 1px solid #ddd; padding: .5rem .75rem; text-align: right; }
+    th:first-child, td:first-child { text-align: left; }
+    th { background: #fafafa; }
+    code { background: #f4f4f4; padding: .1rem .25rem; border-radius: .2rem; font-size: .9em; }
+    label { display: inline-block; margin-right: .75rem; }
+    button { padding: .5rem 1rem; }
+    #status { margin-top: 1rem; color: #666; }
+  </style>
+</head>
+<body>
+  <h1>wickra-exchange WASM — paper trade</h1>
+  <p class="meta">
+    The differentiator demo in the browser: an offline <code>PaperExchange</code>
+    fills orders deterministically through the same API a live venue uses. The
+    page counterpart of <code>examples/node/paper_trade.js</code> and
+    <code>examples/rust/src/paper_trade.rs</code>.
+  </p>
+
+  <p>
+    <label>Market: <input type="text" id="market" value="BTC/USDT" size="12" /></label>
+    <label>Mark price: <input type="number" id="price" value="20000" step="100" /></label>
+    <label>Quantity: <input type="number" id="qty" value="1" step="0.1" /></label>
+    <button id="go" disabled>Market buy</button>
+  </p>
+
+  <p id="status">Loading WASM module…</p>
+
+  <table id="fill" hidden>
+    <thead><tr><th>Field</th><th>Value</th></tr></thead>
+    <tbody></tbody>
+  </table>
+
+  <table id="balances" hidden>
+    <thead><tr><th>Asset</th><th>Free</th></tr></thead>
+    <tbody></tbody>
+  </table>
+
+  <table id="events" hidden>
+    <thead><tr><th>#</th><th>Event</th></tr></thead>
+    <tbody></tbody>
+  </table>
+
+  <script type="module">
+    import init, { Exchange, OrderRequest, version }
+      from "../../bindings/wasm/pkg/wickra_exchange_wasm.js";
+
+    const status = document.getElementById("status");
+    const go = document.getElementById("go");
+
+    function fill(table, rows) {
+      const body = table.querySelector("tbody");
+      body.replaceChildren();
+      for (const cells of rows) {
+        const tr = document.createElement("tr");
+        for (const cell of cells) {
+          const td = document.createElement("td");
+          td.textContent = String(cell);
+          tr.append(td);
+        }
+        body.append(tr);
+      }
+      table.hidden = rows.length === 0;
+    }
+
+    // A fresh account per run: the paper backend carries balances and open
+    // orders, so reusing one across clicks would compound earlier fills and the
+    // second run would report something the inputs no longer explain.
+    function run() {
+      const market = document.getElementById("market").value.trim();
+      const price = Number(document.getElementById("price").value);
+      const quantity = Number(document.getElementById("qty").value);
+
+      // maker 1 bp, taker 5 bp, slippage 10 bp -- the same seed as the sibling
+      // examples, so the printed fill is comparable across languages.
+      const ex = Exchange.paper({ USDT: 100000 }, 1, 5, 10);
+      ex.setPrice(market, price);
+
+      const order = ex.placeOrder(OrderRequest.marketBuy(market, quantity));
+      fill(document.getElementById("fill"), [
+        ["venue", ex.name()],
+        ["market", market],
+        ["status", order.status],
+        ["filled quantity", order.filledQuantity],
+        ["average price", order.averagePrice],
+      ]);
+
+      fill(document.getElementById("balances"),
+           Object.entries(ex.balances()));
+
+      // Execution events arrive through the same pull loop as market data --
+      // there are no callbacks to register, in the browser or anywhere else.
+      fill(document.getElementById("events"),
+           ex.pollEvents().map((event, i) => [i + 1, event.kind]));
+
+      status.textContent = `Filled through the offline paper backend (wickra-exchange-wasm ${version()}).`;
+    }
+
+    await init();
+    status.textContent = `Module ready — wickra-exchange-wasm ${version()}.`;
+    go.disabled = false;
+    go.addEventListener("click", () => {
+      try {
+        run();
+      } catch (err) {
+        status.textContent = `Error: ${err}`;
+      }
+    });
+  </script>
+</body>
+</html>

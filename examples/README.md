@@ -14,6 +14,7 @@ through the same API a live venue uses.
 | Go       | `go/paper_trade.go`        | `go run paper_trade.go`                         |
 | Java     | `java/PaperTrade.java`     | `java --enable-native-access=ALL-UNNAMED ...`   |
 | R        | `r/paper_trade.R`          | `Rscript paper_trade.R`                         |
+| WASM     | `wasm/paper_trade.html`    | serve the repo root, open in a browser          |
 
 The `rust/ticker` binary fetches a live public ticker:
 `cargo run -p wickra-exchange-examples --bin ticker -- binance BTC/USDT`.

@@ -29,6 +29,20 @@
 connectivity — market data *and* signed order execution — built on the
 [Wickra](https://github.com/wickra-lib/wickra) core.
 
+```rust
+use wickra_exchange::{Exchange, ExchangeOptions, MarketData, OrderRequest, PaperExchange};
+
+// Offline: fills are simulated, deterministically.
+let mut ex = PaperExchange::new().with_balance("USDT", dec!(100_000));
+ex.set_price(&market, dec!(20_000));
+
+// Live: same trait, same calls, same order type — only the constructor differs.
+let mut ex = Exchange::new("binance", creds, ExchangeOptions::testnet(MarketType::Spot))?;
+
+let order = ex.place_order(&OrderRequest::market_buy(market, dec!(1)))?;
+println!("{} filled at {:?}", order.filled_quantity, order.average_price);
+```
+
 > **▶ Live demo:** all 514 indicators over real Binance market data, computed live in your browser — **[live.wickra.org](https://live.wickra.org)** · zero backend, powered by `wickra-wasm`.
 
 > **Part of the [Wickra ecosystem](https://github.com/wickra-lib):** the same data-driven core and ten-language binding surface also power [wickra-backtest](https://github.com/wickra-lib/wickra-backtest), [wickra-terminal](https://github.com/wickra-lib/wickra-terminal), [wickra-screener](https://github.com/wickra-lib/wickra-screener) and 20 more — see [the full list](https://github.com/wickra-lib).
