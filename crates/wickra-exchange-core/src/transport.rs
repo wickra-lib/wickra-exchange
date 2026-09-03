@@ -282,15 +282,38 @@ impl HttpTransport for MockHttpTransport {
     }
 }
 
+/// What the next [`connect`](WsTransport::connect) does.
+///
+/// A socket has three ways to behave badly and the mock could script none of
+/// them: it always opened, and always accepted whatever was sent. That left the
+/// reconnect helper's failure paths -- refused connection, subscriptions that
+/// cannot be replayed -- with no way to be reached from a test, so the one
+/// outcome that reads as a quiet market (a live socket subscribed to nothing)
+/// was never exercised.
+#[derive(Debug)]
+enum ScriptedConnection {
+    /// Opens, replays `frames` from `recv`, accepts everything sent.
+    Open(Vec<Result<Option<String>>>),
+    /// `connect` fails.
+    Refused,
+    /// Opens, then rejects the first `send`. This is the venue that accepts the
+    /// socket and drops it before the subscribe frames land.
+    OpenButUnsendable,
+}
+
 /// A [`WsTransport`] whose connections replay a scripted sequence of frames.
 ///
 /// Each call to [`push_connection`](MockWsTransport::push_connection) queues the
 /// script (a list of `recv` results) for the next [`connect`](WsTransport::connect).
 /// Frames sent by the client are recorded and readable via
 /// [`sent`](MockWsTransport::sent).
+///
+/// [`push_refused_connection`](MockWsTransport::push_refused_connection) and
+/// [`push_unsendable_connection`](MockWsTransport::push_unsendable_connection)
+/// queue the two ways a connection can fail instead.
 #[derive(Debug, Default)]
 pub struct MockWsTransport {
-    scripts: Mutex<VecDeque<Vec<Result<Option<String>>>>>,
+    scripts: Mutex<VecDeque<ScriptedConnection>>,
     connected_urls: Mutex<Vec<String>>,
     sent: Arc<Mutex<Vec<String>>>,
 }
@@ -306,7 +329,31 @@ impl MockWsTransport {
     /// of one `recv`; `Ok(Some(frame))` delivers a frame, `Ok(None)` closes the
     /// connection, `Err(..)` surfaces a read error.
     pub fn push_connection(&self, frames: Vec<Result<Option<String>>>) {
-        self.scripts.lock().unwrap().push_back(frames);
+        self.scripts
+            .lock()
+            .unwrap()
+            .push_back(ScriptedConnection::Open(frames));
+    }
+
+    /// Queue a refused connection: the next `connect` returns an error.
+    pub fn push_refused_connection(&self) {
+        self.scripts
+            .lock()
+            .unwrap()
+            .push_back(ScriptedConnection::Refused);
+    }
+
+    /// Queue a connection that opens and then rejects everything sent on it.
+    ///
+    /// The shape that matters for reconnection: the socket comes up, so the
+    /// client believes it recovered, and the subscribe frames never land. What
+    /// follows is a live connection delivering nothing, which is what a quiet
+    /// market looks like.
+    pub fn push_unsendable_connection(&self) {
+        self.scripts
+            .lock()
+            .unwrap()
+            .push_back(ScriptedConnection::OpenButUnsendable);
     }
 
     /// The URLs connected to so far, in order.
@@ -325,11 +372,24 @@ impl MockWsTransport {
 impl WsTransport for MockWsTransport {
     fn connect(&self, url: &str) -> Result<Box<dyn WsConnection>> {
         self.connected_urls.lock().unwrap().push(url.to_string());
-        let script = self.scripts.lock().unwrap().pop_front().unwrap_or_default();
+        let script = self
+            .scripts
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(ScriptedConnection::Open(Vec::new()));
+        let (frames, unsendable) = match script {
+            ScriptedConnection::Open(frames) => (frames, false),
+            ScriptedConnection::OpenButUnsendable => (Vec::new(), true),
+            ScriptedConnection::Refused => {
+                return Err(Error::Network("mock: connection refused".to_string()))
+            }
+        };
         Ok(Box::new(MockWsConnection {
-            incoming: script.into(),
+            incoming: frames.into(),
             sent: Arc::clone(&self.sent),
             closed: false,
+            unsendable,
         }))
     }
 }
@@ -344,11 +404,14 @@ pub(crate) struct MockWsConnection {
     incoming: VecDeque<Result<Option<String>>>,
     sent: Arc<Mutex<Vec<String>>>,
     closed: bool,
+    /// Open, but every `send` fails. See
+    /// [`push_unsendable_connection`](MockWsTransport::push_unsendable_connection).
+    unsendable: bool,
 }
 
 impl WsConnection for MockWsConnection {
     fn send(&mut self, text: &str) -> Result<()> {
-        if self.closed {
+        if self.closed || self.unsendable {
             return Err(Error::NotConnected);
         }
         self.sent.lock().unwrap().push(text.to_string());
@@ -519,6 +582,7 @@ mod tests {
             incoming: VecDeque::new(),
             sent: Arc::new(Mutex::new(Vec::new())),
             closed: false,
+            unsendable: false,
         };
         assert!(format!("{conn:?}").starts_with("MockWsConnection"));
     }

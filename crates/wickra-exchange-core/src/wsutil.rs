@@ -8,6 +8,17 @@
 use crate::events::Event;
 use crate::transport::{WsConnection, WsTransport};
 
+/// Each call below is written on one line, for the reason `throttle.rs` gives:
+/// `llvm-cov` marks the continuation lines of a multi-line macro invocation
+/// uncovered even when the call runs.
+///
+/// The URL is deliberately never logged. A private stream's URL carries its
+/// credential in the path -- Binance's user-data socket is
+/// `wss://.../ws/<listenKey>`, and a listen key opens the account's order and
+/// balance stream. Which venue it is is already clear from the caller's target;
+/// what a reader needs here is which of the four outcomes happened.
+const TARGET: &str = "wickra_exchange_core::wsutil";
+
 /// If the peer has closed `connection`, reopen it via `ws` at `url` and replay
 /// every message in `subscribe_messages`, pushing `Disconnected` then
 /// `Reconnected` into `events`.
@@ -26,20 +37,26 @@ pub(crate) fn reconnect_if_dropped(
         return;
     }
 
+    let subscriptions = subscribe_messages.len();
+    tracing::info!(target: TARGET, subscriptions, "stream closed by the peer; reconnecting");
     events.push(Event::Disconnected);
     *connection = None;
 
     let Some(ws) = ws else {
+        tracing::warn!(target: TARGET, "no WebSocket transport is configured; the stream stays closed");
         return;
     };
     let Ok(mut fresh) = ws.connect(url) else {
+        tracing::warn!(target: TARGET, "reconnect could not open a connection; the next poll retries");
         return;
     };
-    for message in subscribe_messages {
+    for (replayed, message) in subscribe_messages.iter().enumerate() {
         if fresh.send(message).is_err() {
+            tracing::warn!(target: TARGET, replayed, subscriptions, "reconnected, but replaying the subscriptions failed; staying closed");
             return; // leave disconnected; the next poll retries
         }
     }
+    tracing::info!(target: TARGET, subscriptions, "reconnected and replayed every subscription");
     *connection = Some(fresh);
     events.push(Event::Reconnected);
 }
@@ -98,6 +115,90 @@ mod tests {
         // One initial connect + one per cycle; a fresh SUBSCRIBE replayed each time.
         assert_eq!(ws.connected_urls().len(), CYCLES + 1);
         assert_eq!(ws.sent().len(), CYCLES);
+    }
+
+    /// A dropped stream with a client that has no transport to reconnect with.
+    ///
+    /// The caller is told the stream went down and never told it came back, and
+    /// no amount of polling will change that: the client was built without a
+    /// `WsTransport`. Nothing exercised this before, so the one outcome that is
+    /// a mistake in the caller's own code looked like every other failure.
+    #[test]
+    fn a_client_without_a_transport_reports_the_drop_and_stops() {
+        let ws = MockWsTransport::new();
+        ws.push_connection(vec![Ok(None)]);
+        let mut connection = Some(ws.connect("wss://x").unwrap());
+        connection.as_mut().unwrap().recv().ok();
+
+        let mut events = Vec::new();
+        reconnect_if_dropped(
+            None,
+            "wss://x",
+            &mut connection,
+            &["sub".into()],
+            &mut events,
+        );
+
+        assert_eq!(events, vec![Event::Disconnected]);
+        assert!(connection.is_none(), "no transport, so nothing to reopen");
+    }
+
+    /// The venue refuses the reconnect. The next poll retries, so the connection
+    /// is left empty rather than half-built.
+    #[test]
+    fn a_refused_reconnect_leaves_the_connection_closed() {
+        let ws = MockWsTransport::new();
+        ws.push_connection(vec![Ok(None)]);
+        ws.push_refused_connection();
+
+        let mut connection = Some(ws.connect("wss://x").unwrap());
+        connection.as_mut().unwrap().recv().ok();
+
+        let mut events = Vec::new();
+        reconnect_if_dropped(
+            Some(&ws),
+            "wss://x",
+            &mut connection,
+            &["sub".into()],
+            &mut events,
+        );
+
+        assert_eq!(events, vec![Event::Disconnected]);
+        assert!(connection.is_none(), "a failed reopen must not be kept");
+        assert_eq!(ws.connected_urls().len(), 2, "it did try");
+    }
+
+    /// The socket reopens and the subscriptions cannot be replayed.
+    ///
+    /// The worst of the four outcomes, and the reason the logging exists: a
+    /// caller that kept this connection would hold a live socket subscribed to
+    /// nothing, which delivers no events and no errors -- indistinguishable
+    /// from a quiet market. So it is not kept, and no `Reconnected` is claimed.
+    #[test]
+    fn a_reconnect_that_cannot_resubscribe_is_not_reported_as_recovered() {
+        let ws = MockWsTransport::new();
+        ws.push_connection(vec![Ok(None)]);
+        ws.push_unsendable_connection();
+
+        let mut connection = Some(ws.connect("wss://x").unwrap());
+        connection.as_mut().unwrap().recv().ok();
+
+        let mut events = Vec::new();
+        reconnect_if_dropped(
+            Some(&ws),
+            "wss://x",
+            &mut connection,
+            &["sub-a".into(), "sub-b".into()],
+            &mut events,
+        );
+
+        assert_eq!(
+            events,
+            vec![Event::Disconnected],
+            "a socket subscribed to nothing is not a recovery"
+        );
+        assert!(connection.is_none());
+        assert!(ws.sent().is_empty(), "not one subscribe frame landed");
     }
 
     #[test]

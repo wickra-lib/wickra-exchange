@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The shared reconnect says which of its four outcomes happened.** Every
+  venue's `poll_events` reconnects through one function, and it was silent: a
+  caller saw `Event::Disconnected` and then, sometimes, `Event::Reconnected`,
+  with no way to tell the absence apart. No WebSocket transport configured, the
+  reconnect failing to open, and the subscriptions failing to replay all look
+  identical from outside and call for three different fixes — the first is a
+  construction mistake, the second is the network, the third leaves a live
+  socket subscribed to nothing.
+
+  Each now logs, at `info` for the two normal outcomes and `warn` for the two
+  that leave the stream closed. The URL is not logged: a private stream carries
+  its credential in the path — Binance's user-data socket is
+  `wss://.../ws/<listenKey>`, and a listen key opens the account's order and
+  balance stream.
+
+  The three failure outcomes now have tests, which none of them had: the mock
+  WebSocket transport could only ever open a connection that accepted
+  everything, so a refused reconnect and a reconnect whose subscriptions cannot
+  be replayed were unreachable from a test. `MockWsTransport` gains
+  `push_refused_connection` and `push_unsendable_connection` for them.
+
+  `retry.rs` and `deadman.rs` were candidates and are deliberately left alone.
+  Both are pure policy types with no I/O — `DeadMansSwitch` has no call site in
+  the library at all, the caller holds it — so there is no decision there to
+  report. `net.rs` is left alone for the opposite reason: its failures already
+  reach the caller as `Error::Network`, so logging them would repeat what the
+  return value says rather than recover something lost.
+
 ### Fixed
 
 - **A reduce-only close sent over Binance's WebSocket opened a position.** The
