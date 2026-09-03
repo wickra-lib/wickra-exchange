@@ -223,16 +223,24 @@ impl Binance {
     ///
     /// Only a hedged *futures* client takes the second branch. Spot is
     /// untouched, and so is one-way futures.
-    fn position_params(&self, request: &OrderRequest) -> Result<String> {
+    /// The position-related parameters as key/value pairs.
+    ///
+    /// The REST body and the WebSocket frame are different encodings of the same
+    /// order, so they resolve this once here rather than each spelling it out.
+    /// They did each spell it out, and drifted: the frame carried the hedged
+    /// `positionSide` but never `reduceOnly`, so a one-way futures close sent
+    /// over the socket opened a position instead, and a spot order carrying
+    /// `reduce_only` was sent rather than refused.
+    fn position_fields(&self, request: &OrderRequest) -> Result<Vec<(&'static str, String)>> {
         if self.is_futures() && self.position_mode == PositionMode::Hedge {
             let side = match PositionSide::for_order(request.side, request.reduce_only) {
                 PositionSide::Long => "LONG",
                 PositionSide::Short => "SHORT",
             };
-            return Ok(format!("&positionSide={side}"));
+            return Ok(vec![("positionSide", side.to_string())]);
         }
         if !request.reduce_only {
-            return Ok(String::new());
+            return Ok(Vec::new());
         }
         // Spot has no positions to reduce and rejects the parameter outright
         // (-1104, "not all sent parameters were read"). Sending the order
@@ -245,7 +253,20 @@ impl Binance {
                 "spot holds balances, not positions, and rejects the parameter",
             ));
         }
-        Ok("&reduceOnly=true".to_string())
+        Ok(vec![("reduceOnly", "true".to_string())])
+    }
+
+    /// [`position_fields`](Self::position_fields) as a query-string fragment,
+    /// for the REST body.
+    fn position_params(&self, request: &OrderRequest) -> Result<String> {
+        use std::fmt::Write as _;
+        Ok(self.position_fields(request)?.into_iter().fold(
+            String::new(),
+            |mut out, (key, value)| {
+                let _ = write!(out, "&{key}={value}");
+                out
+            },
+        ))
     }
 
     /// The single-order endpoint (place/cancel/query) for this market.
@@ -1086,14 +1107,11 @@ impl Binance {
         if let Some(mode) = stp_str(request.stp) {
             params.push(("selfTradePreventionMode".to_string(), mode.to_string()));
         }
-        // The ws-api connection goes to ws-fapi on a futures client, so a hedged
-        // account needs the side named here exactly as on the REST path.
-        if self.is_futures() && self.position_mode == PositionMode::Hedge {
-            let side = match PositionSide::for_order(request.side, request.reduce_only) {
-                PositionSide::Long => "LONG",
-                PositionSide::Short => "SHORT",
-            };
-            params.push(("positionSide".to_string(), side.to_string()));
+        // The ws-api connection goes to ws-fapi on a futures client, so the
+        // position fields are named here exactly as on the REST path -- and
+        // resolved by the same function, so the two cannot drift again.
+        for (key, value) in self.position_fields(request)? {
+            params.push((key.to_string(), value));
         }
         let result = self.ws_request("order.place", params)?;
         let raw: RawOrder =

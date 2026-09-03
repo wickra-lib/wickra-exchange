@@ -38,13 +38,13 @@ order missing a field the caller set is a different order, not a smaller one.
 | Venue    | GTC | IOC | FOK | `post_only` | `stp` | `reduce_only` |
 |----------|:---:|:---:|:---:|:-----------:|:-----:|:-------------:|
 | Binance  | ✅  | ✅¹ | ✅¹ | `LIMIT_MAKER`² | `selfTradePreventionMode` | futures only³ |
-| Bybit    | ✅  | ✅  | ✅  | `PostOnly`⁴ | `smpType` | ✅ |
-| OKX      | ✅  | ✅⁵ | ✅⁵ | `post_only`⁵ | `stpMode` | ✅ |
-| Bitget   | ✅  | ✅  | ✅  | `post_only`⁴ | `stpMode` | ✅ |
-| KuCoin   | ✅  | ✅  | ✅  | `postOnly` | `stp` | futures only |
-| Gate.io  | ✅  | ✅  | ✅  | `poc`⁴ | `stp_act` | futures only |
-| HTX      | ✅  | ✅⁶ | ✅¹ ⁶ | `limit-maker`⁶ | — refused | futures only |
-| Kraken   | ✅  | ✅  | — refused⁷ | `oflags=post` | — refused | futures only |
+| Bybit    | ✅  | ✅  | ✅  | `PostOnly`⁴ | `smpType` | futures only³ |
+| OKX      | ✅  | ✅⁵ | ✅⁵ | `post_only`⁵ | `stpMode` | futures only³ |
+| Bitget   | ✅  | ✅  | ✅  | `post_only`⁴ | `stpMode` | futures only³ |
+| KuCoin   | ✅  | ✅  | ✅  | `postOnly` | `stp` | futures only³ |
+| Gate.io  | ✅  | ✅  | ✅  | `poc`⁴ | `stp_act` | futures only³ |
+| HTX      | ✅  | ✅⁶ | ✅¹ ⁶ | `limit-maker`⁶ | — refused | futures only³ |
+| Kraken   | ✅  | ✅  | — refused⁷ | `oflags=post` | — refused | futures only³ |
 | Coinbase | ✅  | — refused⁸ | ✅¹ | `post_only` | — refused⁹ | — (spot only) |
 | Upbit    | ✅  | ✅¹ | ✅¹ | — refused | — refused | — (spot only) |
 
@@ -54,7 +54,13 @@ order missing a field the caller set is a different order, not a smaller one.
    fill-or-kill the order is refused rather than left able to fill partially.
 2. `LIMIT_MAKER` is Binance's post-only type and accepts no `timeInForce` at all,
    so post-only together with IOC/FOK is refused.
-3. Spot holds balances, not positions, and rejects `reduceOnly` outright (-1104).
+3. `reduce_only` is the one field whose meaning comes from the account rather
+   than the venue: it says "close, do not open", and a spot account holds
+   balances, not positions, so there is nothing to close. **Every spot client
+   refuses it**, on the single-order, batch and WebSocket paths alike. Binance
+   says so on the wire too (-1104, "not all sent parameters were read"); the
+   others accept the field and never act on it, which reaches the caller as the
+   same falsehood from the other direction.
 4. The venue spells post-only as a *value* of its time-in-force field, so the two
    share one slot: post-only together with a non-GTC time-in-force is refused.
 5. OKX carries all three inside `ordType` (`ioc`, `fok`, `post_only` are order
@@ -66,11 +72,18 @@ order missing a field the caller set is a different order, not a smaller one.
    there is no `limit_limit_ioc`.
 9. Coinbase sets self-trade prevention per portfolio, not per order.
 
-`tests/conformance.rs` holds every client to that table without naming it: four
+`tests/conformance.rs` holds every client to that table without naming it: six
 contracts assert that each field is *carried or refused* on the single-order
-path, on the batch path, when two fields land in one venue slot, and when a
-market order asks for fill-or-kill. A venue that gains a field later moves from
-one column to the other without those tests changing.
+path, on the batch path, on the WebSocket path, when two fields land in one
+venue slot, when a market order asks for fill-or-kill, and — for `reduce_only`,
+whose answer depends on the account — carried on a derivatives client and
+refused on a spot one. A venue that gains a field later moves from one column to
+the other without those tests changing.
+
+The three order paths are three hand-written builders of the same order, so they
+drift, and every round of this has found them drifted: the batch path dropping
+what the single path carried, and the WebSocket frame dropping what both
+carried. Each path is now held to the same table rather than to its own.
 
 **Trigger (stop) orders are the exception, and only Binance carries them.**
 `OrderType::StopMarket` and `StopLimit` rest until the market reaches
@@ -197,6 +210,13 @@ configuration. A field added to the core is a field the check demands.
 > WebSocket one. A post-only order over Kraken's WebSocket returns
 > `Error::Exchange` and points at REST, rather than being placed as a limit that
 > may take liquidity.
+>
+> That the frame carries what the REST body carries is now a test rather than an
+> intention: `the_websocket_path_carries_every_field_too` holds all five sockets
+> to the same field table as the REST and batch paths. It was written because the
+> claim was not true — Binance's frame named the hedged `positionSide` and never
+> `reduceOnly`, so a one-way futures close sent over the socket opened a position
+> instead of closing one.
 >
 > All three surfaces are reachable through the facade factory
 > (`connect`, `connect_derivatives`, `connect_advanced`, `connect_user_data`,

@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A reduce-only close sent over Binance's WebSocket opened a position.** The
+  REST body and the WebSocket frame each resolved the position fields for
+  themselves, and the frame only ever spelled the hedged `positionSide`: on a
+  one-way futures account it never sent `reduceOnly` at all. An order the caller
+  had marked "close, do not open" went out as an opening order — the opposite
+  trade, on the venue where the WebSocket order API is most used. Both paths now
+  resolve the same function, so they cannot drift again.
+
+- **`reduce_only` is refused on every spot client, not silently dropped.** It is
+  the one order field whose meaning comes from the account rather than the
+  venue: a spot account holds balances, not positions, so there is nothing for
+  it to close. Binance and Upbit already refused. Bitget, Coinbase, Gate, HTX,
+  Kraken and KuCoin dropped it in silence, and Bybit and OKX sent it to a spot
+  endpoint that does not apply it — which reaches the caller as the same
+  falsehood from the other side. All ten now refuse, on the single-order, batch
+  and WebSocket paths alike.
+
+### Added
+
+- **The order-field contract covers all six fields and all three paths.** It
+  held four fields on two paths: `time_in_force`, `post_only` and `stp` on the
+  single-order and batch paths, with the WebSocket path under contract for the
+  trigger price alone. `client_order_id` and `reduce_only` were outside it
+  entirely, and the WebSocket frame — a third hand-written builder of the same
+  order, in a protocol that shares no field names with the REST body — was
+  checked for one field out of six.
+
+  Two contracts close it: `the_websocket_path_carries_every_field_too` holds all
+  five order sockets to the same table as the other two paths, and
+  `reduce_only_is_carried_on_a_derivatives_client_and_refused_on_a_spot_one`
+  states the field's account-dependent answer on all three paths. The Binance
+  defect above is what the first one found on its first run.
+
+  `client_order_id` is matched by its value rather than by its key: ten venues
+  spell that key ten ways, and a list of ten spellings is a list to keep in step
+  with ten clients, while the id itself is on the wire whichever key carries it.
+
 ### Security
 
 - **Two credentials were being printed by `Debug`.** The hand-written

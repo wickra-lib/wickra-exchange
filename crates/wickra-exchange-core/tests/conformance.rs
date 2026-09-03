@@ -12,9 +12,9 @@ use std::sync::Arc;
 use wickra_exchange_core::{
     AdvancedOrders, Binance, Bitget, Bybit, Coinbase, Credentials, Error, Event, Exchange,
     ExchangeOptions, Gate, HttpRequest, HttpResponse, HttpTransport, Htx, Kraken, KuCoin,
-    MarketData, MarketType, MockHttpTransport, Okx, OrderRequest, OrderStatus, OrderType,
-    PaperExchange, ReplayExchange, Result, SelfTradePrevention, Symbol, TimeInForce, TradePrint,
-    Upbit, WsExecution, WsUserData,
+    MarketData, MarketType, MockHttpTransport, MockWsTransport, Okx, OrderRequest, OrderStatus,
+    OrderType, PaperExchange, ReplayExchange, Result, SelfTradePrevention, Symbol, TimeInForce,
+    TradePrint, Upbit, WsConnection, WsExecution, WsTransport, WsUserData,
 };
 
 /// An EC private key, so the Coinbase client can sign the ES256 JWT its order
@@ -40,6 +40,13 @@ const POST_ONLY_SPELLINGS: &[&str] = &[
 /// Every spelling that proves an immediate-or-cancel reached the wire.
 const IOC_SPELLINGS: &[&str] = &["ioc"];
 
+/// The client order id the field contracts send.
+///
+/// Distinctive enough that finding it on the wire means the client put it there,
+/// and lowercase so it survives the case-insensitive match. Venues that decorate
+/// it -- Gate prefixes `t-` -- still contain it.
+const CLIENT_ORDER_ID: &str = "conformance-7f3a";
+
 /// Share one [`MockHttpTransport`] between the test and the client that owns it,
 /// so the requests a client built can be read back after the call.
 struct ArcTransport(Arc<MockHttpTransport>);
@@ -47,6 +54,16 @@ struct ArcTransport(Arc<MockHttpTransport>);
 impl HttpTransport for ArcTransport {
     fn execute(&self, request: &HttpRequest) -> Result<HttpResponse> {
         self.0.execute(request)
+    }
+}
+
+/// The same sharing for a [`MockWsTransport`], so the frames a client sent can
+/// be read back after the call.
+struct ArcWs(Arc<MockWsTransport>);
+
+impl WsTransport for ArcWs {
+    fn connect(&self, url: &str) -> Result<Box<dyn WsConnection>> {
+        self.0.connect(url)
     }
 }
 
@@ -422,6 +439,17 @@ fn every_order_field_is_either_carried_or_refused_but_never_dropped() {
                 "\"stp\"",
             ],
         },
+        // Matched by the value rather than by the key. Ten venues spell the key
+        // ten ways -- `newClientOrderId`, `orderLinkId`, `clOrdId`, `clientOid`,
+        // `text`, `cl_ord_id`, `identifier` -- and a list of keys is a list to
+        // keep in step with ten clients. The id itself is on the wire whatever
+        // the key is called, and a venue that prefixes it (Gate sends `t-`)
+        // still contains it.
+        Field {
+            name: "client_order_id",
+            apply: |r| r.with_client_order_id(CLIENT_ORDER_ID),
+            spellings: &[CLIENT_ORDER_ID],
+        },
     ];
 
     fn assert_contract(
@@ -634,6 +662,355 @@ fn the_batch_path_carries_every_field_too() {
     check!("Gate.io", Gate);
     check!("HTX", Htx);
     check!("Kraken", Kraken);
+}
+
+/// The same field contract on the WebSocket order path.
+///
+/// The third hand-written copy of the order builder, and until now the least
+/// watched: the WebSocket path was under contract for `stop_price` alone
+/// ([`the_batch_and_websocket_paths_refuse_triggers_too`]), while the single
+/// order and the batch had every field held to account. A frame is a different
+/// protocol from the REST body beside it -- Kraken's v2 socket names the same
+/// fields `order_qty`, `limit_price` and `cl_ord_id`, so nothing carries over
+/// from the REST spelling by accident -- which is exactly the condition under
+/// which a field goes missing on one path and not the other.
+///
+/// What goes out is the contract, so the reply is not scripted: the client sends
+/// its frame and then fails to read an answer, and the frame it sent is already
+/// recorded. That keeps this test independent of ten venue-specific response
+/// shapes, which are each venue's own parse tests to prove.
+#[test]
+fn the_websocket_path_carries_every_field_too() {
+    struct Field {
+        name: &'static str,
+        apply: fn(OrderRequest) -> OrderRequest,
+        spellings: &'static [&'static str],
+    }
+
+    const FIELDS: &[Field] = &[
+        Field {
+            name: "time_in_force = Ioc",
+            apply: |r| r.with_time_in_force(TimeInForce::Ioc),
+            spellings: IOC_SPELLINGS,
+        },
+        Field {
+            name: "post_only",
+            apply: OrderRequest::post_only,
+            spellings: POST_ONLY_SPELLINGS,
+        },
+        Field {
+            name: "stp",
+            apply: |r| r.with_stp(SelfTradePrevention::ExpireMaker),
+            spellings: &[
+                "stpmode",
+                "smptype",
+                "selftradeprevention",
+                "stp_act",
+                "\"stp\"",
+            ],
+        },
+        Field {
+            name: "client_order_id",
+            apply: |r| r.with_client_order_id(CLIENT_ORDER_ID),
+            spellings: &[CLIENT_ORDER_ID],
+        },
+    ];
+
+    let market = market();
+    let creds = || {
+        Credentials::new("APIKEY", "c2VjcmV0")
+            .with_passphrase("PASS")
+            .with_private_key(EC_KEY)
+    };
+    let options = ExchangeOptions::mainnet(MarketType::Spot);
+
+    macro_rules! check {
+        ($name:literal, $venue:ident) => {{
+            for field in FIELDS {
+                let http = Arc::new(MockHttpTransport::new());
+                // Kraken buys a WebSocket token over REST before it may send an
+                // order frame; the others need nothing. Enough replies for that,
+                // shaped so the token parse succeeds.
+                for _ in 0..3 {
+                    http.push_json(
+                        200,
+                        r#"{"error":[],"result":{"token":"WSTOKEN","expires":900}}"#,
+                    );
+                }
+                let ws = Arc::new(MockWsTransport::new());
+                let mut client = $venue::with_credentials(
+                    Box::new(ArcTransport(Arc::clone(&http))),
+                    &options,
+                    creds(),
+                )
+                .with_ws(Box::new(ArcWs(Arc::clone(&ws))));
+                let request =
+                    (field.apply)(OrderRequest::limit_buy(market.clone(), dec!(1), dec!(100)));
+                let outcome = WsExecution::place_order_ws(&mut client, &request);
+                let refused = matches!(
+                    &outcome,
+                    Err(Error::Exchange { code, .. }) if code == "unsupported"
+                );
+                // The order frame is the last one out; a login or auth frame in
+                // front of it is the client getting ready to send it.
+                let sent: Vec<String> = ws.sent().last().cloned().into_iter().collect();
+                if refused {
+                    assert!(
+                        sent.is_empty(),
+                        "{}/{}: ws refused, yet sent a frame anyway",
+                        $name,
+                        field.name
+                    );
+                    continue;
+                }
+                assert!(
+                    !sent.is_empty(),
+                    "{}/{}: ws neither refused the field nor sent an order",
+                    $name,
+                    field.name
+                );
+                let wire = sent.join(" ").to_lowercase();
+                assert!(
+                    field.spellings.iter().any(|s| wire.contains(s)),
+                    "{}/{}: the order frame went out without the field, while the \
+                     single-order path carries it.\nframe: {wire}",
+                    $name,
+                    field.name
+                );
+            }
+        }};
+    }
+
+    check!("Binance", Binance);
+    check!("Bybit", Bybit);
+    check!("OKX", Okx);
+    check!("Gate.io", Gate);
+    check!("Kraken", Kraken);
+}
+
+/// `reduce_only` is carried by a derivatives client and refused by a spot one,
+/// on every order path.
+///
+/// It is the one order field whose meaning depends on the account rather than on
+/// the venue: it says "close, do not open", and a spot account holds balances,
+/// not positions, so there is nothing for it to close. Binance says so on the
+/// wire -- spot rejects the parameter outright with -1104 -- and both it and
+/// Upbit already refused. Six others dropped it in silence, and two sent it to a
+/// spot endpoint that does not apply it, which is the same outcome reached from
+/// the other side: the caller is told the order will only ever reduce, and it
+/// will not.
+///
+/// A dropped `reduce_only` is the most expensive field to drop in the request.
+/// Every other field makes the order behave differently; this one makes it open
+/// a position where the caller asked to close one, which is the opposite trade.
+#[test]
+fn reduce_only_is_carried_on_a_derivatives_client_and_refused_on_a_spot_one() {
+    /// Every spelling of "this order may only reduce" across the eight
+    /// derivatives clients. Gate switches to `auto_size` on a hedged account and
+    /// HTX has no flag at all -- it spells the same thing as the order's
+    /// `offset`, which is `close` rather than `open`.
+    const CARRIED: &[&str] = &[
+        "reduceonly",
+        "reduce_only",
+        "reduce-only",
+        "auto_size",
+        "close_on_trigger",
+        "\"offset\":\"close\"",
+    ];
+
+    fn transport() -> Arc<MockHttpTransport> {
+        let mock = Arc::new(MockHttpTransport::new());
+        for _ in 0..3 {
+            mock.push_json(
+                200,
+                r#"{"status":"ok","code":"0","data":[{"id":42,"type":"spot","state":"working"}]}"#,
+            );
+        }
+        mock
+    }
+
+    fn refused(outcome: &Result<wickra_exchange_core::Order>) -> bool {
+        matches!(outcome, Err(Error::Exchange { code, .. }) if code == "unsupported")
+    }
+
+    let market = market();
+    let creds = || {
+        Credentials::new("APIKEY", "c2VjcmV0")
+            .with_passphrase("PASS")
+            .with_private_key(EC_KEY)
+    };
+    let reducing = || OrderRequest::limit_buy(market.clone(), dec!(1), dec!(100)).reduce_only();
+
+    // On a derivatives client the flag must reach the venue.
+    macro_rules! futures {
+        ($name:literal, $venue:ident) => {{
+            let mock = transport();
+            let options = ExchangeOptions::mainnet(MarketType::UsdMFutures);
+            let client = $venue::with_credentials(
+                Box::new(ArcTransport(Arc::clone(&mock))),
+                &options,
+                creds(),
+            );
+            let outcome = client.place_order(&reducing());
+            let wire = mock
+                .recorded_requests()
+                .last()
+                .map(|r| format!("{} {}", r.url, r.body.clone().unwrap_or_default()))
+                .unwrap_or_default()
+                .to_lowercase();
+            assert!(
+                !wire.is_empty(),
+                "{}: futures client sent no order at all ({outcome:?})",
+                $name
+            );
+            assert!(
+                CARRIED.iter().any(|s| wire.contains(s)),
+                "{}: a reduce-only futures order went out without saying so; it \
+                 opens a position where the caller asked to close one.\nwire: {wire}",
+                $name
+            );
+        }};
+    }
+
+    futures!("Binance", Binance);
+    futures!("Bybit", Bybit);
+    futures!("OKX", Okx);
+    futures!("Bitget", Bitget);
+    futures!("KuCoin", KuCoin);
+    futures!("Gate.io", Gate);
+    futures!("HTX", Htx);
+    futures!("Kraken", Kraken);
+
+    // On a spot client it must be refused, on every path that takes an order.
+    let spot = ExchangeOptions::mainnet(MarketType::Spot);
+
+    macro_rules! spot_single {
+        ($name:literal, $venue:ident) => {{
+            let mock = transport();
+            let client =
+                $venue::with_credentials(Box::new(ArcTransport(Arc::clone(&mock))), &spot, creds());
+            let outcome = client.place_order(&reducing());
+            assert!(
+                refused(&outcome),
+                "{}: spot accepted reduce_only, which it cannot honour ({outcome:?})",
+                $name
+            );
+            assert!(
+                mock.recorded_requests().is_empty(),
+                "{}: spot refused reduce_only, yet sent a request anyway",
+                $name
+            );
+        }};
+    }
+
+    spot_single!("Binance", Binance);
+    spot_single!("Bybit", Bybit);
+    spot_single!("OKX", Okx);
+    spot_single!("Bitget", Bitget);
+    spot_single!("KuCoin", KuCoin);
+    spot_single!("Gate.io", Gate);
+    spot_single!("HTX", Htx);
+    spot_single!("Kraken", Kraken);
+    spot_single!("Coinbase", Coinbase);
+    spot_single!("Upbit", Upbit);
+
+    macro_rules! spot_batch {
+        ($name:literal, $venue:ident) => {{
+            let mock = transport();
+            let mut client =
+                $venue::with_credentials(Box::new(ArcTransport(Arc::clone(&mock))), &spot, creds());
+            let outcome = AdvancedOrders::place_batch(&mut client, &[reducing()]);
+            // A batch may refuse as a whole or per leg -- Binance reports one
+            // result per request and rejects the leg -- and both keep the
+            // promise. What neither may do is let the order reach the venue.
+            let whole = matches!(&outcome, Err(Error::Exchange { code, .. }) if code == "unsupported");
+            let per_leg = matches!(&outcome, Ok(results) if !results.is_empty()
+                && results.iter().all(|r| matches!(r, Err(Error::Exchange { code, .. }) if code == "unsupported")));
+            assert!(
+                whole || per_leg,
+                "{}: spot batch accepted reduce_only ({outcome:?})",
+                $name
+            );
+            assert!(
+                mock.recorded_requests().is_empty(),
+                "{}: spot batch refused reduce_only, yet sent a request anyway",
+                $name
+            );
+        }};
+    }
+
+    spot_batch!("Binance", Binance);
+    spot_batch!("Bybit", Bybit);
+    spot_batch!("OKX", Okx);
+    spot_batch!("Bitget", Bitget);
+    spot_batch!("KuCoin", KuCoin);
+    spot_batch!("Gate.io", Gate);
+    spot_batch!("HTX", Htx);
+    spot_batch!("Kraken", Kraken);
+
+    macro_rules! spot_ws {
+        ($name:literal, $venue:ident) => {{
+            let http = transport();
+            let ws = Arc::new(MockWsTransport::new());
+            let mut client =
+                $venue::with_credentials(Box::new(ArcTransport(Arc::clone(&http))), &spot, creds())
+                    .with_ws(Box::new(ArcWs(Arc::clone(&ws))));
+            let outcome = WsExecution::place_order_ws(&mut client, &reducing());
+            assert!(
+                refused(&outcome),
+                "{}: spot ws accepted reduce_only ({outcome:?})",
+                $name
+            );
+            assert!(
+                ws.sent().is_empty(),
+                "{}: spot ws refused reduce_only, yet sent a frame anyway",
+                $name
+            );
+        }};
+    }
+
+    spot_ws!("Binance", Binance);
+    spot_ws!("Bybit", Bybit);
+    spot_ws!("OKX", Okx);
+    spot_ws!("Gate.io", Gate);
+    spot_ws!("Kraken", Kraken);
+
+    // And where the socket does serve a derivatives account, the frame carries
+    // the flag. Binance's did not: it spelled the hedged `positionSide` and
+    // stopped there, so a one-way close sent over the socket opened a position.
+    // Gate and Kraken are absent because their order sockets are spot-only and
+    // refuse a futures client outright.
+    macro_rules! futures_ws {
+        ($name:literal, $venue:ident) => {{
+            let http = transport();
+            let ws = Arc::new(MockWsTransport::new());
+            let options = ExchangeOptions::mainnet(MarketType::UsdMFutures);
+            let mut client = $venue::with_credentials(
+                Box::new(ArcTransport(Arc::clone(&http))),
+                &options,
+                creds(),
+            )
+            .with_ws(Box::new(ArcWs(Arc::clone(&ws))));
+            let _ = WsExecution::place_order_ws(&mut client, &reducing());
+            let frame = ws.sent().last().cloned().unwrap_or_default().to_lowercase();
+            assert!(
+                !frame.is_empty(),
+                "{}: futures ws sent no order frame at all",
+                $name
+            );
+            assert!(
+                CARRIED.iter().any(|s| frame.contains(s)),
+                "{}: a reduce-only futures order frame went out without saying \
+                 so; it opens a position where the caller asked to close one.\n\
+                 frame: {frame}",
+                $name
+            );
+        }};
+    }
+
+    futures_ws!("Binance", Binance);
+    futures_ws!("Bybit", Bybit);
+    futures_ws!("OKX", Okx);
 }
 
 /// Two fields that a venue spells in *one* slot are refused together, never
