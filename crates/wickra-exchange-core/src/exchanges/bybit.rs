@@ -615,9 +615,6 @@ impl Bybit {
     /// Returns an [`Error`] if the order is invalid, credentials are missing, or
     /// the venue rejects it.
     pub fn place_order(&self, request: &OrderRequest) -> Result<Order> {
-        if request.order_type.is_trigger() {
-            return Err(Error::unsupported_trigger("Bybit"));
-        }
         self.ensure_reduce_only_is_reducible(request)?;
         request.validate()?;
         let time_in_force = tif_for(request)?;
@@ -643,6 +640,11 @@ impl Bybit {
         }
         if let Some(smp) = smp_str(request.stp) {
             body["smpType"] = serde_json::json!(smp);
+        }
+        if request.order_type.is_trigger() {
+            for (key, value) in trigger_fields(request, self.category)? {
+                body[key] = value;
+            }
         }
         let result =
             self.signed_request(HttpMethod::Post, "/v5/order/create", "", &body.to_string())?;
@@ -1212,6 +1214,41 @@ fn side_str(side: OrderSide) -> &'static str {
         OrderSide::Buy => "Buy",
         OrderSide::Sell => "Sell",
     }
+}
+
+/// The fields that turn a Bybit order into a conditional one.
+///
+/// `triggerDirection` says which way the market has to cross the trigger, and
+/// Bybit will not infer it: 1 is "rises to", 2 is "falls to". A sell stop
+/// protects a long and fires on the way *down*; a buy stop covers a short and
+/// fires on the way *up*. Sending the wrong direction arms the order on the
+/// side that never comes, so the stop simply never fires.
+///
+/// Spot conditional orders also need `orderFilter`, because Bybit's spot
+/// endpoint serves plain and conditional orders through the same call and
+/// defaults to the plain one -- a trigger sent without it is accepted and
+/// placed immediately.
+fn trigger_fields(
+    request: &OrderRequest,
+    category: &str,
+) -> Result<Vec<(&'static str, serde_json::Value)>> {
+    let stop = request
+        .stop_price
+        .ok_or(Error::InvalidOrder("a trigger order requires a stop price"))?;
+    let direction = match request.side {
+        // Selling to protect a long: the market has to fall to the trigger.
+        OrderSide::Sell => 2,
+        // Buying to cover a short: it has to rise to it.
+        OrderSide::Buy => 1,
+    };
+    let mut fields = vec![
+        ("triggerPrice", serde_json::json!(format_decimal(stop))),
+        ("triggerDirection", serde_json::json!(direction)),
+    ];
+    if category == "spot" {
+        fields.push(("orderFilter", serde_json::json!("StopOrder")));
+    }
+    Ok(fields)
 }
 
 fn order_type_str(order_type: OrderType) -> &'static str {
@@ -2126,6 +2163,94 @@ mod tests {
         )
         .with_clock(Box::new(move || now_ms));
         (bybit, mock)
+    }
+
+    /// Bybit will not infer which way the market must cross the trigger.
+    ///
+    /// `triggerDirection` is 1 for "rises to" and 2 for "falls to". A sell stop
+    /// protects a long and fires on the way *down*; a buy stop covers a short
+    /// and fires on the way *up*. The wrong direction arms the order on the
+    /// side that never comes, so the stop simply never fires -- and nothing
+    /// reports an error, because the order was accepted.
+    #[test]
+    fn a_trigger_carries_the_direction_the_market_must_cross() {
+        for (side, expected) in [(OrderSide::Sell, 2), (OrderSide::Buy, 1)] {
+            let (bybit, mock) = signed_futures_client(1000);
+            mock.push_json(
+                200,
+                r#"{"retCode":0,"result":{"orderId":"a","orderLinkId":""}}"#,
+            );
+            let request = OrderRequest {
+                order_type: OrderType::StopMarket,
+                stop_price: Some(dec!(19000)),
+                side,
+                ..OrderRequest::market_sell(symbol(), dec!(1))
+            };
+            Bybit::place_order(&bybit, &request).unwrap();
+
+            let body = mock.recorded_requests()[0].body.clone().unwrap();
+            assert!(body.contains(r#""triggerPrice":"19000""#), "{body}");
+            assert!(
+                body.contains(&format!(r#""triggerDirection":{expected}"#)),
+                "a {side:?} stop must fire on the other side: {body}"
+            );
+        }
+    }
+
+    /// Bybit's spot endpoint serves plain and conditional orders through one
+    /// call and defaults to the plain one, so a trigger without `orderFilter`
+    /// is accepted and placed **immediately** -- the stop that executes at once.
+    #[test]
+    fn a_spot_trigger_names_the_order_filter() {
+        let (bybit, mock) = signed_client(1000);
+        mock.push_json(
+            200,
+            r#"{"retCode":0,"result":{"orderId":"a","orderLinkId":""}}"#,
+        );
+        let request = OrderRequest {
+            order_type: OrderType::StopMarket,
+            stop_price: Some(dec!(19000)),
+            ..OrderRequest::market_sell(symbol(), dec!(1))
+        };
+        Bybit::place_order(&bybit, &request).unwrap();
+
+        let body = mock.recorded_requests()[0].body.clone().unwrap();
+        assert!(body.contains(r#""orderFilter":"StopOrder""#), "{body}");
+    }
+
+    /// A futures trigger needs no order filter: the category already says which
+    /// endpoint behaviour applies.
+    #[test]
+    fn a_futures_trigger_needs_no_order_filter() {
+        let (bybit, mock) = signed_futures_client(1000);
+        mock.push_json(
+            200,
+            r#"{"retCode":0,"result":{"orderId":"a","orderLinkId":""}}"#,
+        );
+        let request = OrderRequest {
+            order_type: OrderType::StopLimit,
+            stop_price: Some(dec!(19000)),
+            ..OrderRequest::limit_sell(symbol(), dec!(1), dec!(18900))
+        };
+        Bybit::place_order(&bybit, &request).unwrap();
+
+        let body = mock.recorded_requests()[0].body.clone().unwrap();
+        assert!(!body.contains("orderFilter"), "{body}");
+        // The limit price keeps its own field; the trigger has another.
+        assert!(body.contains(r#""price":"18900""#), "{body}");
+        assert!(body.contains(r#""triggerPrice":"19000""#), "{body}");
+    }
+
+    #[test]
+    fn a_bybit_trigger_without_a_stop_price_is_refused() {
+        let (bybit, mock) = signed_client(1000);
+        let request = OrderRequest {
+            order_type: OrderType::StopMarket,
+            stop_price: None,
+            ..OrderRequest::market_sell(symbol(), dec!(1))
+        };
+        assert!(Bybit::place_order(&bybit, &request).is_err());
+        assert!(mock.recorded_requests().is_empty());
     }
 
     #[test]

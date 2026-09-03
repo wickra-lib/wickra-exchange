@@ -234,9 +234,11 @@ fn a_trigger_order_is_either_carried_or_refused_but_never_flattened() {
             !sent.is_empty(),
             "{name}: neither refused the trigger order nor sent one"
         );
-        let carried = sent
-            .iter()
-            .any(|req| req.contains("stopPrice") || req.contains("triggerPx"));
+        // Matched by the value, not the key. Kraken's trigger types move what
+        // `price` means, so its trigger rides in a field every limit order also
+        // has -- no list of spellings can tell the two apart. The request is a
+        // market sell with no limit price, so 19000 on the wire is the trigger.
+        let carried = sent.iter().any(|req| req.contains("19000"));
         assert!(
             carried,
             "{name}: sent a trigger order with no trigger price; it would execute now"
@@ -250,7 +252,10 @@ fn a_trigger_order_is_either_carried_or_refused_but_never_flattened() {
     };
     let market = market();
     let creds = || {
-        Credentials::new("APIKEY", "SECRET")
+        // Base64, because Kraken's secret is decoded before it signs: a secret
+        // that is not base64 fails before the request is built, and the client
+        // then looks as though it refused the order.
+        Credentials::new("APIKEY", "c2VjcmV0")
             .with_passphrase("PASS")
             .with_private_key(
                 "-----BEGIN EC PRIVATE KEY-----

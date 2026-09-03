@@ -979,9 +979,6 @@ impl Kraken {
     }
 
     pub fn place_order(&self, request: &OrderRequest) -> Result<Order> {
-        if request.order_type.is_trigger() {
-            return Err(Error::unsupported_trigger("Kraken"));
-        }
         self.ensure_reduce_only_is_reducible(request)?;
         self.ensure_one_way()?;
         request.validate()?;
@@ -993,10 +990,21 @@ impl Kraken {
         let mut params: Vec<(&str, String)> = vec![
             ("pair", Self::wire_symbol(&request.symbol)),
             ("type", side_str(request.side).to_string()),
-            ("ordertype", order_type_str(request.order_type).to_string()),
+            ("ordertype", spot_order_type(request.order_type).to_string()),
             ("volume", volume),
         ];
-        if let Some(price) = request.price {
+        // On a trigger order `price` is the *trigger* and `price2` the limit;
+        // on a plain limit `price` is the limit. Getting this the wrong way
+        // round would arm the stop at the limit price.
+        if request.order_type.is_trigger() {
+            let stop = request
+                .stop_price
+                .ok_or(Error::InvalidOrder("a trigger order requires a stop price"))?;
+            params.push(("price", format_decimal(stop)));
+            if let Some(price) = request.price {
+                params.push(("price2", format_decimal(price)));
+            }
+        } else if let Some(price) = request.price {
             params.push(("price", format_decimal(price)));
         }
         if request.post_only {
@@ -1297,10 +1305,14 @@ impl Kraken {
                     "both are Kraken Futures order types and only one is sent",
                 ))
             }
-            (OrderType::Market | OrderType::StopMarket, _, _) => "mkt",
-            (OrderType::Limit | OrderType::StopLimit, TimeInForce::Ioc, false) => "ioc",
-            (OrderType::Limit | OrderType::StopLimit, TimeInForce::Gtc, true) => "post",
-            (OrderType::Limit | OrderType::StopLimit, TimeInForce::Gtc, false) => "lmt",
+            // A trigger is its own order type here, so it is matched before
+            // the plain forms. Falling through to `mkt` would send the order
+            // with no trigger at all -- the stop-loss that executes at once.
+            (OrderType::StopMarket | OrderType::StopLimit, _, _) => "stp",
+            (OrderType::Market, _, _) => "mkt",
+            (OrderType::Limit, TimeInForce::Ioc, false) => "ioc",
+            (OrderType::Limit, TimeInForce::Gtc, true) => "post",
+            (OrderType::Limit, TimeInForce::Gtc, false) => "lmt",
         };
         let mut params: Vec<(&str, String)> = vec![
             ("orderType", order_type.to_string()),
@@ -1309,6 +1321,17 @@ impl Kraken {
             ("size", format_decimal(request.quantity)),
             ("reduceOnly", request.reduce_only.to_string()),
         ];
+        if request.order_type.is_trigger() {
+            let stop = request
+                .stop_price
+                .ok_or(Error::InvalidOrder("a trigger order requires a stop price"))?;
+            params.push(("stopPrice", format_decimal(stop)));
+            // Which price arms the stop. `mark` is the venue's default and the
+            // one a position is liquidated against, so it is the one a stop is
+            // usually meant to watch; naming it is better than inheriting a
+            // default that may change.
+            params.push(("triggerSignal", "mark".to_string()));
+        }
         if let Some(price) = request.price {
             params.push(("limitPrice", format_decimal(price)));
         }
@@ -1916,6 +1939,22 @@ fn order_type_str(order_type: OrderType) -> &'static str {
     match order_type {
         OrderType::Market | OrderType::StopMarket => "market",
         OrderType::Limit | OrderType::StopLimit => "limit",
+    }
+}
+
+/// The `ordertype` for a spot order, including its trigger forms.
+///
+/// Kraken names the trigger types `stop-loss` and `stop-loss-limit`, and
+/// **moves what `price` means**: on a trigger order `price` is the trigger and
+/// `price2` is the limit, where on a plain limit `price` is the limit. Sending
+/// a stop-limit's limit price as `price` would place the trigger at the limit --
+/// an order that fires at the wrong level, in the direction that hurts.
+fn spot_order_type(order_type: OrderType) -> &'static str {
+    match order_type {
+        OrderType::Market => "market",
+        OrderType::Limit => "limit",
+        OrderType::StopMarket => "stop-loss",
+        OrderType::StopLimit => "stop-loss-limit",
     }
 }
 
@@ -2790,6 +2829,102 @@ mod tests {
         )
         .with_clock(Box::new(move || now_ms));
         (kraken, mock)
+    }
+
+    /// Kraken's trigger types **move what `price` means**.
+    ///
+    /// On a plain limit, `price` is the limit. On `stop-loss-limit`, `price` is
+    /// the *trigger* and `price2` is the limit. Sending the limit as `price`
+    /// would arm the stop at the limit level -- an order that fires at the
+    /// wrong price, in the direction that hurts.
+    #[test]
+    fn a_spot_stop_limit_sends_the_trigger_as_price_and_the_limit_as_price2() {
+        let (kraken, mock) = signed_client(1000);
+        mock.push_json(200, r#"{"error":[],"result":{"txid":["OABC-1"]}}"#);
+        let request = OrderRequest {
+            order_type: OrderType::StopLimit,
+            stop_price: Some(dec!(19000)),
+            ..OrderRequest::limit_sell(symbol(), dec!(1), dec!(18900))
+        };
+        Kraken::place_order(&kraken, &request).unwrap();
+
+        let body = mock.recorded_requests()[0].body.clone().unwrap();
+        assert!(body.contains("ordertype=stop-loss-limit"), "{body}");
+        assert!(
+            body.contains("price=19000"),
+            "the trigger rides in `price`: {body}"
+        );
+        assert!(
+            body.contains("price2=18900"),
+            "the limit rides in `price2`: {body}"
+        );
+    }
+
+    #[test]
+    fn a_spot_stop_market_sends_only_the_trigger() {
+        let (kraken, mock) = signed_client(1000);
+        mock.push_json(200, r#"{"error":[],"result":{"txid":["OABC-1"]}}"#);
+        let request = OrderRequest {
+            order_type: OrderType::StopMarket,
+            stop_price: Some(dec!(19000)),
+            ..OrderRequest::market_sell(symbol(), dec!(1))
+        };
+        Kraken::place_order(&kraken, &request).unwrap();
+
+        let body = mock.recorded_requests()[0].body.clone().unwrap();
+        assert!(body.contains("ordertype=stop-loss"), "{body}");
+        assert!(body.contains("price=19000"), "{body}");
+        assert!(
+            !body.contains("price2"),
+            "a stop-market has no limit: {body}"
+        );
+    }
+
+    /// A trigger order with no trigger price is refused before it is built.
+    #[test]
+    fn a_trigger_without_a_stop_price_is_refused() {
+        let (kraken, mock) = signed_client(1000);
+        let request = OrderRequest {
+            order_type: OrderType::StopMarket,
+            stop_price: None,
+            ..OrderRequest::market_sell(symbol(), dec!(1))
+        };
+        assert!(Kraken::place_order(&kraken, &request).is_err());
+        assert!(mock.recorded_requests().is_empty());
+    }
+
+    /// The futures path must not flatten a trigger into a plain market order.
+    ///
+    /// Kraken Futures spells a trigger as its own `orderType`, so a `StopMarket`
+    /// that fell through to the `mkt` arm would go out with no trigger at all --
+    /// the stop-loss that executes at once, at the price it existed to protect
+    /// against.
+    #[test]
+    fn a_futures_trigger_carries_its_stop_price_and_signal() {
+        let (kraken, mock) = signed_futures_client(1000);
+        mock.push_json(
+            200,
+            r#"{"result":"success","sendStatus":{"order_id":"1","status":"placed",
+            "orderEvents":[]}}"#,
+        );
+        let request = OrderRequest {
+            order_type: OrderType::StopMarket,
+            stop_price: Some(dec!(19000)),
+            ..OrderRequest::market_sell(symbol(), dec!(1))
+        };
+        let _ = Kraken::place_order(&kraken, &request);
+
+        let sent = format!(
+            "{} {}",
+            mock.recorded_requests()[0].url,
+            mock.recorded_requests()[0].body.clone().unwrap_or_default()
+        );
+        assert!(sent.contains("orderType=stp"), "{sent}");
+        assert!(sent.contains("stopPrice=19000"), "{sent}");
+        // Which price arms the stop: `mark` is the one a position is liquidated
+        // against, and naming it beats inheriting a default that may change.
+        assert!(sent.contains("triggerSignal=mark"), "{sent}");
+        assert!(!sent.contains("orderType=mkt"), "flattened: {sent}");
     }
     fn hedged_futures_client(now_ms: i64) -> (Kraken, Arc<MockHttpTransport>) {
         let mock = Arc::new(MockHttpTransport::new());

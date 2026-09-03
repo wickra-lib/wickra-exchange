@@ -366,10 +366,46 @@ impl Coinbase {
         Ok(())
     }
 
+    /// The `order_configuration` for a trigger order.
+    ///
+    /// Coinbase has one trigger configuration, `stop_limit_stop_limit_gtc`, and
+    /// it is a **stop-limit**: there is no stop-market. A `StopMarket` is
+    /// refused rather than sent as a stop-limit at some invented price -- a
+    /// limit chosen here would decide, on the caller's behalf, how much
+    /// slippage their stop may take.
+    ///
+    /// `stop_direction` is not inferred by the venue. `STOP_DIRECTION_STOP_DOWN`
+    /// fires when the market falls to the trigger, which is what protects a
+    /// long; `STOP_DIRECTION_STOP_UP` fires on the way up, which covers a short.
+    /// The wrong one arms the order on the side that never comes.
+    fn stop_configuration(request: &OrderRequest, base_size: &str) -> Result<serde_json::Value> {
+        let stop = request
+            .stop_price
+            .ok_or(Error::InvalidOrder("a trigger order requires a stop price"))?;
+        let Some(price) = request.price else {
+            return Err(Error::unsupported_field(
+                "Coinbase",
+                "a stop-market order",
+                "Coinbase's only trigger configuration is `stop_limit_stop_limit_gtc`, \
+                 and choosing a limit price here would decide how much slippage the \
+                 caller's stop may take",
+            ));
+        };
+        let direction = match request.side {
+            OrderSide::Sell => "STOP_DIRECTION_STOP_DOWN",
+            OrderSide::Buy => "STOP_DIRECTION_STOP_UP",
+        };
+        Ok(serde_json::json!({
+            "stop_limit_stop_limit_gtc": {
+                "base_size": base_size,
+                "limit_price": format_decimal(price),
+                "stop_price": format_decimal(stop),
+                "stop_direction": direction,
+            }
+        }))
+    }
+
     pub fn place_order(&self, request: &OrderRequest) -> Result<Order> {
-        if request.order_type.is_trigger() {
-            return Err(Error::unsupported_trigger("Coinbase"));
-        }
         Self::ensure_reduce_only_is_reducible(request)?;
         request.validate()?;
         let client_order_id = request
@@ -382,6 +418,13 @@ impl Coinbase {
         // itself -- `market_market_ioc`, `limit_limit_gtc`, `limit_limit_fok` --
         // so the key is chosen from the order type and the time-in-force
         // together, and a pairing the venue has no key for is refused.
+        // A trigger is its own configuration key, chosen before the plain
+        // ones: falling through to `market_market_ioc` would place the order
+        // now, which is the whole failure a stop exists to avoid.
+        if request.order_type.is_trigger() {
+            let configuration = Self::stop_configuration(request, &base_size)?;
+            return self.submit_order(request, &client_order_id, &configuration);
+        }
         let configuration = match (request.order_type, request.time_in_force) {
             (OrderType::Market | OrderType::StopMarket, TimeInForce::Fok) => {
                 return Err(Error::unsupported_field(
@@ -432,6 +475,19 @@ impl Coinbase {
                 }
             }
         };
+        self.submit_order(request, &client_order_id, &configuration)
+    }
+    /// Send an order and read back what the venue made of it.
+    ///
+    /// Shared by the plain and the trigger branch: two copies of this body
+    /// would be two places to drift, which is the defect this repository has
+    /// found once per layer.
+    fn submit_order(
+        &self,
+        request: &OrderRequest,
+        client_order_id: &str,
+        configuration: &serde_json::Value,
+    ) -> Result<Order> {
         let body = serde_json::json!({
             "client_order_id": client_order_id,
             "product_id": Self::wire_symbol(&request.symbol),
@@ -462,7 +518,7 @@ impl Coinbase {
             .ok_or_else(|| Error::Deserialization("missing order id".to_string()))?;
         Ok(Order {
             id: order_id.to_string(),
-            client_order_id: Some(client_order_id),
+            client_order_id: Some(client_order_id.to_string()),
             symbol: request.symbol.clone(),
             side: request.side,
             order_type: request.order_type,
@@ -973,6 +1029,75 @@ wHvqY4aizCFHQFTVNQCzDGy8/TOhRANCAAS69zNVQjOQ4RgxJVI8esP+jMfHLSTw\n\
         )
         .with_clock(Box::new(move || now_ms));
         (coinbase, mock)
+    }
+
+    /// Coinbase names the trigger in the configuration key, and does not infer
+    /// which way the market must cross it.
+    ///
+    /// `STOP_DIRECTION_STOP_DOWN` fires when the market falls to the trigger,
+    /// which is what protects a long; `..._UP` fires on the way up, which
+    /// covers a short. The wrong one arms the order on the side that never
+    /// comes, and nothing reports an error because the order was accepted.
+    #[test]
+    fn a_stop_limit_carries_its_configuration_and_direction() {
+        for (side, expected) in [
+            (OrderSide::Sell, "STOP_DIRECTION_STOP_DOWN"),
+            (OrderSide::Buy, "STOP_DIRECTION_STOP_UP"),
+        ] {
+            let (coinbase, mock) = signed_client(1000);
+            mock.push_json(
+                200,
+                r#"{"success":true,"success_response":{"order_id":"o-1"}}"#,
+            );
+            let request = OrderRequest {
+                order_type: OrderType::StopLimit,
+                stop_price: Some(dec!(19000)),
+                side,
+                ..OrderRequest::limit_sell(symbol(), dec!(1), dec!(18900))
+            };
+            Coinbase::place_order(&coinbase, &request).unwrap();
+
+            let body = mock.recorded_requests()[0].body.clone().unwrap();
+            assert!(body.contains("stop_limit_stop_limit_gtc"), "{body}");
+            assert!(body.contains(r#""stop_price":"19000""#), "{body}");
+            assert!(body.contains(r#""limit_price":"18900""#), "{body}");
+            assert!(
+                body.contains(expected),
+                "a {side:?} stop fires the other way: {body}"
+            );
+        }
+    }
+
+    /// Coinbase has no stop-*market*, and this client will not invent the limit
+    /// price one would need.
+    ///
+    /// Choosing a limit here would decide, on the caller's behalf, how much
+    /// slippage their stop may take -- which is the number a stop-market exists
+    /// to leave open.
+    #[test]
+    fn a_stop_market_is_refused_rather_than_given_an_invented_limit() {
+        let (coinbase, mock) = signed_client(1000);
+        let request = OrderRequest {
+            order_type: OrderType::StopMarket,
+            stop_price: Some(dec!(19000)),
+            ..OrderRequest::market_sell(symbol(), dec!(1))
+        };
+        let err = Coinbase::place_order(&coinbase, &request)
+            .expect_err("Coinbase has no stop-market configuration");
+        assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
+        assert!(mock.recorded_requests().is_empty(), "refused, yet sent");
+    }
+
+    #[test]
+    fn a_coinbase_trigger_without_a_stop_price_is_refused() {
+        let (coinbase, mock) = signed_client(1000);
+        let request = OrderRequest {
+            order_type: OrderType::StopLimit,
+            stop_price: None,
+            ..OrderRequest::limit_sell(symbol(), dec!(1), dec!(18900))
+        };
+        assert!(Coinbase::place_order(&coinbase, &request).is_err());
+        assert!(mock.recorded_requests().is_empty());
     }
 
     #[test]
