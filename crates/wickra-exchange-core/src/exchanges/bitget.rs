@@ -20,6 +20,9 @@ use crate::clock::ServerClock;
 use crate::credentials::Credentials;
 use crate::error::{Error, Result};
 use crate::events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
+use crate::feeds::{
+    DerivativesChannel, DerivativesFeed, FundingRate, LongShortRatio, MarkIndex, OpenInterest,
+};
 use crate::idempotency::ClientIdGenerator;
 use crate::normalize::{format_decimal, parse_decimal};
 use crate::options::{ExchangeOptions, MarginMode, MarketType, PositionMode, SelfTradePrevention};
@@ -27,7 +30,8 @@ use crate::positions::{Position, PositionSide};
 use crate::signing::hmac_sha256_base64;
 use crate::symbol::Symbol;
 use crate::traits::{
-    AdvancedOrders, Derivatives, Exchange, Execution, MarketData, WsExecution, WsUserData,
+    AdvancedOrders, Derivatives, DerivativesStream, Exchange, Execution, MarketData, WsExecution,
+    WsUserData,
 };
 use crate::transport::{HttpMethod, HttpRequest, HttpTransport, WsConnection, WsTransport};
 use crate::types::{
@@ -94,6 +98,13 @@ pub struct Bitget {
     connection: Option<Box<dyn WsConnection>>,
     sub_messages: Vec<String>,
     subscriptions: Vec<(String, Symbol)>,
+    /// Which derivatives channels are subscribed, per wire symbol.
+    ///
+    /// Bitget publishes funding and mark/index inside the ordinary `ticker`
+    /// frame, so one frame can answer three subscriptions. Only the prints
+    /// that were asked for are emitted: a caller watching prices does not
+    /// start receiving funding it never subscribed to.
+    derivatives_channels: Vec<(String, DerivativesChannel)>,
     /// The private user-data connection, opened by
     /// [`subscribe_user_data`](Self::subscribe_user_data) and drained by
     /// [`poll_events`](Self::poll_events) alongside the public stream.
@@ -148,6 +159,7 @@ impl Bitget {
             connection: None,
             sub_messages: Vec::new(),
             subscriptions: Vec::new(),
+            derivatives_channels: Vec::new(),
             private_connection: None,
             user_data_active: false,
         }
@@ -332,6 +344,115 @@ impl Bitget {
         })
     }
 
+    /// Subscribe to a pushed derivatives channel.
+    ///
+    /// Bitget publishes the funding rate, the mark price and the index price
+    /// inside the mix `ticker` frame -- all three in one reading, taken at one
+    /// moment -- so `Funding` and `MarkIndex` are the same subscription seen
+    /// two ways.
+    ///
+    /// `Liquidations` is refused: Bitget publishes no public stream of forced
+    /// orders. Subscribing to nothing and waiting would be the worse answer.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] on a spot client, for `Liquidations`, or if the
+    /// subscription fails.
+    pub fn subscribe_derivatives(
+        &mut self,
+        symbol: &Symbol,
+        channel: DerivativesChannel,
+    ) -> Result<()> {
+        if !self.is_futures() {
+            return Err(Error::unsupported_field(
+                "Bitget",
+                "a derivatives channel on a spot client",
+                "funding and mark/index exist only on the futures venue",
+            ));
+        }
+        if channel == DerivativesChannel::Liquidations {
+            return Err(Error::unsupported_field(
+                "Bitget",
+                "a liquidations channel",
+                "Bitget publishes no public stream of forced orders",
+            ));
+        }
+        let wire = Self::wire_symbol(symbol);
+        if !self
+            .derivatives_channels
+            .iter()
+            .any(|(w, c)| w == &wire && *c == channel)
+        {
+            self.derivatives_channels.push((wire, channel));
+        }
+        self.subscribe(symbol, "ticker")
+    }
+
+    /// The current open interest (`GET /api/v2/mix/market/open-interest`).
+    ///
+    /// Polled, not pushed. The figure is in base currency.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] on a spot client, if the request fails, or if the
+    /// venue returns no data point.
+    pub fn open_interest(&self, symbol: &Symbol) -> Result<OpenInterest> {
+        if !self.is_futures() {
+            return Err(Error::unsupported_field(
+                "Bitget",
+                "open interest on a spot client",
+                "open interest is a futures figure",
+            ));
+        }
+        let query = format!(
+            "symbol={}&productType=USDT-FUTURES",
+            Self::wire_symbol(symbol)
+        );
+        let data = self.get("/api/v2/mix/market/open-interest", &query)?;
+        let point = data
+            .get("openInterestList")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|rows| rows.first())
+            .ok_or_else(|| Error::NotFound("no open-interest data point".to_string()))?;
+        Ok(OpenInterest {
+            symbol: symbol.clone(),
+            open_interest: parse_decimal(field_str(point, "size")?)?,
+            timestamp: opt_str(&data, "ts").parse().unwrap_or(0),
+        })
+    }
+
+    /// The current long/short account ratio
+    /// (`GET /api/v2/mix/market/account-long-short`), most recent point.
+    ///
+    /// Polled, not pushed. Bitget publishes the two proportions directly, as
+    /// Binance does, so nothing is derived here.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] on a spot client, if the request fails, or if the
+    /// venue returns no data point.
+    pub fn long_short_ratio(&self, symbol: &Symbol) -> Result<LongShortRatio> {
+        if !self.is_futures() {
+            return Err(Error::unsupported_field(
+                "Bitget",
+                "long/short positioning on a spot client",
+                "positioning is a futures figure",
+            ));
+        }
+        let query = format!(
+            "symbol={}&productType=USDT-FUTURES&period=5m",
+            Self::wire_symbol(symbol)
+        );
+        let data = self.get("/api/v2/mix/market/account-long-short", &query)?;
+        let point = data
+            .as_array()
+            .and_then(|rows| rows.first())
+            .ok_or_else(|| Error::NotFound("no long/short data point".to_string()))?;
+        Ok(LongShortRatio {
+            symbol: symbol.clone(),
+            long_size: parse_decimal(field_str(point, "longAccountRatio")?)?,
+            short_size: parse_decimal(field_str(point, "shortAccountRatio")?)?,
+            timestamp: opt_str(point, "ts").parse().unwrap_or(0),
+        })
+    }
+
     /// Subscribe to the public trade stream for `symbol`.
     ///
     /// # Errors
@@ -389,10 +510,14 @@ impl Bitget {
                 .cloned()
                 .unwrap_or_else(|| Symbol::new(wire, ""))
         };
+        let channels = self.derivatives_channels.clone();
+        let subscribed = |wire: &str, channel: DerivativesChannel| {
+            channels.iter().any(|(w, c)| w == wire && *c == channel)
+        };
         let mut events = Vec::new();
         if let Some(connection) = self.connection.as_mut() {
             while let Ok(Some(frame)) = connection.recv() {
-                if let Ok(mut parsed) = parse_ws_message(&frame, &resolve) {
+                if let Ok(mut parsed) = parse_ws_message(&frame, &resolve, &subscribed) {
                     events.append(&mut parsed);
                 }
             }
@@ -400,7 +525,7 @@ impl Bitget {
         // Drain the private user-data stream (orders/account channels), if open.
         if let Some(connection) = self.private_connection.as_mut() {
             while let Ok(Some(frame)) = connection.recv() {
-                if let Ok(mut parsed) = parse_ws_message(&frame, &resolve) {
+                if let Ok(mut parsed) = parse_ws_message(&frame, &resolve, &subscribed) {
                     events.append(&mut parsed);
                 }
             }
@@ -999,7 +1124,11 @@ fn parse_ws_levels(value: Option<&serde_json::Value>) -> Result<Vec<BookLevel>> 
         .collect()
 }
 
-fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Vec<Event>> {
+fn parse_ws_message(
+    text: &str,
+    resolve: &impl Fn(&str) -> Symbol,
+    subscribed: &impl Fn(&str, DerivativesChannel) -> bool,
+) -> Result<Vec<Event>> {
     let value: serde_json::Value =
         serde_json::from_str(text).map_err(|e| Error::Deserialization(e.to_string()))?;
     let arg = value.get("arg");
@@ -1033,18 +1162,50 @@ fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Vec
             })
             .collect()
     } else if channel == "ticker" {
-        data.iter()
-            .map(|t| {
-                Ok(Event::Ticker(Ticker {
-                    symbol: symbol.clone(),
-                    last: parse_decimal(field_str(t, "lastPr")?)?,
-                    bid: dec_or_zero(opt_str(t, "bidPr")),
-                    ask: dec_or_zero(opt_str(t, "askPr")),
-                    volume: dec_or_zero(opt_str(t, "baseVolume")),
-                    timestamp: opt_str(t, "ts").parse().unwrap_or(0),
-                }))
-            })
-            .collect()
+        // One frame, up to three answers. The mix ticker carries the funding
+        // rate, the mark price and the index price beside the quote, all read at
+        // the same moment -- so a `MarkIndex` from here is one observation
+        // rather than two stitched together. Only what was subscribed to is
+        // emitted, so a caller watching prices is not handed funding prints.
+        let mut out = Vec::new();
+        for t in data {
+            let wire = opt_str(t, "instId");
+            let timestamp = opt_str(t, "ts").parse().unwrap_or(0);
+            out.push(Event::Ticker(Ticker {
+                symbol: symbol.clone(),
+                last: parse_decimal(field_str(t, "lastPr")?)?,
+                bid: dec_or_zero(opt_str(t, "bidPr")),
+                ask: dec_or_zero(opt_str(t, "askPr")),
+                volume: dec_or_zero(opt_str(t, "baseVolume")),
+                timestamp,
+            }));
+            let mark = parse_decimal(opt_str(t, "markPrice")).ok();
+            if subscribed(wire, DerivativesChannel::Funding) {
+                if let (Some(rate), Some(mark_price)) =
+                    (parse_decimal(opt_str(t, "fundingRate")).ok(), mark)
+                {
+                    out.push(Event::Derivatives(DerivativesFeed::Funding(FundingRate {
+                        symbol: symbol.clone(),
+                        rate,
+                        mark_price,
+                        timestamp,
+                    })));
+                }
+            }
+            if subscribed(wire, DerivativesChannel::MarkIndex) {
+                if let (Some(mark_price), Some(index_price)) =
+                    (mark, parse_decimal(opt_str(t, "indexPrice")).ok())
+                {
+                    out.push(Event::Derivatives(DerivativesFeed::MarkIndex(MarkIndex {
+                        symbol: symbol.clone(),
+                        mark_price,
+                        index_price,
+                        timestamp,
+                    })));
+                }
+            }
+        }
+        Ok(out)
     } else if channel == "books" {
         let action = value.get("action").and_then(serde_json::Value::as_str);
         data.iter()
@@ -1563,6 +1724,22 @@ impl Derivatives for Bitget {
     }
 }
 
+impl DerivativesStream for Bitget {
+    fn subscribe_derivatives(
+        &mut self,
+        symbol: &Symbol,
+        channel: DerivativesChannel,
+    ) -> Result<()> {
+        Bitget::subscribe_derivatives(self, symbol, channel)
+    }
+    fn open_interest(&mut self, symbol: &Symbol) -> Result<OpenInterest> {
+        Bitget::open_interest(self, symbol)
+    }
+    fn long_short_ratio(&mut self, symbol: &Symbol) -> Result<LongShortRatio> {
+        Bitget::long_short_ratio(self, symbol)
+    }
+}
+
 #[derive(Deserialize)]
 struct RawMixAccount {
     #[serde(rename = "marginCoin")]
@@ -1692,6 +1869,135 @@ mod tests {
         .with_ws(Box::new(ArcWs(Arc::clone(&ws))))
         .with_clock(Box::new(move || now_ms));
         (bitget, ws)
+    }
+
+    /// A futures client over HTTP only, for the polled reads.
+    fn futures_client() -> (Bitget, Arc<MockHttpTransport>) {
+        let mock = Arc::new(MockHttpTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::UsdMFutures);
+        (
+            Bitget::with_http(Box::new(ArcTransport(Arc::clone(&mock))), &opts),
+            mock,
+        )
+    }
+    #[test]
+    fn a_spot_client_refuses_the_derivatives_surface() {
+        let (mut bitget, _) = client();
+        for channel in [
+            DerivativesChannel::Funding,
+            DerivativesChannel::MarkIndex,
+            DerivativesChannel::Liquidations,
+        ] {
+            let err = Bitget::subscribe_derivatives(&mut bitget, &symbol(), channel)
+                .expect_err("spot has no derivatives channels");
+            assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
+        }
+        let (bitget, _) = client();
+        assert!(Bitget::open_interest(&bitget, &symbol()).is_err());
+        assert!(Bitget::long_short_ratio(&bitget, &symbol()).is_err());
+    }
+
+    /// Bitget publishes no public stream of forced orders, so the subscription
+    /// is refused rather than accepted and left to deliver nothing.
+    #[test]
+    fn liquidations_are_refused_because_bitget_publishes_none() {
+        let (mut bitget, ws) = futures_ws_client(1_700_000_000_000);
+        let err =
+            Bitget::subscribe_derivatives(&mut bitget, &symbol(), DerivativesChannel::Liquidations)
+                .expect_err("Bitget has no public liquidation stream");
+        assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
+        assert!(ws.sent().is_empty(), "refused, yet subscribed to something");
+    }
+
+    /// One frame answers both subscriptions, because the venue reads all three
+    /// prices at one moment and sends them together.
+    #[test]
+    fn the_ticker_frame_answers_funding_and_mark_index_together() {
+        let (mut bitget, ws) = futures_ws_client(1_700_000_000_000);
+        ws.push_connection(vec![Ok(Some(
+            r#"{"action":"snapshot","arg":{"instType":"USDT-FUTURES","channel":"ticker",
+            "instId":"BTCUSDT"},"data":[{"instId":"BTCUSDT","lastPr":"81115.8","bidPr":"81115.7",
+            "askPr":"81115.9","baseVolume":"12345","markPrice":"81117","indexPrice":"81155.1985",
+            "fundingRate":"0.000039","ts":"1788459657009"}]}"#
+                .to_string(),
+        ))]);
+        Bitget::subscribe_derivatives(&mut bitget, &symbol(), DerivativesChannel::Funding).unwrap();
+        Bitget::subscribe_derivatives(&mut bitget, &symbol(), DerivativesChannel::MarkIndex)
+            .unwrap();
+
+        let events = Bitget::poll_events(&mut bitget);
+        assert_eq!(
+            events.len(),
+            3,
+            "ticker, funding and mark/index: {events:?}"
+        );
+
+        let Event::Derivatives(DerivativesFeed::Funding(funding)) = &events[1] else {
+            panic!("expected a funding print, got {:?}", events[1]);
+        };
+        assert_eq!(funding.rate, dec!(0.000039));
+        assert_eq!(funding.mark_price, dec!(81117));
+        assert_eq!(funding.timestamp, 1_788_459_657_009);
+
+        let Event::Derivatives(DerivativesFeed::MarkIndex(mark)) = &events[2] else {
+            panic!("expected a mark/index print, got {:?}", events[2]);
+        };
+        assert_eq!(mark.mark_price, dec!(81117));
+        assert_eq!(mark.index_price, dec!(81155.1985));
+    }
+
+    /// A caller watching prices does not start receiving funding prints.
+    #[test]
+    fn an_unsubscribed_derivatives_print_is_not_emitted() {
+        let (mut bitget, ws) = futures_ws_client(1_700_000_000_000);
+        ws.push_connection(vec![Ok(Some(
+            r#"{"action":"snapshot","arg":{"instType":"USDT-FUTURES","channel":"ticker",
+            "instId":"BTCUSDT"},"data":[{"instId":"BTCUSDT","lastPr":"81115.8","bidPr":"81115.7",
+            "askPr":"81115.9","baseVolume":"12345","markPrice":"81117","indexPrice":"81155.1985",
+            "fundingRate":"0.000039","ts":"1788459657009"}]}"#
+                .to_string(),
+        ))]);
+        Bitget::subscribe_ticker(&mut bitget, &symbol()).unwrap();
+
+        let events = Bitget::poll_events(&mut bitget);
+        assert_eq!(events.len(), 1, "only the ticker was asked for: {events:?}");
+        assert!(matches!(events[0], Event::Ticker(_)));
+    }
+
+    #[test]
+    fn open_interest_reads_the_base_currency_figure() {
+        let (bitget, mock) = futures_client();
+        mock.push_json(
+            200,
+            r#"{"code":"00000","msg":"success","requestTime":1788459644402,
+            "data":{"openInterestList":[{"symbol":"BTCUSDT","size":"34083.9067999999127"}],
+            "ts":"1788459644403"}}"#,
+        );
+        let open_interest = Bitget::open_interest(&bitget, &symbol()).unwrap();
+        assert_eq!(open_interest.open_interest, dec!(34083.9067999999127));
+        assert_eq!(open_interest.timestamp, 1_788_459_644_403);
+        assert!(mock.recorded_requests()[0]
+            .url
+            .contains("productType=USDT-FUTURES"));
+    }
+
+    /// Bitget publishes both proportions directly, so nothing is derived.
+    #[test]
+    fn the_long_short_ratio_is_read_not_derived() {
+        let (bitget, mock) = futures_client();
+        mock.push_json(
+            200,
+            r#"{"code":"00000","msg":"success","requestTime":1788459645484,
+            "data":[{"longAccountRatio":"0.5236","shortAccountRatio":"0.4764",
+                     "longShortAccountRatio":"1.099","ts":"1788450600000"},
+                    {"longAccountRatio":"0.5255","shortAccountRatio":"0.4745",
+                     "longShortAccountRatio":"1.107","ts":"1788450000000"}]}"#,
+        );
+        let ratio = Bitget::long_short_ratio(&bitget, &symbol()).unwrap();
+        assert_eq!(ratio.long_size, dec!(0.5236));
+        assert_eq!(ratio.short_size, dec!(0.4764));
+        // Newest first: the older row must not be the one read.
+        assert_eq!(ratio.timestamp, 1_788_450_600_000);
     }
 
     /// Every WebSocket subscription names the market the client is on.

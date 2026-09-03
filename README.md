@@ -65,9 +65,9 @@ of Wickra**:
   exact input type the indicators consume (`Trade`, `OrderBook`, `CrossSection`)
   — feeding 514 indicators and the backtester with zero glue. The derivatives
   channels (funding, open interest, liquidations, positioning, mark/index) are
-  typed too and fold into a `DerivativesTick`. **Three of the eight futures
-  venues subscribe to them today** — Binance, Bybit and OKX; on the other five
-  you supply those frames. The matrix says which channel each venue publishes,
+  typed too and fold into a `DerivativesTick`. **Four of the eight futures
+  venues subscribe to them today** — Binance, Bybit, OKX and Bitget; on the
+  other four you supply those frames. The matrix says which channel each venue publishes,
   and where a venue publishes none it refuses rather than subscribing to
   nothing. See [Derivatives feeds](docs/DERIVATIVES.md#derivatives-feeds).
 - **`ReplayExchange`** — a recorded feed driven through the same trait, so a
@@ -254,7 +254,7 @@ touch mainnet with real keys. Fuzzing requires a nightly toolchain — see
 Run the suites with the commands in
 [Building everything from source](#building-everything-from-source).
 
-- **`wickra-exchange-core`** — 543 unit tests. Every venue client is generic over
+- **`wickra-exchange-core`** — 559 unit tests. Every venue client is generic over
   an injected transport, so its request-build, signing, parse and normalise path
   is exercised offline against `MockHttpTransport` / `MockWsTransport`: queued
   responses in, recorded requests out.

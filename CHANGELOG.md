@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Bitget subscribes to the derivatives channels it publishes.** The fourth of
+  the eight futures venues. Its mix `ticker` frame carries the funding rate, the
+  mark price and the index price beside the quote, all read at one moment, so
+  `Funding` and `MarkIndex` are one subscription seen two ways -- and a
+  `MarkIndex` from it is a single observation rather than two stitched together.
+  Open interest and long/short positioning are read from
+  `/api/v2/mix/market/open-interest` and `/api/v2/mix/market/account-long-short`;
+  Bitget publishes both proportions directly, so nothing is derived.
+
+  **`Liquidations` is refused.** Bitget publishes no public stream of forced
+  orders, and accepting a subscription that will never deliver would be the
+  worse answer.
+
 - **OKX subscribes to the derivatives channels it publishes.** It is the third
   of the eight futures venues to implement `DerivativesStream`, after Binance
   and Bybit: `funding-rate` and `liquidation-orders` are subscribed, and open
