@@ -161,6 +161,17 @@ impl fmt::Debug for Kraken {
 }
 
 impl Kraken {
+    /// Refuse a market this client does not route.
+    ///
+    /// Called at every seam that reaches the venue -- the HTTP helpers and each
+    /// WebSocket connect -- so an unrouted market is refused before a request
+    /// is built rather than answered by whichever market the URL happened to
+    /// name. See [`ensure_market_is_routed`](super::ensure_market_is_routed)
+    /// for what each client used to answer instead.
+    fn ensure_market_is_routed(&self) -> Result<()> {
+        super::ensure_market_is_routed("Kraken", self.market_type, super::SPOT_AND_LINEAR)
+    }
+
     fn build(
         http: Box<dyn HttpTransport>,
         options: &ExchangeOptions,
@@ -441,6 +452,7 @@ impl Kraken {
     }
 
     fn subscribe(&mut self, symbol: &Symbol, channel: &str) -> Result<()> {
+        self.ensure_market_is_routed()?;
         if self.is_futures() {
             return self.subscribe_futures(symbol, channel);
         }
@@ -472,6 +484,7 @@ impl Kraken {
     /// spelled the same as the spot channels -- `trade`, `book`, `ticker` --
     /// which is the only thing the two protocols share.
     fn subscribe_futures(&mut self, symbol: &Symbol, feed: &str) -> Result<()> {
+        self.ensure_market_is_routed()?;
         let product = Self::futures_symbol(symbol);
         if self.connection.is_none() {
             let ws = self.ws.as_ref().ok_or(Error::NotConnected)?;
@@ -671,6 +684,7 @@ impl Kraken {
     /// [`Error::NotConnected`] without a WebSocket transport, or another
     /// [`Error`] if the token request fails.
     pub fn subscribe_user_data(&mut self) -> Result<()> {
+        self.ensure_market_is_routed()?;
         if self.is_futures() {
             return self.subscribe_user_data_futures();
         }
@@ -709,6 +723,7 @@ impl Kraken {
     /// [`Error::NotConnected`] without a WebSocket transport, or another
     /// [`Error`] if the handshake fails.
     fn subscribe_user_data_futures(&mut self) -> Result<()> {
+        self.ensure_market_is_routed()?;
         let creds = self.credentials.as_ref().ok_or(Error::InvalidCredentials(
             "user-data stream requires credentials",
         ))?;
@@ -856,6 +871,7 @@ impl Kraken {
     /// `GetWebSocketsToken` token over REST, connect `wss://ws-auth.kraken.com/v2`,
     /// and cache both.
     fn ensure_ws_api(&mut self) -> Result<()> {
+        self.ensure_market_is_routed()?;
         // An open connection is not enough: the token is sent with every order
         // frame and expires on its own schedule, so a live connection can carry
         // a dead token.
@@ -1169,6 +1185,7 @@ impl Kraken {
     }
 
     fn get(&self, path: &str, query: &str) -> Result<serde_json::Value> {
+        self.ensure_market_is_routed()?;
         let url = format!("{}{path}?{query}", self.rest_base);
         let response = self.http.execute(&HttpRequest::get(url))?;
         unwrap_result(&response.body).map_err(|e| e.with_retry_after(response.retry_after()))
@@ -1191,6 +1208,7 @@ impl Kraken {
         path: &str,
         params: &[(String, String)],
     ) -> Result<serde_json::Value> {
+        self.ensure_market_is_routed()?;
         let creds = self.credentials.as_ref().ok_or(Error::InvalidCredentials(
             "signed endpoint requires credentials",
         ))?;
@@ -1215,6 +1233,7 @@ impl Kraken {
 
     /// Public Kraken Futures GET (no signing).
     fn futures_get(&self, path: &str, query: &str) -> Result<serde_json::Value> {
+        self.ensure_market_is_routed()?;
         let url = if query.is_empty() {
             format!("{}{path}", self.rest_base)
         } else {
@@ -1234,6 +1253,7 @@ impl Kraken {
         path: &str,
         params: &[(&str, String)],
     ) -> Result<serde_json::Value> {
+        self.ensure_market_is_routed()?;
         let creds = self.credentials.as_ref().ok_or(Error::InvalidCredentials(
             "signed endpoint requires credentials",
         ))?;

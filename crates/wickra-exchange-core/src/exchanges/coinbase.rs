@@ -15,7 +15,7 @@ use crate::error::{Error, Result};
 use crate::events::{BookDelta, BookLevel, Event, OrderBookSnapshot, TradePrint};
 use crate::idempotency::ClientIdGenerator;
 use crate::normalize::{format_decimal, parse_decimal};
-use crate::options::{ExchangeOptions, SelfTradePrevention};
+use crate::options::{ExchangeOptions, MarketType, SelfTradePrevention};
 use crate::symbol::Symbol;
 use crate::traits::{Exchange, Execution, MarketData};
 use crate::transport::{
@@ -50,6 +50,12 @@ pub struct Coinbase {
     http: Box<dyn HttpTransport>,
     ws: Option<Box<dyn WsTransport>>,
     rest_base: String,
+    /// The market this client was built for.
+    ///
+    /// This venue serves spot only, and the market was previously dropped on the
+    /// floor: a client built for futures answered spot questions with spot data
+    /// and said nothing.
+    market_type: MarketType,
     credentials: Option<Credentials>,
     now_ms: Box<dyn Fn() -> i64 + Send + Sync>,
     /// Client order ids for orders the caller did not name.
@@ -87,15 +93,27 @@ impl fmt::Debug for Coinbase {
 }
 
 impl Coinbase {
+    /// Refuse a market this client does not route.
+    ///
+    /// Called at every seam that reaches the venue -- the HTTP helpers and each
+    /// WebSocket connect -- so an unrouted market is refused before a request
+    /// is built rather than answered by whichever market the URL happened to
+    /// name. See [`ensure_market_is_routed`](super::ensure_market_is_routed)
+    /// for what each client used to answer instead.
+    fn ensure_market_is_routed(&self) -> Result<()> {
+        super::ensure_market_is_routed("Coinbase", self.market_type, super::SPOT_ONLY)
+    }
+
     fn build(
         http: Box<dyn HttpTransport>,
-        _options: &ExchangeOptions,
+        options: &ExchangeOptions,
         credentials: Option<Credentials>,
     ) -> Self {
         Self {
             http,
             ws: None,
             rest_base: format!("https://{HOST}"),
+            market_type: options.market_type,
             credentials,
             now_ms: Box::new(system_now_ms),
             client_ids: ClientIdGenerator::with_seed(
@@ -132,6 +150,7 @@ impl Coinbase {
     /// # Errors
     /// Returns an [`Error`] if the request fails or the response cannot be parsed.
     pub fn sync_time(&mut self) -> Result<i64> {
+        self.ensure_market_is_routed()?;
         // Every other endpoint on this client is signed; the time endpoint is
         // public, so the request is built here rather than through signed_get.
         let local_before = (self.now_ms)();
@@ -288,6 +307,7 @@ impl Coinbase {
     }
 
     fn subscribe(&mut self, symbol: &Symbol, channel: &str) -> Result<()> {
+        self.ensure_market_is_routed()?;
         let jwt = self.build_jwt(None)?;
         let product = Self::wire_symbol(symbol);
         if self.connection.is_none() {
@@ -654,6 +674,7 @@ impl Coinbase {
     }
 
     fn signed_get(&self, path: &str, query: &str) -> Result<serde_json::Value> {
+        self.ensure_market_is_routed()?;
         let jwt = self.build_jwt(Some(format!("GET {HOST}{path}")))?;
         let url = if query.is_empty() {
             format!("{}{path}", self.rest_base)
@@ -666,6 +687,7 @@ impl Coinbase {
     }
 
     fn signed_post(&self, path: &str, body: &str) -> Result<serde_json::Value> {
+        self.ensure_market_is_routed()?;
         let jwt = self.build_jwt(Some(format!("POST {HOST}{path}")))?;
         let url = format!("{}{path}", self.rest_base);
         let request = HttpRequest::new(HttpMethod::Post, url)

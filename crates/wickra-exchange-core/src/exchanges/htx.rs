@@ -184,6 +184,17 @@ impl fmt::Debug for Htx {
 }
 
 impl Htx {
+    /// Refuse a market this client does not route.
+    ///
+    /// Called at every seam that reaches the venue -- the HTTP helpers and each
+    /// WebSocket connect -- so an unrouted market is refused before a request
+    /// is built rather than answered by whichever market the URL happened to
+    /// name. See [`ensure_market_is_routed`](super::ensure_market_is_routed)
+    /// for what each client used to answer instead.
+    fn ensure_market_is_routed(&self) -> Result<()> {
+        super::ensure_market_is_routed("HTX", self.market_type, super::SPOT_AND_LINEAR)
+    }
+
     fn build(
         http: Box<dyn HttpTransport>,
         options: &ExchangeOptions,
@@ -432,6 +443,7 @@ impl Htx {
         symbol: &Symbol,
         channel: DerivativesChannel,
     ) -> Result<()> {
+        self.ensure_market_is_routed()?;
         if !self.is_futures() {
             return Err(Error::unsupported_field(
                 "HTX",
@@ -614,6 +626,7 @@ impl Htx {
     }
 
     fn subscribe(&mut self, symbol: &Symbol, topic: &str) -> Result<()> {
+        self.ensure_market_is_routed()?;
         // The frames come back keyed by whatever form the topic used, so the
         // resolve table has to be keyed the same way: `BTC-USDT` on futures,
         // `btcusdt` on spot. Keying it on the spot form would leave every
@@ -737,6 +750,7 @@ impl Htx {
     /// [`Error::NotConnected`] without a WebSocket transport, or another
     /// [`Error`] if the request fails.
     pub fn subscribe_user_data(&mut self) -> Result<()> {
+        self.ensure_market_is_routed()?;
         // The stream below is the venue's *spot* private feed. A futures client
         // would watch the spot account, where its own futures orders never
         // appear -- so it would wait for fills that cannot arrive, with nothing
@@ -1340,6 +1354,7 @@ impl Htx {
     }
 
     fn get(&self, path: &str, query: &str) -> Result<serde_json::Value> {
+        self.ensure_market_is_routed()?;
         let url = format!("{}{path}?{query}", self.rest_base);
         let response = self.http.execute(&HttpRequest::get(url))?;
         unwrap_status(&response.body).map_err(|e| e.with_retry_after(response.retry_after()))
@@ -1354,6 +1369,7 @@ impl Htx {
         extra: &[(&str, &str)],
         body: &str,
     ) -> Result<serde_json::Value> {
+        self.ensure_market_is_routed()?;
         let creds = self.credentials.as_ref().ok_or(Error::InvalidCredentials(
             "signed endpoint requires credentials",
         ))?;

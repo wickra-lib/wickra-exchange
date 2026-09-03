@@ -204,6 +204,89 @@ fn every_trading_venue_is_object_safe_as_ws_user_data_and_ws_execution() {
     }
 }
 
+/// A client refuses a market it does not route, and sends nothing.
+///
+/// `MarketType` names four markets and no client here routes all four, but
+/// until now none of them said so. The unrouted ones did not fail -- each
+/// resolved to whichever market that client's URL builder happened to produce:
+///
+/// * Binance answered a **coin-margined** request from
+///   `api/v3/ticker/24hr?symbol=BTCUSD`. `BTCUSD` is a real Binance *spot*
+///   pair, so that is real spot data returned for a futures question, with
+///   nothing to notice. An order would have bought spot BTC.
+/// * Kraken asked for `PF_XBTUSD`, its *linear* perpetual, where the
+///   coin-margined product is `PI_XBTUSD`. Both exist; both answer.
+/// * Every client sent `Margin` down its plain spot path, where a margin order
+///   is an ordinary spot order and the borrow never happens.
+/// * Coinbase and Upbit serve spot only and ignored the market outright, so a
+///   futures client there was a spot client with a different name.
+///
+/// The assertion is the shape that matters rather than the list: **nothing goes
+/// out**. A venue that gains a market later moves from this test's set into the
+/// routed one, and a venue added without either is caught.
+#[test]
+fn a_client_refuses_a_market_it_does_not_route_before_it_sends_anything() {
+    fn assert_refused(name: &str, market: MarketType, outcome: &Result<()>, sent: usize) {
+        let refused = matches!(outcome, Err(Error::Exchange { code, .. }) if code == "unsupported");
+        assert!(
+            refused,
+            "{name}: {market:?} was not refused; it answered from whichever market the URL named"
+        );
+        assert_eq!(
+            sent, 0,
+            "{name}: refused {market:?}, yet sent a request anyway"
+        );
+    }
+
+    let market = market();
+    let creds = || Credentials::new("APIKEY", "c2VjcmV0").with_passphrase("PASS");
+
+    macro_rules! check {
+        ($name:literal, $venue:ident, $unrouted:expr) => {{
+            for unrouted in $unrouted {
+                let mock = Arc::new(MockHttpTransport::new());
+                mock.push_json(200, "{}");
+                let options = ExchangeOptions::mainnet(unrouted);
+                let mut client = $venue::with_credentials(
+                    Box::new(ArcTransport(Arc::clone(&mock))),
+                    &options,
+                    creds(),
+                );
+                // Market data, an order, and a stream: the three ways in.
+                let read = client.ticker(&market).map(|_| ());
+                assert_refused($name, unrouted, &read, mock.recorded_requests().len());
+
+                let placed = client
+                    .place_order(&OrderRequest::market_sell(market.clone(), dec!(1)))
+                    .map(|_| ());
+                assert_refused($name, unrouted, &placed, mock.recorded_requests().len());
+
+                let streamed = client.subscribe_trades(&market);
+                assert_refused($name, unrouted, &streamed, mock.recorded_requests().len());
+            }
+        }};
+    }
+
+    // Eight venues route spot and USD-margined futures; Coinbase and Upbit
+    // serve spot only, so linear futures is unrouted there too.
+    let both: [MarketType; 2] = [MarketType::CoinMFutures, MarketType::Margin];
+    let spot_only: [MarketType; 3] = [
+        MarketType::CoinMFutures,
+        MarketType::Margin,
+        MarketType::UsdMFutures,
+    ];
+    check!("Binance", Binance, both);
+    check!("Bybit", Bybit, both);
+    check!("OKX", Okx, both);
+    check!("Bitget", Bitget, both);
+    check!("KuCoin", KuCoin, both);
+    check!("Gate.io", Gate, both);
+    check!("HTX", Htx, both);
+    check!("Kraken", Kraken, both);
+    check!("Coinbase", Coinbase, spot_only);
+    check!("Upbit", Upbit, spot_only);
+}
+
 /// A trigger order either carries its trigger price to the venue, or is
 /// refused. It must never be sent as a plain order.
 ///

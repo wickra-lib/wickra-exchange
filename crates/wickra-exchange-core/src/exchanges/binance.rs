@@ -140,6 +140,17 @@ impl fmt::Debug for Binance {
 }
 
 impl Binance {
+    /// Refuse a market this client does not route.
+    ///
+    /// Called at every seam that reaches the venue -- the HTTP helpers and each
+    /// WebSocket connect -- so an unrouted market is refused before a request
+    /// is built rather than answered by whichever market the URL happened to
+    /// name. See [`ensure_market_is_routed`](super::ensure_market_is_routed)
+    /// for what each client used to answer instead.
+    fn ensure_market_is_routed(&self) -> Result<()> {
+        super::ensure_market_is_routed("Binance", self.market_type, super::SPOT_AND_LINEAR)
+    }
+
     fn build(
         http: Box<dyn HttpTransport>,
         options: &ExchangeOptions,
@@ -517,6 +528,7 @@ impl Binance {
     /// Open the connection if needed, send a SUBSCRIBE for `<symbol>@<channel>`,
     /// and register the symbol for wire-name resolution.
     fn subscribe(&mut self, symbol: &Symbol, channel: &str) -> Result<()> {
+        self.ensure_market_is_routed()?;
         let wire = Self::wire_symbol(symbol);
         if self.connection.is_none() {
             let ws = self.ws.as_ref().ok_or(Error::NotConnected)?;
@@ -737,6 +749,7 @@ impl Binance {
     /// Issue a GET and return the body, mapping non-2xx responses onto the error
     /// taxonomy.
     fn get(&self, path: &str, query: &str) -> Result<String> {
+        self.ensure_market_is_routed()?;
         let url = if query.is_empty() {
             format!("{}{path}", self.rest_base)
         } else {
@@ -790,6 +803,7 @@ impl Binance {
     /// Sign `params` (HMAC-SHA256 over the query with `recvWindow` + `timestamp`)
     /// and issue the request with the API-key header.
     fn signed_request(&self, method: HttpMethod, path: &str, params: &str) -> Result<String> {
+        self.ensure_market_is_routed()?;
         let creds = self.credentials.as_ref().ok_or(Error::InvalidCredentials(
             "signed endpoint requires credentials",
         ))?;
@@ -1148,6 +1162,7 @@ impl Binance {
     /// Returns [`Error::InvalidCredentials`] without an API key, [`Error::NotConnected`]
     /// without a WebSocket transport, or another [`Error`] if the request fails.
     pub fn subscribe_user_data(&mut self) -> Result<()> {
+        self.ensure_market_is_routed()?;
         let creds = self.credentials.as_ref().ok_or(Error::InvalidCredentials(
             "user-data stream requires credentials",
         ))?;
@@ -1195,6 +1210,7 @@ impl Binance {
     /// Returns [`Error::InvalidCredentials`] without an API key, or another
     /// [`Error`] if the refresh request fails.
     pub fn keepalive_user_data(&mut self) -> Result<()> {
+        self.ensure_market_is_routed()?;
         let Some(listen_key) = self.user_data_listen_key.clone() else {
             return Ok(());
         };
@@ -1229,6 +1245,7 @@ impl Binance {
         method: &str,
         mut params: Vec<(String, String)>,
     ) -> Result<serde_json::Value> {
+        self.ensure_market_is_routed()?;
         let creds = self.credentials.as_ref().ok_or(Error::InvalidCredentials(
             "signed endpoint requires credentials",
         ))?;
