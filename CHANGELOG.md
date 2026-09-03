@@ -87,6 +87,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The venue clients are now checked against the venues.** The offline suite
+  drives every client over a mock transport with hand-written JSON. It proves
+  the parser reads what the author believed, and it cannot prove that belief
+  matched the venue: the fixture and the parser were written by the same hand,
+  from the same reading of the same documentation, so they agree whether or not
+  the reading was right. That is not hypothetical — it is how seven clients came
+  to never send `time_in_force` under a green suite, because the fixtures did
+  not expect it either.
+
+  `crates/wickra-exchange/tests/live_public.rs` asks the real venue instead. All
+  ten clients, through `ticker`, `klines` and `order_book`, against the live
+  public API with no credentials. It runs from the existing nightly
+  `testnet.yml`, never on a push.
+
+  A failure means one thing: the venue answered and the parser could not read
+  the reply. Network errors, timeouts, rate limits, HTTP 451/403 geo-blocks and
+  auth errors are skipped out loud, because they say nothing about the code —
+  and because a nightly job that failed on a blocked runner IP would be switched
+  off within a week, taking the drift detection with it.
+
+  First run: nine of the ten venues verified end to end. Coinbase is skipped —
+  its Advanced Trade market endpoints require an EC key, so there is nothing to
+  read anonymously.
+
+### Changed
+
+- **Coverage measures the facade and the C ABI, not just the core.** The facade
+  was excluded wholesale on the grounds that it holds the real-socket transport
+  adapters. That was true of `net.rs` and not of `factory.rs` beside it: the
+  `connect*` dispatch is ordinary offline logic with its own unit tests, and
+  leaving it unmeasured left unmeasured the exact place a defect had already
+  hidden — no binding could reach a futures market, because the factory built
+  every client with `MarketType::Spot` hardcoded.
+
+  The exclusion is now the file that is genuinely untestable offline (`net.rs`)
+  rather than the crate around it. The C ABI joins too, since its tests are
+  cargo tests. Python, Node and WASM stay out for a different reason and not
+  because they do not matter: their tests are pytest and node:test, so measuring
+  them here would compile their Rust and never run it — reporting a zero that
+  means "not measured" while looking like "not tested".
+
+  The reported project percentage will move when this lands. That is more code
+  being measured, not less being tested.
+
 - **The derivatives feeds have producers.** `feeds.rs` carried `FundingRate`,
   `OpenInterest`, `Liquidation`, `LongShortRatio`, `MarkIndex`,
   `DerivativesFeed` and `DerivativesTickBuilder` — 471 lines of public API that

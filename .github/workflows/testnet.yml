@@ -3,6 +3,18 @@ name: Testnet integration
 # The gated integration tests hit live exchange endpoints (public market data,
 # no keys), so they are not part of the per-push ci.yml. They run on a schedule
 # and on demand instead, surfacing upstream/API drift without flaking every PR.
+#
+# What they are for: the offline suite drives every client over a mock transport
+# with hand-written JSON, which proves the parser reads what the author believed
+# and cannot prove that belief matched the venue -- the fixture and the parser
+# were written by the same hand from the same reading. This job asks the real
+# venue and hands the answer to the real parser, across all ten clients.
+#
+# A failure here means one thing: the venue answered and the parser could not
+# read the reply. Network errors, timeouts, rate limits, HTTP 451/403 geo-blocks
+# and auth errors are skipped out loud instead, because they say nothing about
+# the code -- and because a nightly job that failed on a blocked runner IP would
+# be switched off within a week, taking the drift detection with it.
 on:
   schedule:
     - cron: "0 4 * * *" # nightly at 04:00 UTC
@@ -34,7 +46,8 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/setup-rust
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      # The real-socket adapters' #[ignore] tests open live HTTP + WebSocket
-      # connections to public endpoints; run them here, not on every push.
+      # Two suites: the real-socket adapters' own #[ignore] tests, and
+      # `tests/live_public.rs`, which drives all ten venue clients through
+      # `ticker`, `klines` and `order_book` against the live venue.
       - name: Run gated integration tests
         run: cargo test -p wickra-exchange --all-features -- --ignored --nocapture
