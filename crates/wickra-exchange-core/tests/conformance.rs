@@ -1178,7 +1178,7 @@ fn a_futures_client_never_subscribes_to_a_spot_stream() {
         "HTX",
         Htx,
         Expected {
-            url: None,
+            url: Some("api.hbdm.com"),
             frame: None
         }
     );

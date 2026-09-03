@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **HTX futures market data streams**, the fourth and last. HTX is the one
+  venue whose two streams share a protocol: the topics are spelled the same and
+  the frames carry the same envelope, so only the host, the symbol form
+  (`BTC-USDT` rather than `btcusdt`) and the quote channel differ. `amount` is
+  already the contract count, which is the unit its futures order path takes.
+
+  The quote channel is `detail` rather than `ticker`, and publishes its top of
+  book as `[price, size]` pairs where the spot one sends scalars — read as
+  scalars they fall back to zero, so a futures ticker would have reported a
+  market with no bid and no ask: a book that looks empty rather than one that
+  was misread.
+
+  **With this, `a_futures_client_never_subscribes_to_a_spot_stream` has no
+  refusals left.** All eight futures venues reach their own market.
+
 - **KuCoin futures market data streams.** The third of the four: host, topic and
   symbol all follow the market — `ws-api-futures.kucoin.com` with
   `/contractMarket` topics and `XBTUSDTM` rather than `BTC-USDT`.
