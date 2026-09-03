@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **KuCoin futures market data streams.** The third of the four: host, topic and
+  symbol all follow the market — `ws-api-futures.kucoin.com` with
+  `/contractMarket` topics and `XBTUSDTM` rather than `BTC-USDT`.
+
+  Three shapes differ from spot. Stamps arrive in **nanoseconds**, so carrying
+  them through unchanged would put every futures event some 56,000 years into
+  the future and take every staleness check with it. The book channel sends one
+  level as the string `"81385.8,sell,0"` instead of a bids/asks object. And
+  sizes are integer contract counts, which is the unit this client's futures
+  order path already takes.
+
 - **Gate futures market data streams.** The second of the four. Both the host
   and the channel prefix follow the market: `fx-ws.gateio.ws` with `futures.`
   channels rather than `api.gateio.ws` with `spot.` ones, and the book channel

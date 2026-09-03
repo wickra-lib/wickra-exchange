@@ -333,25 +333,25 @@ impl KuCoin {
     }
 
     fn subscribe(&mut self, symbol: &Symbol, topic_prefix: &str) -> Result<()> {
-        // The socket below is the venue's *spot* stream. A futures client
-        // reading futures over REST would be handed the spot book, the spot
-        // trades and the spot quote -- a different instrument at a different
-        // price, with nothing to say so. Refused until this client speaks the
-        // venue's futures stream.
-        if self.is_futures() {
-            return Err(Error::unsupported_field(
-                "KuCoin",
-                "a market-data subscription on a futures client",
-                "KuCoin Futures streams from `ws-api-futures.kucoin.com` with `/contractMarket` topics, which this client does not implement",
-            ));
-        }
-
-        let wire = Self::wire_symbol(symbol);
+        // Spot and futures are different hosts with differently named topics.
+        // The topic arrives spelled `/market/<name>`; on a futures client it is
+        // mapped once here rather than at each call site.
+        let futures = self.is_futures();
+        let (topic_prefix, wire) = if futures {
+            (futures_topic(topic_prefix), Self::futures_symbol(symbol))
+        } else {
+            (topic_prefix, Self::wire_symbol(symbol))
+        };
         if self.connection.is_none() {
             // The bullet-token negotiation and instance endpoint are handled by
             // the real transport adapter; the module only produces the topics.
             let ws = self.ws.as_ref().ok_or(Error::NotConnected)?;
-            let connection = ws.connect("wss://ws-api-spot.kucoin.com/")?;
+            let url = if futures {
+                FUTURES_WS_URL
+            } else {
+                "wss://ws-api-spot.kucoin.com/"
+            };
+            let connection = ws.connect(url)?;
             self.connection = Some(connection);
         }
         let id = (self.now_ms)();
@@ -902,6 +902,53 @@ fn parse_ws_levels(value: Option<&serde_json::Value>) -> Result<Vec<BookLevel>> 
         .collect()
 }
 
+/// An integer field, or zero. KuCoin's futures frames send sizes and stamps as
+/// JSON numbers where its spot frames send strings.
+fn opt_i64(value: &serde_json::Value, key: &str) -> i64 {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0)
+}
+
+/// KuCoin Futures' WebSocket host.
+const FUTURES_WS_URL: &str = "wss://ws-api-futures.kucoin.com/";
+
+/// The futures topic that answers the same question as a spot one.
+///
+/// The two streams are not the same protocol with a prefix swapped -- the
+/// payloads differ as well -- but the mapping of *what is asked for* is
+/// one-to-one, so it lives in one place.
+fn futures_topic(spot_topic: &str) -> &'static str {
+    match spot_topic {
+        "/market/match" => "/contractMarket/execution",
+        "/market/level2" => "/contractMarket/level2",
+        _ => "/contractMarket/ticker",
+    }
+}
+
+/// KuCoin Futures stamps in nanoseconds where its spot stream uses
+/// milliseconds. Reporting the raw figure would put every futures event about
+/// 56,000 years into the future.
+fn futures_millis(raw: i64) -> i64 {
+    raw / 1_000_000
+}
+
+/// One level from `/contractMarket/level2`, which sends `"price,side,size"` as
+/// a single string rather than a bids/asks object. A size of zero removes the
+/// level, which is what the delta type already means.
+fn futures_change(change: &str) -> Option<(BookLevel, OrderSide)> {
+    let mut parts = change.split(',');
+    let price = parse_decimal(parts.next()?.trim()).ok()?;
+    let side = match parts.next()?.trim() {
+        "buy" => OrderSide::Buy,
+        "sell" => OrderSide::Sell,
+        _ => return None,
+    };
+    let quantity = parse_decimal(parts.next()?.trim()).ok()?;
+    Some((BookLevel { price, quantity }, side))
+}
+
 fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Option<Event>> {
     let value: serde_json::Value =
         serde_json::from_str(text).map_err(|e| Error::Deserialization(e.to_string()))?;
@@ -915,6 +962,47 @@ fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Opt
     let symbol = resolve(wire);
     let null = serde_json::Value::Null;
     let data = value.get("data").unwrap_or(&null);
+
+    // --- futures ------------------------------------------------------------
+    if topic.starts_with("/contractMarket/execution:") {
+        // `size` is an integer contract count and `ts` is in nanoseconds.
+        return Ok(Some(Event::Trade(TradePrint {
+            symbol,
+            price: parse_decimal(field_str(data, "price")?)?,
+            quantity: parse_decimal(&opt_i64(data, "size").to_string())?,
+            aggressor: parse_side(field_str(data, "side")?)?,
+            timestamp: futures_millis(opt_i64(data, "ts")),
+        })));
+    } else if topic.starts_with("/contractMarket/ticker:") {
+        return Ok(Some(Event::Ticker(Ticker {
+            symbol,
+            last: parse_decimal(field_str(data, "price")?)?,
+            bid: dec_or_zero(opt_str(data, "bestBidPrice")),
+            ask: dec_or_zero(opt_str(data, "bestAskPrice")),
+            // The futures ticker publishes no traded volume; inventing one from
+            // the print size would be a different figure wearing the same name.
+            volume: Decimal::ZERO,
+            timestamp: futures_millis(opt_i64(data, "ts")),
+        })));
+    } else if topic.starts_with("/contractMarket/level2:") {
+        // One level per frame, as `"price,side,size"`.
+        let Some((level, side)) = futures_change(opt_str(data, "change")) else {
+            return Ok(None);
+        };
+        let sequence = opt_i64(data, "sequence");
+        let (bids, asks) = match side {
+            OrderSide::Buy => (vec![level], Vec::new()),
+            OrderSide::Sell => (Vec::new(), vec![level]),
+        };
+        return Ok(Some(Event::BookDelta(BookDelta {
+            symbol,
+            first_update_id: sequence.unsigned_abs(),
+            final_update_id: sequence.unsigned_abs(),
+            bids,
+            asks,
+            timestamp: opt_i64(data, "timestamp"),
+        })));
+    }
 
     if topic.starts_with("/market/match:") {
         Ok(Some(Event::Trade(TradePrint {
@@ -1523,6 +1611,135 @@ mod tests {
             KuCoin::with_http(Box::new(ArcTransport(Arc::clone(&mock))), &opts),
             mock,
         )
+    }
+
+    fn futures_ws_client() -> (KuCoin, Arc<MockWsTransport>) {
+        let http = Arc::new(MockHttpTransport::new());
+        let ws = Arc::new(MockWsTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::UsdMFutures);
+        let kucoin = KuCoin::with_http(Box::new(ArcTransport(http)), &opts)
+            .with_ws(Box::new(ArcWs(Arc::clone(&ws))));
+        (kucoin, ws)
+    }
+
+    /// Host, topic and symbol all follow the market.
+    #[test]
+    fn a_futures_client_subscribes_to_contract_topics() {
+        let (mut kucoin, ws) = futures_ws_client();
+        KuCoin::subscribe_trades(&mut kucoin, &symbol()).unwrap();
+        KuCoin::subscribe_book(&mut kucoin, &symbol()).unwrap();
+        KuCoin::subscribe_ticker(&mut kucoin, &symbol()).unwrap();
+
+        assert_eq!(ws.connected_urls()[0], "wss://ws-api-futures.kucoin.com/");
+        assert!(ws.sent()[0].contains("/contractMarket/execution:XBTUSDTM"));
+        assert!(ws.sent()[1].contains("/contractMarket/level2:XBTUSDTM"));
+        assert!(ws.sent()[2].contains("/contractMarket/ticker:XBTUSDTM"));
+        assert!(ws.sent().iter().all(|f| !f.contains("/market/")));
+    }
+
+    /// KuCoin Futures stamps in **nanoseconds**.
+    ///
+    /// Carrying the figure through unchanged would put every futures event
+    /// roughly 56,000 years into the future, and every staleness check with it.
+    #[test]
+    fn a_futures_trade_frame_converts_its_nanosecond_stamp() {
+        let (mut kucoin, ws) = futures_ws_client();
+        ws.push_connection(vec![Ok(Some(
+            r#"{"topic":"/contractMarket/execution:XBTUSDTM","type":"message",
+            "subject":"match","sn":1942782214230,"data":{"symbol":"XBTUSDTM",
+            "sequence":1942782214230,"side":"buy","size":104,"price":"81303.2",
+            "takerOrderId":"485067687312056321","tradeId":"1942782214230",
+            "ts":1788462350779000000}}"#
+                .to_string(),
+        ))]);
+        KuCoin::subscribe_trades(&mut kucoin, &symbol()).unwrap();
+
+        let events = KuCoin::poll_events(&mut kucoin);
+        let Event::Trade(trade) = &events[0] else {
+            panic!("expected a trade, got {:?}", events[0]);
+        };
+        assert_eq!(trade.price, dec!(81303.2));
+        // Contracts, which is the unit the futures order path takes.
+        assert_eq!(trade.quantity, dec!(104));
+        assert_eq!(trade.aggressor, OrderSide::Buy);
+        assert_eq!(trade.timestamp, 1_788_462_350_779);
+    }
+
+    /// The futures book sends one level as `"price,side,size"`, not an object.
+    #[test]
+    fn a_futures_book_change_is_one_csv_level() {
+        let (mut kucoin, ws) = futures_ws_client();
+        ws.push_connection(vec![
+            Ok(Some(
+                r#"{"topic":"/contractMarket/level2:XBTUSDTM","type":"message",
+                "subject":"level2","sn":1747328682771,"data":{"sequence":1747328682771,
+                "change":"81385.8,sell,0","timestamp":1788462349758}}"#
+                    .to_string(),
+            )),
+            Ok(Some(
+                r#"{"topic":"/contractMarket/level2:XBTUSDTM","type":"message",
+                "subject":"level2","sn":1747328682772,"data":{"sequence":1747328682772,
+                "change":"81300.1,buy,42","timestamp":1788462349759}}"#
+                    .to_string(),
+            )),
+        ]);
+        KuCoin::subscribe_book(&mut kucoin, &symbol()).unwrap();
+
+        let events = KuCoin::poll_events(&mut kucoin);
+        let Event::BookDelta(removed) = &events[0] else {
+            panic!("expected a delta, got {:?}", events[0]);
+        };
+        assert!(removed.bids.is_empty());
+        assert_eq!(removed.asks[0].price, dec!(81385.8));
+        // A size of zero removes the level, which the delta type already means.
+        assert_eq!(removed.asks[0].quantity, Decimal::ZERO);
+        assert_eq!(removed.timestamp, 1_788_462_349_758);
+
+        let Event::BookDelta(added) = &events[1] else {
+            panic!("expected a delta, got {:?}", events[1]);
+        };
+        assert!(added.asks.is_empty());
+        assert_eq!(added.bids[0].quantity, dec!(42));
+    }
+
+    /// The futures ticker carries a last price and a top of book, and no volume
+    /// — so volume stays zero rather than borrowing the print size.
+    #[test]
+    fn a_futures_ticker_parses() {
+        let (mut kucoin, ws) = futures_ws_client();
+        ws.push_connection(vec![Ok(Some(
+            r#"{"topic":"/contractMarket/ticker:XBTUSDTM","type":"message","subject":"ticker",
+            "sn":1942783616429,"data":{"symbol":"XBTUSDTM","sequence":1942783616429,
+            "side":"buy","size":1,"price":"81484.4","bestBidSize":4775,
+            "bestBidPrice":"81484.3","bestAskPrice":"81487.7","bestAskSize":68,
+            "ts":1788463466281000000}}"#
+                .to_string(),
+        ))]);
+        KuCoin::subscribe_ticker(&mut kucoin, &symbol()).unwrap();
+
+        let events = KuCoin::poll_events(&mut kucoin);
+        let Event::Ticker(ticker) = &events[0] else {
+            panic!("expected a ticker, got {:?}", events[0]);
+        };
+        assert_eq!(ticker.last, dec!(81484.4));
+        assert_eq!(ticker.bid, dec!(81484.3));
+        assert_eq!(ticker.ask, dec!(81487.7));
+        assert_eq!(ticker.volume, Decimal::ZERO);
+        assert_eq!(ticker.timestamp, 1_788_463_466_281);
+    }
+
+    /// The spot client keeps its own host and topics.
+    #[test]
+    fn a_spot_client_still_subscribes_to_market_topics() {
+        let ws = Arc::new(MockWsTransport::new());
+        let http = Arc::new(MockHttpTransport::new());
+        let opts = ExchangeOptions::mainnet(crate::MarketType::Spot);
+        let mut kucoin = KuCoin::with_http(Box::new(ArcTransport(http)), &opts)
+            .with_ws(Box::new(ArcWs(Arc::clone(&ws))));
+        KuCoin::subscribe_trades(&mut kucoin, &symbol()).unwrap();
+
+        assert_eq!(ws.connected_urls()[0], "wss://ws-api-spot.kucoin.com/");
+        assert!(ws.sent()[0].contains("/market/match:BTC-USDT"));
     }
 
     fn signed_client(now_ms: i64) -> (KuCoin, Arc<MockHttpTransport>) {

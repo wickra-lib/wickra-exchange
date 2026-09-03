@@ -254,7 +254,7 @@ touch mainnet with real keys. Fuzzing requires a nightly toolchain — see
 Run the suites with the commands in
 [Building everything from source](#building-everything-from-source).
 
-- **`wickra-exchange-core`** — 574 unit tests. Every venue client is generic over
+- **`wickra-exchange-core`** — 579 unit tests. Every venue client is generic over
   an injected transport, so its request-build, signing, parse and normalise path
   is exercised offline against `MockHttpTransport` / `MockWsTransport`: queued
   responses in, recorded requests out.

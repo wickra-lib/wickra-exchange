@@ -1162,7 +1162,7 @@ fn a_futures_client_never_subscribes_to_a_spot_stream() {
         "KuCoin",
         KuCoin,
         Expected {
-            url: None,
+            url: Some("ws-api-futures.kucoin.com"),
             frame: None
         }
     );
