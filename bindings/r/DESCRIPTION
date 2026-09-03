@@ -10,6 +10,7 @@ Description: R bindings for wickra-exchange over its C ABI hub: one synchronous,
 License: MIT + file LICENSE | Apache License 2.0
 URL: https://github.com/wickra-lib/wickra-exchange
 BugReports: https://github.com/wickra-lib/wickra-exchange/issues
+Depends: R (>= 2.10)
 Encoding: UTF-8
 NeedsCompilation: yes
 SystemRequirements: the wickra-exchange C ABI shared library (WKEX_LIB) and its
