@@ -1290,8 +1290,13 @@ fn a_futures_client_never_subscribes_to_a_spot_stream() {
     // The private stream has the same rule, and was wrong on the same venues. A
     // futures client watching the spot account waits for fills that cannot
     // arrive: its own orders never appear there, and nothing reports an error.
+    //
+    // `$refuses` is what a client is allowed to do while it does not yet speak
+    // the venue's futures private stream: refuse, and send nothing. Reaching
+    // the futures account is the other allowed answer. Quietly subscribing to
+    // spot is neither.
     macro_rules! private {
-        ($name:literal, $venue:ident, $refuses:literal) => {{
+        ($name:literal, $venue:ident, $refuses:literal, $spot:literal) => {{
             let http = Arc::new(MockHttpTransport::new());
             let ws = Arc::new(MockWsTransport::new());
             let mut client = $venue::with_credentials(
@@ -1318,16 +1323,31 @@ fn a_futures_client_never_subscribes_to_a_spot_stream() {
                     $name
                 );
             }
+            // Whichever branch it took, nothing spot-shaped may have gone out.
+            // This is the assertion that fails if a futures client quietly
+            // subscribes to the spot account, which is what all three did.
+            assert!(
+                !ws.connected_urls().iter().any(|url| url.contains($spot)),
+                "{}: a futures client opened the spot stream ({:?})",
+                $name,
+                ws.connected_urls()
+            );
+            assert!(
+                !ws.sent().iter().any(|frame| frame.contains($spot)),
+                "{}: a futures client sent a spot subscription ({:?})",
+                $name,
+                ws.sent()
+            );
         }};
     }
 
-    private!("KuCoin", KuCoin, true);
-    private!("Gate.io", Gate, true);
-    private!("HTX", Htx, true);
-    // Kraken already routes here: `subscribe_user_data` dispatches to
-    // `subscribe_user_data_futures`, which is the rule being kept rather than
-    // an exception to it.
-    private!("Kraken", Kraken, false);
+    // All four now reach the futures account. The three that used to refuse
+    // here moved from one branch of this contract to the other without the
+    // contract changing, which is what it was shaped for.
+    private!("KuCoin", KuCoin, false, "spotMarket");
+    private!("Gate.io", Gate, false, "spot.orders");
+    private!("HTX", Htx, false, "api.huobi.pro");
+    private!("Kraken", Kraken, false, "ws-auth.kraken.com");
 }
 
 /// Two fields that a venue spells in *one* slot are refused together, never

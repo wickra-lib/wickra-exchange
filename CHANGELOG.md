@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The futures private stream on KuCoin, Gate and HTX.** All three refused it
+  rather than watching the wrong account — the honest answer while the stream
+  was unimplemented, and the last of those refusals. A futures client now
+  receives its own order and balance updates on every venue that has them.
+
+  Each speaks it differently, and each difference is one that fails quietly:
+
+  * **KuCoin** negotiates the same bullet token against the futures host and
+    subscribes `/contractMarket/tradeOrders` and `/contractAccount/wallet`. Its
+    order frame says `done` for both a fill and a cancel — only the event type
+    separates them, so reading the status alone reports every cancelled order as
+    filled. The contract name comes back as `XBTUSDTM`, which has to be read
+    back into `BTC/USDT`: the private stream is not subscribed per symbol, so
+    there is no subscription to look it up in.
+  * **Gate** addresses its futures channels to a **user id**, which the spot
+    ones do not take; subscribing without it is a subscription to nobody, so the
+    id is fetched once and cached. Its order frame carries a *signed size*
+    instead of a side and reports what is *left* instead of what filled, and
+    `status` only ever reaches `finished` — `finish_as` says whether that was a
+    fill or a cancel.
+  * **HTX** puts the futures private stream on the same socket as the public
+    derivatives channels, separated by authentication rather than by host, and
+    numbers the order lifecycle from 1 to 11. An unknown number is reported as
+    still open rather than as filled: guessing "filled" closes a position in the
+    caller's own bookkeeping that the venue still has open.
+
 - **Native trigger orders on nine of the ten venues.** A stop-loss now reaches
   every venue that has one, instead of being refused; Upbit, whose order API
   exposes limit and market only, still refuses rather than flattens — the
@@ -230,6 +256,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   return value says rather than recover something lost.
 
 ### Fixed
+
+- **HTX's derivatives stream closed itself after thirty seconds.** The
+  notification socket pings every five seconds in a form the client did not
+  answer — `{"op":"ping","ts":"..."}`, a third shape beside the two it already
+  handled — and HTX closes a socket whose pings go unanswered.
+
+  Measured against the live venue, same subscription, same budget: **silent, the
+  socket lasted 30.3 s and closed after five unanswered pings; answering, it was
+  still open at 91 s across seventeen.** Every public funding, mark and
+  liquidation stream on HTX was therefore dying half a minute in, and reporting
+  nothing — no test could see it, because the venue's own timer is the only
+  thing that fails.
 
 - **A market a client does not route is now refused, not silently swapped.**
   `MarketType` names four markets; no client routes all four, and until now none

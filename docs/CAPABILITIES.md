@@ -329,10 +329,25 @@ reaches a field on one path and not another fails rather than averaging out.
 > **WS user-data streams** ([`WsUserData`]) push the account's own order and
 > balance updates: `subscribe_user_data` opens a private stream (Binance listen
 > key, Bybit/OKX/Bitget signed login, KuCoin bullet-private token, Gate signed
-> subscribe, HTX v2 auth, Kraken token; the Kraken **futures** client uses the
-> separate `futures.kraken.com` challenge/response feed) so `poll_events` surfaces
-> the user's own `OrderUpdate` / `BalanceUpdate` events. Available on the eight
-> trading venues; Coinbase and Upbit are spot-only and do not implement it.
+> subscribe, HTX v2 auth, Kraken token) so `poll_events` surfaces the user's own
+> `OrderUpdate` / `BalanceUpdate` events. Available on the eight trading venues;
+> Coinbase and Upbit are spot-only and do not implement it.
+>
+> **A futures client watches the futures account**, which on four venues is a
+> different socket with different topics, and on three of those was refused
+> until recently rather than pointed at spot — a futures order never appears in
+> the spot account, so watching it is waiting for a fill that cannot arrive.
+> KuCoin negotiates its bullet token against the futures host and takes
+> `/contractMarket/tradeOrders` + `/contractAccount/wallet`; Gate takes
+> `futures.orders` + `futures.balances` on `fx-ws.gateio.ws`, addressed to a
+> **user id** the spot channels do not need; HTX takes `orders_cross.*` +
+> `accounts_cross.*` on the same notification socket its public derivatives
+> channels use, separated by authentication rather than by host; Kraken uses the
+> separate `futures.kraken.com` challenge/response feed. Each frame shape differs
+> from its spot counterpart in a way that fails quietly if read as the spot one —
+> KuCoin's `done` covers a fill *and* a cancel, Gate carries a signed size and
+> what is *left*, HTX numbers the lifecycle 1..11 — so each is parsed on its own
+> terms.
 > `keepalive_user_data` keeps the stream alive (Binance listen-key `PUT`, KuCoin
 > bullet-token refresh via re-subscribe, per-venue ping frame); a dropped stream
 > is also recovered automatically on the next `poll_events`, which re-subscribes
