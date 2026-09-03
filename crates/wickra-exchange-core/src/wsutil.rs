@@ -8,6 +8,17 @@
 use crate::events::Event;
 use crate::transport::{WsConnection, WsTransport};
 
+/// Each call below is written on one line, for the reason `throttle.rs` gives:
+/// `llvm-cov` marks the continuation lines of a multi-line macro invocation
+/// uncovered even when the call runs.
+///
+/// The URL is deliberately never logged. A private stream's URL carries its
+/// credential in the path -- Binance's user-data socket is
+/// `wss://.../ws/<listenKey>`, and a listen key opens the account's order and
+/// balance stream. Which venue it is is already clear from the caller's target;
+/// what a reader needs here is which of the four outcomes happened.
+const TARGET: &str = "wickra_exchange_core::wsutil";
+
 /// If the peer has closed `connection`, reopen it via `ws` at `url` and replay
 /// every message in `subscribe_messages`, pushing `Disconnected` then
 /// `Reconnected` into `events`.
@@ -26,20 +37,26 @@ pub(crate) fn reconnect_if_dropped(
         return;
     }
 
+    let subscriptions = subscribe_messages.len();
+    tracing::info!(target: TARGET, subscriptions, "stream closed by the peer; reconnecting");
     events.push(Event::Disconnected);
     *connection = None;
 
     let Some(ws) = ws else {
+        tracing::warn!(target: TARGET, "no WebSocket transport is configured; the stream stays closed");
         return;
     };
     let Ok(mut fresh) = ws.connect(url) else {
+        tracing::warn!(target: TARGET, "reconnect could not open a connection; the next poll retries");
         return;
     };
-    for message in subscribe_messages {
+    for (replayed, message) in subscribe_messages.iter().enumerate() {
         if fresh.send(message).is_err() {
+            tracing::warn!(target: TARGET, replayed, subscriptions, "reconnected, but replaying the subscriptions failed; staying closed");
             return; // leave disconnected; the next poll retries
         }
     }
+    tracing::info!(target: TARGET, subscriptions, "reconnected and replayed every subscription");
     *connection = Some(fresh);
     events.push(Event::Reconnected);
 }
