@@ -1707,6 +1707,27 @@ mod tests {
         assert!(reqs[0].body.as_ref().unwrap().contains(r#""stp":"CB""#));
     }
 
+    /// KuCoin stamps both public reads with `data.time`. Payloads captured from
+    /// the live endpoints.
+    #[test]
+    fn the_public_reads_carry_the_venue_stamp() {
+        let (kucoin, mock) = signed_client(1000);
+        mock.push_json(
+            200,
+            r#"{"code":"200000","data":{"time":1788396666570,"last":"77083.8","buy":"77083.7","sell":"77083.8","vol":"1234.5"}}"#,
+        );
+        let ticker = kucoin.ticker(&symbol()).unwrap();
+        assert_eq!(ticker.timestamp, 1_788_396_666_570);
+
+        let (kucoin, mock) = signed_client(1000);
+        mock.push_json(
+            200,
+            r#"{"code":"200000","data":{"time":1788396668372,"sequence":"36500054130","bids":[["77083.7","0.92"]],"asks":[["77083.8","0.06"]]}}"#,
+        );
+        let book = kucoin.order_book(&symbol(), 5).unwrap();
+        assert_eq!(book.timestamp, 1_788_396_668_372);
+    }
+
     #[test]
     fn place_batch_multi_per_order_results() {
         let (kucoin, mock) = signed_client(1000);

@@ -1981,6 +1981,27 @@ mod tests {
             .contains(r#""marginMode":"isolated""#));
     }
 
+    /// Bitget stamps both public reads. Payloads captured from the live
+    /// endpoints.
+    #[test]
+    fn the_public_reads_carry_the_venue_stamp() {
+        let (bitget, mock) = signed_client(1000);
+        mock.push_json(
+            200,
+            r#"{"code":"00000","msg":"success","data":[{"symbol":"BTCUSDT","lastPr":"77100.52","bidPr":"77100.51","askPr":"77100.52","baseVolume":"2886.70","ts":"1788396650211"}]}"#,
+        );
+        let ticker = bitget.ticker(&symbol()).unwrap();
+        assert_eq!(ticker.timestamp, 1_788_396_650_211);
+
+        let (bitget, mock) = signed_client(1000);
+        mock.push_json(
+            200,
+            r#"{"code":"00000","msg":"success","data":{"asks":[["77100.52","0.56"]],"bids":[["77100.51","0.37"]],"ts":"1788396651599"}}"#,
+        );
+        let book = bitget.order_book(&symbol(), 5).unwrap();
+        assert_eq!(book.timestamp, 1_788_396_651_599);
+    }
+
     #[test]
     fn place_batch_aligns_success_and_failure() {
         let (bitget, mock) = signed_client(1000);

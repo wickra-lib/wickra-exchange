@@ -858,6 +858,27 @@ mod tests {
     /// Upbit is spot-only and its order API carries no reduce-only flag, so a
     /// caller asking to reduce a position is asking for something this venue has
     /// no concept of. The client order id it *does* carry, as `identifier`.
+    /// Upbit stamps the ticker with `trade_timestamp` and the book with
+    /// `timestamp`. Payloads captured from the live endpoints.
+    #[test]
+    fn the_public_reads_carry_the_venue_stamp() {
+        let (upbit, mock) = signed_client(1000);
+        mock.push_json(
+            200,
+            r#"[{"market":"KRW-BTC","trade_timestamp":1788396652184,"trade_price":106112000.0,"acc_trade_volume_24h":123.4}]"#,
+        );
+        let ticker = upbit.ticker(&Symbol::new("BTC", "KRW")).unwrap();
+        assert_eq!(ticker.timestamp, 1_788_396_652_184);
+
+        let (upbit, mock) = signed_client(1000);
+        mock.push_json(
+            200,
+            r#"[{"market":"KRW-BTC","timestamp":1788396655466,"orderbook_units":[{"bid_price":106101000,"bid_size":0.002,"ask_price":106112000,"ask_size":0.06}]}]"#,
+        );
+        let book = upbit.order_book(&Symbol::new("BTC", "KRW"), 5).unwrap();
+        assert_eq!(book.timestamp, 1_788_396_655_466);
+    }
+
     #[test]
     fn spot_only_fields_are_refused_and_the_client_id_is_carried() {
         let (upbit, mock) = signed_client(1000);

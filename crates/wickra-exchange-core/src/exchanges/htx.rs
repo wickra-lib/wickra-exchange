@@ -2013,6 +2013,29 @@ mod tests {
         ));
     }
 
+    /// HTX stamps the envelope for the ticker and the `tick` for depth.
+    /// Payloads captured from the live endpoints.
+    #[test]
+    fn the_public_reads_carry_the_venue_stamp() {
+        let (htx, mock) = signed_client(1000);
+        mock.push_json(
+            200,
+            r#"{"ch":"market.btcusdt.detail.merged","status":"ok","ts":1788396667304,"tick":{"close":77072.07,"bid":[77072.06,0.0009],"ask":[77072.07,0.019],"vol":95769370.0}}"#,
+        );
+        let ticker = htx.ticker(&symbol()).unwrap();
+        assert_eq!(ticker.timestamp, 1_788_396_667_304);
+
+        let (htx, mock) = signed_client(1000);
+        mock.push_json(
+            200,
+            r#"{"ch":"market.btcusdt.depth.step0","status":"ok","ts":1788396667785,"tick":{"ts":1788396667002,"version":193172167185,"bids":[[77072.06,0.0009]],"asks":[[77072.07,0.019]]}}"#,
+        );
+        let book = htx.order_book(&symbol(), 5).unwrap();
+        // The `tick`'s own stamp, not the envelope's: the envelope says when the
+        // server replied, the tick says when the book was true.
+        assert_eq!(book.timestamp, 1_788_396_667_002);
+    }
+
     #[test]
     fn place_batch_reads_per_order_err_code() {
         let (htx, mock) = signed_client(0);

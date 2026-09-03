@@ -65,6 +65,17 @@ use crate::transport::{HttpMethod, HttpRequest, HttpResponse, HttpTransport};
 /// Binance's escalation for an IP that ignored a 429.
 const RATE_LIMIT_STATUSES: [u16; 2] = [429, 418];
 
+/// The tracing target for this layer, so a consumer can filter it on its own.
+///
+/// Each call below is written on one line: `llvm-cov` attributes a multi-line
+/// macro invocation with expression arguments across several lines and marks the
+/// continuation lines uncovered even when the call runs.
+///
+/// The request URL is deliberately not logged. Every field here already
+/// identifies the decision, and a signed URL carries its signature in the query
+/// string -- a log line is the last place that should end up.
+const TARGET: &str = "wickra_exchange_core::throttle";
+
 /// The cool-off applied when a venue rate-limits without saying for how long.
 const DEFAULT_COOL_OFF: Duration = Duration::from_secs(1);
 
@@ -163,12 +174,7 @@ impl ThrottledTransport {
             match advice {
                 Acquire::Allowed => return,
                 Acquire::Throttled { retry_after_ms } => {
-                    tracing::debug!(
-                        target: "wickra_exchange_core::throttle",
-                        retry_after_ms,
-                        url = %request.url,
-                        "request budget exhausted; waiting before sending"
-                    );
+                    tracing::debug!(target: TARGET, retry_after_ms, "budget exhausted; waiting");
                     (self.sleep)(millis(retry_after_ms));
                 }
             }
@@ -240,12 +246,7 @@ impl HttpTransport for ThrottledTransport {
             };
 
             if let Some(wait) = cool_off {
-                tracing::debug!(
-                    target: "wickra_exchange_core::throttle",
-                    wait_ms = wait.as_millis(),
-                    url = %request.url,
-                    "venue rate-limited the request; cooling off"
-                );
+                tracing::debug!(target: TARGET, wait_ms = wait.as_millis(), "venue rate-limited; cooling off");
                 self.note_cool_off(wait);
             }
 
@@ -253,22 +254,11 @@ impl HttpTransport for ThrottledTransport {
                 // The distinction that matters most in a log: this request may
                 // already have been executed, so it is not repeated, and the
                 // caller is left to reconcile.
-                tracing::warn!(
-                    target: "wickra_exchange_core::throttle",
-                    method = ?request.method,
-                    url = %request.url,
-                    "not repeating a request the venue may have executed; \
-                     reconcile the order state"
-                );
+                tracing::warn!(target: TARGET, method = ?request.method, "not repeating a request the venue may have executed; reconcile the order state");
                 return outcome;
             }
             if !self.backoff.should_retry(attempt) {
-                tracing::debug!(
-                    target: "wickra_exchange_core::throttle",
-                    attempt,
-                    url = %request.url,
-                    "retry budget exhausted; returning the outcome"
-                );
+                tracing::debug!(target: TARGET, attempt, "retry budget exhausted; returning the outcome");
                 return outcome;
             }
 
@@ -277,14 +267,7 @@ impl HttpTransport for ThrottledTransport {
             let delay = cool_off.unwrap_or_else(|| {
                 Duration::from_millis(self.backoff.jittered_delay_ms(attempt, (self.jitter)()))
             });
-            tracing::debug!(
-                target: "wickra_exchange_core::throttle",
-                attempt,
-                delay_ms = delay.as_millis(),
-                venue_advised = cool_off.is_some(),
-                url = %request.url,
-                "retrying after delay"
-            );
+            tracing::debug!(target: TARGET, attempt, delay_ms = delay.as_millis(), venue_advised = cool_off.is_some(), "retrying after delay");
             (self.sleep)(delay);
             attempt += 1;
         }
