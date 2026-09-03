@@ -29,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   | Java | `withExactQuantity` / `withExactPrice` / `withExactStopPrice` as `BigDecimal` |
   | Go | `QuantityText` / `PriceText` / `StopPriceText` |
   | R | `quantity_text` / `price_text` / `stop_price_text` |
+  | WASM | a string, beside a number — the offline simulators take one too |
 
   Nothing that exists today changes: a request built without them behaves
   exactly as it did, and the ABI reads the double beside a null pointer. Text
