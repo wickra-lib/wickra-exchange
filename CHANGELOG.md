@@ -83,6 +83,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **HTX's WebSocket stream had never delivered a single event.** Every frame HTX
+  sends — spot and futures, public and private — is gzip-compressed, and the
+  transport forwarded a binary frame only when its bytes happened to be valid
+  UTF-8. Gzip never is: it begins `1f 8b`. So `recv` returned nothing, for as
+  long as anyone waited, with no error and no disconnect. Verified against the
+  live socket: six frames, zero valid UTF-8.
+
+  Its 500-odd unit tests passed the whole time, because `MockWsTransport` hands
+  the parser plain JSON and a real frame never reached it. That is the same
+  shape as everything else this round found — the mock agrees with the parser,
+  and neither has met the venue.
+
+  The transport now decompresses a gzip frame and forwards the text; anything
+  that is neither gzip nor UTF-8 is still dropped, since there is nothing to
+  hand a parser that speaks text.
+
+- **HTX closed the stream because nothing answered its heartbeat.** The public
+  socket sends `{"ping": <ms>}` and the private v2 socket
+  `{"action":"ping",...}`; both were discarded as unrecognised, since neither
+  carries a `ch`. HTX closes a connection that does not reply — and the reconnect
+  opened another socket that was closed for the same reason, so even with the
+  frames readable the stream would have reconnected forever and delivered
+  nothing. Both heartbeats are now answered with the value the venue sent.
+
 - **On four venues a futures client watched the spot market.** KuCoin, Gate, HTX
   and Kraken each opened one hardcoded *spot* socket and sent spot channels,
   whatever market the client was built for. A futures client therefore read
