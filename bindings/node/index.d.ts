@@ -100,12 +100,11 @@ export declare class Exchange {
   pollEvents(): Array<StreamEvent>
 }
 
-/** An order request, built with the market/limit factory methods. */
 export declare class OrderRequest {
-  static marketBuy(market: string, quantity: number): OrderRequest
-  static marketSell(market: string, quantity: number): OrderRequest
-  static limitBuy(market: string, quantity: number, price: number): OrderRequest
-  static limitSell(market: string, quantity: number, price: number): OrderRequest
+  static marketBuy(market: string, quantity: number | string): OrderRequest
+  static marketSell(market: string, quantity: number | string): OrderRequest
+  static limitBuy(market: string, quantity: number | string, price: number | string): OrderRequest
+  static limitSell(market: string, quantity: number | string, price: number | string): OrderRequest
   /**
    * Rest until the market reaches `stopPrice`, then fire.
    *
@@ -113,7 +112,7 @@ export declare class OrderRequest {
    * a stop-limit. Without it the four factories above were the whole surface,
    * so a stop order could not be expressed from Node at all.
    */
-  withStopPrice(stopPrice: number): OrderRequest
+  withStopPrice(stopPrice: number | string): OrderRequest
   /**
    * `"GTC"` (rest until cancelled), `"IOC"` (fill what is possible now,
    * cancel the rest) or `"FOK"` (fill entirely now or not at all).
@@ -127,6 +126,16 @@ export declare class OrderRequest {
    * venue as the same order rather than placed twice.
    */
   withClientOrderId(id: string): OrderRequest
+  /**
+   * The request with its numbers written exactly.
+   *
+   * Every other number this binding reports is a JS number, which is the
+   * right shape for market data and the wrong one for answering "which
+   * number is in this order". An order kept in an exact decimal that can
+   * only be read back through a double cannot be checked, so this reads it
+   * back as text.
+   */
+  describe(): string
   /** Close-only: the order may not increase a position. */
   reduceOnly(): OrderRequest
   /** Maker-only: the order is cancelled rather than crossing the spread. */
