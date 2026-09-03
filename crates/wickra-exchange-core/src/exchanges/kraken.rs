@@ -1308,8 +1308,7 @@ impl Kraken {
             // A trigger is its own order type here, so it is matched before
             // the plain forms. Falling through to `mkt` would send the order
             // with no trigger at all -- the stop-loss that executes at once.
-            (OrderType::StopMarket, _, _) => "stp",
-            (OrderType::StopLimit, _, _) => "stp",
+            (OrderType::StopMarket | OrderType::StopLimit, _, _) => "stp",
             (OrderType::Market, _, _) => "mkt",
             (OrderType::Limit, TimeInForce::Ioc, false) => "ioc",
             (OrderType::Limit, TimeInForce::Gtc, true) => "post",
@@ -2896,7 +2895,7 @@ mod tests {
 
     /// The futures path must not flatten a trigger into a plain market order.
     ///
-    /// Kraken Futures spells a trigger as its own `orderType`, so a StopMarket
+    /// Kraken Futures spells a trigger as its own `orderType`, so a `StopMarket`
     /// that fell through to the `mkt` arm would go out with no trigger at all --
     /// the stop-loss that executes at once, at the price it existed to protect
     /// against.
