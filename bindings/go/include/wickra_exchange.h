@@ -349,6 +349,12 @@ typedef struct {
      * Rolling base-asset volume.
      */
     double volume;
+    /**
+     * Venue timestamp in milliseconds since the Unix epoch, or 0 when the
+     * venue published none. Appended at the end of the struct so the offsets
+     * of every field before it are unchanged.
+     */
+    int64_t timestamp;
 } WickraTicker;
 
 /**

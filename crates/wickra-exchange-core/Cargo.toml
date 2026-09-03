@@ -16,6 +16,7 @@ description = "Core traits, types and shared connectivity machinery for wickra-e
 wickra-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tracing = { workspace = true }
 thiserror = { workspace = true }
 rust_decimal = { workspace = true }
 zeroize = { workspace = true }

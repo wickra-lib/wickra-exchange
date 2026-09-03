@@ -325,6 +325,15 @@ pub struct Ticker {
     pub ask: Decimal,
     /// Rolling base-asset volume.
     pub volume: Decimal,
+    /// Venue timestamp (milliseconds since the Unix epoch), or `0` when the
+    /// venue did not supply one.
+    ///
+    /// Without this a consumer cannot tell how old a quote is, which is the
+    /// difference between acting on the market and acting on a memory of it. A
+    /// venue that publishes no timestamp reports `0` rather than the local
+    /// clock: a locally-stamped quote looks fresh by construction, which is the
+    /// one thing a staleness check must never be told.
+    pub timestamp: i64,
 }
 
 /// A one-cancels-other (OCO) order: a take-profit limit leg paired with a

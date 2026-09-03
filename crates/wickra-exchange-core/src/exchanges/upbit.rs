@@ -146,6 +146,10 @@ impl Upbit {
             bid: last,
             ask: last,
             volume: decimal_field(entry, "acc_trade_volume_24h").unwrap_or(Decimal::ZERO),
+            timestamp: entry
+                .get("trade_timestamp")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0),
         })
     }
 
@@ -198,6 +202,10 @@ impl Upbit {
             last_update_id: 0,
             bids,
             asks,
+            timestamp: entry
+                .get("timestamp")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0),
         })
     }
 
@@ -716,6 +724,10 @@ fn parse_ws_message(text: &str) -> Result<Option<Event>> {
             bid: decimal_field(&value, "trade_price").unwrap_or(Decimal::ZERO),
             ask: decimal_field(&value, "trade_price").unwrap_or(Decimal::ZERO),
             volume: decimal_field(&value, "acc_trade_volume_24h").unwrap_or(Decimal::ZERO),
+            timestamp: value
+                .get("trade_timestamp")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0),
         }))),
         "orderbook" => {
             let units = value
@@ -740,6 +752,10 @@ fn parse_ws_message(text: &str) -> Result<Option<Event>> {
                 last_update_id: 0,
                 bids,
                 asks,
+                timestamp: value
+                    .get("timestamp")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0),
             })))
         }
         _ => Ok(None),

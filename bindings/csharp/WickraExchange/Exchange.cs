@@ -125,7 +125,12 @@ public sealed record EventInfo(EventKind Kind, string? Symbol, double? Price, do
 }
 
 /// <summary>A point-in-time ticker snapshot.</summary>
-public sealed record TickerInfo(string Symbol, double Last, double Bid, double Ask, double Volume);
+/// <summary>A point-in-time quote.</summary>
+/// <param name="Timestamp">The venue own stamp in milliseconds since the Unix
+/// epoch, or 0 when the venue published none -- never the local clock, since a
+/// locally stamped quote looks fresh by construction.</param>
+public sealed record TickerInfo(string Symbol, double Last, double Bid, double Ask, double Volume,
+    long Timestamp);
 
 /// <summary>A single OHLCV candle.</summary>
 public sealed record CandleInfo(double Open, double High, double Low, double Close, double Volume, long Timestamp);
@@ -608,7 +613,7 @@ public sealed unsafe class Exchange : IDisposable
     internal static TickerInfo ReadTicker(Native.Ticker t)
     {
         var symbol = CString(new Span<byte>(t.Symbol, Native.StrCap));
-        return new TickerInfo(symbol, t.Last, t.Bid, t.Ask, t.Volume);
+        return new TickerInfo(symbol, t.Last, t.Bid, t.Ask, t.Volume, t.Timestamp);
     }
 
     internal static EventInfo ReadEvent(Native.Event ev)

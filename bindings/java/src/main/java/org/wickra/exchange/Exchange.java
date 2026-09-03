@@ -40,7 +40,15 @@ public final class Exchange implements AutoCloseable {
     }
 
     /** A point-in-time ticker snapshot. */
-    public record TickerInfo(String symbol, double last, double bid, double ask, double volume) {}
+    /**
+     * A point-in-time quote.
+     *
+     * <p>{@code timestamp} is the venue's own stamp in milliseconds since the
+     * Unix epoch, or 0 when the venue published none -- never the local clock,
+     * since a locally stamped quote looks fresh by construction.
+     */
+    public record TickerInfo(String symbol, double last, double bid, double ask, double volume,
+                             long timestamp) {}
 
     /** A single OHLCV candle. */
     public record CandleInfo(double open, double high, double low, double close,
@@ -458,7 +466,8 @@ public final class Exchange implements AutoCloseable {
         double bid = ticker.get(ValueLayout.JAVA_DOUBLE, Native.T_BID);
         double ask = ticker.get(ValueLayout.JAVA_DOUBLE, Native.T_ASK);
         double volume = ticker.get(ValueLayout.JAVA_DOUBLE, Native.T_VOLUME);
-        return new TickerInfo(symbol, last, bid, ask, volume);
+        long timestamp = ticker.get(ValueLayout.JAVA_LONG, Native.T_TIMESTAMP);
+        return new TickerInfo(symbol, last, bid, ask, volume, timestamp);
     }
 
     static CandleInfo readCandle(MemorySegment candle) {

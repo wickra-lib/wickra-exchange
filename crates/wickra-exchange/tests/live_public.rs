@@ -81,12 +81,26 @@ fn check<T>(venue: &str, what: &str, outcome: Result<T, Error>) -> bool {
     }
 }
 
+/// Whether this venue stamps its public reads, checked against the live API
+/// when these were written.
+///
+/// A venue listed here that stops sending a timestamp is drift as surely as a
+/// renamed price field, and the offline fixtures cannot notice: they contain
+/// whatever the author put in them. A venue *not* listed reports `0`, and that
+/// is recorded rather than assumed -- Gate, Bybit and Kraken publish no stamp on
+/// these endpoints, and Coinbase's need a key.
+#[derive(Clone, Copy)]
+struct Stamps {
+    ticker: bool,
+    order_book: bool,
+}
+
 /// The public market-data surface, against the live venue.
 ///
 /// `ticker`, `klines` and `order_book` are the three public reads every client
 /// implements, and between them they exercise most of each venue's response
 /// shapes: a scalar quote, an array of candles, and two arrays of levels.
-fn public_reads(venue: &str, symbol: &Symbol) {
+fn public_reads(venue: &str, symbol: &Symbol, stamps: Stamps) {
     let options = ExchangeOptions::mainnet(MarketType::Spot);
     let Ok(mut client) = connect(venue, anonymous(), &options) else {
         panic!("{venue}: the factory could not build a client");
@@ -94,9 +108,35 @@ fn public_reads(venue: &str, symbol: &Symbol) {
 
     eprintln!("{venue}:");
     let mut reached = 0;
-    reached += usize::from(check(venue, "ticker", client.ticker(symbol)));
+
+    let ticker = client.ticker(symbol);
+    if let Ok(quote) = &ticker {
+        assert_eq!(
+            quote.timestamp > 0,
+            stamps.ticker,
+            "{venue}: ticker timestamp presence changed -- expected stamped={}, \
+             got {}. Either the venue changed what it sends, or the parser \
+             stopped reading it.",
+            stamps.ticker,
+            quote.timestamp
+        );
+    }
+    reached += usize::from(check(venue, "ticker", ticker));
+
     reached += usize::from(check(venue, "klines", client.klines(symbol, "1m", 5)));
-    reached += usize::from(check(venue, "order_book", client.order_book(symbol, 5)));
+
+    let book = client.order_book(symbol, 5);
+    if let Ok(snapshot) = &book {
+        assert_eq!(
+            snapshot.timestamp > 0,
+            stamps.order_book,
+            "{venue}: order-book timestamp presence changed -- expected \
+             stamped={}, got {}",
+            stamps.order_book,
+            snapshot.timestamp
+        );
+    }
+    reached += usize::from(check(venue, "order_book", book));
 
     if reached == 0 {
         eprintln!("  {venue}: unreachable from this runner; nothing was verified");
@@ -110,43 +150,95 @@ fn usdt(base: &str) -> Symbol {
 #[test]
 #[ignore = "hits the live venue; run explicitly with --ignored"]
 fn binance_public_reads_parse() {
-    public_reads("binance", &usdt("BTC"));
+    public_reads(
+        "binance",
+        &usdt("BTC"),
+        // Spot depth carries no timestamp; the 24h ticker carries `closeTime`.
+        Stamps {
+            ticker: true,
+            order_book: false,
+        },
+    );
 }
 
 #[test]
 #[ignore = "hits the live venue; run explicitly with --ignored"]
 fn bybit_public_reads_parse() {
-    public_reads("bybit", &usdt("BTC"));
+    public_reads(
+        "bybit",
+        &usdt("BTC"),
+        // The ticker list entries carry none; the book result carries `ts`.
+        Stamps {
+            ticker: false,
+            order_book: true,
+        },
+    );
 }
 
 #[test]
 #[ignore = "hits the live venue; run explicitly with --ignored"]
 fn okx_public_reads_parse() {
-    public_reads("okx", &usdt("BTC"));
+    public_reads(
+        "okx",
+        &usdt("BTC"),
+        Stamps {
+            ticker: true,
+            order_book: true,
+        },
+    );
 }
 
 #[test]
 #[ignore = "hits the live venue; run explicitly with --ignored"]
 fn bitget_public_reads_parse() {
-    public_reads("bitget", &usdt("BTC"));
+    public_reads(
+        "bitget",
+        &usdt("BTC"),
+        Stamps {
+            ticker: true,
+            order_book: true,
+        },
+    );
 }
 
 #[test]
 #[ignore = "hits the live venue; run explicitly with --ignored"]
 fn kucoin_public_reads_parse() {
-    public_reads("kucoin", &usdt("BTC"));
+    public_reads(
+        "kucoin",
+        &usdt("BTC"),
+        Stamps {
+            ticker: true,
+            order_book: true,
+        },
+    );
 }
 
 #[test]
 #[ignore = "hits the live venue; run explicitly with --ignored"]
 fn gate_public_reads_parse() {
-    public_reads("gateio", &usdt("BTC"));
+    public_reads(
+        "gateio",
+        &usdt("BTC"),
+        // Gate stamps the book (`update`) but not the ticker.
+        Stamps {
+            ticker: false,
+            order_book: true,
+        },
+    );
 }
 
 #[test]
 #[ignore = "hits the live venue; run explicitly with --ignored"]
 fn htx_public_reads_parse() {
-    public_reads("htx", &usdt("BTC"));
+    public_reads(
+        "htx",
+        &usdt("BTC"),
+        Stamps {
+            ticker: true,
+            order_book: true,
+        },
+    );
 }
 
 /// Kraken quotes BTC against USD and spells the asset `XBT` on the wire; the
@@ -154,14 +246,29 @@ fn htx_public_reads_parse() {
 #[test]
 #[ignore = "hits the live venue; run explicitly with --ignored"]
 fn kraken_public_reads_parse() {
-    public_reads("kraken", &Symbol::new("BTC", "USD"));
+    public_reads(
+        "kraken",
+        &Symbol::new("BTC", "USD"),
+        // Kraken stamps individual depth levels, never the book or quote.
+        Stamps {
+            ticker: false,
+            order_book: false,
+        },
+    );
 }
 
 /// Coinbase Advanced Trade quotes against USD.
 #[test]
 #[ignore = "hits the live venue; run explicitly with --ignored"]
 fn coinbase_public_reads_parse() {
-    public_reads("coinbase", &Symbol::new("BTC", "USD"));
+    public_reads(
+        "coinbase",
+        &Symbol::new("BTC", "USD"),
+        Stamps {
+            ticker: false,
+            order_book: false,
+        },
+    );
 }
 
 /// Upbit is a KRW venue and spells its markets quote-first (`KRW-BTC`), which
@@ -169,5 +276,12 @@ fn coinbase_public_reads_parse() {
 #[test]
 #[ignore = "hits the live venue; run explicitly with --ignored"]
 fn upbit_public_reads_parse() {
-    public_reads("upbit", &Symbol::new("BTC", "KRW"));
+    public_reads(
+        "upbit",
+        &Symbol::new("BTC", "KRW"),
+        Stamps {
+            ticker: true,
+            order_book: true,
+        },
+    );
 }

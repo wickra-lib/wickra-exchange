@@ -233,6 +233,9 @@ impl Gate {
             bid: parse_decimal(&entry.highest_bid)?,
             ask: parse_decimal(&entry.lowest_ask)?,
             volume: parse_decimal(&entry.base_volume)?,
+            // Gate's spot ticker carries no timestamp; verified against the
+            // live endpoint.
+            timestamp: 0,
         })
     }
 
@@ -256,6 +259,8 @@ impl Gate {
             bid: book.bids.first().map_or(Decimal::ZERO, |l| l.price),
             ask: book.asks.first().map_or(Decimal::ZERO, |l| l.price),
             volume: parse_decimal(&entry.volume_24h_base)?,
+            // Gate's futures ticker carries no timestamp either.
+            timestamp: 0,
         })
     }
 
@@ -299,6 +304,7 @@ impl Gate {
                 last_update_id: raw.id,
                 bids: parse_futures_levels(&raw.bids)?,
                 asks: parse_futures_levels(&raw.asks)?,
+                timestamp: 0,
             });
         }
         let query = format!("currency_pair={}&limit={depth}", Self::wire_symbol(symbol));
@@ -309,6 +315,9 @@ impl Gate {
             last_update_id: raw.update,
             bids: parse_levels(&raw.bids)?,
             asks: parse_levels(&raw.asks)?,
+            // `update` is the book's own last-change time in milliseconds,
+            // which is also what the client uses as the sequence id.
+            timestamp: i64::try_from(raw.update).unwrap_or(0),
         })
     }
 
@@ -1219,6 +1228,7 @@ fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Vec
             bid: dec_or_zero(opt_str(result, "highest_bid")),
             ask: dec_or_zero(opt_str(result, "lowest_ask")),
             volume: dec_or_zero(opt_str(result, "base_volume")),
+            timestamp: 0,
         })]),
         "spot.order_book_update" => {
             let update_id = opt_u64(result, "u");
@@ -1228,6 +1238,7 @@ fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Vec
                 final_update_id: update_id,
                 bids: parse_ws_levels(result.get("b"))?,
                 asks: parse_ws_levels(result.get("a"))?,
+                timestamp: opt_u64(result, "t").try_into().unwrap_or(0),
             })])
         }
         // Private order channel: `result` is an array of order objects, each

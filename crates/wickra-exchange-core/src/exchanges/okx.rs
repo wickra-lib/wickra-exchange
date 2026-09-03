@@ -262,6 +262,7 @@ impl Okx {
             bid: parse_decimal(&entry.bid_px)?,
             ask: parse_decimal(&entry.ask_px)?,
             volume: parse_decimal(&entry.vol24h)?,
+            timestamp: entry.ts.parse().unwrap_or(0),
         })
     }
 
@@ -303,6 +304,7 @@ impl Okx {
             last_update_id: raw.ts.parse().unwrap_or(0),
             bids: parse_levels(&raw.bids)?,
             asks: parse_levels(&raw.asks)?,
+            timestamp: raw.ts.parse().unwrap_or(0),
         })
     }
 
@@ -1111,6 +1113,7 @@ fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Vec
                     bid: dec_or_zero(opt_str(t, "bidPx")),
                     ask: dec_or_zero(opt_str(t, "askPx")),
                     volume: dec_or_zero(opt_str(t, "vol24h")),
+                    timestamp: opt_str(t, "ts").parse().unwrap_or(0),
                 }))
             })
             .collect()
@@ -1128,6 +1131,7 @@ fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Vec
                         last_update_id: update_id,
                         bids,
                         asks,
+                        timestamp: i64::try_from(update_id).unwrap_or(0),
                     }))
                 } else {
                     Ok(Event::BookDelta(BookDelta {
@@ -1136,6 +1140,7 @@ fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Vec
                         final_update_id: update_id,
                         bids,
                         asks,
+                        timestamp: i64::try_from(update_id).unwrap_or(0),
                     }))
                 }
             })
@@ -1201,6 +1206,9 @@ struct RawTicker {
     #[serde(rename = "askPx")]
     ask_px: String,
     vol24h: String,
+    /// OKX stamps every ticker; verified against the live endpoint.
+    #[serde(default)]
+    ts: String,
 }
 
 #[derive(Deserialize)]

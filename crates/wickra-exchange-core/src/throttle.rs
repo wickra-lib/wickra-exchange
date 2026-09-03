@@ -37,6 +37,21 @@
 //! plus a code in their JSON envelope, which only the venue client can read —
 //! for those, the reactive cool-off below does not engage, and the proactive
 //! budget is what protects them.
+//!
+//! # What it says while doing it
+//!
+//! Everything above is invisible from outside: a caller that waited two seconds
+//! cannot tell whether the budget held it, the venue refused it, or the network
+//! dropped it, and those three call for different fixes. So each decision is
+//! traced through the [`tracing`] facade, on the `wickra_exchange_core::throttle`
+//! target:
+//!
+//! * `debug` — a budget wait, a venue cool-off, a retry and its delay
+//! * `warn` — a repeat refused because the method is not safe to repeat, which
+//!   is the case where a caller is left holding an order it cannot account for
+//!
+//! `tracing` costs a relaxed atomic load when no subscriber is installed, so a
+//! consumer that wants none pays for none.
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -148,6 +163,12 @@ impl ThrottledTransport {
             match advice {
                 Acquire::Allowed => return,
                 Acquire::Throttled { retry_after_ms } => {
+                    tracing::debug!(
+                        target: "wickra_exchange_core::throttle",
+                        retry_after_ms,
+                        url = %request.url,
+                        "request budget exhausted; waiting before sending"
+                    );
                     (self.sleep)(millis(retry_after_ms));
                 }
             }
@@ -219,12 +240,35 @@ impl HttpTransport for ThrottledTransport {
             };
 
             if let Some(wait) = cool_off {
+                tracing::debug!(
+                    target: "wickra_exchange_core::throttle",
+                    wait_ms = wait.as_millis(),
+                    url = %request.url,
+                    "venue rate-limited the request; cooling off"
+                );
                 self.note_cool_off(wait);
             }
 
-            if !may_repeat(request.method, cool_off.is_some())
-                || !self.backoff.should_retry(attempt)
-            {
+            if !may_repeat(request.method, cool_off.is_some()) {
+                // The distinction that matters most in a log: this request may
+                // already have been executed, so it is not repeated, and the
+                // caller is left to reconcile.
+                tracing::warn!(
+                    target: "wickra_exchange_core::throttle",
+                    method = ?request.method,
+                    url = %request.url,
+                    "not repeating a request the venue may have executed; \
+                     reconcile the order state"
+                );
+                return outcome;
+            }
+            if !self.backoff.should_retry(attempt) {
+                tracing::debug!(
+                    target: "wickra_exchange_core::throttle",
+                    attempt,
+                    url = %request.url,
+                    "retry budget exhausted; returning the outcome"
+                );
                 return outcome;
             }
 
@@ -233,6 +277,14 @@ impl HttpTransport for ThrottledTransport {
             let delay = cool_off.unwrap_or_else(|| {
                 Duration::from_millis(self.backoff.jittered_delay_ms(attempt, (self.jitter)()))
             });
+            tracing::debug!(
+                target: "wickra_exchange_core::throttle",
+                attempt,
+                delay_ms = delay.as_millis(),
+                venue_advised = cool_off.is_some(),
+                url = %request.url,
+                "retrying after delay"
+            );
             (self.sleep)(delay);
             attempt += 1;
         }

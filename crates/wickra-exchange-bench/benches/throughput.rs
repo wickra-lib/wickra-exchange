@@ -89,6 +89,7 @@ fn bench_orderbook_diff(c: &mut Criterion) {
         last_update_id: 1,
         bids: book_levels(20000, 50, true),
         asks: book_levels(20001, 50, false),
+        timestamp: 0,
     };
     let delta = BookDelta {
         symbol: symbol.clone(),
@@ -96,6 +97,7 @@ fn bench_orderbook_diff(c: &mut Criterion) {
         final_update_id: 3,
         bids: book_levels(19995, 10, true),
         asks: book_levels(20005, 10, false),
+        timestamp: 0,
     };
     let mut group = c.benchmark_group("orderbook");
     group.bench_function("apply_snapshot", |b| {

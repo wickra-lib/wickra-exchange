@@ -107,13 +107,17 @@ static SEXP event_to_list(const WickraEvent *event) {
 }
 
 static SEXP ticker_to_list(const WickraTicker *t) {
-    const char *names[] = {"symbol", "last", "bid", "ask", "volume", ""};
+    const char *names[] = {"symbol", "last", "bid", "ask", "volume", "timestamp", ""};
     SEXP out = PROTECT(Rf_mkNamed(VECSXP, names));
     SET_VECTOR_ELT(out, 0, Rf_mkString(t->symbol));
     SET_VECTOR_ELT(out, 1, Rf_ScalarReal(t->last));
     SET_VECTOR_ELT(out, 2, Rf_ScalarReal(t->bid));
     SET_VECTOR_ELT(out, 3, Rf_ScalarReal(t->ask));
     SET_VECTOR_ELT(out, 4, Rf_ScalarReal(t->volume));
+    /* The venue's own stamp in milliseconds, or 0 when it published none. R has
+       no 64-bit integer, so this rides as a double -- exact to 2^53 ms, which is
+       roughly 285,000 years. */
+    SET_VECTOR_ELT(out, 5, Rf_ScalarReal((double)t->timestamp));
     UNPROTECT(1);
     return out;
 }

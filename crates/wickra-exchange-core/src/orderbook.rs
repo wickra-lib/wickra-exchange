@@ -33,6 +33,10 @@ pub struct OrderBookBuilder {
     bids: BTreeMap<Decimal, Decimal>,
     asks: BTreeMap<Decimal, Decimal>,
     last_update_id: u64,
+    /// The venue stamp of the most recent frame folded in, so a snapshot taken
+    /// from the builder reports how fresh the book actually is rather than when
+    /// it happened to be read.
+    timestamp: i64,
     initialized: bool,
 }
 
@@ -45,6 +49,7 @@ impl OrderBookBuilder {
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
             last_update_id: 0,
+            timestamp: 0,
             initialized: false,
         }
     }
@@ -82,6 +87,7 @@ impl OrderBookBuilder {
             .map(|l| (l.price, l.quantity))
             .collect();
         self.last_update_id = snapshot.last_update_id;
+        self.timestamp = snapshot.timestamp;
         self.initialized = true;
     }
 
@@ -109,6 +115,7 @@ impl OrderBookBuilder {
             apply_level(&mut self.asks, level);
         }
         self.last_update_id = delta.final_update_id;
+        self.timestamp = delta.timestamp;
         BookUpdate::Applied
     }
 
@@ -163,6 +170,9 @@ impl OrderBookBuilder {
             last_update_id: self.last_update_id,
             bids,
             asks,
+            // The builder folds deltas into a book; the freshest thing it knows
+            // is the stamp on the last delta it applied.
+            timestamp: self.timestamp,
         }
     }
 }
@@ -197,6 +207,7 @@ mod tests {
                 BookLevel::new(dec!(101), dec!(1)),
                 BookLevel::new(dec!(102), dec!(3)),
             ],
+            timestamp: 0,
         }
     }
 
@@ -210,6 +221,7 @@ mod tests {
             final_update_id: 2,
             bids: vec![],
             asks: vec![],
+            timestamp: 0,
         };
         assert_eq!(book.apply_delta(&delta), BookUpdate::Uninitialized);
     }
@@ -238,6 +250,7 @@ mod tests {
             // Improve the bid, remove the top ask.
             bids: vec![BookLevel::new(dec!(100.5), dec!(5))],
             asks: vec![BookLevel::new(dec!(101), dec!(0))],
+            timestamp: 0,
         };
         assert_eq!(book.apply_delta(&delta), BookUpdate::Applied);
         assert_eq!(book.last_update_id(), 12);
@@ -255,6 +268,7 @@ mod tests {
             final_update_id: 9,
             bids: vec![BookLevel::new(dec!(100), dec!(99))],
             asks: vec![],
+            timestamp: 0,
         };
         assert_eq!(book.apply_delta(&delta), BookUpdate::Stale);
         // Unchanged.
@@ -273,6 +287,7 @@ mod tests {
             final_update_id: 14,
             bids: vec![],
             asks: vec![],
+            timestamp: 0,
         };
         assert_eq!(book.apply_delta(&delta), BookUpdate::Gap);
         assert!(!book.is_initialized());

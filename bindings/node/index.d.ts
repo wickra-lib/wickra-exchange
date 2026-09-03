@@ -262,6 +262,12 @@ export interface TickerInfo {
   bid: number
   ask: number
   volume: number
+  /**
+   * The venue's own stamp in milliseconds since the Unix epoch, or 0 when
+   * the venue published none -- never the local clock, since a locally
+   * stamped quote looks fresh by construction.
+   */
+  timestamp: number
 }
 
 /** Library version (matches the Rust crate version). */

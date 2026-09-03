@@ -271,6 +271,10 @@ pub struct WickraTicker {
     pub ask: f64,
     /// Rolling base-asset volume.
     pub volume: f64,
+    /// Venue timestamp in milliseconds since the Unix epoch, or 0 when the
+    /// venue published none. Appended at the end of the struct so the offsets
+    /// of every field before it are unchanged.
+    pub timestamp: i64,
 }
 
 /// A single OHLCV candle (C-ABI mirror of `Candle`).
@@ -524,6 +528,7 @@ fn fill_ticker(dst: &mut WickraTicker, ticker: &Ticker) {
     dst.bid = to_float(ticker.bid);
     dst.ask = to_float(ticker.ask);
     dst.volume = to_float(ticker.volume);
+    dst.timestamp = ticker.timestamp;
 }
 
 fn fill_candle(dst: &mut WickraCandle, candle: &Candle) {
@@ -2250,6 +2255,48 @@ mod tests {
     /// the C# one by field order, so a field inserted in the middle would move
     /// what those bindings read without any of them failing to compile. This is
     /// the test that fails instead.
+    /// The venue stamp survives the ABI crossing.
+    ///
+    ///  is read by Java at a hand-written byte offset and by C# by
+    /// field order, so a stamp that stopped being written here would be read as
+    /// whatever sat at that address -- silently, and as a plausible number.
+    #[test]
+    fn a_ticker_carries_its_venue_stamp_across_the_abi() {
+        use core::mem::{offset_of, size_of};
+
+        // Appended at the end, so every offset before it is untouched.
+        assert_eq!(size_of::<WickraTicker>(), 104);
+        assert_eq!(offset_of!(WickraTicker, volume), 88);
+        assert_eq!(offset_of!(WickraTicker, timestamp), 96);
+
+        let ticker = Ticker {
+            symbol: Symbol::new("BTC", "USDT"),
+            last: Decimal::from(20_000),
+            bid: Decimal::from(19_999),
+            ask: Decimal::from(20_001),
+            volume: Decimal::from(5),
+            timestamp: 1_700_000_000_000,
+        };
+        let mut out = WickraTicker {
+            symbol: [0; WICKRA_STR_CAP],
+            last: 0.0,
+            bid: 0.0,
+            ask: 0.0,
+            volume: 0.0,
+            timestamp: 0,
+        };
+        fill_ticker(&mut out, &ticker);
+        assert_eq!(out.timestamp, 1_700_000_000_000);
+
+        // A venue that published none reports zero, not the local clock.
+        let unstamped = Ticker {
+            timestamp: 0,
+            ..ticker
+        };
+        fill_ticker(&mut out, &unstamped);
+        assert_eq!(out.timestamp, 0);
+    }
+
     #[test]
     fn the_request_layout_is_what_the_bindings_assume() {
         use core::mem::{align_of, offset_of, size_of};
@@ -2496,6 +2543,7 @@ mod tests {
                 bid: 0.0,
                 ask: 0.0,
                 volume: -1.0,
+                timestamp: 0,
             };
             assert_eq!(
                 wickra_exchange_ticker(ex, market.as_ptr(), &raw mut ticker),
@@ -2632,6 +2680,7 @@ mod tests {
                 bid: 0.0,
                 ask: 0.0,
                 volume: 0.0,
+                timestamp: 0,
             };
             assert_eq!(
                 wickra_exchange_ticker(core::ptr::null_mut(), market.as_ptr(), &raw mut ticker),

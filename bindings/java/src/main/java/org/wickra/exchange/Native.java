@@ -97,12 +97,13 @@ final class Native {
     static final long E_ORDER = 96;
 
     // WickraTicker field offsets (repr(C), 8-aligned; total 96 bytes).
-    static final long TICKER_SIZE = 96;
+    static final long TICKER_SIZE = 104;
     static final long T_SYMBOL = 0;
     static final long T_LAST = 64;
     static final long T_BID = 72;
     static final long T_ASK = 80;
     static final long T_VOLUME = 88;
+    static final long T_TIMESTAMP = 96;
 
     // WickraCandle field offsets (repr(C), 8-aligned; total 48 bytes).
     static final long CANDLE_SIZE = 48;

@@ -232,6 +232,7 @@ mod tests {
             last_update_id: 1,
             bids: vec![BookLevel::new(dec!(100), dec!(1))],
             asks: vec![BookLevel::new(dec!(102), dec!(1))],
+            timestamp: 0,
         });
         let mut ex = ReplayExchange::with_paper(vec![snapshot], paper);
         ex.poll_events();

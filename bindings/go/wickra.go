@@ -126,6 +126,9 @@ type Ticker struct {
 	Bid    float64
 	Ask    float64
 	Volume float64
+	// Timestamp is the venue's own stamp in milliseconds since the Unix epoch,
+	// or 0 when the venue published none.
+	Timestamp int64
 }
 
 // Candle is a single OHLCV bar.
@@ -554,11 +557,12 @@ func readPosition(p *C.WickraPosition) Position {
 
 func readTicker(t *C.WickraTicker) Ticker {
 	return Ticker{
-		Symbol: C.GoString(&t.symbol[0]),
-		Last:   float64(t.last),
-		Bid:    float64(t.bid),
-		Ask:    float64(t.ask),
-		Volume: float64(t.volume),
+		Symbol:    C.GoString(&t.symbol[0]),
+		Last:      float64(t.last),
+		Bid:       float64(t.bid),
+		Ask:       float64(t.ask),
+		Volume:    float64(t.volume),
+		Timestamp: int64(t.timestamp),
 	}
 }
 

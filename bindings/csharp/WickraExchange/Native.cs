@@ -165,6 +165,7 @@ internal static unsafe class Native
         public double Bid;
         public double Ask;
         public double Volume;
+        public long Timestamp;
     }
 
     [StructLayout(LayoutKind.Sequential)]

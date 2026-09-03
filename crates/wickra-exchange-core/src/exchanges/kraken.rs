@@ -304,6 +304,9 @@ impl Kraken {
             bid: decimal_at(tick, "b", 0)?,
             ask: decimal_at(tick, "a", 0)?,
             volume: decimal_at(tick, "v", 1)?,
+            // Kraken's spot ticker carries no timestamp; verified against the
+            // live endpoint.
+            timestamp: 0,
         })
     }
 
@@ -327,6 +330,7 @@ impl Kraken {
             bid: decimal_field(tick, "bid").unwrap_or(Decimal::ZERO),
             ask: decimal_field(tick, "ask").unwrap_or(Decimal::ZERO),
             volume: decimal_field(tick, "vol24h").unwrap_or(Decimal::ZERO),
+            timestamp: 0,
         })
     }
 
@@ -374,6 +378,7 @@ impl Kraken {
                 last_update_id: 0,
                 bids: num_pair_levels(book.get("bids"))?,
                 asks: num_pair_levels(book.get("asks"))?,
+                timestamp: 0,
             });
         }
         let query = format!("pair={}&count={depth}", Self::wire_symbol(symbol));
@@ -384,6 +389,9 @@ impl Kraken {
             last_update_id: 0,
             bids: rest_levels(book.get("bids"))?,
             asks: rest_levels(book.get("asks"))?,
+            // Kraken's REST depth stamps each level, not the book; there is no
+            // single "as of" to report here.
+            timestamp: 0,
         })
     }
 
@@ -1979,6 +1987,8 @@ fn parse_ws_message(text: &str) -> Result<Vec<Event>> {
                     bid: decimal_field(t, "bid").unwrap_or(Decimal::ZERO),
                     ask: decimal_field(t, "ask").unwrap_or(Decimal::ZERO),
                     volume: decimal_field(t, "volume").unwrap_or(Decimal::ZERO),
+                    // Kraken's v2 ticker payload carries no timestamp.
+                    timestamp: 0,
                 }))
             })
             .collect(),
@@ -1994,6 +2004,7 @@ fn parse_ws_message(text: &str) -> Result<Vec<Event>> {
                         last_update_id: 0,
                         bids,
                         asks,
+                        timestamp: 0,
                     }))
                 } else {
                     Ok(Event::BookDelta(BookDelta {
@@ -2002,6 +2013,7 @@ fn parse_ws_message(text: &str) -> Result<Vec<Event>> {
                         final_update_id: 0,
                         bids,
                         asks,
+                        timestamp: 0,
                     }))
                 }
             })

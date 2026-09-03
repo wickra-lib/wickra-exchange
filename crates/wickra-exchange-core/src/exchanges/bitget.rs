@@ -262,6 +262,7 @@ impl Bitget {
             bid: parse_decimal(&entry.bid_pr)?,
             ask: parse_decimal(&entry.ask_pr)?,
             volume: parse_decimal(&entry.base_volume)?,
+            timestamp: entry.ts.parse().unwrap_or(0),
         })
     }
 
@@ -312,6 +313,7 @@ impl Bitget {
             last_update_id: raw.ts.parse().unwrap_or(0),
             bids: parse_levels(&raw.bids)?,
             asks: parse_levels(&raw.asks)?,
+            timestamp: raw.ts.parse().unwrap_or(0),
         })
     }
 
@@ -1002,6 +1004,7 @@ fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Vec
                     bid: dec_or_zero(opt_str(t, "bidPr")),
                     ask: dec_or_zero(opt_str(t, "askPr")),
                     volume: dec_or_zero(opt_str(t, "baseVolume")),
+                    timestamp: opt_str(t, "ts").parse().unwrap_or(0),
                 }))
             })
             .collect()
@@ -1018,6 +1021,7 @@ fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Vec
                         last_update_id: update_id,
                         bids,
                         asks,
+                        timestamp: i64::try_from(update_id).unwrap_or(0),
                     }))
                 } else {
                     Ok(Event::BookDelta(BookDelta {
@@ -1026,6 +1030,7 @@ fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Vec
                         final_update_id: update_id,
                         bids,
                         asks,
+                        timestamp: i64::try_from(update_id).unwrap_or(0),
                     }))
                 }
             })
@@ -1081,6 +1086,9 @@ struct RawTicker {
     ask_pr: String,
     #[serde(rename = "baseVolume")]
     base_volume: String,
+    /// Bitget stamps every ticker; verified against the live endpoint.
+    #[serde(default)]
+    ts: String,
 }
 
 #[derive(Deserialize)]

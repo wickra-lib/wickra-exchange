@@ -303,6 +303,10 @@ impl Htx {
             bid: decimal_at(tick, "bid", 0)?,
             ask: decimal_at(tick, "ask", 0)?,
             volume: decimal_field(tick, "vol")?,
+            timestamp: value
+                .get("ts")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0),
         })
     }
 
@@ -372,6 +376,10 @@ impl Htx {
                 .unwrap_or(0),
             bids: num_levels(tick.get("bids"))?,
             asks: num_levels(tick.get("asks"))?,
+            timestamp: tick
+                .get("ts")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0),
         })
     }
 
@@ -1493,6 +1501,10 @@ fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Vec
             bid: decimal_field(tick, "bid").unwrap_or(Decimal::ZERO),
             ask: decimal_field(tick, "ask").unwrap_or(Decimal::ZERO),
             volume: decimal_field(tick, "vol").unwrap_or(Decimal::ZERO),
+            timestamp: value
+                .get("ts")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0),
         })]),
         "depth" => {
             let update_id = tick
@@ -1505,6 +1517,10 @@ fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Vec
                 final_update_id: update_id,
                 bids: num_levels(tick.get("bids"))?,
                 asks: num_levels(tick.get("asks"))?,
+                timestamp: tick
+                    .get("ts")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0),
             })])
         }
         _ => Ok(Vec::new()),

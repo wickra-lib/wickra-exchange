@@ -266,6 +266,7 @@ impl KuCoin {
             bid: parse_decimal(&raw.buy)?,
             ask: parse_decimal(&raw.sell)?,
             volume: parse_decimal(&raw.vol)?,
+            timestamp: raw.time,
         })
     }
 
@@ -303,6 +304,7 @@ impl KuCoin {
             last_update_id: raw.sequence.parse().unwrap_or(0),
             bids: parse_levels(&raw.bids)?,
             asks: parse_levels(&raw.asks)?,
+            timestamp: raw.time,
         })
     }
 
@@ -886,6 +888,10 @@ fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Opt
             bid: dec_or_zero(opt_str(data, "bestBid")),
             ask: dec_or_zero(opt_str(data, "bestAsk")),
             volume: dec_or_zero(opt_str(data, "size")),
+            timestamp: data
+                .get("time")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0),
         })))
     } else if topic.starts_with("/market/level2:") {
         let changes = data.get("changes");
@@ -898,6 +904,10 @@ fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Opt
             final_update_id: update_id,
             bids,
             asks,
+            timestamp: data
+                .get("time")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0),
         })))
     } else if topic == "/spotMarket/tradeOrders" {
         Ok(Some(Event::OrderUpdate(ws_order_from_data(data)?)))
@@ -966,6 +976,9 @@ struct Envelope {
 
 #[derive(Deserialize)]
 struct RawStats {
+    /// Verified against the live endpoint: KuCoin stamps this payload.
+    #[serde(default)]
+    time: i64,
     last: String,
     buy: String,
     sell: String,
@@ -974,6 +987,9 @@ struct RawStats {
 
 #[derive(Deserialize)]
 struct RawDepth {
+    /// Verified against the live endpoint: KuCoin stamps this payload.
+    #[serde(default)]
+    time: i64,
     #[serde(default)]
     sequence: String,
     bids: Vec<[String; 2]>,

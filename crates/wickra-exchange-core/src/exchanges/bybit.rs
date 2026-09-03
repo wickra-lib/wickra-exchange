@@ -264,6 +264,9 @@ impl Bybit {
             bid: parse_decimal(&entry.bid1_price)?,
             ask: parse_decimal(&entry.ask1_price)?,
             volume: parse_decimal(&entry.volume24h)?,
+            // Bybit's ticker entries carry no timestamp; the envelope's `time`
+            // is when the server replied, not when the quote was true.
+            timestamp: 0,
         })
     }
 
@@ -309,6 +312,7 @@ impl Bybit {
             last_update_id: raw.update_id,
             bids: parse_levels(&raw.bids)?,
             asks: parse_levels(&raw.asks)?,
+            timestamp: raw.ts,
         })
     }
 
@@ -998,6 +1002,9 @@ struct KlineList {
 struct RawDepth {
     #[serde(rename = "u")]
     update_id: u64,
+    /// Verified against the live endpoint: the book result is stamped.
+    #[serde(default)]
+    ts: i64,
     #[serde(rename = "b")]
     bids: Vec<[String; 2]>,
     #[serde(rename = "a")]
@@ -1458,6 +1465,10 @@ fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Vec
             bid: dec_or_zero(opt_str(data, "bid1Price")),
             ask: dec_or_zero(opt_str(data, "ask1Price")),
             volume: dec_or_zero(opt_str(data, "volume24h")),
+            timestamp: value
+                .get("ts")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0),
         })])
     } else if topic.starts_with("orderbook.") {
         let symbol = resolve(field_str(data, "s")?);
@@ -1473,6 +1484,10 @@ fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Vec
                 last_update_id: update_id,
                 bids,
                 asks,
+                timestamp: value
+                    .get("ts")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0),
             })])
         } else {
             Ok(vec![Event::BookDelta(BookDelta {
@@ -1481,6 +1496,10 @@ fn parse_ws_message(text: &str, resolve: &impl Fn(&str) -> Symbol) -> Result<Vec
                 final_update_id: update_id,
                 bids,
                 asks,
+                timestamp: value
+                    .get("ts")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0),
             })])
         }
     } else if topic == "order" {

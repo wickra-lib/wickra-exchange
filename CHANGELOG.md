@@ -87,6 +87,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`Ticker`, `OrderBookSnapshot` and `BookDelta` carry the venue's timestamp.**
+  Only `TradePrint` did, so a consumer could see how old a trade was and not how
+  old the quote or the book was — the difference between acting on the market
+  and acting on a memory of it. `Health.last_message_ms` could likewise only be
+  fed from trades.
+
+  Every expression was verified against the venue's real response, fetched from
+  the same endpoint the client calls, rather than read out of documentation:
+
+  | | ticker | book |
+  |---|---|---|
+  | Binance | `closeTime` | futures `T`; spot publishes none |
+  | OKX, Bitget | `ts` | `ts` |
+  | HTX | envelope `ts` | `tick.ts` |
+  | KuCoin | `data.time` | `data.time` |
+  | Upbit | `trade_timestamp` | `timestamp` |
+  | Gate | — | `update` |
+  | Bybit | — | `ts` |
+  | Kraken, Coinbase | — | — |
+
+  A venue that publishes none reports `0`, never the local clock: a
+  locally-stamped quote looks fresh by construction, which is the one thing a
+  staleness check must never be told. Kraken stamps individual depth levels but
+  never the book as a whole, and Coinbase's market endpoints need a key.
+
+  The field is appended at the end of `WickraTicker`, so every C-ABI offset
+  before it is unchanged, and it reaches all nine languages. The gated live
+  suite now asserts *presence* per venue as well, so a venue that stops sending
+  a stamp — or a parser that stops reading one — fails nightly rather than
+  quietly reporting zero.
+
+- **`tracing` is wired, having been declared and unused.** It sat in
+  `workspace.dependencies` with no crate depending on it and not one log
+  statement in the codebase. `ThrottledTransport` now traces its decisions,
+  which is where they were least visible: a caller that waited two seconds could
+  not tell whether the request budget held it, the venue refused it, or the
+  network dropped it, and those three call for different fixes. Retries, venue
+  cool-offs and budget waits log at `debug`; a repeat refused because the method
+  is not safe to repeat logs at `warn`, since that is the case where a caller is
+  left holding an order it cannot account for.
+
 - **The venue clients are now checked against the venues.** The offline suite
   drives every client over a mock transport with hand-written JSON. It proves
   the parser reads what the author believed, and it cannot prove that belief
