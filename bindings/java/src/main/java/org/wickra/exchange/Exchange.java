@@ -203,26 +203,45 @@ public final class Exchange implements AutoCloseable {
      * weakening it, which arrives here as an exception rather than as a
      * differently-shaped order reaching the exchange.
      */
+    /**
+     * Write one {@link OrderRequest} into a {@code WickraOrderRequest} at
+     * {@code offset} bytes into {@code target}.
+     *
+     * <p>Shared by every path that sends an order — single, batch and the
+     * WebSocket frame — so the fields a batched order carries cannot drift from
+     * the fields a single one carries. They did drift: a batch and a WebSocket
+     * order from this binding could only ever be a plain market or limit,
+     * because each path wrote its own arguments and only this struct has room
+     * for the rest.
+     *
+     * <p>Strings are allocated in {@code arena}, so they outlive the call only
+     * as long as the arena does.
+     */
+    static void writeRequest(Arena arena, MemorySegment target, long offset, OrderRequest request) {
+        MemorySegment req = target.asSlice(offset, Native.REQUEST_SIZE);
+        req.set(Native.C_PTR, Native.R_MARKET, arena.allocateFrom(request.market()));
+        req.set(Native.C_INT, Native.R_SIDE, sideCode(request.side()));
+        req.set(Native.C_INT, Native.R_ORDER_TYPE, request.type().code());
+        req.set(Native.C_DOUBLE, Native.R_QUANTITY, request.quantity());
+        // NaN is how the ABI is told a price carries no value.
+        req.set(Native.C_DOUBLE, Native.R_PRICE,
+                request.price() == null ? Double.NaN : request.price());
+        req.set(Native.C_DOUBLE, Native.R_STOP_PRICE,
+                request.stopPrice() == null ? Double.NaN : request.stopPrice());
+        req.set(Native.C_INT, Native.R_TIME_IN_FORCE, request.timeInForce().code());
+        req.set(Native.C_PTR, Native.R_CLIENT_ORDER_ID,
+                request.clientOrderId() == null
+                        ? MemorySegment.NULL
+                        : arena.allocateFrom(request.clientOrderId()));
+        req.set(Native.C_BOOL, Native.R_REDUCE_ONLY, (byte) (request.reduceOnly() ? 1 : 0));
+        req.set(Native.C_BOOL, Native.R_POST_ONLY, (byte) (request.postOnly() ? 1 : 0));
+        req.set(Native.C_INT, Native.R_STP, request.stp().code());
+    }
+
     public OrderInfo placeOrder(OrderRequest request) {
         try (Arena arena = Arena.ofConfined()) {
             MemorySegment req = arena.allocate(Native.REQUEST_SIZE, 8);
-            req.set(Native.C_PTR, Native.R_MARKET, arena.allocateFrom(request.market()));
-            req.set(Native.C_INT, Native.R_SIDE, sideCode(request.side()));
-            req.set(Native.C_INT, Native.R_ORDER_TYPE, request.type().code());
-            req.set(Native.C_DOUBLE, Native.R_QUANTITY, request.quantity());
-            // NaN is how the ABI is told a price carries no value.
-            req.set(Native.C_DOUBLE, Native.R_PRICE,
-                    request.price() == null ? Double.NaN : request.price());
-            req.set(Native.C_DOUBLE, Native.R_STOP_PRICE,
-                    request.stopPrice() == null ? Double.NaN : request.stopPrice());
-            req.set(Native.C_INT, Native.R_TIME_IN_FORCE, request.timeInForce().code());
-            req.set(Native.C_PTR, Native.R_CLIENT_ORDER_ID,
-                    request.clientOrderId() == null
-                            ? MemorySegment.NULL
-                            : arena.allocateFrom(request.clientOrderId()));
-            req.set(Native.C_BOOL, Native.R_REDUCE_ONLY, (byte) (request.reduceOnly() ? 1 : 0));
-            req.set(Native.C_BOOL, Native.R_POST_ONLY, (byte) (request.postOnly() ? 1 : 0));
-            req.set(Native.C_INT, Native.R_STP, request.stp().code());
+            writeRequest(arena, req, 0, request);
 
             MemorySegment out = arena.allocate(Native.ORDER_SIZE, 8);
             int rc = (int) Native.PLACE_ORDER.invokeExact(handle, req, out);
@@ -445,7 +464,7 @@ public final class Exchange implements AutoCloseable {
         return new Exchange(handle);
     }
 
-    private static int sideCode(Side side) {
+    static int sideCode(Side side) {
         return side == Side.BUY ? Native.SIDE_BUY : Native.SIDE_SELL;
     }
 

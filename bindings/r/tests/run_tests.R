@@ -95,6 +95,11 @@ stopifnot(inherits(adv, "wickra_advanced"))
 stopifnot(is.function(wkex_positions))
 stopifnot(is.function(wkex_place_oco))
 stopifnot(is.function(wkex_place_batch))
+## The full-request forms: a batched or socket-sent order from R could carry
+## only market, side, quantity and price, so a stop-loss was unplaceable on
+## either path however carefully the venue clients carried the trigger.
+stopifnot(is.function(wkex_place_batch_full))
+stopifnot(is.function(wkex_ws_place_order_full))
 ## place_batch marshals parallel vectors: a NA price means a market order.
 reqs <- data.frame(
   market = c("BTC/USDT", "ETH/USDT"),
@@ -132,7 +137,8 @@ for (verb in c(
   "wkex_positions", "wkex_set_leverage", "wkex_set_margin_mode", "wkex_close_position",
   "wkex_amend_order", "wkex_place_batch", "wkex_cancel_batch", "wkex_place_oco",
   "wkex_subscribe_user_data", "wkex_keepalive_user_data", "wkex_user_data_poll",
-  "wkex_ws_place_order", "wkex_ws_cancel_order"
+  "wkex_ws_place_order", "wkex_ws_cancel_order",
+  "wkex_place_batch_full", "wkex_ws_place_order_full"
 )) {
   stopifnot(is.function(get(verb, envir = asNamespace("wickraexchange"))))
 }

@@ -564,6 +564,45 @@ public sealed unsafe class Exchange : IDisposable
         return bytes;
     }
 
+    /// <summary>
+    /// Project a managed <see cref="OrderRequest"/> onto the C-ABI struct, with
+    /// its two strings in unmanaged memory.
+    /// </summary>
+    /// <remarks>
+    /// The caller owns the returned pointers and must free them with
+    /// <see cref="FreeNative"/>; unmanaged rather than pinned, because the batch
+    /// path needs an array of these alive at once and <c>fixed</c> pins one at a
+    /// time. Every path that sends an order goes through here, so the fields a
+    /// batch or a WebSocket frame carries cannot drift from the fields a single
+    /// order carries.
+    /// </remarks>
+    internal static Native.OrderRequest ToNative(OrderRequest request)
+    {
+        return new Native.OrderRequest
+        {
+            Market = (byte*)Marshal.StringToCoTaskMemUTF8(request.Market),
+            Side = (int)request.Side,
+            OrderType = (int)request.Type,
+            Quantity = request.Quantity,
+            Price = request.Price ?? double.NaN,
+            StopPrice = request.StopPrice ?? double.NaN,
+            TimeInForce = (int)request.TimeInForce,
+            ClientOrderId = request.ClientOrderId is null
+                ? null
+                : (byte*)Marshal.StringToCoTaskMemUTF8(request.ClientOrderId),
+            ReduceOnly = request.ReduceOnly,
+            PostOnly = request.PostOnly,
+            Stp = (int)request.Stp,
+        };
+    }
+
+    /// <summary>Free the strings <see cref="ToNative"/> allocated.</summary>
+    internal static void FreeNative(Native.OrderRequest native)
+    {
+        if (native.Market is not null) { Marshal.FreeCoTaskMem((nint)native.Market); }
+        if (native.ClientOrderId is not null) { Marshal.FreeCoTaskMem((nint)native.ClientOrderId); }
+    }
+
     private static (nint[] assets, double[] amounts) MarshalBalances(IReadOnlyDictionary<string, double> balances)
     {
         var assets = new nint[balances.Count];

@@ -44,6 +44,38 @@ public class DerivativesTests
     }
 
     [Fact]
+    public void PlaceBatchFullEmptyIsNoop()
+    {
+        // The full-request batch, which is the one that can carry a stop-loss.
+        // Empty returns without opening a socket, like its narrow sibling.
+        using var a = AdvancedOrders.Connect("binance", "k", "s");
+        var results = a.PlaceBatch(System.Array.Empty<OrderRequest>());
+        Assert.Empty(results);
+    }
+
+    [Fact]
+    public void ABatchedOrderCanCarryEveryField()
+    {
+        // The shape the narrow BatchOrderRequest has no room for. Nothing is
+        // sent here -- what this pins is that the binding can express it at all,
+        // which it could not: a batched order from C# was a market or a limit
+        // and nothing else, whatever the venue clients supported.
+        var request = new OrderRequest("BTC/USDT", Side.Buy, OrderType.StopLimit, 1.0)
+        {
+            Price = 100.0,
+            StopPrice = 95.0,
+            TimeInForce = TimeInForce.Ioc,
+            ClientOrderId = "batch-1",
+            ReduceOnly = true,
+            PostOnly = true,
+            Stp = SelfTradePrevention.ExpireMaker,
+        };
+        Assert.Equal(95.0, request.StopPrice);
+        Assert.Equal(TimeInForce.Ioc, request.TimeInForce);
+        Assert.Equal("batch-1", request.ClientOrderId);
+    }
+
+    [Fact]
     public void BatchRequestShapeRoundTrips()
     {
         var requests = new[]

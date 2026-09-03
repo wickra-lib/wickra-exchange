@@ -278,6 +278,10 @@ internal static unsafe class Native
         Order* outBuf, int* outCodes, nuint cap);
 
     [DllImport(Lib)]
+    public static extern int wickra_advanced_place_batch_full(
+        nint handle, OrderRequest* requests, nuint n, Order* outBuf, int* outCodes, nuint cap);
+
+    [DllImport(Lib)]
     public static extern nint wickra_connect_user_data(
         byte* name, byte* apiKey, byte* apiSecret, byte* passphrase, byte* privateKey,
         [MarshalAs(UnmanagedType.U1)] bool testnet, [MarshalAs(UnmanagedType.U1)] bool futures,
@@ -307,6 +311,10 @@ internal static unsafe class Native
     [DllImport(Lib)]
     public static extern int wickra_ws_place_order(
         nint handle, byte* market, int side, double quantity, double price, Order* outOrder);
+
+    [DllImport(Lib)]
+    public static extern int wickra_ws_place_order_full(
+        nint handle, OrderRequest* request, Order* outOrder);
 
     [DllImport(Lib)]
     public static extern int wickra_ws_cancel_order(nint handle, byte* market, byte* orderId);
