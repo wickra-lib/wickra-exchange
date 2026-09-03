@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-09-04
+
 ### Added
 
 - **What each binding costs to cross, measured.** The benchmark crate measured
@@ -1591,4 +1593,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reached the tree through `tokio-tungstenite 0.30 -> tungstenite 0.30 -> rand
   0.10.2`. Locked to `0.10.2`, which is not yanked. Nothing else moved.
 
-[Unreleased]: https://github.com/wickra-lib/wickra-exchange/commits/main
+[Unreleased]: https://github.com/wickra-lib/wickra-exchange/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/wickra-lib/wickra-exchange/releases/tag/v0.1.0
