@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Kraken Futures market data streams.** The first of the four venues #206 left
+  refusing rather than serving spot. Kraken Futures is not the spot v2 socket
+  with different names — it is a different service: another host, `{"event":
+  "subscribe","feed":..,"product_ids":[..]}` instead of `{"method":"subscribe",
+  "params":{..}}`, frames keyed by `feed` rather than `channel`, `PF_XBTUSD`
+  rather than `BTC/USD`, and values as JSON numbers where spot sends strings.
+
+  Those numbers go through their string form on the way to `Decimal`. Parsing
+  `0.3` as `f64` first would introduce exactly the binary rounding the order
+  layer keeps `Decimal` to avoid, and a test pins it.
+
+  Frames for a product that was never subscribed to are dropped: one connection
+  carries every subscription. The spot client is untouched, and a test says so —
+  a fix that moved every client to the futures service would otherwise pass.
+
 - **Bitget subscribes to the derivatives channels it publishes.** The fourth of
   the eight futures venues. Its mix `ticker` frame carries the funding rate, the
   mark price and the index price beside the quote, all read at one moment, so

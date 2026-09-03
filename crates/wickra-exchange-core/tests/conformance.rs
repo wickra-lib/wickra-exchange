@@ -1186,7 +1186,7 @@ fn a_futures_client_never_subscribes_to_a_spot_stream() {
         "Kraken",
         Kraken,
         Expected {
-            url: None,
+            url: Some("futures.kraken.com"),
             frame: None
         }
     );
