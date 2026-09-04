@@ -6,7 +6,7 @@
 
   <groupId>org.wickra</groupId>
   <artifactId>wickra-exchange</artifactId>
-  <version>0.1.0</version>
+  <version>0.1.1</version>
   <packaging>jar</packaging>
 
   <name>wickra-exchange</name>
@@ -159,7 +159,14 @@
           <plugin>
             <groupId>org.sonatype.central</groupId>
             <artifactId>central-publishing-maven-plugin</artifactId>
-            <version>0.7.0</version>
+            <!--
+              A publishing plugin is only ever exercised by a release, so its
+              version ages with nothing watching it: 0.7.0 uploaded the
+              deployment and then failed reading Central's answer, because the
+              API's response grew a `warnings` field that version cannot
+              deserialise. Both sibling repositories were already on 0.11.0.
+            -->
+            <version>0.11.0</version>
             <extensions>true</extensions>
             <configuration>
               <!-- Matches `server-id: central` in the workflow's setup-java

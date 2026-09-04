@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "wickra-exchange"
-version = "0.1.0"
+version = "0.1.1"
 description = "Streaming-native, unified connectivity for the ten largest crypto exchanges (market data + signed order execution), with paper and replay simulators."
 readme = "README.md"
 license = "MIT OR Apache-2.0"

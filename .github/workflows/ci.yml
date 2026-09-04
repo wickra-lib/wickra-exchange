@@ -594,6 +594,55 @@ jobs:
             echo "gofmt needed on:"; echo "$unformatted"; exit 1
           fi
 
+      # The release mirrors this binding into the standalone wickra-exchange-go
+      # repository: the .go files, the vendored header, go.mod and the golden
+      # tapes, laid out differently from the tree they live in here. That layout
+      # is assembled by release.yml and had never been compiled anywhere else,
+      # so the first thing to try it was a release tag -- and it did not build,
+      # because the smoke test release.yml writes declared the wrong package
+      # name and the directory then held two packages.
+      #
+      # Assembled and vetted here instead, on the runner's own platform. The
+      # per-platform native libraries are the release's business; what this
+      # proves is that the *tree* compiles and its tests pass.
+      - name: The mirrored Go module assembles and passes its own tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          out=$(mktemp -d)/wickra-exchange-go-module
+          mkdir -p "$out/include"
+          cp bindings/go/*.go "$out/"
+          cp bindings/go/include/wickra_exchange.h "$out/include/"
+          cp bindings/go/go.mod "$out/go.mod"
+          cp -r golden "$out/golden"
+          # The staged library goes where the module's own cgo LDFLAGS look.
+          libdir="${WICKRA_GO_LIBDIR#"$PWD/bindings/go/"}"
+          mkdir -p "$out/$libdir"
+          cp "$WICKRA_GO_LIBDIR"/* "$out/$libdir/"
+          # The same smoke test release.yml writes, so a package-name mismatch
+          # fails here rather than at the tag.
+          cat > "$out/smoke_main_test.go" <<'GO'
+          package wickraexchange
+
+          import "testing"
+
+          func TestMirroredModuleSmoke(t *testing.T) {
+            ex, err := Paper(map[string]float64{"USDT": 100000}, 0, 0, 0)
+            if err != nil {
+              t.Fatalf("Paper: %v", err)
+            }
+            defer ex.Close()
+            if got := ex.Name(); got != "paper" {
+              t.Fatalf("Name() = %q, want \"paper\"", got)
+            }
+          }
+          GO
+          cd "$out"
+          export PATH="$out/$libdir:$PATH"
+          go vet ./...
+          go test ./...
+          echo "the mirrored module builds and passes its tests"
+
       - name: Vet and test the Go binding
         shell: bash
         # On Windows there is no rpath; the loader resolves wickra_exchange.dll via

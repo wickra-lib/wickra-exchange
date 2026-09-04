@@ -14,6 +14,16 @@ max_concurrency = 8
 # Exclude links that are not meant to resolve at check time: localhost,
 # example/placeholder hosts, and the package-registry URLs that 404 until a
 # release is published.
+#
+# The CHANGELOG version-compare links are the same class: they point at the
+# release tag, which is created *after* the version bump is merged. The link
+# check runs on push/PR and never on the tag, so on every release PR the new
+# tag does not exist yet and the compare URL 404s. One pattern covers every
+# future version — no per-release exclude needed.
+#
+# GitHub serves 404 to anonymous clients for /stargazers and /network/members
+# (anti-scraping). The README social-footer badges link there; the pages are
+# live in a browser.
 exclude = [
     "^https?://localhost",
     "^https?://127\\.0\\.0\\.1",
@@ -24,4 +34,7 @@ exclude = [
     "^https?://pkg\\.go\\.dev/github\\.com/wickra-lib/wickra-exchange-go",
     "^https?://www\\.nuget\\.org/packages/WickraExchange",
     "^https?://central\\.sonatype\\.com/artifact/org\\.wickra/wickra-exchange",
+    "github\\.com/wickra-lib/wickra-exchange/compare/",
+    "github\\.com/wickra-lib/wickra-exchange/stargazers",
+    "github\\.com/wickra-lib/wickra-exchange/network/members",
 ]
