@@ -775,8 +775,12 @@ jobs:
         run: |
           set -euo pipefail
           cd wickra-exchange-go-module
+          # The package name has to be the module's own: a test file declaring
+          # anything else does not compile against it, it makes the directory
+          # hold two packages, and `go vet` stops at "found packages
+          # wickraexchange and wickra" before a single line is checked.
           cat > smoke_main_test.go <<'GO'
-          package wickra
+          package wickraexchange
 
           import "testing"
 

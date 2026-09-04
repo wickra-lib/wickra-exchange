@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-04
+
+### Fixed
+
+- **Three publish jobs in `release.yml` had never run, and all three were
+  wrong.** `0.1.0` reached crates.io, PyPI and npm and stopped there; NuGet,
+  Maven Central and the Go mirror failed, so no GitHub Release was created —
+  which is what that job depending on all seven publishes is for.
+
+  Each failure was in code whose first execution is a release tag:
+
+  * **The Go mirror wrote its own smoke test with the wrong package name.**
+    `release.yml` generates a test declaring `package wickra` into a module
+    whose files declare `package wickraexchange`, so the directory held two
+    packages and `go vet` stopped at `found packages wickraexchange and wickra`
+    before checking a line. CI now assembles that module the same way and runs
+    its tests, so the mirrored tree is compiled on every pull request rather
+    than for the first time at a tag.
+  * **The Maven publishing plugin was three minor versions behind the API it
+    talks to.** Central's response grew a `warnings` field that
+    `central-publishing-maven-plugin:0.7.0` cannot deserialise, so the
+    deployment uploaded and then failed while reading the answer. Both sibling
+    repositories were already on `0.11.0`. A publishing plugin is exercised only
+    by a release, which is how it aged with nothing watching it.
+  * **NuGet's trusted-publishing policy named the wrong repository.** The policy
+    is bound to a permanent GitHub repository id, and the one on file was
+    `wickra`'s. Nothing in this repository could have detected that: the token
+    exchange is the only thing that tests it.
+
+  `0.1.0` stays where it is. It is published and immutable on three registries,
+  and `cargo publish` records the commit it was built from — moving the tag to
+  carry these fixes would leave that recording pointing at a tree the tag no
+  longer names. `0.1.1` is the first release that reaches all seven.
+
+- **The aarch64 glibc wheel could not be cross-compiled.** `ring` requires the
+  assembler to define `__ARM_ARCH`, and the manylinux2014 aarch64 cross
+  toolchain does not, so the build stopped at `#error "ARM assembler must define
+  __ARM_ARCH"`. Fixed by stating the value aarch64 has by definition, and the
+  container smoke job now covers both architectures instead of x86_64 alone —
+  the cross-build had never run anywhere before a tag tried it.
+
 ## [0.1.0] - 2026-09-04
 
 ### Added
@@ -1593,5 +1634,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reached the tree through `tokio-tungstenite 0.30 -> tungstenite 0.30 -> rand
   0.10.2`. Locked to `0.10.2`, which is not yanked. Nothing else moved.
 
-[Unreleased]: https://github.com/wickra-lib/wickra-exchange/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/wickra-lib/wickra-exchange/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/wickra-lib/wickra-exchange/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/wickra-lib/wickra-exchange/releases/tag/v0.1.0
