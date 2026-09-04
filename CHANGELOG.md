@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-09-04
+
+No change to the library. This release exists so r-universe can build the R
+package again: it tracks `*release`, not `main`, so the fix that landed after
+`v0.1.1` is invisible to it until a tag moves.
+
+### Fixed
+
+- **The R package shipped a test that cannot run where it is shipped.**
+  `tests/run_tests.R` carried the golden-fixture parity block, which resolves
+  the corpus by walking up the directory tree. In this repository the corpus is
+  at the root, above `bindings/r`, so it resolves. Inside the tarball
+  `R CMD build` produces there is nothing above the package, and `R CMD check`
+  runs everything under `tests/` from exactly there — which is what r-universe
+  runs on every platform. `0.1.1` built its source package cleanly and **0 of 13**
+  platform binaries, every one of them on
+  `no golden/ directory found above …`.
+
+  The block moves to `tests/golden.R`, `.Rbuildignore` keeps it out of the
+  tarball, and `ci.yml` runs it explicitly from the repository root, which is
+  the only place it can mean anything.
+
+
 ## [0.1.1] - 2026-09-04
 
 ### Fixed
@@ -1634,6 +1657,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reached the tree through `tokio-tungstenite 0.30 -> tungstenite 0.30 -> rand
   0.10.2`. Locked to `0.10.2`, which is not yanked. Nothing else moved.
 
-[Unreleased]: https://github.com/wickra-lib/wickra-exchange/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/wickra-lib/wickra-exchange/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/wickra-lib/wickra-exchange/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/wickra-lib/wickra-exchange/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/wickra-lib/wickra-exchange/releases/tag/v0.1.0

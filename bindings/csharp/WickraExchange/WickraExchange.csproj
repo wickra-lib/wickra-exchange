@@ -10,7 +10,7 @@
     <AssemblyName>WickraExchange</AssemblyName>
 
     <PackageId>WickraExchange</PackageId>
-    <Version>0.1.1</Version>
+    <Version>0.1.2</Version>
     <Authors>kingchenc</Authors>
     <Description>Streaming-native, unified connectivity for the ten largest crypto exchanges, with paper and replay simulators — for .NET over the Wickra C ABI.</Description>
     <PackageLicenseExpression>MIT OR Apache-2.0</PackageLicenseExpression>
