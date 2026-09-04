@@ -15,3 +15,12 @@
 ^src/symbols\.rds$
 ^src/dlltool\.log$
 ^\.gitignore$
+
+# The golden corpus lives at the repository root, outside this package, so
+# tests/golden.R only resolves when run from there -- which CI does explicitly.
+# `R CMD check` runs everything under tests/ from the built tarball, where the
+# corpus does not exist, so shipping this file fails the check that r-universe
+# runs: v0.1.1 built 0 of 13 platform binaries, every one of them on
+# `no golden/ directory found above ...`. The other test files build their own
+# data and travel fine.
+^tests/golden\.R$
