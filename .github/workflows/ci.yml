@@ -904,6 +904,12 @@ jobs:
           export WKEX_LIB="${WKEX_LIB//\\//}"
           R CMD INSTALL bindings/r
           Rscript bindings/r/tests/run_tests.R
+          # golden.R is kept out of the built tarball (.Rbuildignore) because it
+          # reads the corpus at the repository root, which does not exist inside
+          # a tarball -- that is what failed all thirteen r-universe binaries for
+          # v0.1.1. Here there *is* a repository root, so it runs, and this is
+          # the only place the golden parity is checked from R.
+          Rscript bindings/r/tests/golden.R
 
   coverage:
     name: Coverage
