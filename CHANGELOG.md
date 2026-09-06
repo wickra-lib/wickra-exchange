@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Five clients reported a blocked reply as a parser failure.** Bybit, OKX,
+  Bitget, Kraken and HTX answer HTTP 200 for their own errors and carry the real
+  code inside the envelope, so their clients read the body and never looked at
+  the status. That is right about the venue and wrong about everything standing
+  in front of it: a geo-block, a gateway error or a CDN challenge answers with a
+  status of its own and a body that was never JSON, and calling that a
+  deserialization failure blames the parser for a document it was never meant to
+  read while discarding the one field that says what happened.
+
+  The nightly live suite is built on exactly that distinction — it skips a venue
+  the runner cannot reach and fails on a parser that cannot read a real reply —
+  so the misattribution turned the runner's location into a standing red build,
+  reported as `key must be a string at line 2 column 5` with nothing in the log
+  to tell the two cases apart. A reply that fails to parse under a non-success
+  status is now `Exchange { code: <status> }`, carrying the body verbatim.
+
+- **A parse failure did not say what it had failed to parse.** Under a
+  successful status the error stays a deserialization failure, as it should, but
+  now carries an excerpt of the body. serde's position alone cannot distinguish
+  a renamed field from a reply that was never JSON, which is why the first
+  occurrence of the above could not be diagnosed from the log it left behind.
+
 ## [0.1.2] - 2026-09-04
 
 No change to the library. This release exists so r-universe can build the R

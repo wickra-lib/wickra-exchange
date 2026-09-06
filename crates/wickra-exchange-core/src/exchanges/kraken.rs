@@ -1188,7 +1188,9 @@ impl Kraken {
         self.ensure_market_is_routed()?;
         let url = format!("{}{path}?{query}", self.rest_base);
         let response = self.http.execute(&HttpRequest::get(url))?;
-        unwrap_result(&response.body).map_err(|e| e.with_retry_after(response.retry_after()))
+        unwrap_result(&response.body).map_err(|e| {
+            super::attribute_to_http_status(&response, e).with_retry_after(response.retry_after())
+        })
     }
 
     /// Sign a private POST: `API-Sign = base64(HMAC-SHA512(base64decode(secret),
@@ -1228,7 +1230,9 @@ impl Kraken {
             .with_header("Content-Type", "application/x-www-form-urlencoded")
             .with_body(postdata);
         let response = self.http.execute(&request)?;
-        unwrap_result(&response.body).map_err(|e| e.with_retry_after(response.retry_after()))
+        unwrap_result(&response.body).map_err(|e| {
+            super::attribute_to_http_status(&response, e).with_retry_after(response.retry_after())
+        })
     }
 
     /// Public Kraken Futures GET (no signing).
@@ -2806,6 +2810,18 @@ mod tests {
 
     fn symbol() -> Symbol {
         Symbol::new("BTC", "USDT")
+    }
+
+    #[test]
+    fn a_blocked_reply_is_reported_as_the_block_not_as_drift() {
+        let (kraken, mock) = client();
+        // What a geo-blocked runner receives: a status of its own and a body
+        // that was never this venue's JSON. Read as an envelope it fails at
+        // line 2 column 5, which says nothing about why it failed.
+        mock.push_json(403, "{\n    error: 'unavailable in your region'\n}");
+        let error = kraken.ticker(&symbol()).unwrap_err();
+        let named = matches!(&error, Error::Exchange { code, .. } if code == "403");
+        assert!(named, "a blocked reply must not be reported as drift");
     }
 
     fn client() -> (Kraken, Arc<MockHttpTransport>) {
