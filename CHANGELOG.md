@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-09-06
+
 ### Fixed
 
 - **Five clients reported a blocked reply as a parser failure.** Bybit, OKX,
@@ -1681,7 +1683,8 @@ package again: it tracks `*release`, not `main`, so the fix that landed after
   reached the tree through `tokio-tungstenite 0.30 -> tungstenite 0.30 -> rand
   0.10.2`. Locked to `0.10.2`, which is not yanked. Nothing else moved.
 
-[Unreleased]: https://github.com/wickra-lib/wickra-exchange/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/wickra-lib/wickra-exchange/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/wickra-lib/wickra-exchange/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/wickra-lib/wickra-exchange/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/wickra-lib/wickra-exchange/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/wickra-lib/wickra-exchange/releases/tag/v0.1.0
