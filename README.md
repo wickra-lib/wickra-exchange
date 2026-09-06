@@ -19,7 +19,7 @@
 [![OpenSSF Scorecard](https://raw.githubusercontent.com/wickra-lib/.github/main/profile/badges/wickra-exchange/scorecard.svg)](https://scorecard.dev/viewer/?uri=github.com/wickra-lib/wickra-exchange)
 [![OpenSSF Best Practices](https://raw.githubusercontent.com/wickra-lib/.github/main/profile/badges/wickra-exchange/best-practices.svg)](https://www.bestpractices.dev)
 [![Build provenance](https://raw.githubusercontent.com/wickra-lib/.github/main/profile/badges/wickra-exchange/provenance.svg)](https://github.com/wickra-lib/wickra-exchange/attestations)
-[![Docs](https://raw.githubusercontent.com/wickra-lib/.github/main/profile/badges/wickra-exchange/docs.svg)](https://wickra.org)
+[![Docs](https://raw.githubusercontent.com/wickra-lib/.github/main/profile/badges/wickra-exchange/docs.svg)](https://exchange.wickra.org)
 [![Verified across 9 languages](https://raw.githubusercontent.com/wickra-lib/.github/main/profile/badges/wickra-exchange/verified.svg)](golden/)
 [![Live demo](https://img.shields.io/badge/live%20demo-live.wickra.org-3b82f6)](https://live.wickra.org)
 
