@@ -7,6 +7,8 @@ abstract: >-
   signed order execution), reachable natively from Rust, Python, Node.js and,
   through a C ABI, from C, C++, C#, Go, Java and R.
 type: software
+version: "0.1.4"
+date-released: "2026-09-13"
 authors:
   - alias: kingchenc
     website: "https://wickra.org"
