@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The exported R functions are documented.** All forty `wkex_*` wrappers
+  carried roxygen comments but no generated `man/` pages, which `R CMD check`
+  reported as "Undocumented code objects" on every platform.
+
 ## [0.1.3] - 2026-09-06
 
 ### Fixed
