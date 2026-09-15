@@ -1,9 +1,9 @@
 <p align="center">
-  <a href="https://wickra.org"><img src="https://raw.githubusercontent.com/wickra-lib/.github/main/profile/wickra-banner.webp?v=514" alt="Wickra — streaming-first technical indicators" width="100%"></a>
+  <a href="https://wickra.org"><img src="https://raw.githubusercontent.com/wickra-lib/.github/main/profile/wickra-banner.webp?v=514" alt="Wickra Exchange — streaming-native crypto-exchange connectivity: one typed API over the ten largest exchanges, across ten languages" width="100%"></a>
 </p>
 
 [![Built on Wickra](https://img.shields.io/badge/built%20on-wickra-3b82f6)](https://github.com/wickra-lib/wickra)
-[![Status](https://img.shields.io/badge/status-pre--alpha%20(scaffolding)-red)](https://github.com/wickra-lib/wickra-exchange)
+[![Status](https://img.shields.io/badge/status-pre--release-orange)](https://github.com/wickra-lib/wickra-exchange)
 [![CI](https://raw.githubusercontent.com/wickra-lib/.github/main/profile/badges/wickra-exchange/ci.svg)](https://github.com/wickra-lib/wickra-exchange/actions/workflows/ci.yml)
 [![CodeQL](https://raw.githubusercontent.com/wickra-lib/.github/main/profile/badges/wickra-exchange/codeql.svg)](https://github.com/wickra-lib/wickra-exchange/actions/workflows/codeql.yml)
 [![codecov](https://raw.githubusercontent.com/wickra-lib/.github/main/profile/badges/wickra-exchange/codecov.svg)](https://codecov.io/gh/wickra-lib/wickra-exchange)
@@ -337,7 +337,7 @@ also need a C compiler, and Java runs with `--enable-native-access=ALL-UNNAMED`.
 | C#       | NuGet · `WickraExchange`                    | .NET 8 (`net8.0`)          |
 | Go       | module · `wickra-lib/wickra-exchange-go`   | Go 1.23 (cgo)              |
 | Java     | Maven Central · `org.wickra:wickra-exchange` | Java 22 (FFM / Panama)   |
-| R        | r-universe · `wickraexchange`              | R ≥ 2.10 (Rtools on Win.)  |
+| R        | r-universe · `wickraexchange`              | R ≥ 4.1 (Rtools on Win.)  |
 
 ## Ecosystem
 

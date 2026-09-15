@@ -771,14 +771,19 @@ jobs:
           set -e
           out=wickra-exchange-go-module
           mkdir -p "$out/include" "$out/lib"
-          cp bindings/go/*.go "$out/"
+          # Single-package Go source + vendored C ABI header.
+          # The tests stay behind: they read the golden tapes from `golden/`
+          # above the module, which exists in this repository and not in the
+          # mirror -- a consumer running `go test ./...` on the module would get
+          # a suite that can never find its fixtures, and a module that ships
+          # the tapes carries megabytes no consumer asked for.
+          for f in bindings/go/*.go; do
+            case "$f" in *_test.go) continue ;; esac
+            cp "$f" "$out/"
+          done
           cp bindings/go/include/wickra_exchange.h "$out/include/"
           cp bindings/go/README.md "$out/"
           cp LICENSE-MIT LICENSE-APACHE "$out/"
-          # golden_test.go travels with the module, so the tapes it reads have
-          # to travel too: in this repository they sit two directories above the
-          # package, which is outside the module a consumer gets.
-          cp -r golden "$out/golden"
           # The in-repo go.mod already declares the standalone module path.
           cp bindings/go/go.mod "$out/go.mod"
           declare -A GO=(
