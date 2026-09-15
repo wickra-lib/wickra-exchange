@@ -110,12 +110,25 @@ jobs:
           # workflows by name would go stale -- testnet.yml is scheduled and
           # legitimately does not run for a version bump -- so the rule is about
           # outcomes rather than about a roster: whatever ran, none of it is red.
+          # Only the newest run of each workflow counts. ci.yml carries
+          # `concurrency: cancel-in-progress`, so a commit that receives two
+          # push events has its first run cancelled by its second; without the
+          # grouping any commit that ran CI twice is unreleasable however green
+          # the surviving run was (wickra-strategy-ci lost a release to exactly
+          # that: 51 superseded checks, zero real failures). Within the newest
+          # run, cancelled is red: a cancelled CI is not a green CI.
+          #
+          # Dependabot's own runs are not this repository's CI: when it tries a
+          # security update on the tagged commit and the update is impossible
+          # (a pin, a transitive dependency with no fixed line), that run is
+          # red on the SHA without a single job of ours having failed. They
+          # carry `event: dynamic`, which nothing of ours does.
           bad=$(gh api "repos/${REPO}/actions/runs?head_sha=${SHA}&per_page=100" \
-                  -q '[.workflow_runs[]
-                       | select(.name != "Release")
-                       | select(.conclusion == "failure" or .conclusion == "timed_out"
-                                or .conclusion == "cancelled")
-                       | .name] | unique | join(", ")')
+                  -q '[.workflow_runs[] | select(.name != "Release" and .event != "dynamic")]
+                      | group_by(.name) | map(max_by(.id))
+                      | map(select(.conclusion == "failure" or .conclusion == "timed_out"
+                                   or .conclusion == "cancelled"))
+                      | map(.name) | unique | join(", ")')
           if [ -n "$bad" ]; then
             echo "::error::the tagged commit has failing runs (${bad}); refusing to publish"
             exit 1
@@ -193,7 +206,7 @@ jobs:
 
       # CycloneDX SBOM per published crate.
       - name: Install cargo-cyclonedx
-        uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2.87.1
+        uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
         with:
           tool: cargo-cyclonedx
 
@@ -243,7 +256,39 @@ jobs:
       # The Python binding depends only on wickra-exchange-core (no native-tls /
       # OpenSSL), so the manylinux/musllinux containers build the wheel with no
       # extra system dependencies — no vendored-tls feature needed.
+      # The container image comes from quay.io, which has failed whole
+      # afternoons (502/504 on the manifest). The first attempt may fail
+      # without failing the row; a pause and one identical retry follow, the
+      # family's retry pair. A second failure is the row's verdict.
       - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        id: wheel
+        continue-on-error: true
+        env:
+          CFLAGS_aarch64_unknown_linux_gnu: -D__ARM_ARCH=8
+        with:
+          working-directory: bindings/python
+          target: ${{ matrix.target }}
+          args: --release --strip --out dist
+          manylinux: ${{ matrix.manylinux }}
+          # `ring` refuses to assemble unless the assembler defines
+          # `__ARM_ARCH` (Arm C Language Extensions), and the manylinux2014
+          # aarch64 *cross* toolchain does not: the build stops at
+          # `#error "ARM assembler must define __ARM_ARCH"`. The musl cross
+          # image is newer and defines it, which is why only the glibc aarch64
+          # wheel failed. aarch64 is ARMv8-A by definition, so 8 is what a
+          # modern compiler defines there -- this states it rather than picks
+          # it. Exported inside the container as well as set on the step: the
+          # Linux wheels are built in a container the step's own environment
+          # does not necessarily reach, and the native macOS/Windows builds
+          # have no container to export into.
+          before-script-linux: |
+            export CFLAGS_aarch64_unknown_linux_gnu="-D__ARM_ARCH=8"
+      - name: Pause before retrying the wheel build
+        if: steps.wheel.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - if: steps.wheel.outcome == 'failure'
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         env:
           CFLAGS_aarch64_unknown_linux_gnu: -D__ARM_ARCH=8
         with:
@@ -726,14 +771,19 @@ jobs:
           set -e
           out=wickra-exchange-go-module
           mkdir -p "$out/include" "$out/lib"
-          cp bindings/go/*.go "$out/"
+          # Single-package Go source + vendored C ABI header.
+          # The tests stay behind: they read the golden tapes from `golden/`
+          # above the module, which exists in this repository and not in the
+          # mirror -- a consumer running `go test ./...` on the module would get
+          # a suite that can never find its fixtures, and a module that ships
+          # the tapes carries megabytes no consumer asked for.
+          for f in bindings/go/*.go; do
+            case "$f" in *_test.go) continue ;; esac
+            cp "$f" "$out/"
+          done
           cp bindings/go/include/wickra_exchange.h "$out/include/"
           cp bindings/go/README.md "$out/"
           cp LICENSE-MIT LICENSE-APACHE "$out/"
-          # golden_test.go travels with the module, so the tapes it reads have
-          # to travel too: in this repository they sit two directories above the
-          # package, which is outside the module a consumer gets.
-          cp -r golden "$out/golden"
           # The in-repo go.mod already declares the standalone module path.
           cp bindings/go/go.mod "$out/go.mod"
           declare -A GO=(
@@ -892,7 +942,7 @@ jobs:
       - name: Install wasm-pack (latest, via prebuilt binary)
         # See the matching note in ci.yml: jetli's default installs an old
         # 0.10.x wasm-pack whose build subcommand rejects --features.
-        uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2.87.1
+        uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
         timeout-minutes: 10 # fail fast on a stuck download instead of hanging the job
         with:
           tool: wasm-pack

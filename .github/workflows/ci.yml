@@ -348,7 +348,40 @@ jobs:
         with:
           platforms: arm64
 
+      # The container image comes from quay.io, which has failed whole
+      # afternoons (502/504 on the manifest). The first attempt may fail
+      # without failing the row; a pause and one identical retry follow, the
+      # family's retry pair. A second failure is the row's verdict.
       - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        id: wheel
+        continue-on-error: true
+        env:
+          CFLAGS_aarch64_unknown_linux_gnu: -D__ARM_ARCH=8
+        with:
+          working-directory: bindings/python
+          target: ${{ matrix.target }}
+          # Keep in sync with release.yml.
+          args: --release --strip --out dist
+          manylinux: ${{ matrix.manylinux }}
+          # `ring` refuses to assemble unless the assembler defines
+          # `__ARM_ARCH` (Arm C Language Extensions), and the manylinux2014
+          # aarch64 *cross* toolchain does not: the build stops at
+          # `#error "ARM assembler must define __ARM_ARCH"`. The musl cross
+          # image is newer and defines it, which is why only the glibc aarch64
+          # wheel failed. aarch64 is ARMv8-A by definition, so 8 is what a
+          # modern compiler defines there -- this states it rather than picks
+          # it. Exported inside the container as well as set on the step: the
+          # Linux wheels are built in a container the step's own environment
+          # does not necessarily reach, and the native macOS/Windows builds
+          # have no container to export into.
+          before-script-linux: |
+            export CFLAGS_aarch64_unknown_linux_gnu="-D__ARM_ARCH=8"
+      - name: Pause before retrying the wheel build
+        if: steps.wheel.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - if: steps.wheel.outcome == 'failure'
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         env:
           CFLAGS_aarch64_unknown_linux_gnu: -D__ARM_ARCH=8
         with:
@@ -674,7 +707,7 @@ jobs:
         # The taiki-e prebuilt installer, as for cbindgen and cargo-codspeed.
         # jetli/wasm-pack-action with no `version:` installs a ~0.10 wasm-pack
         # whose `build` does not accept `--features`, which this build needs.
-        uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2.87.1
+        uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
         timeout-minutes: 10 # fail fast on a stuck download instead of hanging the job
         with:
           tool: wasm-pack
@@ -770,7 +803,7 @@ jobs:
       - uses: ./.github/actions/setup-rust
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install cbindgen
-        uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2.87.1
+        uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
         with:
           tool: cbindgen
       - name: Build the C ABI library (cdylib + staticlib)
@@ -924,7 +957,7 @@ jobs:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2.87.1
+        uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
         with:
           tool: cargo-llvm-cov
       - name: Generate coverage (lcov)
@@ -986,7 +1019,7 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Install cargo-semver-checks
-        uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2.87.1
+        uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
         timeout-minutes: 10 # fail fast on a stuck download instead of hanging the job
         with:
           tool: cargo-semver-checks
@@ -1042,7 +1075,7 @@ jobs:
         with:
           workspaces: fuzz
       - name: Install cargo-fuzz
-        uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2.87.1
+        uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
         with:
           tool: cargo-fuzz
       - name: Fuzz response_parse (30 s)

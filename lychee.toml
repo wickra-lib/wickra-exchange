@@ -1,40 +1,49 @@
 # Configuration for the lychee link checker (used by the links CI workflow).
 
-# Treat these as success in addition to 2xx.
-accept = [200, 206, 429]
+# Treat these as success in addition to 2xx. 429 and the 5xx entries say the
+# same thing: the host is having a moment, which is not the link being wrong.
+# A 404 still fails, because that is link rot.
+accept = [200, 206, 429, 502, 503, 504]
 
 # Retry transient failures.
 max_retries = 3
 retry_wait_time = 2
+timeout = 20
 
 # Don't hammer hosts.
 max_concurrency = 8
 
+# Check real external links only: no mailto:, no file:, no tel:.
+scheme = ["https", "http"]
+# Covers loopback and every private range: 10.0.0.0/8, 172.16.0.0/12,
+# 192.168.0.0/16 and ::1, not only the two hand-written patterns this replaces.
+exclude_all_private = true
 
-# Exclude links that are not meant to resolve at check time: localhost,
-# example/placeholder hosts, and the package-registry URLs that 404 until a
-# release is published.
-#
-# The CHANGELOG version-compare links are the same class: they point at the
-# release tag, which is created *after* the version bump is merged. The link
-# check runs on push/PR and never on the tag, so on every release PR the new
-# tag does not exist yet and the compare URL 404s. One pattern covers every
-# future version — no per-release exclude needed.
-#
-# GitHub serves 404 to anonymous clients for /stargazers and /network/members
-# (anti-scraping). The README social-footer badges link there; the pages are
-# live in a browser.
+
+# Exclude only what genuinely cannot be checked. Everything a release
+# published -- PyPI, pkg.go.dev, NuGet, Maven Central, r-universe, docs.rs --
+# is checked once it answers rather than skipped forever by an exclusion
+# written for a repository that had published nothing. Loopback and private
+# addresses are handled by exclude_all_private above.
 exclude = [
-    "^https?://localhost",
-    "^https?://127\\.0\\.0\\.1",
     "example\\.com",
+    # Published, but both refuse automated clients: crates.io and npmjs.com
+    # answer 403 to a non-browser request. Checked through their APIs instead.
+    # Excluded because the tool cannot see them, not because they are missing.
     "^https?://crates\\.io/crates/wickra-exchange",
-    "^https?://pypi\\.org/project/wickra-exchange",
     "^https?://www\\.npmjs\\.com/package/wickra-exchange",
-    "^https?://pkg\\.go\\.dev/github\\.com/wickra-lib/wickra-exchange-go",
-    "^https?://www\\.nuget\\.org/packages/WickraExchange",
-    "^https?://central\\.sonatype\\.com/artifact/org\\.wickra/wickra-exchange",
-    "github\\.com/wickra-lib/wickra-exchange/compare/",
-    "github\\.com/wickra-lib/wickra-exchange/stargazers",
-    "github\\.com/wickra-lib/wickra-exchange/network/members",
+    # The CHANGELOG's own reference links. The first release writes a
+    # `releases/tag/vX` link and every one after it a `compare/vA...vB`; the
+    # `[Unreleased]` link points at a tag too. All of them 404 between the
+    # release commit landing and the tag being pushed, and that gap is
+    # deliberate -- a tag is irreversible, so it waits for a human. Excluded for
+    # the same reason as the registry URLs above: they resolve after the
+    # publish, not before.
+    "^https?://github\\.com/wickra-lib/wickra-exchange/releases/tag/",
+    "^https?://github\\.com/wickra-lib/wickra-exchange/compare/",
+    # GitHub serves 404 for /stargazers and /network/members to anonymous
+    # clients; the README social footer links there and the pages are live
+    # in a browser.
+    "^https?://github\\.com/wickra-lib/wickra-exchange/stargazers",
+    "^https?://github\\.com/wickra-lib/wickra-exchange/network/members",
 ]
