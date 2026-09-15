@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-09-15
+
 ### Security
 
 - **rustls 0.23.45.** RUSTSEC-2026-0285: rustls accepted TLS 1.3 handshake
@@ -1697,7 +1699,8 @@ package again: it tracks `*release`, not `main`, so the fix that landed after
   reached the tree through `tokio-tungstenite 0.30 -> tungstenite 0.30 -> rand
   0.10.2`. Locked to `0.10.2`, which is not yanked. Nothing else moved.
 
-[Unreleased]: https://github.com/wickra-lib/wickra-exchange/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/wickra-lib/wickra-exchange/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/wickra-lib/wickra-exchange/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/wickra-lib/wickra-exchange/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/wickra-lib/wickra-exchange/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/wickra-lib/wickra-exchange/compare/v0.1.1...v0.1.2
