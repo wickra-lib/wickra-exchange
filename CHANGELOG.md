@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The pinned `uv` bootstrap could not verify its download.**
+  `scripts/update-lockfiles.sh` named uv 0.12.14 but kept the release
+  checksums of 0.12.7, so `WICKRA_BOOTSTRAP_UV=1` fetched the
+  archive and then refused it. The pin and all four checksums now name
+  0.12.15, taken from the release's `.sha256` files.
+
 ## [0.1.5] - 2026-09-15
 
 ### Security
