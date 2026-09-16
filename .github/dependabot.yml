@@ -200,3 +200,20 @@ updates:
     groups:
       go-binding:
         patterns: ["*"]
+  # The Go benchmark harness: its go.mod replaces the binding with the local
+  # checkout and pulls nothing else today; listed so a dependency it grows is
+  # covered like the sibling repos' second Go module.
+  - package-ecosystem: gomod
+    directory: "/benchmarks/go"
+    schedule:
+      interval: monthly
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 10
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "deps(gomod)"
+    groups:
+      go-benchmarks:
+        patterns: ["*"]
