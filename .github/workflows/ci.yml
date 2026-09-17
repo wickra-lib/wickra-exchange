@@ -151,14 +151,14 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "stable"
+          go-version: "1.23"
           cache: false
 
       - name: Set up JDK 25
         uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c # v6.0.0
         with:
           distribution: temurin
-          java-version: "25"
+          java-version: "22"
 
       - name: Set up R
         uses: r-lib/actions/setup-r@465b7d8e732ca3921382b1674c59bada9cbf3399 # v2.13.0
@@ -856,7 +856,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
-          dotnet-version: "8.0"
+          dotnet-version: "8.0.x"
       # The test project copies the native library next to the test assembly from
       # target/debug (see the <Content> items in the .csproj), so build it in the
       # debug profile here.
@@ -1070,7 +1070,10 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/setup-rust
         with:
-          toolchain: nightly
+          # The family's fuzz nightly, pinned by date: a rolling `nightly` regressed
+          # with a codegen ICE unrelated to this code. Move the date deliberately,
+          # in every repo at once.
+          toolchain: nightly-2026-07-01
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: fuzz
@@ -1079,17 +1082,17 @@ jobs:
         with:
           tool: cargo-fuzz
       - name: Fuzz response_parse (30 s)
-        run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu response_parse -- -max_total_time=30
+        run: cargo +nightly-2026-07-01 fuzz run --target x86_64-unknown-linux-gnu response_parse -- -max_total_time=30
         working-directory: fuzz
       - name: Fuzz credentials_parse (30 s)
-        run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu credentials_parse -- -max_total_time=30
+        run: cargo +nightly-2026-07-01 fuzz run --target x86_64-unknown-linux-gnu credentials_parse -- -max_total_time=30
         working-directory: fuzz
       - name: Fuzz filter_round (30 s)
-        run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu filter_round -- -max_total_time=30
+        run: cargo +nightly-2026-07-01 fuzz run --target x86_64-unknown-linux-gnu filter_round -- -max_total_time=30
         working-directory: fuzz
       - name: Fuzz ws_frame (30 s)
-        run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ws_frame -- -max_total_time=30
+        run: cargo +nightly-2026-07-01 fuzz run --target x86_64-unknown-linux-gnu ws_frame -- -max_total_time=30
         working-directory: fuzz
       - name: Fuzz orderbook_diff (30 s)
-        run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu orderbook_diff -- -max_total_time=30
+        run: cargo +nightly-2026-07-01 fuzz run --target x86_64-unknown-linux-gnu orderbook_diff -- -max_total_time=30
         working-directory: fuzz
