@@ -24,6 +24,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The Java binding loads the library it ships.** The jar carries the native
+  library under `native/<os>-<arch>/` -- the release pipeline stages every
+  platform there -- but the loader only ever looked at `-Dnative.lib.dir` and
+  the working directory, so a Maven Central consumer got a jar it could not
+  load without pointing the JVM at a library it had to build itself. The loader
+  now resolves in wickra's order: `-Dnative.lib.dir` when set, the bundled copy
+  extracted to a temporary file, every `target/release` or `target/debug` up
+  the tree from the working directory and the class's own location, then the
+  bare name.
+
+### Changed
+
+- **Every README follows wickra's shape.** A cross-repo scan compared the
+  heading skeleton of each README against wickra's and this repository's
+  differed throughout. The root README opens as wickra's does (banner, badges,
+  the one-liner, the live-demo and ecosystem lines, no separate H1), the
+  License section carries wickra's wording and its `### Contribution` clause,
+  and the shared sections run in wickra's order. Each binding README is
+  `Install`, `Quick start`, `Benchmark`, `Documentation`, `Security`,
+  `Disclaimer`, `License` with the product's own surface and protocol notes
+  as subsections; the registry pages that render them now say how to report a
+  vulnerability and under which licence the package ships.
+  `examples/README.md` lists every language the way wickra's does, with the
+  commands the CI examples job runs; the per-language example READMEs,
+  `fuzz/README.md` and the `## Editing the docs` section of
+  `docs/README.md` exist as they do in wickra.
+
+### Changed
+
+- **The repository spells shared things the way the family does.** A cross-repo
+  scan lined the 24 wickra-lib repositories up and this one differed in: the
+  Maven compiler, surefire, gpg, javadoc and source plugins each one line behind
+  (3.16.0 / 3.6.0 / 3.2.8 / 3.12.0 / 3.4.0 now), `@napi-rs/cli` at ^3.8.6
+  against the family's ^3.9.0, the C example's `CMAKE_CXX_STANDARD` 14 where
+  the family builds with 17, the example job running the newest Go and Java
+  rather than the floors (`go 1.23`, `release 22`, `dotnet 8.0.x` now, so the
+  floor the manifests promise is what CI proves), the fuzz job on a rolling
+  nightly rather than the family's pinned `nightly-2026-07-01`, and the Go
+  benchmark module absent from Dependabot. The 3.9 requirement row now says
+  `pytest<9` -- what it resolved to all along, since pytest 9 requires 3.10 --
+  with the reason next to it.
+
+### Fixed
+
 - **The pinned `uv` bootstrap could not verify its download.**
   `scripts/update-lockfiles.sh` named uv 0.12.14 but kept the release
   checksums of 0.12.7, so `WICKRA_BOOTSTRAP_UV=1` fetched the

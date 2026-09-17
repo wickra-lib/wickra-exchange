@@ -1,46 +1,43 @@
-# wickra-exchange WASM examples
+# Wickra Exchange WASM examples
 
-Browser demos for the `wickra-exchange-wasm` binding.
-
-The WASM surface is deliberately smaller than the others: `wasm32-unknown-unknown`
-has no sockets, so no live venue client exists there, and signed execution needs
-secret keys a browser sandbox has no business holding. What it does carry is the
-part that needs neither — the offline `PaperExchange` and `ReplayExchange`, with
-the same order, balance and event API the live clients expose. See
-[bindings/wasm/README.md](../../bindings/wasm/README.md) for the full boundary.
+Browser demos for the [Wickra Exchange WASM binding](../../bindings/wasm): an HTML page whose module script
+loads the package the same way (`init()`, then construct), builds the same
+object every other binding builds and prints the same output into the page, so
+the pattern transfers one-to-one to your own page.
 
 ## Build
 
-The module ships as a `wasm-pack` `--target web` bundle. Build it once from the
-repository root:
+The WASM module ships as a `wasm-pack` `--target web` bundle. Build it once from
+the repository root:
 
 ```bash
-wasm-pack build bindings/wasm --target web --release --features panic-hook
+wasm-pack build bindings/wasm --target web
 ```
-
-That writes `bindings/wasm/pkg/` with the `.wasm` binary, the JS loader and the
-TypeScript types. The demos import the loader via
-`../../bindings/wasm/pkg/wickra_exchange_wasm.js`.
 
 ## Serve
 
-ES-module imports need a real HTTP origin, not `file://`. Any static server from
-the repository root works:
+ES modules and `fetch()` both need a real HTTP origin, not `file://`. Any static
+server from the repository root works:
 
 ```bash
+# Python:
 python -m http.server 8000
+
+# Or Node:
+npx http-server -p 8000
 ```
 
-Then open `http://localhost:8000/examples/wasm/paper_trade.html`.
+Then open the demo at `http://localhost:8000/examples/wasm/<file>`. CI cannot open
+a browser; it extracts the `<script type="module">` and parses it with
+`node --check`, so a broken edit fails there rather than in a reader's tab.
 
 ## Demos
 
-| File | What it does |
-| --- | --- |
-| `paper_trade.html` | Seeds an offline paper account, sets a mark price, places a market buy and prints the fill, the resulting balances and the execution events drained from `pollEvents()`. The page counterpart of `examples/node/paper_trade.js` and `examples/rust/src/paper_trade.rs`. |
+| Demo | What it shows |
+|------|---------------|
+| `paper_trade.html` | A runnable example against this binding. |
 
 ## See also
 
-- [examples/README.md](../README.md) — the same scenario in every other language.
-- [docs/STREAMING.md](../../docs/STREAMING.md) — the pull-based event model the
-  demo drains, which is identical here and against a live venue.
+- [`bindings/wasm/README.md`](../../bindings/wasm/README.md) — install, quick start and the API of the package.
+- [`examples/README.md`](../README.md) — the same example in every other language.

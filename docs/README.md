@@ -25,7 +25,7 @@ than the API: [`ARCHITECTURE.md`](../ARCHITECTURE.md) for the crate layout and
 [`BENCHMARKS.md`](../BENCHMARKS.md) for the measured throughput of signing,
 parsing and filter rounding.
 
-## Editing
+## Editing the docs
 
 These pages are part of this repository — change them in the same pull request
 as the behaviour they describe. There is no separate docs repository and no
