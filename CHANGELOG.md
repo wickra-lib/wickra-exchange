@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-09-18
+
 ### Changed
 
 - **The repository spells shared things the way the family does.** A cross-repo
@@ -1766,7 +1768,8 @@ package again: it tracks `*release`, not `main`, so the fix that landed after
   reached the tree through `tokio-tungstenite 0.30 -> tungstenite 0.30 -> rand
   0.10.2`. Locked to `0.10.2`, which is not yanked. Nothing else moved.
 
-[Unreleased]: https://github.com/wickra-lib/wickra-exchange/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/wickra-lib/wickra-exchange/compare/v0.1.6...HEAD
+[0.1.6]: https://github.com/wickra-lib/wickra-exchange/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/wickra-lib/wickra-exchange/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/wickra-lib/wickra-exchange/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/wickra-lib/wickra-exchange/compare/v0.1.2...v0.1.3
