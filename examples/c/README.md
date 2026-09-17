@@ -25,12 +25,23 @@ A static library (`libwickra_exchange.a` / `wickra_exchange.lib`) is emitted alo
 
 ## Build and run the examples
 
-With CMake, as the CI C ABI job does:
+### With CMake (portable, used by CI)
 
 ```sh
 cmake -S examples/c -B examples/c/build
 cmake --build examples/c/build --config Release
 ctest --test-dir examples/c/build -C Release --output-on-failure
+```
+
+### Directly with a compiler
+
+```sh
+# Linux / macOS
+cc examples/c/replay.c -I bindings/c/include -L target/release -lwickra_exchange -lm -o replay
+LD_LIBRARY_PATH=target/release ./replay        # macOS: DYLD_LIBRARY_PATH
+
+# Windows (MinGW gcc, linking the DLL directly)
+gcc examples/c/replay.c -I bindings/c/include target/release/wickra_exchange.dll -lm -o replay.exe
 ```
 
 ## The examples
