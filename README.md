@@ -45,7 +45,7 @@ println!("{} filled at {:?}", order.filled_quantity, order.average_price);
 
 > **▶ Live demo:** all 514 indicators over real Binance market data, computed live in your browser — **[live.wickra.org](https://live.wickra.org)** · zero backend, powered by `wickra-wasm`.
 
-> **Part of the [Wickra ecosystem](https://github.com/wickra-lib):** the same data-driven core and ten-language binding surface also power [wickra-backtest](https://github.com/wickra-lib/wickra-backtest), [wickra-terminal](https://github.com/wickra-lib/wickra-terminal), [wickra-screener](https://github.com/wickra-lib/wickra-screener) and 20 more — see [the full list](https://github.com/wickra-lib).
+**Part of the [Wickra ecosystem](#ecosystem):** the same data-driven core and ten-language binding surface also power [wickra-backtest](https://github.com/wickra-lib/wickra-backtest), [wickra-terminal](https://github.com/wickra-lib/wickra-terminal), [wickra-screener](https://github.com/wickra-lib/wickra-screener) and 20 more — see [the full list](https://github.com/wickra-lib).
 
 A single, compile-time-typed `Exchange` trait spans the ten largest venues
 (Binance, OKX, Bybit, Coinbase, Upbit, Bitget, Gate.io, Kraken, KuCoin, HTX)
@@ -90,12 +90,12 @@ page; the browser-safe slice of *public market data* remains covered by
 
 ## Status
 
-**Pre-alpha — scaffolding.** This repository is being built out from the
-[`wickra-backtest`](https://github.com/wickra-lib/wickra-backtest) template. The
-workspace, the core crate and the project governance are in place; the exchange
-implementations, the connectivity machinery and the language bindings are landing
-incrementally. **The API shown below is the target surface, not yet shippable.**
-Track progress in [ROADMAP.md](ROADMAP.md). Not released to any registry.
+**0.1.5 — the current release.** Ten exchanges behind one typed API — market
+data and signed execution — the deterministic paper exchange, all ten language
+bindings, the byte-exact golden corpus, property + fuzz tests, benchmarks and one
+runnable example per language are in place and green across the full CI matrix
+(10 languages × 3 OS). [ROADMAP.md](ROADMAP.md) has what is done, what is open
+and what is not planned.
 
 > ⚠️ **Real orders move real money.** Every signed-execution code path is
 > safety-critical. Use withdrawal-disabled keys, test against exchange testnets
@@ -173,7 +173,7 @@ The ten largest venues by volume, each behind the same `Exchange` trait. The
 ✅ implemented · ⏳ planned · — not offered by the venue. The current state of
 each cell is tracked in [docs/EXCHANGES.md](docs/EXCHANGES.md).
 
-## Use the same API in any language
+## Use in any language
 
 | Language | Binding | Quickstart |
 |----------|---------|------------|
@@ -302,6 +302,24 @@ integration tests nightly and on demand against public endpoints. They are
 `#[ignore]` by default and gated behind environment variables, so a normal
 `cargo test` never opens a socket and mainnet with real keys is never touched.
 
+## Requirements
+
+The minimum supported version per language. The same Rust core runs behind every
+binding; the C-ABI bindings that compile on install — Go (cgo) and R (`.Call`) —
+also need a C compiler, and Java runs with `--enable-native-access=ALL-UNNAMED`.
+
+| Language | Package                                    | Minimum supported          |
+|----------|--------------------------------------------|----------------------------|
+| Rust     | crates.io · `wickra-exchange`              | 1.86 (MSRV)                |
+| Python   | PyPI · `wickra-exchange` (abi3 wheel)      | 3.9 (tested through 3.13)  |
+| Node.js  | npm · `wickra-exchange` (N-API 8)          | 22 (tested on 22 · 24 LTS) |
+| C        | `wickra_exchange.h` + library (releases)   | C99 compiler               |
+| C++      | over the C ABI                             | C++14 compiler             |
+| C#       | NuGet · `WickraExchange`                    | .NET 8 (`net8.0`)          |
+| Go       | module · `wickra-lib/wickra-exchange-go`   | Go 1.23 (cgo)              |
+| Java     | Maven Central · `org.wickra:wickra-exchange` | Java 22 (FFM / Panama)   |
+| R        | r-universe · `wickraexchange`              | R ≥ 4.1 (Rtools on Win.)  |
+
 ## Benchmarks
 
 Connectivity throughput is dominated by the network, not the CPU, so the
@@ -320,24 +338,6 @@ order-book diff application including sequence-gap detection.
 
 Measured figures, the methodology and the machine they were taken on are in
 [BENCHMARKS.md](BENCHMARKS.md).
-
-## Requirements
-
-The minimum supported version per language. The same Rust core runs behind every
-binding; the C-ABI bindings that compile on install — Go (cgo) and R (`.Call`) —
-also need a C compiler, and Java runs with `--enable-native-access=ALL-UNNAMED`.
-
-| Language | Package                                    | Minimum supported          |
-|----------|--------------------------------------------|----------------------------|
-| Rust     | crates.io · `wickra-exchange`              | 1.86 (MSRV)                |
-| Python   | PyPI · `wickra-exchange` (abi3 wheel)      | 3.9 (tested through 3.13)  |
-| Node.js  | npm · `wickra-exchange` (N-API 8)          | 22 (tested on 22 · 24 LTS) |
-| C        | `wickra_exchange.h` + library (releases)   | C99 compiler               |
-| C++      | over the C ABI                             | C++14 compiler             |
-| C#       | NuGet · `WickraExchange`                    | .NET 8 (`net8.0`)          |
-| Go       | module · `wickra-lib/wickra-exchange-go`   | Go 1.23 (cgo)              |
-| Java     | Maven Central · `org.wickra:wickra-exchange` | Java 22 (FFM / Panama)   |
-| R        | r-universe · `wickraexchange`              | R ≥ 4.1 (Rtools on Win.)  |
 
 ## Ecosystem
 
