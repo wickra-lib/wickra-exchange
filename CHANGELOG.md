@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The repository spells shared things the way the family does.** A cross-repo
+  scan lined the 24 wickra-lib repositories up and this one differed in: the
+  Maven compiler, surefire, gpg, javadoc and source plugins each one line behind
+  (3.16.0 / 3.6.0 / 3.2.8 / 3.12.0 / 3.4.0 now), `@napi-rs/cli` at ^3.8.6
+  against the family's ^3.9.0, the C example's `CMAKE_CXX_STANDARD` 14 where
+  the family builds with 17, the example job running the newest Go and Java
+  rather than the floors (`go 1.23`, `release 22`, `dotnet 8.0.x` now, so the
+  floor the manifests promise is what CI proves), the fuzz job on a rolling
+  nightly rather than the family's pinned `nightly-2026-07-01`, and the Go
+  benchmark module absent from Dependabot. The 3.9 requirement row now says
+  `pytest<9` -- what it resolved to all along, since pytest 9 requires 3.10 --
+  with the reason next to it.
+
 ### Fixed
 
 - **The Java binding loads the library it ships.** The jar carries the native
