@@ -92,7 +92,7 @@ page; the browser-safe slice of *public market data* remains covered by
 
 ## Status
 
-**0.1.5 — the current release.** Ten exchanges behind one typed API — market
+**0.1.6 — the current release.** Ten exchanges behind one typed API — market
 data and signed execution — the deterministic paper exchange, all ten language
 bindings, the byte-exact golden corpus, property + fuzz tests, benchmarks and one
 runnable example per language are in place and green across the full CI matrix
