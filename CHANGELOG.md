@@ -11,6 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **rust_decimal 1.43.0.** Its optional `rkyv` dependency moves to the 0.8 line,
+  which retires the RUSTSEC-2026-0235 suppression that 1.42.1 needed and the
+  Dependabot hold that followed it. The cost is upstream and measured: the
+  bench crate's `parse_decimal`, `round_price` and `round_quantity` run 10-16%
+  more instructions than on 1.42.1. Every consumer of the engine compiles it
+  with the same version, so the family carries one rust_decimal rather than an
+  advisory ignore in eleven repositories.
 - **The repository spells shared things the way the family does.** A cross-repo
   scan lined the 24 wickra-lib repositories up and this one differed in: the
   Maven compiler, surefire, gpg, javadoc and source plugins each one line behind
