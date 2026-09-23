@@ -5,6 +5,215 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#ifdef WICKRA_WASM_STUB
+/* WebAssembly (webR, r-universe's wasm build). The C ABI is a network client on
+ * tokio, reqwest and tokio-tungstenite, and wasm32-unknown-emscripten has no
+ * sockets for them, so configure builds this glue without it. The package
+ * installs and loads in webR, and every entry point says why it cannot run
+ * there instead of the install failing. The stubs are generated from the
+ * registration table below, so each has the exact arity R calls it with --
+ * webR's call_indirect traps on a mismatch. The offline paper and replay
+ * simulators run in the browser as the wickra-exchange-wasm npm package. */
+static SEXP wkex_unavailable(void) {
+    Rf_error("wickraexchange is not available in WebAssembly: it is a network client, and webR has "
+             "no sockets. Use it from a native R session; the offline paper and replay simulators run "
+             "in the browser as the wickra-exchange-wasm npm package.");
+    return R_NilValue;
+}
+
+SEXP wkex_version(void) { return wkex_unavailable(); }
+
+SEXP wkex_connect(SEXP a1, SEXP a2, SEXP a3, SEXP a4, SEXP a5, SEXP a6, SEXP a7, SEXP a8, SEXP a9) {
+    (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; (void)a7; (void)a8; (void)a9;
+    return wkex_unavailable();
+}
+
+SEXP wkex_paper_new(SEXP a1, SEXP a2, SEXP a3, SEXP a4, SEXP a5) {
+    (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+    return wkex_unavailable();
+}
+
+SEXP wkex_replay_new(SEXP a1, SEXP a2, SEXP a3, SEXP a4, SEXP a5, SEXP a6, SEXP a7) {
+    (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; (void)a7;
+    return wkex_unavailable();
+}
+
+SEXP wkex_name(SEXP a1) {
+    (void)a1;
+    return wkex_unavailable();
+}
+
+SEXP wkex_set_price(SEXP a1, SEXP a2, SEXP a3) {
+    (void)a1; (void)a2; (void)a3;
+    return wkex_unavailable();
+}
+
+SEXP wkex_place_order(SEXP a1, SEXP a2, SEXP a3, SEXP a4, SEXP a5, SEXP a6, SEXP a7, SEXP a8, SEXP a9, SEXP a10, SEXP a11, SEXP a12, SEXP a13, SEXP a14, SEXP a15) {
+    (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; (void)a7; (void)a8; (void)a9; (void)a10; (void)a11; (void)a12; (void)a13; (void)a14; (void)a15;
+    return wkex_unavailable();
+}
+
+SEXP wkex_place(SEXP a1, SEXP a2, SEXP a3, SEXP a4, SEXP a5) {
+    (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+    return wkex_unavailable();
+}
+
+SEXP wkex_cancel(SEXP a1, SEXP a2, SEXP a3) {
+    (void)a1; (void)a2; (void)a3;
+    return wkex_unavailable();
+}
+
+SEXP wkex_balance(SEXP a1, SEXP a2) {
+    (void)a1; (void)a2;
+    return wkex_unavailable();
+}
+
+SEXP wkex_poll(SEXP a1, SEXP a2) {
+    (void)a1; (void)a2;
+    return wkex_unavailable();
+}
+
+SEXP wkex_exchange_ticker(SEXP a1, SEXP a2) {
+    (void)a1; (void)a2;
+    return wkex_unavailable();
+}
+
+SEXP wkex_exchange_klines(SEXP a1, SEXP a2, SEXP a3, SEXP a4) {
+    (void)a1; (void)a2; (void)a3; (void)a4;
+    return wkex_unavailable();
+}
+
+SEXP wkex_exchange_order_book(SEXP a1, SEXP a2, SEXP a3) {
+    (void)a1; (void)a2; (void)a3;
+    return wkex_unavailable();
+}
+
+SEXP wkex_exchange_subscribe_trades(SEXP a1, SEXP a2) {
+    (void)a1; (void)a2;
+    return wkex_unavailable();
+}
+
+SEXP wkex_exchange_subscribe_book(SEXP a1, SEXP a2) {
+    (void)a1; (void)a2;
+    return wkex_unavailable();
+}
+
+SEXP wkex_exchange_subscribe_ticker(SEXP a1, SEXP a2) {
+    (void)a1; (void)a2;
+    return wkex_unavailable();
+}
+
+SEXP wkex_exchange_query_order(SEXP a1, SEXP a2, SEXP a3) {
+    (void)a1; (void)a2; (void)a3;
+    return wkex_unavailable();
+}
+
+SEXP wkex_exchange_open_orders(SEXP a1, SEXP a2) {
+    (void)a1; (void)a2;
+    return wkex_unavailable();
+}
+
+SEXP wkex_connect_derivatives(SEXP a1, SEXP a2, SEXP a3, SEXP a4, SEXP a5, SEXP a6) {
+    (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
+    return wkex_unavailable();
+}
+
+SEXP wkex_derivatives_position(SEXP a1, SEXP a2) {
+    (void)a1; (void)a2;
+    return wkex_unavailable();
+}
+
+SEXP wkex_derivatives_positions(SEXP a1, SEXP a2) {
+    (void)a1; (void)a2;
+    return wkex_unavailable();
+}
+
+SEXP wkex_derivatives_set_leverage(SEXP a1, SEXP a2, SEXP a3) {
+    (void)a1; (void)a2; (void)a3;
+    return wkex_unavailable();
+}
+
+SEXP wkex_derivatives_set_margin_mode(SEXP a1, SEXP a2, SEXP a3) {
+    (void)a1; (void)a2; (void)a3;
+    return wkex_unavailable();
+}
+
+SEXP wkex_derivatives_close_position(SEXP a1, SEXP a2) {
+    (void)a1; (void)a2;
+    return wkex_unavailable();
+}
+
+SEXP wkex_connect_advanced(SEXP a1, SEXP a2, SEXP a3, SEXP a4, SEXP a5, SEXP a6, SEXP a7) {
+    (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; (void)a7;
+    return wkex_unavailable();
+}
+
+SEXP wkex_advanced_amend_order(SEXP a1, SEXP a2, SEXP a3, SEXP a4, SEXP a5) {
+    (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+    return wkex_unavailable();
+}
+
+SEXP wkex_advanced_cancel_batch(SEXP a1, SEXP a2, SEXP a3) {
+    (void)a1; (void)a2; (void)a3;
+    return wkex_unavailable();
+}
+
+SEXP wkex_advanced_place_oco(SEXP a1, SEXP a2, SEXP a3, SEXP a4, SEXP a5, SEXP a6, SEXP a7) {
+    (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; (void)a7;
+    return wkex_unavailable();
+}
+
+SEXP wkex_advanced_place_batch(SEXP a1, SEXP a2, SEXP a3, SEXP a4, SEXP a5) {
+    (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+    return wkex_unavailable();
+}
+
+SEXP wkex_advanced_place_batch_full(SEXP a1, SEXP a2, SEXP a3, SEXP a4, SEXP a5, SEXP a6, SEXP a7, SEXP a8, SEXP a9, SEXP a10, SEXP a11, SEXP a12, SEXP a13, SEXP a14, SEXP a15) {
+    (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; (void)a7; (void)a8; (void)a9; (void)a10; (void)a11; (void)a12; (void)a13; (void)a14; (void)a15;
+    return wkex_unavailable();
+}
+
+SEXP wkex_connect_user_data(SEXP a1, SEXP a2, SEXP a3, SEXP a4, SEXP a5, SEXP a6, SEXP a7) {
+    (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; (void)a7;
+    return wkex_unavailable();
+}
+
+SEXP wkex_user_data_subscribe(SEXP a1) {
+    (void)a1;
+    return wkex_unavailable();
+}
+
+SEXP wkex_user_data_keepalive(SEXP a1) {
+    (void)a1;
+    return wkex_unavailable();
+}
+
+SEXP wkex_user_data_poll(SEXP a1, SEXP a2) {
+    (void)a1; (void)a2;
+    return wkex_unavailable();
+}
+
+SEXP wkex_connect_ws_execution(SEXP a1, SEXP a2, SEXP a3, SEXP a4, SEXP a5, SEXP a6, SEXP a7) {
+    (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; (void)a7;
+    return wkex_unavailable();
+}
+
+SEXP wkex_ws_place_order(SEXP a1, SEXP a2, SEXP a3, SEXP a4, SEXP a5) {
+    (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+    return wkex_unavailable();
+}
+
+SEXP wkex_ws_place_order_full(SEXP a1, SEXP a2, SEXP a3, SEXP a4, SEXP a5, SEXP a6, SEXP a7, SEXP a8, SEXP a9, SEXP a10, SEXP a11, SEXP a12, SEXP a13, SEXP a14, SEXP a15) {
+    (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; (void)a7; (void)a8; (void)a9; (void)a10; (void)a11; (void)a12; (void)a13; (void)a14; (void)a15;
+    return wkex_unavailable();
+}
+
+SEXP wkex_ws_cancel_order(SEXP a1, SEXP a2, SEXP a3) {
+    (void)a1; (void)a2; (void)a3;
+    return wkex_unavailable();
+}
+
+#else
 #include "wickra_exchange.h"
 
 /* --- handle lifetime ----------------------------------------------------- */
@@ -812,6 +1021,8 @@ SEXP wkex_ws_cancel_order(SEXP ext, SEXP market, SEXP order_id) {
                                     CHAR(STRING_ELT(order_id, 0)));
     return Rf_ScalarInteger(rc);
 }
+
+#endif /* WICKRA_WASM_STUB */
 
 /* --- registration -------------------------------------------------------- */
 

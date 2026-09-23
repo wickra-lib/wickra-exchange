@@ -38,15 +38,18 @@ wkex_download() {
   return 1
 }
 
-# WebAssembly (r-universe's webR target) is not supported and says so rather
-# than failing further in with a link error. Unlike the indicator library, this
-# one is a network client: the C ABI is built on tokio, reqwest and
-# tokio-tungstenite, and wasm32-unknown-emscripten has no sockets for them. A
-# build here could only produce something that compiles and then cannot connect.
+# WebAssembly (r-universe's webR target). Unlike the indicator library, this one
+# is a network client: the C ABI is built on tokio, reqwest and
+# tokio-tungstenite, and wasm32-unknown-emscripten has no sockets for them, so a
+# C ABI built here could only compile and then never connect. The glue is built
+# without it instead (WICKRA_WASM_STUB): the package installs and loads in webR,
+# and each entry point says why it cannot run there -- rather than a failed
+# build on every release.
 if [ "$(uname -s)" = "Emscripten" ]; then
-  echo "wickra-exchange: no WebAssembly build -- this package is a network client and wasm has no sockets."
+  echo "wickra-exchange: WebAssembly build without the C ABI -- a network client needs sockets, which webR has not; every call says so."
   echo "wickra-exchange: the offline paper/replay simulators are published separately as the wickra-exchange-wasm npm package."
-  exit 1
+  printf 'PKG_CPPFLAGS = -DWICKRA_WASM_STUB\n' > src/Makevars
+  exit 0
 fi
 
 if [ -n "${WKEX_INC}" ] && [ -n "${WKEX_LIB}" ]; then

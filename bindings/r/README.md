@@ -34,6 +34,10 @@ nothing but a C toolchain (Rtools on Windows) for the thin `.Call` glue layer. T
 build against a local checkout instead, point it at the header and library with
 the environment variables below.
 
+In the browser (webR, r-universe's WebAssembly build) the package installs and loads, but it
+cannot run: it is a network client, and webR has no sockets. Every call says so; the offline
+paper and replay simulators run in the browser as the `wickra-exchange-wasm` npm package.
+
 `configure` fetches the C ABI for your platform from the GitHub release matching
 this package's version, stages it into `src/`, and `install.libs.R` bundles it
 beside the compiled object — so the installed package carries its own native
