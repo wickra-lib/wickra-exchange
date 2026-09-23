@@ -18,7 +18,9 @@ publishes the refreshed dependency tree and toolchain pins.
   release; the `1.0` requirement already admitted it.
 - **Third-party dependencies refreshed.** `Cargo.lock` takes 96 crates to their
   newest semver-compatible versions, run across the family in one pass so every
-  repository resolves the same day's versions. No manifest changed.
+  repository resolves the same day's versions. No manifest changed. The icu
+  crates (reached through `reqwest`) stay at 2.2.0: 2.3.0 raised its declared
+  `rust-version` to 1.88, above this workspace's 1.86 floor.
 - **`@napi-rs/cli` 3.10.4** for the Node binding, the family's line.
 - **uv 0.12.18** for the lockfile bootstrap in `scripts/update-lockfiles.sh`,
   with all four platform checksums moved together.
