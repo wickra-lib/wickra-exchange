@@ -16,11 +16,22 @@ publishes the refreshed dependency tree and toolchain pins.
 
 - **Built on wickra-core 1.0.5.** The lock takes the indicator core's latest
   release; the `1.0` requirement already admitted it.
-- **Third-party dependencies refreshed.** `Cargo.lock` takes 96 crates to their
-  newest semver-compatible versions, run across the family in one pass so every
-  repository resolves the same day's versions. No manifest changed. The icu
-  crates (reached through `reqwest`) stay at 2.2.0: 2.3.0 raised its declared
-  `rust-version` to 1.88, above this workspace's 1.86 floor.
+- **Third-party dependencies refreshed.** `Cargo.lock` takes 106 crates to their
+  newest versions compatible with the Rust floor (the lock now resolves
+  MSRV-aware, see below), run across the family in one pass so every repository
+  resolves the same day's versions. No manifest changed. The icu crates (reached
+  through `reqwest`) stay at 2.2.0: 2.3.0 raised its declared `rust-version` to
+  1.88, above this workspace's 1.86 floor.
+- **The lockfile resolves for the Rust floor.** `.cargo/config.toml` sets
+  `incompatible-rust-versions = "fallback"`, so `cargo update` takes the newest
+  version the workspace's `rust-version` can build rather than the newest
+  release -- the setting compile, copilot and shazam already carried, now
+  family-wide. Without it, a routine refresh elsewhere in the family raised the
+  icu crates to 2.3.0, which declares Rust 1.88, above a 1.86 floor. Re-resolved
+  under it, the lock steps back to the newest versions the floor can build for
+  `wasip2`, `wit-bindgen`. `yoke-derive` stays at 0.8.2: 0.8.3 needs Rust 1.87
+  without declaring a `rust-version`, so no resolver setting can see it, and
+  here it lies inside the MSRV build (through the icu crates).
 - **`@napi-rs/cli` 3.10.4** for the Node binding, the family's line.
 - **uv 0.12.18** for the lockfile bootstrap in `scripts/update-lockfiles.sh`,
   with all four platform checksums moved together.
