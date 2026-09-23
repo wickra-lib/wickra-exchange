@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-09-23
+
+A maintenance release: the exchange facade and its bindings are unchanged. It
+publishes the refreshed dependency tree and toolchain pins.
+
+### Changed
+
+- **Built on wickra-core 1.0.5.** The lock takes the indicator core's latest
+  release; the `1.0` requirement already admitted it.
+- **Third-party dependencies refreshed.** `Cargo.lock` takes 96 crates to their
+  newest semver-compatible versions, run across the family in one pass so every
+  repository resolves the same day's versions. No manifest changed.
+- **`@napi-rs/cli` 3.10.4** for the Node binding, the family's line.
+- **uv 0.12.18** for the lockfile bootstrap in `scripts/update-lockfiles.sh`,
+  with all four platform checksums moved together.
+- **The README's static badges are served by the organization** rather than
+  hot-linked from shields.io, so they no longer break when shields is down.
+
 ## [0.1.6] - 2026-09-18
 
 ### Changed
@@ -146,7 +164,6 @@ package again: it tracks `*release`, not `main`, so the fix that landed after
   The block moves to `tests/golden.R`, `.Rbuildignore` keeps it out of the
   tarball, and `ci.yml` runs it explicitly from the repository root, which is
   the only place it can mean anything.
-
 
 ## [0.1.1] - 2026-09-04
 
@@ -1775,7 +1792,8 @@ package again: it tracks `*release`, not `main`, so the fix that landed after
   reached the tree through `tokio-tungstenite 0.30 -> tungstenite 0.30 -> rand
   0.10.2`. Locked to `0.10.2`, which is not yanked. Nothing else moved.
 
-[Unreleased]: https://github.com/wickra-lib/wickra-exchange/compare/v0.1.6...HEAD
+[Unreleased]: https://github.com/wickra-lib/wickra-exchange/compare/v0.1.7...HEAD
+[0.1.7]: https://github.com/wickra-lib/wickra-exchange/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/wickra-lib/wickra-exchange/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/wickra-lib/wickra-exchange/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/wickra-lib/wickra-exchange/compare/v0.1.3...v0.1.4
