@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The R package's WebAssembly build installs instead of failing.** r-universe
+  builds every package for webR, and `configure` refused with an error, so the
+  wasm build of every release was red. The C ABI still cannot target
+  `wasm32-unknown-emscripten` -- it is a network client, and webR has no sockets
+  -- so `configure` now builds the `.Call` glue without it: the package installs
+  and loads in webR, and each of the 39 entry points raises an error that says
+  why it cannot run there and points to the `wickra-exchange-wasm` npm package
+  for the offline simulators. The stubs are generated from the registration
+  table, so each has the arity R calls it with. Native builds are unchanged;
+  both variants compiled with the same exported symbols, the stub with
+  r-universe's emcc 5.0.7.
+
 ## [0.1.7] - 2026-09-23
 
 A maintenance release: the exchange facade and its bindings are unchanged. It
