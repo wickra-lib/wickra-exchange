@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-09-24
+
+The exchange facade and its native bindings are unchanged. The R package now
+builds on r-universe's WebAssembly target, and a release can be finished by a
+re-run once Maven Central has the bundle.
+
 ### Fixed
 
 - **The R package's WebAssembly build installs instead of failing.** r-universe
@@ -20,6 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   table, so each has the arity R calls it with. Native builds are unchanged;
   both variants compiled with the same exported symbols, the stub with
   r-universe's emcc 5.0.7.
+- **A release can be finished by a re-run once Maven Central has the bundle.**
+  The Java job looks the version up on repo1.maven.org before deploying and
+  skips the deploy when it is there, building the jar instead. Central can take
+  longer to publish than the plugin polls for; the deploy then fails after the
+  bundle was accepted, the jobs behind it -- build provenance and the GitHub
+  Release -- are skipped, and a re-run used to fail on the duplicate. The same
+  pre-check the family's other release workflows carry.
 
 ## [0.1.7] - 2026-09-23
 
@@ -1820,7 +1833,8 @@ package again: it tracks `*release`, not `main`, so the fix that landed after
   reached the tree through `tokio-tungstenite 0.30 -> tungstenite 0.30 -> rand
   0.10.2`. Locked to `0.10.2`, which is not yanked. Nothing else moved.
 
-[Unreleased]: https://github.com/wickra-lib/wickra-exchange/compare/v0.1.7...HEAD
+[Unreleased]: https://github.com/wickra-lib/wickra-exchange/compare/v0.1.8...HEAD
+[0.1.8]: https://github.com/wickra-lib/wickra-exchange/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/wickra-lib/wickra-exchange/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/wickra-lib/wickra-exchange/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/wickra-lib/wickra-exchange/compare/v0.1.4...v0.1.5
