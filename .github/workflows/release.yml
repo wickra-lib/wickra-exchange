@@ -206,7 +206,7 @@ jobs:
 
       # CycloneDX SBOM per published crate.
       - name: Install cargo-cyclonedx
-        uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2.87.17
+        uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
         with:
           tool: cargo-cyclonedx
 
@@ -967,7 +967,7 @@ jobs:
       - name: Install wasm-pack (latest, via prebuilt binary)
         # See the matching note in ci.yml: jetli's default installs an old
         # 0.10.x wasm-pack whose build subcommand rejects --features.
-        uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2.87.17
+        uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
         timeout-minutes: 10 # fail fast on a stuck download instead of hanging the job
         with:
           tool: wasm-pack
