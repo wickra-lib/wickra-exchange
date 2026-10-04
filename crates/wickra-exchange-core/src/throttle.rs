@@ -407,7 +407,7 @@ mod tests {
 
         assert!(matches!(error, Error::Timeout));
         assert_eq!(mock.recorded_requests().len(), 1, "it must not be re-sent");
-        assert!(recorder.waits().is_empty());
+        assert_eq!(recorder.waits(), Vec::new());
     }
 
     #[test]
@@ -437,7 +437,7 @@ mod tests {
 
         assert!(matches!(error, Error::Auth(_)));
         assert_eq!(mock.recorded_requests().len(), 1);
-        assert!(recorder.waits().is_empty());
+        assert_eq!(recorder.waits(), Vec::new());
     }
 
     #[test]

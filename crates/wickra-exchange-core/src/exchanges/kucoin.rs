@@ -1989,7 +1989,7 @@ mod tests {
         KuCoin::subscribe_derivatives(&mut kucoin, &symbol(), DerivativesChannel::MarkIndex)
             .unwrap();
 
-        assert!(KuCoin::poll_events(&mut kucoin).is_empty());
+        assert_eq!(KuCoin::poll_events(&mut kucoin), Vec::new());
     }
 
     /// An instrument frame missing its prices is dropped rather than half-read.
@@ -2012,7 +2012,7 @@ mod tests {
             .unwrap();
         KuCoin::subscribe_derivatives(&mut kucoin, &symbol(), DerivativesChannel::Funding).unwrap();
 
-        assert!(KuCoin::poll_events(&mut kucoin).is_empty());
+        assert_eq!(KuCoin::poll_events(&mut kucoin), Vec::new());
     }
 
     /// Both channels arrive on one topic, under two subjects.
@@ -2069,7 +2069,7 @@ mod tests {
         KuCoin::subscribe_derivatives(&mut kucoin, &symbol(), DerivativesChannel::MarkIndex)
             .unwrap();
 
-        assert!(KuCoin::poll_events(&mut kucoin).is_empty());
+        assert_eq!(KuCoin::poll_events(&mut kucoin), Vec::new());
     }
 
     /// Open interest is in contracts; the multiplier arrives in the same reply,
@@ -2099,7 +2099,7 @@ mod tests {
             KuCoin::subscribe_derivatives(&mut kucoin, &symbol(), DerivativesChannel::Liquidations)
                 .expect_err("KuCoin has no public liquidation stream");
         assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
-        assert!(ws.sent().is_empty());
+        assert_eq!(ws.sent(), Vec::<String>::new());
 
         let (kucoin, _) = futures_ws_client();
         assert!(KuCoin::long_short_ratio(&kucoin, &symbol()).is_err());
@@ -2189,7 +2189,7 @@ mod tests {
         let Event::BookDelta(removed) = &events[0] else {
             panic!("expected a delta, got {:?}", events[0]);
         };
-        assert!(removed.bids.is_empty());
+        assert_eq!(removed.bids, Vec::new());
         assert_eq!(removed.asks[0].price, dec!(81385.8));
         // A size of zero removes the level, which the delta type already means.
         assert_eq!(removed.asks[0].quantity, Decimal::ZERO);
@@ -2198,7 +2198,7 @@ mod tests {
         let Event::BookDelta(added) = &events[1] else {
             panic!("expected a delta, got {:?}", events[1]);
         };
-        assert!(added.asks.is_empty());
+        assert_eq!(added.asks, Vec::new());
         assert_eq!(added.bids[0].quantity, dec!(42));
     }
 
@@ -2493,7 +2493,7 @@ mod tests {
     fn keepalive_user_data_is_a_noop_before_subscribe() {
         let (mut kucoin, _http, ws) = signed_ws_client(1000);
         kucoin.keepalive_user_data().unwrap();
-        assert!(ws.sent().is_empty());
+        assert_eq!(ws.sent(), Vec::<String>::new());
     }
 
     #[test]
@@ -2621,7 +2621,7 @@ mod tests {
             ..OrderRequest::market_sell(symbol(), dec!(1))
         };
         assert!(KuCoin::place_order(&kucoin, &request).is_err());
-        assert!(mock.recorded_requests().is_empty());
+        assert_eq!(mock.recorded_requests(), Vec::new());
     }
     fn hedged_futures_client(now_ms: i64) -> (KuCoin, Arc<MockHttpTransport>) {
         let mock = Arc::new(MockHttpTransport::new());

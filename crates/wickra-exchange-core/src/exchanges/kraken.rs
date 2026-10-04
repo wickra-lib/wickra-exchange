@@ -2926,7 +2926,7 @@ mod tests {
             ..OrderRequest::market_sell(symbol(), dec!(1))
         };
         assert!(Kraken::place_order(&kraken, &request).is_err());
-        assert!(mock.recorded_requests().is_empty());
+        assert_eq!(mock.recorded_requests(), Vec::new());
     }
 
     /// The futures path must not flatten a trigger into a plain market order.
@@ -3097,7 +3097,7 @@ mod tests {
         ]);
         Kraken::subscribe_trades(&mut kraken, &symbol()).unwrap();
 
-        assert!(Kraken::poll_events(&mut kraken).is_empty());
+        assert_eq!(Kraken::poll_events(&mut kraken), Vec::new());
     }
 
     /// A trade snapshot replays several trades in one frame.
@@ -3298,7 +3298,7 @@ mod tests {
         let Event::BookDelta(delta) = &events[0] else {
             panic!("expected a delta, got {:?}", events[0]);
         };
-        assert!(delta.bids.is_empty());
+        assert_eq!(delta.bids, Vec::new());
         assert_eq!(delta.asks.len(), 1);
         assert_eq!(delta.asks[0].price, dec!(81270.0));
         assert_eq!(delta.asks[0].quantity, dec!(3.1591));
@@ -3339,7 +3339,7 @@ mod tests {
         ))]);
         Kraken::subscribe_trades(&mut kraken, &symbol()).unwrap();
 
-        assert!(Kraken::poll_events(&mut kraken).is_empty());
+        assert_eq!(Kraken::poll_events(&mut kraken), Vec::new());
     }
 
     /// The spot client is untouched by any of it.
@@ -3511,7 +3511,7 @@ mod tests {
     fn keepalive_user_data_is_a_noop_before_subscribe() {
         let (mut kraken, _http, ws) = signed_ws_client(1000);
         kraken.keepalive_user_data().unwrap();
-        assert!(ws.sent().is_empty());
+        assert_eq!(ws.sent(), Vec::<String>::new());
     }
 
     #[test]
@@ -3894,21 +3894,21 @@ mod tests {
             .with_time_in_force(TimeInForce::Ioc);
         let err = kraken.place_order(&both).unwrap_err();
         assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
-        assert!(mock.recorded_requests().is_empty());
+        assert_eq!(mock.recorded_requests(), Vec::new());
 
         let (kraken, mock) = signed_futures_client(1000);
         let fok = OrderRequest::limit_buy(symbol(), dec!(1), dec!(100))
             .with_time_in_force(TimeInForce::Fok);
         let err = kraken.place_order(&fok).unwrap_err();
         assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
-        assert!(mock.recorded_requests().is_empty());
+        assert_eq!(mock.recorded_requests(), Vec::new());
 
         let (kraken, mock) = signed_futures_client(1000);
         let stp = OrderRequest::limit_buy(symbol(), dec!(1), dec!(100))
             .with_stp(SelfTradePrevention::ExpireMaker);
         let err = kraken.place_order(&stp).unwrap_err();
         assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
-        assert!(mock.recorded_requests().is_empty());
+        assert_eq!(mock.recorded_requests(), Vec::new());
     }
 
     /// The batch and WebSocket paths honour the same two limits.
@@ -3919,14 +3919,14 @@ mod tests {
             .with_stp(SelfTradePrevention::ExpireMaker);
         let err = AdvancedOrders::place_batch(&mut kraken, &[stp]).unwrap_err();
         assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
-        assert!(mock.recorded_requests().is_empty());
+        assert_eq!(mock.recorded_requests(), Vec::new());
 
         let (mut kraken, mock) = signed_client(1000);
         let fok = OrderRequest::limit_buy(symbol(), dec!(1), dec!(100))
             .with_time_in_force(TimeInForce::Fok);
         let err = AdvancedOrders::place_batch(&mut kraken, &[fok]).unwrap_err();
         assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
-        assert!(mock.recorded_requests().is_empty());
+        assert_eq!(mock.recorded_requests(), Vec::new());
 
         let (mut kraken, _mock) = signed_client(1000);
         let ws_stp = OrderRequest::limit_buy(symbol(), dec!(1), dec!(100))

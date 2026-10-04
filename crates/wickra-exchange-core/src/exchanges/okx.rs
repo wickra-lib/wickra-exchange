@@ -2256,7 +2256,7 @@ mod tests {
             ..OrderRequest::market_sell(symbol(), dec!(1))
         };
         assert!(Okx::place_order(&okx, &request).is_err());
-        assert!(mock.recorded_requests().is_empty());
+        assert_eq!(mock.recorded_requests(), Vec::new());
     }
 
     fn signed_futures_client(now_ms: i64) -> (Okx, Arc<MockHttpTransport>) {
@@ -2504,7 +2504,7 @@ mod tests {
         let request = OrderRequest::market_buy(symbol(), dec!(1)).post_only();
         let err = okx.place_order(&request).unwrap_err();
         assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
-        assert!(mock.recorded_requests().is_empty());
+        assert_eq!(mock.recorded_requests(), Vec::new());
     }
 
     #[test]
@@ -3154,7 +3154,7 @@ mod tests {
     fn keepalive_user_data_is_a_noop_before_subscribe() {
         let (mut okx, ws) = signed_ws_client(1_700_000_000_000);
         okx.keepalive_user_data().unwrap();
-        assert!(ws.sent().is_empty());
+        assert_eq!(ws.sent(), Vec::<String>::new());
     }
 
     #[test]

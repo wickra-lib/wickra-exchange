@@ -2873,7 +2873,7 @@ mod tests {
             ..OrderRequest::market_sell(symbol(), dec!(1))
         };
         assert!(htx.place_order(&request).is_err());
-        assert!(mock.recorded_requests().is_empty());
+        assert_eq!(mock.recorded_requests(), Vec::new());
     }
 
     fn signed_ws_client(now_ms: i64) -> (Htx, Arc<MockWsTransport>) {
@@ -2965,7 +2965,7 @@ mod tests {
         Htx::subscribe_derivatives(&mut htx, &symbol(), DerivativesChannel::Funding).unwrap();
         Htx::subscribe_derivatives(&mut htx, &symbol(), DerivativesChannel::Liquidations).unwrap();
 
-        assert!(Htx::poll_events(&mut htx).is_empty());
+        assert_eq!(Htx::poll_events(&mut htx), Vec::new());
     }
 
     /// The futures quote channel without its paired top of book.
@@ -3046,7 +3046,7 @@ mod tests {
         ))]);
         Htx::subscribe_derivatives(&mut htx, &symbol(), DerivativesChannel::Liquidations).unwrap();
 
-        assert!(Htx::poll_events(&mut htx).is_empty());
+        assert_eq!(Htx::poll_events(&mut htx), Vec::new());
     }
 
     /// HTX publishes mark and index as separate kline channels, never together.
@@ -3056,7 +3056,7 @@ mod tests {
         let err = Htx::subscribe_derivatives(&mut htx, &symbol(), DerivativesChannel::MarkIndex)
             .expect_err("HTX publishes no combined mark/index frame");
         assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
-        assert!(ws.sent().is_empty());
+        assert_eq!(ws.sent(), Vec::<String>::new());
     }
 
     /// HTX's field names invert between endpoints: here `volume` is contracts
@@ -3325,7 +3325,7 @@ mod tests {
     fn keepalive_user_data_is_a_noop_before_subscribe() {
         let (mut htx, ws) = signed_ws_client(1_700_000_000_000);
         htx.keepalive_user_data().unwrap();
-        assert!(ws.sent().is_empty());
+        assert_eq!(ws.sent(), Vec::<String>::new());
     }
 
     #[test]
@@ -3633,14 +3633,14 @@ mod tests {
             .with_time_in_force(TimeInForce::Ioc);
         let err = htx.place_order(&both).unwrap_err();
         assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
-        assert!(mock.recorded_requests().is_empty());
+        assert_eq!(mock.recorded_requests(), Vec::new());
 
         let (htx, mock) = signed_futures_client(1000);
         let market_fok =
             OrderRequest::market_buy(symbol(), dec!(1)).with_time_in_force(TimeInForce::Fok);
         let err = htx.place_order(&market_fok).unwrap_err();
         assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
-        assert!(mock.recorded_requests().is_empty());
+        assert_eq!(mock.recorded_requests(), Vec::new());
     }
 
     /// Post-only is the `limit-maker` order kind on spot, so it cannot ride on a
@@ -3651,7 +3651,7 @@ mod tests {
         let request = OrderRequest::market_buy(symbol(), dec!(1)).post_only();
         let err = htx.place_order(&request).unwrap_err();
         assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
-        assert!(mock.recorded_requests().is_empty());
+        assert_eq!(mock.recorded_requests(), Vec::new());
     }
 
     #[test]

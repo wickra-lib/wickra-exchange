@@ -1119,7 +1119,7 @@ wHvqY4aizCFHQFTVNQCzDGy8/TOhRANCAAS69zNVQjOQ4RgxJVI8esP+jMfHLSTw\n\
             ..OrderRequest::limit_sell(symbol(), dec!(1), dec!(18900))
         };
         assert!(Coinbase::place_order(&coinbase, &request).is_err());
-        assert!(mock.recorded_requests().is_empty());
+        assert_eq!(mock.recorded_requests(), Vec::new());
     }
 
     #[test]
@@ -1174,7 +1174,7 @@ wHvqY4aizCFHQFTVNQCzDGy8/TOhRANCAAS69zNVQjOQ4RgxJVI8esP+jMfHLSTw\n\
         let market_post_only = OrderRequest::market_buy(symbol(), dec!(1)).post_only();
         let err = coinbase.place_order(&market_post_only).unwrap_err();
         assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
-        assert!(mock.recorded_requests().is_empty());
+        assert_eq!(mock.recorded_requests(), Vec::new());
 
         let (coinbase, mock) = signed_client(1000);
         let fok_post_only = OrderRequest::limit_buy(symbol(), dec!(1), dec!(100))
@@ -1182,7 +1182,7 @@ wHvqY4aizCFHQFTVNQCzDGy8/TOhRANCAAS69zNVQjOQ4RgxJVI8esP+jMfHLSTw\n\
             .with_time_in_force(TimeInForce::Fok);
         let err = coinbase.place_order(&fok_post_only).unwrap_err();
         assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
-        assert!(mock.recorded_requests().is_empty());
+        assert_eq!(mock.recorded_requests(), Vec::new());
     }
 
     #[test]

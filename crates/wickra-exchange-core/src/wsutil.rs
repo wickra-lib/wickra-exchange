@@ -213,7 +213,7 @@ mod tests {
             &["sub".to_string()],
             &mut events,
         );
-        assert!(events.is_empty());
+        assert_eq!(events, Vec::new());
         assert!(connection.is_some());
     }
 }

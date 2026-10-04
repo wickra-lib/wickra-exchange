@@ -192,7 +192,7 @@ mod tests {
         assert_eq!(ex.ticker(&sym()).unwrap().last, dec!(100));
 
         assert!(ex.is_finished());
-        assert!(ex.poll_events().is_empty());
+        assert_eq!(ex.poll_events(), Vec::new());
         assert_eq!(ex.name(), "replay");
     }
 
@@ -250,12 +250,12 @@ mod tests {
             .unwrap();
         assert_eq!(ex.open_orders(None).unwrap().len(), 1);
         ex.cancel_order(&sym(), &order.id).unwrap();
-        assert!(ex.open_orders(None).unwrap().is_empty());
+        assert_eq!(ex.open_orders(None).unwrap(), Vec::new());
         assert_eq!(
             ex.query_order(&sym(), &order.id).unwrap().status,
             OrderStatus::Canceled
         );
-        assert!(!ex.balances().unwrap().is_empty());
+        assert_ne!(ex.balances().unwrap(), Vec::new());
     }
 
     /// End-to-end: a recorded tape drives a wickra-core indicator, whose signal
