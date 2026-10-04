@@ -310,7 +310,7 @@ mod tests {
             "upbit",
         ] {
             let client = connect(name, creds(), &opts()).unwrap();
-            assert!(!client.name().is_empty());
+            assert_ne!(client.name(), "");
         }
     }
 
@@ -452,7 +452,7 @@ mod tests {
                 .unwrap_or_else(|_| panic!("{name} should dispatch a user-data client"));
             // `WsUserData: MarketData`, so the boxed facade handle can poll without
             // opening a socket (nothing is buffered yet).
-            assert!(client.poll_events().is_empty());
+            assert_eq!(client.poll_events(), Vec::new());
         }
     }
 

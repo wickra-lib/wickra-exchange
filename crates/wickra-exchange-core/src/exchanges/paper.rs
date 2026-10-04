@@ -524,7 +524,7 @@ mod tests {
         assert!(matches!(events[0], Event::OrderUpdate(_)));
         assert!(matches!(events[1], Event::BalanceUpdate(_)));
         // Draining clears the buffer.
-        assert!(ex.poll_events().is_empty());
+        assert_eq!(ex.poll_events(), Vec::new());
     }
 
     #[test]
@@ -540,7 +540,7 @@ mod tests {
 
         ex.cancel_order(&sym(), &order.id).unwrap();
         assert_eq!(ex.free_of("USDT"), dec!(100000));
-        assert!(ex.open_orders(None).unwrap().is_empty());
+        assert_eq!(ex.open_orders(None).unwrap(), Vec::new());
         assert_eq!(
             ex.query_order(&sym(), &order.id).unwrap().status,
             OrderStatus::Canceled
@@ -568,7 +568,7 @@ mod tests {
         assert!(switch.is_expired(6_000));
         let cancelled = ex.cancel_all();
         assert_eq!(cancelled, 2);
-        assert!(ex.open_orders(None).unwrap().is_empty());
+        assert_eq!(ex.open_orders(None).unwrap(), Vec::new());
         // Locked funds are released back to free on both sides.
         assert_eq!(ex.free_of("USDT"), dec!(100000));
         assert_eq!(ex.free_of("BTC"), dec!(2));
@@ -654,7 +654,7 @@ mod tests {
         assert!(ex.subscribe_trades(&sym()).is_ok());
         assert!(ex.subscribe_book(&sym()).is_ok());
         assert!(ex.subscribe_ticker(&sym()).is_ok());
-        assert!(ex.poll_events().is_empty());
+        assert_eq!(ex.poll_events(), Vec::new());
         assert_eq!(ex.name(), "paper");
         assert_eq!(ex.market_type(), MarketType::Spot);
     }

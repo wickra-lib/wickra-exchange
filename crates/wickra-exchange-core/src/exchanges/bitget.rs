@@ -2226,7 +2226,7 @@ mod tests {
     fn keepalive_user_data_is_a_noop_before_subscribe() {
         let (mut bitget, ws) = signed_ws_client(1_700_000_000_000);
         bitget.keepalive_user_data().unwrap();
-        assert!(ws.sent().is_empty());
+        assert_eq!(ws.sent(), Vec::<String>::new());
     }
 
     #[test]
@@ -2350,7 +2350,7 @@ mod tests {
             ..OrderRequest::market_sell(symbol(), dec!(1))
         };
         assert!(Bitget::place_order(&bitget, &request).is_err());
-        assert!(mock.recorded_requests().is_empty());
+        assert_eq!(mock.recorded_requests(), Vec::new());
     }
 
     const MIX_POSITIONS: &str = r#"{"code":"00000","msg":"success","data":[

@@ -2567,7 +2567,7 @@ mod tests {
         let request = OrderRequest::limit_sell(symbol(), dec!(1), dec!(100)).reduce_only();
         let err = binance.place_order(&request).unwrap_err();
         assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
-        assert!(mock.recorded_requests().is_empty());
+        assert_eq!(mock.recorded_requests(), Vec::new());
     }
 
     /// One `markPrice` frame answers two possible subscriptions, and answers
@@ -2582,7 +2582,7 @@ mod tests {
         let resolve = |_: &str| symbol();
 
         let none = parse_derivatives_message(FRAME, &resolve, &[]);
-        assert!(none.is_empty());
+        assert_eq!(none, Vec::new());
 
         let funding_only = parse_derivatives_message(
             FRAME,
@@ -2642,7 +2642,7 @@ mod tests {
         assert_eq!(liq.timestamp, 1_700_000_000_123);
 
         // Not subscribed: nothing.
-        assert!(parse_derivatives_message(FRAME, &resolve, &[]).is_empty());
+        assert_eq!(parse_derivatives_message(FRAME, &resolve, &[]), Vec::new());
     }
 
     /// A frame that is not a derivatives print, or is malformed, yields nothing
@@ -2666,7 +2666,10 @@ mod tests {
             // forceOrder with a side that is neither
             r#"{"e":"forceOrder","o":{"s":"BTCUSDT","S":"HOLD","p":"1","q":"1"}}"#,
         ] {
-            assert!(parse_derivatives_message(frame, &resolve, &subscribed).is_empty());
+            assert_eq!(
+                parse_derivatives_message(frame, &resolve, &subscribed),
+                Vec::new()
+            );
         }
     }
 
@@ -3147,7 +3150,7 @@ mod tests {
     fn keepalive_user_data_is_a_noop_before_subscribe() {
         let (mut binance, http, _ws) = user_data_client(MarketType::Spot);
         binance.keepalive_user_data().unwrap();
-        assert!(http.recorded_requests().is_empty());
+        assert_eq!(http.recorded_requests(), Vec::new());
     }
 
     #[test]
@@ -3518,7 +3521,7 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert!(matches!(events[0], Event::Trade(_)));
         // Draining again yields nothing.
-        assert!(binance.poll_events().is_empty());
+        assert_eq!(binance.poll_events(), Vec::new());
     }
 
     #[test]
@@ -3587,7 +3590,7 @@ mod tests {
         let http = Arc::new(MockHttpTransport::new());
         let opts = ExchangeOptions::mainnet(MarketType::Spot);
         let mut binance = Binance::with_http(Box::new(ArcTransport(http)), &opts);
-        assert!(binance.poll_events().is_empty());
+        assert_eq!(binance.poll_events(), Vec::new());
     }
 
     #[test]

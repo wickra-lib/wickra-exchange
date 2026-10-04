@@ -83,8 +83,8 @@ mod tests {
         let rec = reconcile_orders(&local, &venue);
         assert!(!rec.has_divergence());
         assert_eq!(rec.still_open, vec!["a", "b"]);
-        assert!(rec.appeared.is_empty());
-        assert!(rec.vanished.is_empty());
+        assert_eq!(rec.appeared, Vec::<String>::new());
+        assert_eq!(rec.vanished, Vec::<String>::new());
     }
 
     #[test]

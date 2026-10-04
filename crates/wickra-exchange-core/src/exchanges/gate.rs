@@ -2592,7 +2592,7 @@ mod tests {
             Gate::subscribe_derivatives(&mut gate, &symbol(), DerivativesChannel::Liquidations)
                 .expect_err("Gate publishes no public forced-order feed");
         assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
-        assert!(ws.sent().is_empty());
+        assert_eq!(ws.sent(), Vec::<String>::new());
     }
 
     /// `contract_stats` carries both polled figures, and stamps in **seconds**.
@@ -2856,7 +2856,7 @@ mod tests {
     fn keepalive_user_data_is_a_noop_before_subscribe() {
         let (mut gate, ws) = signed_ws_client(1_700_000_000_000);
         gate.keepalive_user_data().unwrap();
-        assert!(ws.sent().is_empty());
+        assert_eq!(ws.sent(), Vec::<String>::new());
     }
 
     #[test]
@@ -3049,7 +3049,7 @@ mod tests {
         };
         let err = gate.place_order(&request).unwrap_err();
         assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
-        assert!(mock.recorded_requests().is_empty());
+        assert_eq!(mock.recorded_requests(), Vec::new());
     }
 
     /// Futures has no such limit: `0` there means "take the market", so a
@@ -3090,7 +3090,7 @@ mod tests {
             ..OrderRequest::market_sell(symbol(), dec!(1))
         };
         assert!(gate.place_order(&request).is_err());
-        assert!(mock.recorded_requests().is_empty());
+        assert_eq!(mock.recorded_requests(), Vec::new());
     }
 
     fn signed_futures_ws_client(
@@ -3310,7 +3310,7 @@ mod tests {
         let fok = OrderRequest::market_buy(symbol(), dec!(1)).with_time_in_force(TimeInForce::Fok);
         let err = gate.place_order(&fok).unwrap_err();
         assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
-        assert!(mock.recorded_requests().is_empty());
+        assert_eq!(mock.recorded_requests(), Vec::new());
     }
 
     #[test]

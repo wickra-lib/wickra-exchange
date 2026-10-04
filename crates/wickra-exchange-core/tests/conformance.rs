@@ -89,10 +89,10 @@ fn assert_lifecycle(exchange: &mut dyn Exchange, market: &Symbol) {
         .query_order(market, &placed.id)
         .expect("query after cancel");
     assert_eq!(after.status, OrderStatus::Canceled);
-    assert!(exchange.open_orders(None).unwrap().is_empty());
+    assert_eq!(exchange.open_orders(None).unwrap(), Vec::new());
 
-    assert!(!exchange.balances().unwrap().is_empty());
-    assert!(!exchange.name().is_empty());
+    assert_ne!(exchange.balances().unwrap(), Vec::new());
+    assert_ne!(exchange.name(), "");
 }
 
 fn market() -> Symbol {
@@ -162,7 +162,7 @@ fn every_venue_client_is_object_safe_and_named() {
     ];
     assert_eq!(clients.len(), 10);
     for client in &clients {
-        assert!(!client.name().is_empty());
+        assert_ne!(client.name(), "");
     }
 }
 
@@ -200,7 +200,7 @@ fn every_trading_venue_is_object_safe_as_ws_user_data_and_ws_execution() {
     // `WsUserData: MarketData`, so a boxed user-data client can poll directly.
     let mut user_data = user_data;
     for client in &mut user_data {
-        assert!(client.poll_events().is_empty());
+        assert_eq!(client.poll_events(), Vec::new());
     }
 }
 

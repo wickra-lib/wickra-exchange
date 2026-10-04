@@ -906,7 +906,7 @@ mod tests {
         let reduce = OrderRequest::limit_buy(symbol(), dec!(1), dec!(100)).reduce_only();
         let err = upbit.place_order(&reduce).unwrap_err();
         assert!(matches!(err, Error::Exchange { ref code, .. } if code == "unsupported"));
-        assert!(mock.recorded_requests().is_empty());
+        assert_eq!(mock.recorded_requests(), Vec::new());
 
         let (upbit, mock) = signed_client(1000);
         mock.push_json(200, "{}");

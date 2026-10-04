@@ -2288,7 +2288,7 @@ mod tests {
             ..OrderRequest::market_sell(symbol(), dec!(1))
         };
         assert!(Bybit::place_order(&bybit, &request).is_err());
-        assert!(mock.recorded_requests().is_empty());
+        assert_eq!(mock.recorded_requests(), Vec::new());
     }
 
     #[test]
@@ -2400,7 +2400,7 @@ mod tests {
         let delta: serde_json::Value =
             serde_json::from_str(r#"{"symbol":"BTCUSDT","markPrice":"20001.0"}"#).unwrap();
         let events = parse_derivatives_message("tickers.BTCUSDT", &delta, &resolve, &both);
-        assert!(events.is_empty());
+        assert_eq!(events, Vec::new());
 
         // A delta with a rate and a mark, but no index: funding only.
         let delta: serde_json::Value = serde_json::from_str(
@@ -2426,7 +2426,10 @@ mod tests {
             r#"{"symbol":"BTCUSDT","markPrice":"20000.5","indexPrice":"19998.25","fundingRate":"0.0001"}"#,
         )
         .unwrap();
-        assert!(parse_derivatives_message("tickers.BTCUSDT", &full, &resolve, &[]).is_empty());
+        assert_eq!(
+            parse_derivatives_message("tickers.BTCUSDT", &full, &resolve, &[]),
+            Vec::new()
+        );
     }
 
     /// `allLiquidation` reports the taker side of the forced order -- the side
@@ -2454,8 +2457,9 @@ mod tests {
         assert_eq!(liq.quantity, dec!(2.5));
         assert_eq!(liq.timestamp, 1_700_000_000_123);
 
-        assert!(
-            parse_derivatives_message("allLiquidation.BTCUSDT", &data, &resolve, &[]).is_empty()
+        assert_eq!(
+            parse_derivatives_message("allLiquidation.BTCUSDT", &data, &resolve, &[]),
+            Vec::new()
         );
     }
 
@@ -2917,7 +2921,7 @@ mod tests {
     fn keepalive_user_data_is_a_noop_before_subscribe() {
         let (mut bybit, ws) = signed_ws_client(1000);
         bybit.keepalive_user_data().unwrap();
-        assert!(ws.sent().is_empty());
+        assert_eq!(ws.sent(), Vec::<String>::new());
     }
 
     #[test]
@@ -3113,7 +3117,7 @@ mod tests {
             bybit.subscribe_trades(&symbol()).unwrap_err(),
             Error::NotConnected
         ));
-        assert!(bybit.poll_events().is_empty());
+        assert_eq!(bybit.poll_events(), Vec::new());
     }
 
     #[test]
