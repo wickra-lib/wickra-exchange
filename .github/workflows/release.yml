@@ -755,12 +755,6 @@ jobs:
         if: steps.central.outputs.published == 'true'
         run: mvn -B -f bindings/java package -DskipTests
 
-  # Mirror the in-repo Go module to the standalone wickra-exchange-go repository
-  # so `go get github.com/wickra-lib/wickra-exchange-go` builds with no extra
-  # steps. The mirror commits the prebuilt libraries per platform under
-  # lib/<goos>_<goarch>/ alongside the vendored header. The push uses a
-  # fine-grained PAT (GO_MIRROR_TOKEN, contents:write on
-  # wickra-exchange-go); the mirror's bot commit is intentionally unsigned.
       # `deploy` packages before it uploads, so the signed jar is already under
       # target/. Only the main artefact is kept: the sources and javadoc jars
       # travel to Maven Central but are not what a consumer downloads from the
@@ -776,6 +770,12 @@ jobs:
             !bindings/java/target/*-javadoc.jar
           if-no-files-found: error
 
+  # Mirror the in-repo Go module to the standalone wickra-exchange-go repository
+  # so `go get github.com/wickra-lib/wickra-exchange-go` builds with no extra
+  # steps. The mirror commits the prebuilt libraries per platform under
+  # lib/<goos>_<goarch>/ alongside the vendored header. The push uses a
+  # fine-grained PAT (GO_MIRROR_TOKEN, contents:write on
+  # wickra-exchange-go); the mirror's bot commit is intentionally unsigned.
   go-mirror:
     name: Mirror the Go module to wickra-exchange-go
     timeout-minutes: 45
