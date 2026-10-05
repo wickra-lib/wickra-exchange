@@ -773,9 +773,10 @@ jobs:
   # Mirror the in-repo Go module to the standalone wickra-exchange-go repository
   # so `go get github.com/wickra-lib/wickra-exchange-go` builds with no extra
   # steps. The mirror commits the prebuilt libraries per platform under
-  # lib/<goos>_<goarch>/ alongside the vendored header. The push uses a
-  # fine-grained PAT (GO_MIRROR_TOKEN, contents:write on
-  # wickra-exchange-go); the mirror's bot commit is intentionally unsigned.
+  # lib/<goos>_<goarch>/ alongside the vendored header. The commit and the tag
+  # go through actions/signed-commit with a wickra-lib-bot token scoped to
+  # wickra-exchange-go, so GitHub signs the mirror's commit like every other in
+  # the org.
   go-mirror:
     name: Mirror the Go module to wickra-exchange-go
     timeout-minutes: 45
@@ -886,30 +887,25 @@ jobs:
           rm smoke_main_test.go
           echo "module builds, links and runs its whole suite"
 
-      - name: Push to wickra-exchange-go and tag the release
-        shell: bash
-        env:
-          MIRROR_TOKEN: ${{ secrets.GO_MIRROR_TOKEN }}
-        run: |
-          set -e
-          version="${GITHUB_REF_NAME#v}"
-          remote="https://x-access-token:${MIRROR_TOKEN}@github.com/wickra-lib/wickra-exchange-go.git"
-          git clone -q "$remote" mirror-repo
-          cd mirror-repo
-          git config user.name "wickra-bot"
-          git config user.email "support@wickra.org"
-          git symbolic-ref HEAD refs/heads/main
-          find . -mindepth 1 -maxdepth 1 -not -name .git -exec rm -rf {} +
-          cp -r ../wickra-exchange-go-module/. .
-          git add -A
-          if git diff --cached --quiet; then
-            echo "wickra-exchange-go already up to date; tagging only"
-          else
-            git -c commit.gpgsign=false commit -q -m "Release v$version"
-          fi
-          git push origin HEAD:refs/heads/main
-          git tag "v$version"
-          git push origin "v$version"
+      # A token of the wickra-lib-bot app scoped to wickra-exchange-go alone: the
+      # commit goes through the API, so GitHub signs it.
+      - name: Mint a token for wickra-exchange-go
+        id: mirror-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.WICKRA_BOT_APP_ID }}
+          private-key: ${{ secrets.WICKRA_BOT_PRIVATE_KEY }}
+          repositories: wickra-exchange-go
+          permission-contents: write
+      - name: Publish to wickra-exchange-go and tag the release (signed)
+        uses: wickra-lib/.github/actions/signed-commit@782bf3d7a8edb80ada87dc7ba9067e2bf5752710 # v1.0.0
+        with:
+          token: ${{ steps.mirror-token.outputs.token }}
+          repository: wickra-lib/wickra-exchange-go
+          mode: tree
+          source: wickra-exchange-go-module
+          message: Release ${{ github.ref_name }}
+          tag: ${{ github.ref_name }}
 
   # --------------------------------------------------------------------------
   # GitHub Release: create a DRAFT, attach every built artefact, then publish-
