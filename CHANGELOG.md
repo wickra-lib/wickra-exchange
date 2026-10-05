@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-06
+
+The exchange facade and its native bindings are unchanged; the indicator core
+underneath moves to wickra 2.0.
+
+### Changed
+
+- **wickra-core 2.0,** the formula-audit release. The `Candle`, tick, trade and
+  order-book types exchange hands out come from it and are unchanged in 2.0, but
+  they are now wickra-core 2's types, so code that mixes them with its own
+  wickra-core needs 2.0 as well.
+
 ## [0.1.8] - 2026-09-24
 
 The exchange facade and its native bindings are unchanged. The R package now
@@ -1833,7 +1845,8 @@ package again: it tracks `*release`, not `main`, so the fix that landed after
   reached the tree through `tokio-tungstenite 0.30 -> tungstenite 0.30 -> rand
   0.10.2`. Locked to `0.10.2`, which is not yanked. Nothing else moved.
 
-[Unreleased]: https://github.com/wickra-lib/wickra-exchange/compare/v0.1.8...HEAD
+[Unreleased]: https://github.com/wickra-lib/wickra-exchange/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/wickra-lib/wickra-exchange/compare/v0.1.8...v0.2.0
 [0.1.8]: https://github.com/wickra-lib/wickra-exchange/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/wickra-lib/wickra-exchange/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/wickra-lib/wickra-exchange/compare/v0.1.5...v0.1.6
