@@ -8,7 +8,7 @@ abstract: >-
   through a C ABI, from C, C++, C#, Go, Java and R.
 type: software
 version: "0.2.0"
-date-released: "2026-10-05"
+date-released: "2026-10-06"
 authors:
   - alias: kingchenc
     website: "https://wickra.org"

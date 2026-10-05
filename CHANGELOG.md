@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.2.0] - 2026-10-05
+## [0.2.0] - 2026-10-06
 
 The exchange facade and its native bindings are unchanged; the indicator core
 underneath moves to wickra 2.0.
