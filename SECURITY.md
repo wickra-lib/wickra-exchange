@@ -8,8 +8,8 @@ inventory, trust boundaries and key-handling guarantees.
 ## Supported versions
 
 This project is pre-1.0. Security fixes land on `main` and ship in the next
-release; `0.2.0` is the latest release and the only one supported. Please
-upgrade to it before reporting an issue.
+release of the `0.2.x` line; `0.2.0` is the latest release and the only one
+supported. Please upgrade to it before reporting an issue.
 
 | Version | Supported |
 |---------|-----------|
