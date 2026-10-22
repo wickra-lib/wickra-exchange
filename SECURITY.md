@@ -7,15 +7,15 @@ inventory, trust boundaries and key-handling guarantees.
 
 ## Supported versions
 
-This project is pre-1.0. Security fixes target the `main` branch and the newest
-published minor line; please upgrade to the newest release before reporting an
-issue.
+This project is pre-1.0. Security fixes land on `main` and ship in the next
+release of the `0.2.x` line; `0.2.0` is the latest release and the only one
+supported. Please upgrade to it before reporting an issue.
 
 | Version | Supported |
 |---------|-----------|
-| `main`  | ✅        |
-| `0.2.x` | ✅        |
-| < 0.2   | ❌        |
+| `main`  | ✅ |
+| 0.2.0 (latest) | ✅ |
+| < 0.2.0 | ❌ |
 
 ## Reporting a vulnerability
 
