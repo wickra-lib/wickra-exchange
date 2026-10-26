@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **MSRV 1.87** (was 1.86). `p256` reaches `crypto-bigint` and `ctutils`, and the
+  releases that fix RUSTSEC-2026-0387 and RUSTSEC-2026-0385 (crypto-bigint 0.7.9,
+  ctutils 0.4.4 and later) require Rust 1.87. Every earlier crypto-bigint 0.7
+  release is yanked, so a fresh resolve already could not build on 1.86.
+
+### Security
+
+- **crypto-bigint 0.7.9, ctutils 0.4.6 and tokio 1.53.3** in the lockfile, for
+  RUSTSEC-2026-0387, RUSTSEC-2026-0385 and RUSTSEC-2026-0386.
+
 ## [0.2.0] - 2026-10-06
 
 The exchange facade and its native bindings are unchanged; the indicator core
