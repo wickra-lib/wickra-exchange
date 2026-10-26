@@ -63,7 +63,7 @@ jobs:
           RUSTDOCFLAGS: -D warnings
 
   msrv:
-    name: MSRV workspace (1.86)
+    name: MSRV workspace (1.87)
     runs-on: ubuntu-latest
     timeout-minutes: 30 # backstop against a hung job, not a budget
     steps:
@@ -72,7 +72,7 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/setup-rust
         with:
-          toolchain: "1.86"
+          toolchain: "1.87"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # The Node binding (napi 3) requires Rust 1.88 and is checked separately
       # below; the Python binding needs maturin's platform link flags and is

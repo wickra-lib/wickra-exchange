@@ -312,7 +312,7 @@ also need a C compiler, and Java runs with `--enable-native-access=ALL-UNNAMED`.
 
 | Language | Package                                    | Minimum supported          |
 |----------|--------------------------------------------|----------------------------|
-| Rust     | crates.io · `wickra-exchange`              | 1.86 (MSRV)                |
+| Rust     | crates.io · `wickra-exchange`              | 1.87 (MSRV)                |
 | Python   | PyPI · `wickra-exchange` (abi3 wheel)      | 3.9 (tested through 3.13)  |
 | Node.js  | npm · `wickra-exchange` (N-API 8)          | 22 (tested on 22 · 24 LTS) |
 | C        | `wickra_exchange.h` + library (releases)   | C99 compiler               |
