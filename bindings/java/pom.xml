@@ -166,7 +166,7 @@
               API's response grew a `warnings` field that version cannot
               deserialise. Both sibling repositories were already on 0.11.0.
             -->
-            <version>0.11.0</version>
+            <version>0.12.0</version>
             <extensions>true</extensions>
             <configuration>
               <!-- Matches `server-id: central` in the workflow's setup-java
