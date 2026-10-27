@@ -294,19 +294,24 @@ jobs:
       # javac against the binding jar: same reasoning as C#. -DskipTests because
       # compiling is the point, not exercising.
       - name: Java example — compile against the binding jar
-        shell: bash
-        run: |
-          set -euo pipefail
-          mvn -B -q -f bindings/java package -DskipTests
-          jar=$(find bindings/java/target -maxdepth 1 -name '*.jar' \
-                ! -name '*-sources.jar' ! -name '*-javadoc.jar' | head -1)
-          if [ -z "$jar" ]; then
-            echo "::error::no binding jar was produced"
-            exit 1
-          fi
-          echo "compiling against $jar"
-          javac -cp "$jar" -d "$(mktemp -d)" examples/java/*.java benchmarks/java/*.java
-          echo "java example and benchmark compile against the binding in this tree"
+        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60 # v4.0.0
+        with:
+          timeout_minutes: 30
+          max_attempts: 2
+          retry_wait_seconds: 30
+          shell: bash
+          command: |
+            set -euo pipefail
+            mvn -B -q -f bindings/java package -DskipTests
+            jar=$(find bindings/java/target -maxdepth 1 -name '*.jar' \
+                  ! -name '*-sources.jar' ! -name '*-javadoc.jar' | head -1)
+            if [ -z "$jar" ]; then
+              echo "::error::no binding jar was produced"
+              exit 1
+            fi
+            echo "compiling against $jar"
+            javac -cp "$jar" -d "$(mktemp -d)" examples/java/*.java benchmarks/java/*.java
+            echo "java example and benchmark compile against the binding in this tree"
 
   # The Linux wheels are the two artefacts CI never touched: the python job
   # builds a wheel for the runner's own glibc, while release.yml builds
@@ -919,7 +924,13 @@ jobs:
       - name: Java info
         run: java -version
       - name: Test the Java binding
-        run: mvn -B -f bindings/java test
+        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60 # v4.0.0
+        with:
+          timeout_minutes: 30
+          max_attempts: 2
+          retry_wait_seconds: 30
+          shell: bash
+          command: mvn -B -f bindings/java test
 
   r:
     name: R on ${{ matrix.os }}

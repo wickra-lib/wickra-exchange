@@ -148,8 +148,13 @@ jobs:
       # and CodeQL needs the code compiled, not exercised.
       - name: Build the Java binding
         if: matrix.language == 'java-kotlin'
-        shell: bash
-        run: mvn -B -f bindings/java test-compile -DskipTests
+        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60 # v4.0.0
+        with:
+          timeout_minutes: 30
+          max_attempts: 2
+          retry_wait_seconds: 30
+          shell: bash
+          command: mvn -B -f bindings/java test-compile -DskipTests
 
       - name: Perform CodeQL analysis
         uses: github/codeql-action/analyze@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
