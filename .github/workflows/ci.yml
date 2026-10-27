@@ -827,6 +827,12 @@ jobs:
         uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cbindgen
+          # install-action ships no cbindgen and falls back to cargo-binstall. Its
+          # upgrade of a preinstalled cargo-binstall deletes the file under its own bin
+          # dir rather than where it found it, so on macOS runners whose rustup lives
+          # in Homebrew the step dies on `rm: No such file or directory`. cargo install
+          # never touches cargo-binstall.
+          fallback: cargo-install
       - name: Build the C ABI library (cdylib + staticlib)
         run: cargo build -p wickra-exchange-c --release
       - name: Rust unit tests
