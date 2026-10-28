@@ -14,6 +14,10 @@ unchanged. It ships the security fixes in the dependency tree.
 
 ### Changed
 
+- **Built on wickra-core 2.1.0.** The lock takes the indicator core's minor
+  release; the `2.0` requirement already admitted it. It adds `RunningDrawdown`
+  and updates `MaxDrawdown` in amortised O(1) with the same values; nothing here
+  computes differently.
 - **MSRV 1.87** (was 1.86). `p256` reaches `crypto-bigint` and `ctutils`, and the
   releases that fix RUSTSEC-2026-0387 and RUSTSEC-2026-0385 (crypto-bigint 0.7.9,
   ctutils 0.4.4 and later) require Rust 1.87. Every earlier crypto-bigint 0.7
