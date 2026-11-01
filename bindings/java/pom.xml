@@ -74,7 +74,7 @@
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-surefire-plugin</artifactId>
-        <version>3.6.0</version>
+        <version>3.6.1</version>
         <configuration>
           <!-- FFM needs native access enabled. native.lib.dir goes through
                systemPropertyVariables (not argLine) so a path with spaces is not
