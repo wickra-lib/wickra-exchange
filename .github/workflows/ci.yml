@@ -783,12 +783,17 @@ jobs:
           node-version: ${{ matrix.node-version }}
           cache: npm
           cache-dependency-path: bindings/node/package-lock.json
-      # npm install (not npm ci): the per-platform optionalDependencies point at
-      # native packages that are not published until the first release, so they
-      # are absent from the lock file and `npm ci` would reject the tree as out
-      # of sync. install treats the missing optional packages as non-fatal.
+      # npm ci, reproducible: it installs exactly the lockfile and refuses a
+      # lock that disagrees with the manifest. This was `npm install` while the
+      # six per-platform optionalDependencies did not exist on the registry and
+      # so could not be in the lock -- npm refuses that with
+      # `EUSAGE ... Missing: wickra-exchange-darwin-arm64@ from lock file`.
+      # The releases published them, the lock now names all six, and the
+      # reason for the looser command is gone. A release bump moves those entries
+      # to the new version before it is published, which npm ci accepts:
+      # wickra-backtest has released this way since 0.1.1.
       - name: Install Node dependencies
-        run: cd bindings/node && npm install --no-audit --no-fund
+        run: cd bindings/node && npm ci --no-audit --no-fund
       # --platform puts the target triple into the filename so the loader finds
       # the freshly built binary instead of a per-platform npm subpackage.
       - name: Build native module
