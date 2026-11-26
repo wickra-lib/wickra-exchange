@@ -1175,7 +1175,8 @@ impl PyWsExecution {
 
 /// The `_wickra_exchange` extension module.
 #[pymodule]
-fn _wickra_exchange(module: &Bound<'_, PyModule>) -> PyResult<()> {
+#[pyo3(name = "_wickra_exchange")]
+fn wickra_exchange_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     module.add_class::<PyCredentials>()?;
     module.add_class::<PyOrderRequest>()?;
