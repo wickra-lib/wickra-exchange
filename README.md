@@ -1,5 +1,5 @@
 <p align="center">
-  <a href="https://wickra.org"><img src="https://raw.githubusercontent.com/wickra-lib/.github/main/profile/wickra-banner.svg?v=514-8" alt="Wickra Exchange — streaming-native crypto-exchange connectivity: one typed API over the ten largest exchanges, across ten languages" width="100%"></a>
+  <a href="https://wickra.org"><img src="https://raw.githubusercontent.com/wickra-lib/.github/main/profile/wickra-banner.svg?v=515-8" alt="Wickra Exchange — streaming-native crypto-exchange connectivity: one typed API over the ten largest exchanges, across ten languages" width="100%"></a>
 </p>
 
 [![Built on Wickra](https://raw.githubusercontent.com/wickra-lib/.github/main/profile/badges/wickra-exchange/built-on.svg)](https://github.com/wickra-lib/wickra)
@@ -45,7 +45,7 @@ println!("{} filled at {:?}", order.filled_quantity, order.average_price);
 
 > **▶ Live demos:** the backtester compiled to WebAssembly, an equity curve building bar by bar — **[backtest-live.wickra.org](https://backtest-live.wickra.org)**;
 > one StrategySpec side by side in Python, Rust, JS and Go — **[playground.wickra.org](https://playground.wickra.org)**;
-> all 514 indicators of the core over a real Binance feed — **[live.wickra.org](https://live.wickra.org)**. Zero backend, all of them.
+> all 515 indicators of the core over a real Binance feed — **[live.wickra.org](https://live.wickra.org)**. Zero backend, all of them.
 
 **Part of the [Wickra ecosystem](#ecosystem):** the same data-driven core and ten-language binding surface also power [wickra-backtest](https://github.com/wickra-lib/wickra-backtest), [wickra-terminal](https://github.com/wickra-lib/wickra-terminal), [wickra-screener](https://github.com/wickra-lib/wickra-screener) and 20 more — see [the full list](https://github.com/wickra-lib).
 
@@ -65,7 +65,7 @@ of Wickra**:
 - **Microstructure-native feeds** — trades and depth arrive from the venue
   streams already shaped for `wickra-core`, and one call converts each into the
   exact input type the indicators consume (`Trade`, `OrderBook`, `CrossSection`)
-  — feeding 514 indicators and the backtester with zero glue. The derivatives
+  — feeding 515 indicators and the backtester with zero glue. The derivatives
   channels (funding, open interest, liquidations, positioning, mark/index) are
   typed too and fold into a `DerivativesTick`, and **all eight futures venues
   subscribe to them**. A venue that publishes no such channel refuses it rather
@@ -92,7 +92,7 @@ page; the browser-safe slice of *public market data* remains covered by
 
 ## Status
 
-**0.2.1 — the current release.** Ten exchanges behind one typed API — market
+**0.2.2 — the current release.** Ten exchanges behind one typed API — market
 data and signed execution — the deterministic paper exchange, all ten language
 bindings, the byte-exact golden corpus, property + fuzz tests, benchmarks and one
 runnable example per language are in place and green across the full CI matrix
