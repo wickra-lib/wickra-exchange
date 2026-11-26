@@ -75,7 +75,7 @@ The differentiators are what make this more than "a typed ccxt":
   swapping the implementation.
 - **Microstructure feeds** (`feeds`) convert what the venue clients emit into
   the exact typed shapes `wickra-core` consumes (`Trade`, `OrderBook`,
-  `CrossSection`), feeding the 514 indicators and the backtester with zero glue.
+  `CrossSection`), feeding the 515 indicators and the backtester with zero glue.
   The derivatives channels fold into a `DerivativesTick` from caller-supplied
   frames — no client subscribes to them yet.
 - **`ReplayExchange`** drives a recorded feed through the same trait.
