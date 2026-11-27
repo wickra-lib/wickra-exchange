@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     branches: [main]
 
 permissions:
@@ -18,6 +19,7 @@ concurrency:
 
 jobs:
   test:
+    if: ${{ !github.event.pull_request.draft }}
     name: Test (${{ matrix.os }})
     strategy:
       fail-fast: false
@@ -37,6 +39,7 @@ jobs:
       - run: cargo test --workspace --all-features --exclude wickra-exchange-python
 
   lint:
+    if: ${{ !github.event.pull_request.draft }}
     name: Format & Clippy
     runs-on: ubuntu-latest
     timeout-minutes: 30 # backstop against a hung job, not a budget
@@ -63,6 +66,7 @@ jobs:
           RUSTDOCFLAGS: -D warnings
 
   msrv:
+    if: ${{ !github.event.pull_request.draft }}
     name: MSRV workspace (1.87)
     runs-on: ubuntu-latest
     timeout-minutes: 30 # backstop against a hung job, not a budget
@@ -80,6 +84,7 @@ jobs:
       - run: cargo build --workspace --exclude wickra-exchange-python --exclude wickra-exchange-node
 
   msrv-node:
+    if: ${{ !github.event.pull_request.draft }}
     name: MSRV node binding (1.88)
     runs-on: ubuntu-latest
     timeout-minutes: 30 # backstop against a hung job, not a budget
@@ -101,6 +106,7 @@ jobs:
   # A job-level continue-on-error would not do: the check run still concludes
   # `failure`, the commit shows red and a release gate reading check runs stops.
   links:
+    if: ${{ !github.event.pull_request.draft }}
     name: External links (non-blocking)
     runs-on: ubuntu-latest
     timeout-minutes: 10 # backstop against a hung job, not a budget
@@ -137,6 +143,7 @@ jobs:
   # method fail. examples/rust is left out on purpose -- it is a workspace
   # member and the `test` job already builds it.
   examples-smoke:
+    if: ${{ !github.event.pull_request.draft }}
     name: Examples (build + parse)
     runs-on: ubuntu-latest
     timeout-minutes: 30 # backstop against a hung job, not a budget
@@ -325,6 +332,7 @@ jobs:
   # wheel a container produces actually installs and imports under that libc.
   # Building a wheel and importing it are different claims.
   python-wheel-container-smoke:
+    if: ${{ !github.event.pull_request.draft }}
     name: Python wheel (${{ matrix.manylinux }}/${{ matrix.target }} smoke)
     runs-on: ubuntu-latest
     timeout-minutes: 30 # backstop against a hung job, not a budget
@@ -447,6 +455,7 @@ jobs:
           "
 
   binding-surface:
+    if: ${{ !github.event.pull_request.draft }}
     name: Binding surface parity
     runs-on: ubuntu-latest
     timeout-minutes: 10 # backstop against a hung job, not a budget
@@ -498,6 +507,7 @@ jobs:
         run: python3 scripts/check_test_count.py
 
   supply-chain:
+    if: ${{ !github.event.pull_request.draft }}
     name: Supply-chain (cargo-deny + osv-scanner)
     runs-on: ubuntu-latest
     timeout-minutes: 30 # backstop: cap a wedged job instead of GitHub's 6h default
@@ -548,6 +558,7 @@ jobs:
             ./
 
   python:
+    if: ${{ !github.event.pull_request.draft }}
     name: Python ${{ matrix.python-version }} on ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -593,6 +604,7 @@ jobs:
       - run: pytest bindings/python/tests -q
 
   go:
+    if: ${{ !github.event.pull_request.draft }}
     name: Go on ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -714,6 +726,7 @@ jobs:
           go test ./...
 
   wasm:
+    if: ${{ !github.event.pull_request.draft }}
     name: WASM build
     runs-on: ubuntu-latest
     timeout-minutes: 30 # backstop against a hung job, not a budget
@@ -764,6 +777,7 @@ jobs:
         run: node --test bindings/wasm/tests/*.test.js
 
   node:
+    if: ${{ !github.event.pull_request.draft }}
     name: Node ${{ matrix.node-version }} on ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -820,6 +834,7 @@ jobs:
         run: cd bindings/node && node --test
 
   c-abi:
+    if: ${{ !github.event.pull_request.draft }}
     name: C ABI on ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -878,6 +893,7 @@ jobs:
           cmake --build benchmarks/c/build --config Release
 
   csharp:
+    if: ${{ !github.event.pull_request.draft }}
     name: C# on ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -903,6 +919,7 @@ jobs:
         run: dotnet test bindings/csharp/WickraExchange.Tests/WickraExchange.Tests.csproj -c Release
 
   java:
+    if: ${{ !github.event.pull_request.draft }}
     name: Java on ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -938,6 +955,7 @@ jobs:
           command: mvn -B -f bindings/java test
 
   r:
+    if: ${{ !github.event.pull_request.draft }}
     name: R on ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -988,6 +1006,7 @@ jobs:
           Rscript bindings/r/tests/golden.R
 
   coverage:
+    if: ${{ !github.event.pull_request.draft }}
     name: Coverage
     runs-on: ubuntu-latest
     timeout-minutes: 30 # backstop against a hung job, not a budget
@@ -1047,6 +1066,7 @@ jobs:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
   semver:
+    if: ${{ !github.event.pull_request.draft }}
     name: Public API (cargo-semver-checks)
     runs-on: ubuntu-latest
     timeout-minutes: 30 # backstop: it builds rustdoc JSON for each crate and its baseline
@@ -1104,6 +1124,7 @@ jobs:
           cargo semver-checks check-release "${published[@]}"
 
   fuzz-smoke:
+    if: ${{ !github.event.pull_request.draft }}
     name: Fuzz (smoke)
     runs-on: ubuntu-latest
     timeout-minutes: 30 # backstop against a hung job, not a budget
@@ -1145,7 +1166,7 @@ jobs:
   # checks are left out on purpose -- an outside outage must not hold a merge.
   ci-ok:
     name: ci-ok
-    if: always()
+    if: ${{ !github.event.pull_request.draft && (always()) }}
     needs:
       - test
       - lint
