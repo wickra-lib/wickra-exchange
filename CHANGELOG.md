@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-11-27
+
+A release of the build and release pipeline; the library code is unchanged.
+
 ### Changed
 
 - **The Maven sources jar no longer carries the native libraries.** The release
@@ -1950,7 +1954,8 @@ package again: it tracks `*release`, not `main`, so the fix that landed after
   reached the tree through `tokio-tungstenite 0.30 -> tungstenite 0.30 -> rand
   0.10.2`. Locked to `0.10.2`, which is not yanked. Nothing else moved.
 
-[Unreleased]: https://github.com/wickra-lib/wickra-exchange/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/wickra-lib/wickra-exchange/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/wickra-lib/wickra-exchange/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/wickra-lib/wickra-exchange/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/wickra-lib/wickra-exchange/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/wickra-lib/wickra-exchange/compare/v0.1.8...v0.2.0
