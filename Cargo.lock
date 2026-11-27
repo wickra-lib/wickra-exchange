@@ -2532,7 +2532,7 @@ dependencies = [
 
 [[package]]
 name = "wickra-exchange"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "flate2",
  "futures-util",
@@ -2544,7 +2544,7 @@ dependencies = [
 
 [[package]]
 name = "wickra-exchange-bench"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "codspeed-criterion-compat",
  "rust_decimal",
@@ -2555,7 +2555,7 @@ dependencies = [
 
 [[package]]
 name = "wickra-exchange-c"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "rust_decimal",
  "wickra-exchange",
@@ -2563,7 +2563,7 @@ dependencies = [
 
 [[package]]
 name = "wickra-exchange-core"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "base64 0.22.1",
  "hex",
@@ -2583,7 +2583,7 @@ dependencies = [
 
 [[package]]
 name = "wickra-exchange-examples"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "rust_decimal",
  "rust_decimal_macros",
@@ -2592,7 +2592,7 @@ dependencies = [
 
 [[package]]
 name = "wickra-exchange-node"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "napi",
  "napi-build",
@@ -2603,7 +2603,7 @@ dependencies = [
 
 [[package]]
 name = "wickra-exchange-python"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "pyo3",
  "rust_decimal",
@@ -2612,7 +2612,7 @@ dependencies = [
 
 [[package]]
 name = "wickra-exchange-wasm"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "console_error_panic_hook",
  "getrandom 0.4.3",
